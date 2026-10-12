@@ -1,0 +1,66 @@
+name: Linux agc_driver_dcc_keys_first_write for boykopovar/AnyPS5#4700
+
+on:
+  push:
+    branches: [ci/linux-dcc-keys-4700]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      MAIN_SHA: d53960612fcfeb0b4c5e2738fafbecaf6ac983cb
+      PR_HEAD: 2fb6dccd756459524ebf2f206da337cec00300da
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: boykopovar/AnyPS5
+          ref: ${{ env.MAIN_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Merge the pull request head into main, as the upstream linux job does
+        run: |
+          git fetch --no-tags origin refs/pull/4700/head
+          if [ "$(git rev-parse FETCH_HEAD)" != "$PR_HEAD" ]; then echo "::error::refs/pull/4700/head is $(git rev-parse FETCH_HEAD), not $PR_HEAD"; exit 1; fi
+          git -c user.name=ci -c user.email=ci@localhost merge --no-ff --no-edit FETCH_HEAD
+          git submodule update --init --recursive
+          git log --oneline -3
+      - name: Install lavapipe and the audio development files, as the upstream linux job does
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers libpipewire-0.3-dev libpulse-dev libasound2-dev
+      - name: Configure with the upstream linux job's options
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DANYPS5_ENABLE_SPIRV_TOOLS=ON
+      - name: Build the test
+        run: cmake --build build --target agc_driver_dcc_keys_first_write_tests
+      - name: Run agc_driver_dcc_keys_first_write with the pull request
+        env:
+          ANYPS5_REQUIRE_VULKAN: 1
+          GALLIUM_OVERRIDE_CPU_CAPS: avx
+        run: ctest --test-dir build -R '^agc_driver_dcc_keys_first_write$' --output-on-failure --timeout 120
+      - name: Take out the ClearSingle memory check in fastTexture
+        run: |
+          python3 - <<'EOF'
+          path = 'core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp'
+          text = open(path, encoding='utf-8').read()
+          old = '} else if ((keys == DccKeys::Uncompressed || keys == DccKeys::ClearSingle) && !GuestMemory::UnchangedSince(address, bytes, record.entryGeneration)) {'
+          new = '} else if (keys == DccKeys::Uncompressed && !GuestMemory::UnchangedSince(address, bytes, record.entryGeneration)) {'
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'expected the fastTexture line once, found it {count} times')
+          open(path, 'w', encoding='utf-8').write(text.replace(old, new))
+          EOF
+          git diff
+      - name: Build the test without the check
+        run: cmake --build build --target agc_driver_dcc_keys_first_write_tests
+      - name: Run agc_driver_dcc_keys_first_write without the check (expected to fail)
+        env:
+          ANYPS5_REQUIRE_VULKAN: 1
+          GALLIUM_OVERRIDE_CPU_CAPS: avx
+        run: |
+          if ctest --test-dir build -R '^agc_driver_dcc_keys_first_write$' --output-on-failure --timeout 120; then
+            echo "::error::agc_driver_dcc_keys_first_write passed without the ClearSingle memory check in fastTexture"
+            exit 1
+          fi
+          echo "agc_driver_dcc_keys_first_write fails without the ClearSingle memory check in fastTexture, as expected."
