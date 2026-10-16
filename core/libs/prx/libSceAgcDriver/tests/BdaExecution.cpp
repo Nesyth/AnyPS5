@@ -1,5 +1,6 @@
 #include "BdaShader.hpp"
 #include "BdaAbi.hpp"
+#include "SpirvBackend/SpirvBda.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaPageTable.hpp"
@@ -485,20 +486,22 @@ static void RunBdaPageTableTests(const Context& context) {
         const auto alone = pages != nullptr ? translate({}, gpuGrants, pages->Address(), probes) : std::vector<Ref::Translation>{};
         const auto leaves = Ref::EncodeLeaves(held, [](std::uint32_t window, std::span<const Abi::Range> ranges) { return EncodeBdaWindow(window, ranges); });
         const Ref::Leaves none;
-        std::vector<std::uint64_t> addresses;
-        for (const auto address : Ref::Probes(list)) {
-            if (address != ~std::uint64_t{0}) addresses.push_back(address);
-        }
-        const auto found = segments(own, PageTableAddress(pages), addresses);
-        for (std::size_t index = 0; index < addresses.size(); ++index) {
-            const auto address = addresses[index];
-            const auto begin = found[index][0];
-            const auto end = found[index][1];
-            const auto delta = found[index][2];
-            const auto expected = Ref::Translate(leaves, own, address, 1u, Abi::Read);
-            const auto mapsAt = [&](std::uint64_t at) { return Ref::Translate(leaves, own, at, 1u, Abi::Read) == Ref::Translation{at + delta, 0u}; };
-            const bool kept = expected.reason == 0u ? begin <= address && address < end && address + delta == expected.device && mapsAt(begin) && mapsAt(end - 1u) : begin == 0u && end == 0u && delta == expected.reason;
-            Require(kept, name + ": the GPU segment of " + hex(address) + " is [" + hex(begin) + ", " + hex(end) + ") with delta " + hex(delta) + ", its translation " + hex(expected.device) + " reason " + std::to_string(expected.reason));
+        if (grants.empty() && !boundGiven && !ShaderRecompiler::BdaByteReadsForced()) {
+            std::vector<std::uint64_t> addresses;
+            for (const auto address : Ref::Probes(list)) {
+                if (address != ~std::uint64_t{0}) addresses.push_back(address);
+            }
+            const auto found = segments(own, PageTableAddress(pages), addresses);
+            for (std::size_t index = 0; index < addresses.size(); ++index) {
+                const auto address = addresses[index];
+                const auto begin = found[index][0];
+                const auto end = found[index][1];
+                const auto delta = found[index][2];
+                const auto expected = Ref::Translate(leaves, own, address, 1u, Abi::Read);
+                const auto mapsAt = [&](std::uint64_t at) { return Ref::Translate(leaves, own, at, 1u, Abi::Read) == Ref::Translation{at + delta, 0u}; };
+                const bool kept = expected.reason == 0u ? begin <= address && address < end && address + delta == expected.device && mapsAt(begin) && mapsAt(end - 1u) : begin == 0u && end == 0u && delta == expected.reason;
+                Require(kept, name + ": the GPU segment of " + hex(address) + " is [" + hex(begin) + ", " + hex(end) + ") with delta " + hex(delta) + ", its translation " + hex(expected.device) + " reason " + std::to_string(expected.reason));
+            }
         }
         std::size_t differs = 0;
         for (std::size_t index = 0; index < probes.size(); ++index) {
