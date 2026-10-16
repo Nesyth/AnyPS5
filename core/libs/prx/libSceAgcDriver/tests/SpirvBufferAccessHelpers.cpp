@@ -29,6 +29,7 @@ struct Function {
     std::size_t rolledLoops = 0;
     std::map<std::uint32_t, std::uint32_t> calls;
     std::size_t bufferMemoryLoads = 0;
+    std::size_t faultHolds = 0;
 };
 
 struct Module {
@@ -78,6 +79,8 @@ Module Parse(std::span<const std::uint32_t> words) {
     std::set<std::uint32_t> wideTypes;
     std::set<std::uint32_t> privateWidePointers;
     std::set<std::uint32_t> privateWide;
+    std::set<std::uint32_t> faultVariables;
+    std::uint32_t faultReason = 0;
     for (std::size_t cursor = 5; cursor < words.size();) {
         const auto count = words[cursor] >> 16u;
         const auto op = words[cursor] & 0xffffu;
@@ -88,11 +91,14 @@ Module Parse(std::span<const std::uint32_t> words) {
         if (op == spv::OpName) {
             std::string name(reinterpret_cast<const char*>(operands + 1), (count - 2u) * 4u);
             module.functions[operands[0]].name = name.c_str();
+            if (module.functions[operands[0]].name.starts_with("bda_fault_")) faultVariables.insert(operands[0]);
+            if (module.functions[operands[0]].name == "bda_fault_reason") faultReason = operands[0];
         }
         if (op == spv::OpTypePointer && operands[1] == spv::StorageClassPhysicalStorageBuffer) physicalPointerTypes.insert(operands[0]);
         if (op == spv::OpTypeInt && operands[1] == 64u) wideTypes.insert(operands[0]);
         if (op == spv::OpTypePointer && operands[1] == spv::StorageClassPrivate && wideTypes.contains(operands[2])) privateWidePointers.insert(operands[0]);
-        if (op == spv::OpVariable && privateWidePointers.contains(operands[0])) privateWide.insert(operands[1]);
+        if (op == spv::OpVariable && privateWidePointers.contains(operands[0]) && !faultVariables.contains(operands[1])) privateWide.insert(operands[1]);
+        if (current != 0 && op == spv::OpStore && faultReason != 0u && operands[0] == faultReason) ++module.functions[current].faultHolds;
         if ((op == spv::OpConvertUToPtr || op == spv::OpAccessChain || op == spv::OpPtrAccessChain) && physicalPointerTypes.contains(operands[0])) physicalPointers.insert(operands[1]);
         if (op == spv::OpFunction) {
             current = operands[1];
@@ -227,16 +233,18 @@ int main() {
         const auto& writer = module.functions.at(write);
         Expect(writer.calls.size() == 1u && callsTo(writer, pieces) == 1u, "write_bda calls " + std::to_string(writer.calls.size()) + " functions, expected only one call of write_bda_bytes for its aligned dword and its bytes");
         const auto& piecewise = module.functions.at(pieces);
-        Expect(piecewise.calls.size() == 3u && callsTo(piecewise, translate) == 1u && callsTo(piecewise, fault) == 1u && callsTo(piecewise, note) == 1u && piecewise.rolledLoops == 1u, "write_bda_bytes translates " + std::to_string(callsTo(piecewise, translate)) + " times, records faults " + std::to_string(callsTo(piecewise, fault)) + " times and notes written pages " + std::to_string(callsTo(piecewise, note)) + " times in " + std::to_string(piecewise.rolledLoops) + " loops kept rolled, expected one of each inside one loop over its pieces that the driver may not unroll");
+        Expect(piecewise.calls.size() == 2u && callsTo(piecewise, translate) == 1u && piecewise.faultHolds == 1u && callsTo(piecewise, note) == 1u && piecewise.rolledLoops == 1u, "write_bda_bytes translates " + std::to_string(callsTo(piecewise, translate)) + " times, holds faults " + std::to_string(piecewise.faultHolds) + " times and notes written pages " + std::to_string(callsTo(piecewise, note)) + " times in " + std::to_string(piecewise.rolledLoops) + " loops kept rolled, expected one of each inside one loop over its pieces that the driver may not unroll");
+        std::uint32_t recordCalls = 0;
+        for (const auto& [id, function] : module.functions) recordCalls += callsTo(function, fault);
+        const auto mainRecords = module.callsFromMain.contains(fault) ? module.callsFromMain.at(fault) : 0u;
+        Expect(fault != 0u && mainRecords != 0u && recordCalls == mainRecords, "record_bda_fault is called " + std::to_string(recordCalls) + " times, " + std::to_string(mainRecords) + " of them from main, expected every fault held and recorded only where main ends the invocation");
         std::size_t spanReaders = 0;
         for (const auto& [id, function] : module.functions) {
             if (!function.name.starts_with("read_bda_span")) continue;
             ++spanReaders;
             const auto found = function.calls.find(segment);
             const auto refreshes = found == function.calls.end() ? 0u : found->second;
-            const auto recorded = function.calls.find(fault);
-            const auto records = recorded == function.calls.end() ? 0u : recorded->second;
-            Expect(refreshes == 1u && records == 1u && function.calls.size() == 2u && function.bufferMemoryLoads != 0u, function.name + " refreshes the invocation's read segment " + std::to_string(refreshes) + " times, records faults " + std::to_string(records) + " times, calls " + std::to_string(function.calls.size()) + " functions and loads buffer memory " + std::to_string(function.bufferMemoryLoads) + " times, expected one refresh and one fault record as its only calls and direct loads of spans inside the cached segment");
+            Expect(refreshes == 1u && function.faultHolds == 1u && function.calls.size() == 1u && function.bufferMemoryLoads != 0u, function.name + " refreshes the invocation's read segment " + std::to_string(refreshes) + " times, holds faults " + std::to_string(function.faultHolds) + " times, calls " + std::to_string(function.calls.size()) + " functions and loads buffer memory " + std::to_string(function.bufferMemoryLoads) + " times, expected one refresh as its only call, one held fault and direct loads of spans inside the cached segment");
         }
         Expect(spanReaders != 0u, "the module has no read_bda_span function");
         for (const auto& [id, function] : module.functions) {
@@ -252,14 +260,10 @@ int main() {
                 }
                 Expect(reads == 1u, function.name + " calls read_bda_components " + std::to_string(reads) + " times, expected one read of the components of every format");
                 Expect(function.dynamicExtracts != 0u, function.name + " selects its destination components without a dynamic extract");
-                const auto recorded = function.calls.find(fault);
-                const auto records = recorded == function.calls.end() ? 0u : recorded->second;
-                Expect(records == 1u, function.name + " records faults " + std::to_string(records) + " times, expected one invalid descriptor record that also covers its selectors and format");
+                Expect(function.faultHolds == 1u, function.name + " holds faults " + std::to_string(function.faultHolds) + " times, expected one invalid descriptor record that also covers its selectors and format");
             }
             if (function.name.starts_with("read_bda_components")) {
-                const auto recorded = function.calls.find(fault);
-                const auto records = recorded == function.calls.end() ? 0u : recorded->second;
-                Expect(records == 1u && function.name.find("_stop") == std::string::npos, function.name + " records faults " + std::to_string(records) + " times, expected a variant that cannot stop invocations and one record for an overflowing or unmapped component");
+                Expect(function.faultHolds == 1u && function.name.find("_stop") == std::string::npos, function.name + " holds faults " + std::to_string(function.faultHolds) + " times, expected a variant that cannot stop invocations and one record for an overflowing or unmapped component");
             }
             if (function.name.starts_with("decode_format_layout_")) Expect((function.control & spv::FunctionControlDontInlineMask) != 0u && function.switches == 1u, function.name + " is not one DontInline switch over the formats of its layout");
             if (function.name.starts_with("store_buffer_x3")) {

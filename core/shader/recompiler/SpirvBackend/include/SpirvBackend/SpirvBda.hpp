@@ -34,7 +34,9 @@ bool BdaComponentReadsAvailable(const SpirvEmitterState& state, const IrValue& i
 bool BdaMaskedDwordReadsAvailable(const SpirvEmitterState& state, const IrValue& inst);
 std::array<std::uint32_t, 4> EmitBdaMaskedDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t used);
 std::array<std::uint32_t, 4> EmitBdaComponentReads(SpirvValueEmitContext& ctx, const IrValue& inst, const std::array<std::uint32_t, 4>& addresses, const std::array<std::uint32_t, 4>& sizes);
-void RecordBdaFault(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason);
+void RecordBdaFault(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason, std::uint32_t condition = 0u);
+void RecordBdaFaultReason(SpirvEmitterState& state, std::uint32_t reason, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, std::uint32_t condition = 0u);
+void FlushBdaFault(SpirvEmitterState& state);
 void RecordBdaFaultWords(SpirvEmitterState& state, std::uint32_t addressLow, std::uint32_t addressHigh, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason);
 void ValidateBdaTarget(const IrProgram& program, const SpirvTargetOptions& target);
 // Whether a faulting BDA access may end its invocation. Programs with workgroup barriers must keep

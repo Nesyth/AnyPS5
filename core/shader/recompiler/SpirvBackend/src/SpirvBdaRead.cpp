@@ -15,7 +15,7 @@ namespace {
 
 void EmitBdaOverflowCheck(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction) {
     const auto overflow = Binary(state, spv::OpUGreaterThan, TypeBool(state), address, BdaConstant(state, std::numeric_limits<std::uint64_t>::max() - bytes));
-    EmitIfCondition(state, overflow, [&] { RecordBdaFault(state, address, ConstantU32(state, bytes), instruction, BdaAbi::FaultReason::Overflow); });
+    RecordBdaFault(state, address, ConstantU32(state, bytes), instruction, BdaAbi::FaultReason::Overflow, overflow);
     StopBdaInvocationIf(state, overflow);
 }
 
@@ -259,7 +259,7 @@ std::uint32_t DefineBdaSpanReadFunction(SpirvEmitterState& state, bool coherent)
         const auto reason = Select(state, u32, overflow, constant(static_cast<std::uint32_t>(BdaAbi::FaultReason::Overflow)), Unary(state, spv::OpUConvert, u32, delta));
         const auto at = Select(state, u64, early, address, Select(state, u64, late, dwordAddress, target));
         const auto bytes = Select(state, u32, early, zero, Select(state, u32, late, constant(4u), one));
-        state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeVoid), state.module.AllocateId(), state.bdaFaultFunction, reason, at, bytes, instruction);
+        RecordBdaFaultReason(state, reason, at, bytes, instruction);
     });
     StopBdaInvocationIf(state, fires);
     const auto next = binary(spv::OpIAdd, u32, position, piece);
@@ -352,7 +352,7 @@ std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std
     auto& state = ctx.state;
     const auto result = Binary(state, subtract ? spv::OpISub : spv::OpIAdd, TypeScalarU64(state), address, offset);
     const auto overflow = subtract ? Binary(state, spv::OpUGreaterThan, TypeBool(state), offset, address) : Binary(state, spv::OpULessThan, TypeBool(state), result, address);
-    EmitIfCondition(state, overflow, [&] { RecordBdaFault(state, address, ConstantU32(state, 0u), BdaInstructionPc(state, inst), BdaAbi::FaultReason::Overflow); });
+    RecordBdaFault(state, address, ConstantU32(state, 0u), BdaInstructionPc(state, inst), BdaAbi::FaultReason::Overflow, overflow);
     StopBdaInvocationIf(state, overflow);
     return result;
 }
@@ -647,7 +647,7 @@ void DefineBdaByteWriteFunctions(SpirvEmitterState& state) {
         state.module.AddFunction(spv::OpCompositeExtract, u32, reason, translated, 1u);
         EmitIfCondition(state, binary(spv::OpLogicalOr, boolean, overflow, binary(spv::OpINotEqual, boolean, reason, constant(0u))), [&] {
             const auto recorded = Select(state, u32, overflow, constant(static_cast<std::uint32_t>(BdaAbi::FaultReason::Overflow)), reason);
-            state.module.AddFunction(spv::OpFunctionCall, voidType, state.module.AllocateId(), state.bdaFaultFunction, recorded, Select(state, u64, overflow, address, guest), Select(state, u32, overflow, bytes, width), instruction);
+            RecordBdaFaultReason(state, recorded, Select(state, u64, overflow, address, guest), Select(state, u32, overflow, bytes, width), instruction);
         });
         EmitIfCondition(state, binary(spv::OpINotEqual, boolean, device, BdaConstant(state, 0u)), [&] {
             EmitIfCondition(state, dword, [&] {
@@ -716,7 +716,6 @@ std::uint32_t DefineBdaComponentReadFunction(SpirvEmitterState& state, bool cohe
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
     const auto boolean = TypeBool(state);
-    const auto voidType = state.module.Type(spv::OpTypeVoid);
     const auto values = TypeU32Vector(state, 4);
     const auto addressVector = state.module.Type(spv::OpTypeVector, u64, 4u);
     const auto byteType = state.module.Type(spv::OpTypeInt, 8u, 0u);
@@ -864,7 +863,7 @@ std::uint32_t DefineBdaComponentReadFunction(SpirvEmitterState& state, bool cohe
         });
         EmitIfCondition(state, binary(spv::OpLogicalOr, boolean, overflow, binary(spv::OpLogicalAnd, boolean, unmapped, settled)), [&] {
             const auto faultReason = Select(state, u32, overflow, constant(static_cast<std::uint32_t>(BdaAbi::FaultReason::Overflow)), reason);
-            state.module.AddFunction(spv::OpFunctionCall, voidType, state.module.AllocateId(), state.bdaFaultFunction, faultReason, guest, Select(state, u32, overflow, size, constant(1u)), instruction);
+            RecordBdaFaultReason(state, faultReason, guest, Select(state, u32, overflow, size, constant(1u)), instruction);
         });
     });
     state.module.AddFunction(spv::OpBranch, continuation);
@@ -1012,7 +1011,7 @@ std::uint32_t EmitBdaAtomic(SpirvValueEmitContext& ctx, const IrValue& inst, std
     const auto type = bytes == 8u ? TypeScalarU64(state) : TypeU32(state);
     const auto zero = bytes == 8u ? BdaConstant(state, 0u) : ConstantU32(state, 0u);
     const auto unaligned = Binary(state, spv::OpINotEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), address, BdaConstant(state, bytes - 1u)), BdaConstant(state, 0u));
-    EmitIfCondition(state, unaligned, [&] { RecordBdaFault(state, address, ConstantU32(state, bytes), instruction, BdaAbi::FaultReason::Unaligned); });
+    RecordBdaFault(state, address, ConstantU32(state, bytes), instruction, BdaAbi::FaultReason::Unaligned, unaligned);
     return EmitValueOrDefaultIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), unaligned), type, zero, [&] {
         const auto physical = state.module.AllocateId();
         state.module.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), physical, state.bdaWritePointerFunction, address, ConstantU32(state, bytes), instruction);

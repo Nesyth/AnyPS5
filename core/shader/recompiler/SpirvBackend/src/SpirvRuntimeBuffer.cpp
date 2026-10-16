@@ -84,7 +84,7 @@ std::uint32_t nonzero(SpirvEmitterState& state, std::uint32_t value) {
 
 void faultIf(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t condition, std::uint32_t address, std::uint32_t bytes, BdaAbi::FaultReason reason) {
     auto& state = context.state;
-    EmitIfCondition(state, condition, [&] { RecordBdaFault(state, address, ConstantU32(state, bytes), BdaInstructionPc(state, instruction), reason); });
+    RecordBdaFault(state, address, ConstantU32(state, bytes), BdaInstructionPc(state, instruction), reason, condition);
 }
 
 bool runtimeWords(const SpirvEmitterState& state, const MemoryInfo& memory) {

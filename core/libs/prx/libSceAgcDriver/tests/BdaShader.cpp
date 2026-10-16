@@ -80,6 +80,7 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
     }
     const auto values = emit(ctx, instruction, base);
     for (std::uint32_t index = 0; index < values.size(); ++index) state.module.AddFunction(spv::OpStore, BdaWord(state, output, ConstantU32(state, index)), values[index]);
+    FlushBdaFault(state);
     state.module.AddFunction(spv::OpReturn);
     state.module.AddFunction(spv::OpFunctionEnd);
     state.module.AddExecutionMode(main, spv::ExecutionModeLocalSize, 1u, 1u, 1u);
@@ -116,6 +117,7 @@ std::vector<std::uint32_t> MakeProbeShader(std::uint32_t count, const TEmit& emi
     const auto index = state.module.AllocateId();
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), index, ids, 0u);
     EmitIfCondition(state, Binary(state, spv::OpULessThan, TypeBool(state), index, ConstantU32(state, count)), [&] { emit(state, io, index); });
+    FlushBdaFault(state);
     state.module.AddFunction(spv::OpReturn);
     state.module.AddFunction(spv::OpFunctionEnd);
     state.module.AddExecutionMode(main, spv::ExecutionModeLocalSize, 64u, 1u, 1u);
@@ -337,6 +339,7 @@ std::vector<std::uint32_t> MakeBdaLaneStoreTestShader(std::uint64_t address, std
                 break;
         }
     });
+    FlushBdaFault(state);
     state.module.AddFunction(spv::OpReturn);
     state.module.AddFunction(spv::OpFunctionEnd);
     state.module.AddExecutionMode(main, spv::ExecutionModeLocalSize, 64u, 1u, 1u);

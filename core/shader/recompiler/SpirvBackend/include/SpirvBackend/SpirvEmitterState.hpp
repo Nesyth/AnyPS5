@@ -167,6 +167,7 @@ struct SpirvEmitterState {
     std::map<std::uint32_t, std::uint32_t> formatDecoders;
     std::map<std::uint32_t, std::uint32_t> formatEncoders;
     std::uint32_t bdaFaultFunction = 0;
+    std::array<std::uint32_t, 5> bdaFaultPending {};
     bool nativeF16ModesEmitted = false;
     bool f16DenormPreserveEmitted = false;
     std::uint32_t dot2F32F16Function = 0;

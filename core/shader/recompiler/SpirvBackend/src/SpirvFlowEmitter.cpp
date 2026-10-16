@@ -90,6 +90,7 @@ const BlockInfo* BlockInfoFor(const IrProgram& program, const IrBlock* block) {
 void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
     auto& state = ctx.state;
     if (state.loopGuardLimit != 0 && state.faultBufferVariable != 0) {
+        FlushBdaFault(state);
         const auto pc = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, TypeU32(state), pc, state.loopGuardPc);
         EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), pc, ConstantU32(state, 0u)), [&] {
@@ -101,6 +102,7 @@ void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
         state.module.AddFunction(spv::OpReturnValue, state.calleeStopValue);
         return;
     }
+    FlushBdaFault(state);
     if (OrderedPixelShader(state)) {
         state.module.AddFunction(spv::OpEndInvocationInterlockEXT);
     }
@@ -1164,8 +1166,12 @@ void EmitGuestCall(SpirvValueEmitContext& caller, StructuredFunctionState& funct
         state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
         state.module.AddFunction(spv::OpBranchConditional, stopped, stop, next);
         EmitLabel(state, stop);
-        if (state.calleeStopValue != 0u) state.module.AddFunction(spv::OpReturnValue, state.calleeStopValue);
-        else state.module.AddFunction(spv::OpReturn);
+        if (state.calleeStopValue != 0u) {
+            state.module.AddFunction(spv::OpReturnValue, state.calleeStopValue);
+        } else {
+            FlushBdaFault(state);
+            state.module.AddFunction(spv::OpReturn);
+        }
         EmitLabel(state, next);
     }
     functionState.blockExitLabels.emplace(program.BlockOrder()[layout.exitBlock[function]], state.currentLabel);
