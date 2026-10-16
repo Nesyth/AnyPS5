@@ -155,8 +155,6 @@ struct SpirvEmitterState {
     std::array<std::array<std::uint32_t, 2>, 2> bdaComponentReadFunctions {};
     std::uint32_t formatTableVariable = 0;
     std::uint32_t bdaPointerFunction = 0;
-    // The lookup without fault recording that wide reads try first (see EmitBdaDwordReads); 0 when
-    // every read takes the byte path.
     std::uint32_t bdaProbeFunction = 0;
     std::uint32_t bdaWritePointerFunction = 0;
     std::uint32_t bdaWriteProbeFunction = 0;

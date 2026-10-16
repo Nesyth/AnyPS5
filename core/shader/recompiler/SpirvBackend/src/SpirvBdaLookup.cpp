@@ -362,8 +362,8 @@ std::uint32_t DefineBdaSegment(SpirvEmitterState& state) {
         return value;
     };
     const auto zero = BdaConstant(state, 0u);
-    const auto empty = state.module.Constant(spv::OpConstantComposite, result, zero, zero, zero);
-    const auto none = [&](std::uint32_t condition) { ReturnValueIf(state, condition, empty); };
+    const auto empty = [&](BdaAbi::FaultReason reason) { return state.module.Constant(spv::OpConstantComposite, result, zero, zero, BdaConstant(state, static_cast<std::uint64_t>(reason))); };
+    const auto none = [&](std::uint32_t condition, BdaAbi::FaultReason reason) { ReturnValueIf(state, condition, empty(reason)); };
     const auto readable = [&](std::uint32_t permissions) { return binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, permissions, constant(BdaAbi::Read)), constant(0u)); };
     const auto function = state.module.AllocateId();
     state.module.AddName(function, "bda_segment");
@@ -380,7 +380,7 @@ std::uint32_t DefineBdaSegment(SpirvEmitterState& state) {
     const auto high = variable(u32);
     const auto entry = variable(entryType);
     const auto shift = variable(u32);
-    const auto table = BdaTableHeader(state, ReturnTableHeader{[&](std::uint32_t condition, BdaAbi::FaultReason) { none(condition); }});
+    const auto table = BdaTableHeader(state, ReturnTableHeader{none});
     const auto count = table.count;
     const auto pages = table.pages;
     const auto walk = both(binary(spv::OpINotEqual, boolean, pages, zero), binary(spv::OpULessThan, boolean, address, BdaConstant(state, BdaAbi::PageTableEnd)));
@@ -416,7 +416,7 @@ std::uint32_t DefineBdaSegment(SpirvEmitterState& state) {
             const auto found = load(entryType, entry);
             const auto bounds = component(found, 2u);
             const auto kind = binary(spv::OpShiftRightLogical, u32, bounds, constant(BdaAbi::KindShift));
-            none(binary(spv::OpUGreaterThan, boolean, kind, constant(static_cast<std::uint32_t>(BdaAbi::PageKind::Segment))));
+            none(binary(spv::OpUGreaterThan, boolean, kind, constant(static_cast<std::uint32_t>(BdaAbi::PageKind::Segment))), BdaAbi::FaultReason::InvalidTable);
             const auto mask = binary(spv::OpISub, u32, binary(spv::OpShiftLeftLogical, u32, constant(1u), load(u32, shift)), constant(1u));
             const auto offset = widen(binary(spv::OpBitwiseAnd, u32, Unary(state, spv::OpUConvert, u32, address), mask));
             const auto first = widen(binary(spv::OpBitwiseAnd, u32, bounds, constant(BdaAbi::FirstMask)));
@@ -424,28 +424,28 @@ std::uint32_t DefineBdaSegment(SpirvEmitterState& state) {
             const auto inside = both(binary(spv::OpUGreaterThanEqual, boolean, offset, first), binary(spv::OpULessThan, boolean, offset, limit));
             const auto held = both(binary(spv::OpIEqual, boolean, kind, constant(static_cast<std::uint32_t>(BdaAbi::PageKind::Segment))), inside);
             const auto permissions = binary(spv::OpBitwiseAnd, u32, binary(spv::OpShiftRightLogical, u32, bounds, constant(BdaAbi::PermissionShift)), constant(BdaAbi::Read | BdaAbi::Write));
-            none(both(held, Unary(state, spv::OpLogicalNot, boolean, readable(permissions))));
+            none(both(held, Unary(state, spv::OpLogicalNot, boolean, readable(permissions))), BdaAbi::FaultReason::Permission);
             const auto start = binary(spv::OpISub, u64, address, offset);
             ReturnValueIf(state, held, segment(binary(spv::OpIAdd, u64, start, first), binary(spv::OpIAdd, u64, start, limit), pair(component(found, 0u), component(found, 1u))));
         });
     });
     if (!state.bdaRangeList) {
-        state.module.AddFunction(spv::OpReturnValue, empty);
+        state.module.AddFunction(spv::OpReturnValue, empty(BdaAbi::FaultReason::Unmapped));
         state.module.AddFunction(spv::OpFunctionEnd);
         return function;
     }
     const auto index = EmitBdaBisection(state, low, high, address, constant(BdaAbi::HeaderWords), count, BdaAbi::RangeWords);
-    none(binary(spv::OpIEqual, boolean, index, constant(0)));
+    none(binary(spv::OpIEqual, boolean, index, constant(0)), BdaAbi::FaultReason::Unmapped);
     const auto selected = binary(spv::OpIAdd, u32, constant(BdaAbi::HeaderWords), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, index, constant(1)), constant(BdaAbi::RangeWords)));
     const auto at = [&](std::uint32_t offset) { return binary(spv::OpIAdd, u32, selected, constant(offset)); };
     const auto begin = BdaLoadAddress(state, selected);
     const auto finish = BdaLoadAddress(state, at(2));
     const auto base = BdaLoadAddress(state, at(4));
-    none(differs(BdaLoadWord(state, at(7)), constant(0)));
-    none(binary(spv::OpUGreaterThanEqual, boolean, begin, finish));
-    none(binary(spv::OpUGreaterThanEqual, boolean, address, finish));
-    none(Unary(state, spv::OpLogicalNot, boolean, readable(BdaLoadWord(state, at(6)))));
-    none(binary(spv::OpIEqual, boolean, base, zero));
+    none(differs(BdaLoadWord(state, at(7)), constant(0)), BdaAbi::FaultReason::InvalidTable);
+    none(binary(spv::OpUGreaterThanEqual, boolean, begin, finish), BdaAbi::FaultReason::InvalidTable);
+    none(binary(spv::OpUGreaterThanEqual, boolean, address, finish), BdaAbi::FaultReason::Unmapped);
+    none(Unary(state, spv::OpLogicalNot, boolean, readable(BdaLoadWord(state, at(6)))), BdaAbi::FaultReason::Permission);
+    none(binary(spv::OpIEqual, boolean, base, zero), BdaAbi::FaultReason::InvalidTable);
     state.module.AddFunction(spv::OpReturnValue, segment(begin, finish, binary(spv::OpISub, u64, base, begin)));
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;

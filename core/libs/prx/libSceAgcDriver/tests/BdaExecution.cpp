@@ -360,9 +360,9 @@ static void RunBdaReadTests(const Context& context, bool paged) {
     }
     constexpr std::uint64_t spanGuest = 0x7fff56780000ULL;
     const std::array<Abi::Range, 3> spanRanges{{ranges[0], ranges[1], {spanGuest, spanGuest + 32, wide.DeviceAddress(), Abi::Read, 0}}};
-    const auto span = [&](std::uint64_t address, std::int32_t offset, std::uint32_t extracted, bool coherent, bool stops, std::array<std::uint32_t, 4> values, Abi::FaultReason reason = {}, std::uint64_t faultAddress = 0, std::uint32_t faultBytes = 0) {
+    const auto span = [&](std::uint64_t address, std::int32_t offset, std::uint32_t extracted, bool coherent, bool stops, std::array<std::uint32_t, 4> values, Abi::FaultReason reason = {}, std::uint64_t faultAddress = 0, std::uint32_t faultBytes = 0, std::uint32_t extraCount = 0) {
         const auto pages = PagesFor(context, paged, spanRanges);
-        const auto spanTable = MakeBinding(context, paged, pages, spanRanges);
+        const auto spanTable = MakeBinding(context, paged, pages, spanRanges, {}, extraCount);
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
         const std::array<std::uint32_t, 4> sentinel{0xdeadbeef, 0xdeadbeef, 0xdeadbeef, 0xdeadbeef};
         std::memcpy(words.Bytes().data(), sentinel.data(), sizeof(sentinel));
@@ -390,6 +390,7 @@ static void RunBdaReadTests(const Context& context, bool paged) {
             span(spanGuest + 28, 0, 0b0101u, coherent, stops, {at(7), 0, 0, 0}, Abi::FaultReason::Unmapped, spanGuest + 36, 1);
             span(guest, 1, 0b1001u, coherent, stops, {0x55443322, 0, 0, 0}, Abi::FaultReason::Unmapped, guest + 13, 1);
             span(4, -8, 0b0001u, coherent, stops, {0, 0, 0, 0}, Abi::FaultReason::Overflow, 4, 0);
+            span(spanGuest, 0, 0b0001u, coherent, stops, {0, 0, 0, 0}, Abi::FaultReason::InvalidTable, spanGuest, 1, 1);
         }
     }
     ranges[0].permissions = 0;
@@ -430,6 +431,27 @@ static void RunBdaPageTableTests(const Context& context) {
         }
         return results;
     };
+    const auto segments = [&](std::span<const Abi::Range> own, std::uint64_t pageTable, std::span<const std::uint64_t> addresses) {
+        const auto root = MakeBinding(context, own, {}, pageTable);
+        const auto count = static_cast<std::uint32_t>(addresses.size());
+        Buffer io(context, std::size_t{count} * 8u * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        auto* words = reinterpret_cast<std::uint32_t*>(io.Bytes().data());
+        for (std::uint32_t index = 0; index < count; ++index) {
+            words[8u * index] = static_cast<std::uint32_t>(addresses[index]);
+            words[8u * index + 1u] = static_cast<std::uint32_t>(addresses[index] >> 32u);
+        }
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        Pipeline pipeline(context, MakeBdaSegmentTestShader(count), {root.get(), &fault, &io});
+        pipeline.Run((count + 63u) / 64u);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        Require(report.state == Abi::FaultState::Empty, "a BDA segment lookup published a fault");
+        std::vector<std::array<std::uint64_t, 3>> results(count);
+        for (std::uint32_t index = 0; index < count; ++index) {
+            for (std::uint32_t field = 0; field < 3u; ++field) results[index][field] = words[8u * index + 2u + 2u * field] | (static_cast<std::uint64_t>(words[8u * index + 3u + 2u * field]) << 32u);
+        }
+        return results;
+    };
     const auto hex = [](std::uint64_t value) {
         char text[24];
         std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(value));
@@ -463,6 +485,21 @@ static void RunBdaPageTableTests(const Context& context) {
         const auto alone = pages != nullptr ? translate({}, gpuGrants, pages->Address(), probes) : std::vector<Ref::Translation>{};
         const auto leaves = Ref::EncodeLeaves(held, [](std::uint32_t window, std::span<const Abi::Range> ranges) { return EncodeBdaWindow(window, ranges); });
         const Ref::Leaves none;
+        std::vector<std::uint64_t> addresses;
+        for (const auto address : Ref::Probes(list)) {
+            if (address != ~std::uint64_t{0}) addresses.push_back(address);
+        }
+        const auto found = segments(own, PageTableAddress(pages), addresses);
+        for (std::size_t index = 0; index < addresses.size(); ++index) {
+            const auto address = addresses[index];
+            const auto begin = found[index][0];
+            const auto end = found[index][1];
+            const auto delta = found[index][2];
+            const auto expected = Ref::Translate(leaves, own, address, 1u, Abi::Read);
+            const auto mapsAt = [&](std::uint64_t at) { return Ref::Translate(leaves, own, at, 1u, Abi::Read) == Ref::Translation{at + delta, 0u}; };
+            const bool kept = expected.reason == 0u ? begin <= address && address < end && address + delta == expected.device && mapsAt(begin) && mapsAt(end - 1u) : begin == 0u && end == 0u && delta == expected.reason;
+            Require(kept, name + ": the GPU segment of " + hex(address) + " is [" + hex(begin) + ", " + hex(end) + ") with delta " + hex(delta) + ", its translation " + hex(expected.device) + " reason " + std::to_string(expected.reason));
+        }
         std::size_t differs = 0;
         for (std::size_t index = 0; index < probes.size(); ++index) {
             const auto& probe = probes[index];
