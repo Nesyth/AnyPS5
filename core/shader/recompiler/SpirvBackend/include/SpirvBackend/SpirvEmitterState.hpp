@@ -152,7 +152,7 @@ struct SpirvEmitterState {
     std::array<std::uint32_t, 3> bdaReadCache {};
     std::array<std::uint32_t, 3> bdaVectorCache {};
     std::array<std::uint32_t, 3> bdaTableVariables {};
-    std::array<std::array<std::uint32_t, 2>, 2> bdaComponentReadFunctions {};
+    std::array<std::uint32_t, 2> bdaComponentReadFunctions {};
     std::uint32_t formatTableVariable = 0;
     std::uint32_t bdaPointerFunction = 0;
     std::uint32_t bdaProbeFunction = 0;

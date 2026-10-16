@@ -231,6 +231,14 @@ int main() {
                 }
                 Expect(reads == 1u, function.name + " calls read_bda_components " + std::to_string(reads) + " times, expected one read of the components of every format");
                 Expect(function.dynamicExtracts != 0u, function.name + " selects its destination components without a dynamic extract");
+                const auto recorded = function.calls.find(fault);
+                const auto records = recorded == function.calls.end() ? 0u : recorded->second;
+                Expect(records == 1u, function.name + " records faults " + std::to_string(records) + " times, expected one invalid descriptor record that also covers its selectors and format");
+            }
+            if (function.name.starts_with("read_bda_components")) {
+                const auto recorded = function.calls.find(fault);
+                const auto records = recorded == function.calls.end() ? 0u : recorded->second;
+                Expect(records == 1u && function.name.find("_stop") == std::string::npos, function.name + " records faults " + std::to_string(records) + " times, expected a variant that cannot stop invocations and one record for an overflowing or unmapped component");
             }
             if (function.name.starts_with("decode_format_layout_")) Expect((function.control & spv::FunctionControlDontInlineMask) != 0u && function.switches == 1u, function.name + " is not one DontInline switch over the formats of its layout");
             if (function.name.starts_with("store_buffer_x3")) {
