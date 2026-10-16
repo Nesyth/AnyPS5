@@ -862,24 +862,28 @@ std::uint32_t DefineBdaComponentReadFunction(SpirvEmitterState& state, bool cohe
             state.module.AddFunction(spv::OpFunctionCall, translation, value, state.bdaTranslateFunction, guest, want, constant(BdaAbi::Read));
             return value;
         };
-        auto translated = 0u;
+        auto device = 0u;
+        auto reason = 0u;
+        auto mapped = 0u;
         if (BdaVectorCacheAvailable(state)) {
-            const auto bytes = Unary(state, spv::OpUConvert, u64, want);
-            EmitIfCondition(state, binary(spv::OpLogicalAnd, boolean, whole, Unary(state, spv::OpLogicalNot, boolean, ProbeBdaVectorCache(state, guest, bytes).hit)), [&] { RefreshBdaVectorCache(state, guest); });
-            const auto cached = ProbeBdaVectorCache(state, guest, bytes);
-            translated = EmitValueIfElse(state, binary(spv::OpLogicalAnd, boolean, whole, cached.hit), translation, [&] {
-                const auto value = state.module.AllocateId();
-                state.module.AddFunction(spv::OpCompositeConstruct, translation, value, cached.device, zero);
-                return value;
-            }, translate);
+            const auto& cache = state.bdaVectorCache;
+            const auto end = binary(spv::OpIAdd, u64, guest, Unary(state, spv::OpUConvert, u64, want));
+            const auto inside = [&] {
+                const auto held = binary(spv::OpLogicalAnd, boolean, binary(spv::OpULessThanEqual, boolean, load(u64, cache[0]), guest), binary(spv::OpULessThanEqual, boolean, end, load(u64, cache[1])));
+                return binary(spv::OpLogicalAnd, boolean, binary(spv::OpULessThan, boolean, guest, end), held);
+            };
+            EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, inside()), [&] { RefreshBdaVectorCache(state, guest); });
+            mapped = inside();
+            device = binary(spv::OpIAdd, u64, guest, load(u64, cache[2]));
+            reason = Select(state, u32, mapped, zero, constant(static_cast<std::uint32_t>(BdaAbi::FaultReason::Unmapped)));
         } else {
-            translated = translate();
+            const auto translated = translate();
+            device = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, u64, device, translated, 0u);
+            reason = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, u32, reason, translated, 1u);
+            mapped = equal(reason, zero);
         }
-        const auto device = state.module.AllocateId();
-        state.module.AddFunction(spv::OpCompositeExtract, u64, device, translated, 0u);
-        const auto reason = state.module.AllocateId();
-        state.module.AddFunction(spv::OpCompositeExtract, u32, reason, translated, 1u);
-        const auto mapped = equal(reason, zero);
         EmitIfCondition(state, mapped, [&] {
             EmitIfCondition(state, whole, [&] {
                 const auto dword = binary(spv::OpLogicalAnd, boolean, equal(size, constant(4u)), Unary(state, spv::OpLogicalNot, boolean, BdaAddressUnaligned(state, device)));
