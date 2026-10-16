@@ -595,7 +595,7 @@ static void RunBdaWrittenPageTests(const Context& context) {
         std::uint64_t active;
     };
     const auto bytesOf = [](BdaLaneStore store) { return store == BdaLaneStore::Byte ? 1u : store == BdaLaneStore::Short ? 2u : store == BdaLaneStore::Dwordx4 ? 16u : 4u; };
-    const std::array<Case, 10> cases{{
+    const std::array<Case, 13> cases{{
         {"unaligned dwords across pages, alternate lanes", BdaLaneStore::Dword, 0x1000u, 0xffeu, 0xaaaaaaaaaaaaaaaaull},
         {"unaligned runtime dwords across pages, other lanes", BdaLaneStore::RuntimeDword, 0x1000u, 0xffdu, 0x5555555555555555ull},
         {"dwordx4 across chunks, scattered lanes", BdaLaneStore::Dwordx4, 0x20000u, 0x1fff8u, 0x8421084210842108ull},
@@ -606,6 +606,9 @@ static void RunBdaWrittenPageTests(const Context& context) {
         {"atomics of all lanes", BdaLaneStore::Atomic, 0x3000u, 0x10u, ~0ull},
         {"one lane", BdaLaneStore::Dword, 0x20000u, 0x1fffeu, 1ull << 37u},
         {"no lane", BdaLaneStore::Dword, 0x1000u, 0xffeu, 0ull},
+        {"dwords of every alignment", BdaLaneStore::Dword, 0x1001u, 0u, ~0ull},
+        {"runtime dwords of every alignment", BdaLaneStore::RuntimeDword, 0x1001u, 0u, ~0ull},
+        {"aligned runtime dwords of all lanes in one page", BdaLaneStore::RuntimeDword, 16u, 0u, ~0ull},
     }};
     Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -1142,6 +1145,7 @@ void RunBdaStoreExecutionTests(const Context& context) {
         } else {
             run("unaligned dword past the top", top - 2u, 32, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::Unmapped, top - 2u, 1);
         }
+        run("aligned dword at the top", top - 3u, 32, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::Overflow, top - 3u, 4);
         extraCount = 1;
         run("aligned dword at the top of an invalid table", top - 3u, 32, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::InvalidTable, top - 3u, 4);
         extraCount = 0;

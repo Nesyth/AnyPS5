@@ -621,53 +621,35 @@ void DefineBdaByteWriteFunctions(SpirvEmitterState& state) {
         state.module.AddFunction(spv::OpFunctionParameter, boolean, dword);
         state.module.AddFunction(spv::OpFunctionParameter, boolean, overflow);
         EmitLabel(state, state.module.AllocateId());
-        const auto counter = state.module.AllocateId();
-        state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, u32), counter, spv::StorageClassFunction);
-        state.module.AddFunction(spv::OpStore, counter, constant(0u));
         const auto pieces = Select(state, u32, dword, constant(1u), bytes);
         const auto width = Select(state, u32, dword, constant(4u), constant(1u));
-        const auto header = state.module.AllocateId();
-        const auto body = state.module.AllocateId();
-        const auto continuation = state.module.AllocateId();
-        const auto merge = state.module.AllocateId();
-        state.module.AddFunction(spv::OpBranch, header);
-        EmitLabel(state, header);
-        const auto piece = state.module.AllocateId();
-        state.module.AddFunction(spv::OpLoad, u32, piece, counter);
-        const auto pending = binary(spv::OpULessThan, boolean, piece, pieces);
-        state.module.AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlDontUnrollMask);
-        state.module.AddFunction(spv::OpBranchConditional, pending, body, merge);
-        EmitLabel(state, body);
-        const auto guest = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, piece));
-        const auto translated = state.module.AllocateId();
-        state.module.AddFunction(spv::OpFunctionCall, translation, translated, state.bdaWriteTranslateFunction, guest, width, constant(BdaAbi::Write));
-        const auto device = state.module.AllocateId();
-        state.module.AddFunction(spv::OpCompositeExtract, u64, device, translated, 0u);
-        const auto reason = state.module.AllocateId();
-        state.module.AddFunction(spv::OpCompositeExtract, u32, reason, translated, 1u);
-        EmitIfCondition(state, binary(spv::OpLogicalOr, boolean, overflow, binary(spv::OpINotEqual, boolean, reason, constant(0u))), [&] {
-            const auto recorded = Select(state, u32, overflow, constant(static_cast<std::uint32_t>(BdaAbi::FaultReason::Overflow)), reason);
-            RecordBdaFaultReason(state, recorded, Select(state, u64, overflow, address, guest), Select(state, u32, overflow, bytes, width), instruction);
-        });
-        EmitIfCondition(state, binary(spv::OpINotEqual, boolean, device, BdaConstant(state, 0u)), [&] {
-            EmitIfCondition(state, dword, [&] {
-                const auto pointer = state.module.AllocateId();
-                state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, device);
-                state.module.AddFunction(spv::OpStore, pointer, value, BdaAccessMask(coherent), 4u);
+        EmitCountedLoop(state, pieces, [&](std::uint32_t piece) {
+            const auto guest = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, piece));
+            const auto translated = state.module.AllocateId();
+            state.module.AddFunction(spv::OpFunctionCall, translation, translated, state.bdaWriteTranslateFunction, guest, width, constant(BdaAbi::Write));
+            const auto device = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, u64, device, translated, 0u);
+            const auto reason = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, u32, reason, translated, 1u);
+            EmitIfCondition(state, binary(spv::OpLogicalOr, boolean, overflow, binary(spv::OpINotEqual, boolean, reason, constant(0u))), [&] {
+                const auto recorded = Select(state, u32, overflow, constant(static_cast<std::uint32_t>(BdaAbi::FaultReason::Overflow)), reason);
+                RecordBdaFaultReason(state, recorded, Select(state, u64, overflow, address, guest), Select(state, u32, overflow, bytes, width), instruction);
             });
-            EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, dword), [&] {
-                const auto shifted = binary(spv::OpShiftRightLogical, u32, value, binary(spv::OpShiftLeftLogical, u32, piece, constant(3u)));
-                const auto pointer = state.module.AllocateId();
-                state.module.AddFunction(spv::OpConvertUToPtr, bytePointer, pointer, device);
-                state.module.AddFunction(spv::OpStore, pointer, Unary(state, spv::OpUConvert, byteType, shifted), BdaAccessMask(coherent), 1u);
+            EmitIfCondition(state, binary(spv::OpINotEqual, boolean, device, BdaConstant(state, 0u)), [&] {
+                EmitIfCondition(state, dword, [&] {
+                    const auto pointer = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, device);
+                    state.module.AddFunction(spv::OpStore, pointer, value, BdaAccessMask(coherent), 4u);
+                });
+                EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, dword), [&] {
+                    const auto shifted = binary(spv::OpShiftRightLogical, u32, value, binary(spv::OpShiftLeftLogical, u32, piece, constant(3u)));
+                    const auto pointer = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpConvertUToPtr, bytePointer, pointer, device);
+                    state.module.AddFunction(spv::OpStore, pointer, Unary(state, spv::OpUConvert, byteType, shifted), BdaAccessMask(coherent), 1u);
+                });
+                state.module.AddFunction(spv::OpFunctionCall, voidType, state.module.AllocateId(), state.bdaNoteWriteFunction, guest);
             });
-            state.module.AddFunction(spv::OpFunctionCall, voidType, state.module.AllocateId(), state.bdaNoteWriteFunction, guest);
         });
-        state.module.AddFunction(spv::OpBranch, continuation);
-        EmitLabel(state, continuation);
-        state.module.AddFunction(spv::OpStore, counter, binary(spv::OpIAdd, u32, piece, constant(1u)));
-        state.module.AddFunction(spv::OpBranch, header);
-        EmitLabel(state, merge);
         state.module.AddFunction(spv::OpReturn);
         state.module.AddFunction(spv::OpFunctionEnd);
         state.bdaByteWriteFunctions[coherent] = function;
