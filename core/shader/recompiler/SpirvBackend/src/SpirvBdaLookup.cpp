@@ -210,7 +210,7 @@ std::uint32_t DefineBdaTranslate(SpirvEmitterState& state, bool writes) {
         ReturnValueIf(state, condition, state.module.Constant(spv::OpConstantComposite, result, BdaConstant(state, 0u), constant(static_cast<std::uint32_t>(reason))));
     };
     const auto function = state.module.AllocateId();
-    state.module.AddName(function, "bda_translate");
+    state.module.AddName(function, writes ? "bda_translate_write" : "bda_translate");
     state.module.AddFunction(spv::OpFunction, result, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, result, u64, u32, u32));
     const auto address = state.module.AllocateId();
     const auto bytes = state.module.AllocateId();
@@ -466,7 +466,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     state.module.AddFunction(spv::OpFunctionParameter, u32, instruction);
     EmitLabel(state, state.module.AllocateId());
     const auto translated = state.module.AllocateId();
-    state.module.AddFunction(spv::OpFunctionCall, TranslationType(state), translated, state.bdaTranslateFunction, address, bytes, ConstantU32(state, permission));
+    state.module.AddFunction(spv::OpFunctionCall, TranslationType(state), translated, permission == BdaAbi::Read ? state.bdaTranslateFunction : state.bdaWriteTranslateFunction, address, bytes, ConstantU32(state, permission));
     const auto device = state.module.AllocateId();
     state.module.AddFunction(spv::OpCompositeExtract, u64, device, translated, 0u);
     if (recordFaults) {
@@ -667,7 +667,7 @@ void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (state.faultBufferVariable != 0) DefineBdaFaultFunction(state);
     if (!state.program.Info().usesDma) return;
     DeclareBdaTable(state);
-    state.bdaTranslateFunction = DefineBdaTranslate(state, state.program.Info().bdaWrites);
+    state.bdaTranslateFunction = DefineBdaTranslate(state, false);
     if (!BdaByteReadsForced()) state.bdaSegmentFunction = DefineBdaSegment(state);
     DeclareBdaVectorCache(state);
     DeclareBdaReadCache(state);
@@ -677,6 +677,7 @@ void DefineGetBdaPointer(SpirvEmitterState& state) {
     DefineBdaSpanReadFunctions(state);
     DefineBdaComponentReadFunctions(state);
     if (state.program.Info().bdaWrites) {
+        state.bdaWriteTranslateFunction = DefineBdaTranslate(state, true);
         state.bdaWritePointerFunction = DefineBdaLookup(state, "get_bda_write_pointer", true, BdaAbi::Write);
         if (!BdaByteReadsForced()) state.bdaWriteProbeFunction = DefineBdaLookup(state, "probe_bda_write_pointer", false, BdaAbi::Write);
         state.bdaAtomicPointerFunction = DefineBdaLookup(state, "get_bda_atomic_pointer", true, BdaAbi::Read | BdaAbi::Write);

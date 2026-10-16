@@ -1076,12 +1076,13 @@ void RunBdaStoreExecutionTests(const Context& context) {
     bool runtime = false;
     bool paged = false;
     bool enabled = true;
+    std::uint32_t extraCount = 0;
     const auto run = [&](const char* name, std::uint64_t address, std::uint32_t bits, bool coherent, const std::array<std::uint8_t, 5>& expected, std::initializer_list<std::uint64_t> writtenAddresses, Abi::FaultReason reason = {}, std::uint64_t faultAddress = 0, std::uint32_t faultBytes = 0) {
         const std::string label = std::string(runtime ? "BDA runtime write " : "BDA store ") + name + (coherent ? " coherent" : "") + (paged ? " paged: " : ": ");
         std::memset(first.Bytes().data(), 0xcd, first.Bytes().size());
         std::memset(second.Bytes().data(), 0xcd, second.Bytes().size());
         const auto pages = PagesFor(context, paged, ranges);
-        const auto table = MakeBinding(context, paged, pages, ranges, grants);
+        const auto table = MakeBinding(context, paged, pages, ranges, grants, extraCount);
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
         std::memset(output.Bytes().data(), 0, output.Bytes().size());
         Pipeline pipeline(context, runtime ? MakeBdaWriteTestShader(address, 0xa1b2c3d4u, bits, coherent, enabled) : MakeBdaStoreTestShader(address, 0xa1b2c3d4u, bits, coherent), {table.get(), &fault, &output});
@@ -1131,6 +1132,16 @@ void RunBdaStoreExecutionTests(const Context& context) {
             run("disabled byte", guest + 1, 8, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {});
             enabled = true;
         }
+        constexpr auto top = std::numeric_limits<std::uint64_t>::max();
+        if (runtime) {
+            run("short past the top", top, 16, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::Overflow, top, 2);
+            run("unaligned dword past the top", top - 2u, 32, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::Overflow, top - 2u, 4);
+        } else {
+            run("unaligned dword past the top", top - 2u, 32, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::Unmapped, top - 2u, 1);
+        }
+        extraCount = 1;
+        run("aligned dword at the top of an invalid table", top - 3u, 32, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::InvalidTable, top - 3u, 4);
+        extraCount = 0;
         ranges[1].permissions = Abi::Read;
         run("read-only byte", guest + 2, 8, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::Permission, guest + 2, 1);
         run("read-only short suffix", guest + 1, 16, coherent, {0xcd, 0xd4, 0xcd, 0xcd, 0xcd}, {guest + 1}, Abi::FaultReason::Permission, guest + 2, 1);

@@ -128,6 +128,7 @@ std::vector<std::uint32_t> MakeProbeShader(std::uint32_t count, const TEmit& emi
 std::vector<std::uint32_t> MakeBdaTranslateTestShader(std::uint32_t count) {
     using namespace ShaderRecompiler;
     return MakeProbeShader(count, [&](SpirvEmitterState& state, std::uint32_t io, std::uint32_t index) {
+        if (state.bdaWriteTranslateFunction == 0u) throw std::runtime_error("the BDA write translate function was not defined");
         const auto u32 = TypeU32(state);
         const auto u64 = TypeScalarU64(state);
         const auto word = [&](std::uint32_t at) { return Binary(state, spv::OpIAdd, u32, Binary(state, spv::OpShiftLeftLogical, u32, index, ConstantU32(state, 2u)), ConstantU32(state, at)); };
@@ -137,8 +138,15 @@ std::vector<std::uint32_t> MakeBdaTranslateTestShader(std::uint32_t count) {
             return value;
         };
         const auto address = Binary(state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, load(0u)), Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, load(1u)), BdaConstant(state, 32u)));
-        const auto translated = state.module.AllocateId();
-        state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeStruct, u64, u32), translated, state.bdaTranslateFunction, address, load(2u), load(3u));
+        const auto bytes = load(2u);
+        const auto permission = load(3u);
+        const auto translation = state.module.Type(spv::OpTypeStruct, u64, u32);
+        const auto translate = [&](std::uint32_t function) {
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpFunctionCall, translation, value, function, address, bytes, permission);
+            return value;
+        };
+        const auto translated = EmitValueIfElse(state, Binary(state, spv::OpIEqual, TypeBool(state), permission, ConstantU32(state, BdaAbi::Read)), translation, [&] { return translate(state.bdaTranslateFunction); }, [&] { return translate(state.bdaWriteTranslateFunction); });
         const auto device = state.module.AllocateId();
         state.module.AddFunction(spv::OpCompositeExtract, u64, device, translated, 0u);
         const auto reason = state.module.AllocateId();

@@ -148,6 +148,7 @@ struct SpirvEmitterState {
     std::uint32_t bdaPagetableVariable = 0;
     std::uint32_t faultBufferVariable = 0;
     std::uint32_t bdaTranslateFunction = 0;
+    std::uint32_t bdaWriteTranslateFunction = 0;
     std::uint32_t bdaSegmentFunction = 0;
     std::array<std::uint32_t, 3> bdaReadCache {};
     std::array<std::uint32_t, 3> bdaVectorCache {};

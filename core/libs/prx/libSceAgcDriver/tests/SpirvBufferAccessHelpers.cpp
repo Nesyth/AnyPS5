@@ -25,6 +25,8 @@ struct Function {
     std::size_t widestSwitch = 0;
     std::size_t switches = 0;
     std::size_t dynamicExtracts = 0;
+    std::size_t loops = 0;
+    std::size_t rolledLoops = 0;
     std::map<std::uint32_t, std::uint32_t> calls;
     std::size_t bufferMemoryLoads = 0;
 };
@@ -106,6 +108,10 @@ Module Parse(std::span<const std::uint32_t> words) {
         }
         if (current != 0 && op == spv::OpFunctionCall) ++module.functions[current].calls[operands[2]];
         if (current != 0 && op == spv::OpVectorExtractDynamic) ++module.functions[current].dynamicExtracts;
+        if (current != 0 && op == spv::OpLoopMerge) {
+            ++module.functions[current].loops;
+            if ((operands[2] & spv::LoopControlDontUnrollMask) != 0u) ++module.functions[current].rolledLoops;
+        }
         if (current != 0 && (op == spv::OpLoad || op == spv::OpAtomicLoad) && physicalPointers.contains(operands[2])) ++module.functions[current].bufferMemoryLoads;
         if (current != 0 && op == spv::OpSwitch) {
             std::set<std::uint32_t> targets{operands[1]};
@@ -196,10 +202,17 @@ int main() {
         Expect(module.mainPrivateWideLoads == 6u, "main loads the read cache " + std::to_string(module.mainPrivateWideLoads) + " times, expected one probe of its begin, end and offset for the three consecutive s_buffer_load_dword and one read of them for the refill");
         Expect(module.mainBufferMemoryLoads == 2u, "main loads buffer memory " + std::to_string(module.mainBufferMemoryLoads) + " times, expected one vector load for the three consecutive s_buffer_load_dword through their cached translation and one through the refilled one");
         std::uint32_t write = 0;
+        std::uint32_t pieces = 0;
+        std::uint32_t translate = 0;
+        std::uint32_t note = 0;
         for (const auto& [id, function] : module.functions) {
             if (function.name == "write_bda") write = id;
+            if (function.name == "write_bda_bytes") pieces = id;
+            if (function.name == "bda_translate_write") translate = id;
+            if (function.name == "note_bda_write") note = id;
         }
         Expect(write != 0u, "the module has no write_bda function");
+        Expect(pieces != 0u && translate != 0u && note != 0u, "the module lacks write_bda_bytes, bda_translate_write or note_bda_write");
         std::uint32_t segment = 0;
         std::uint32_t fault = 0;
         for (const auto& [id, function] : module.functions) {
@@ -207,6 +220,14 @@ int main() {
             if (function.name == "record_bda_fault") fault = id;
         }
         Expect(segment != 0u, "the module has no bda_segment function");
+        const auto callsTo = [](const Function& function, std::uint32_t callee) {
+            const auto found = function.calls.find(callee);
+            return found == function.calls.end() ? 0u : found->second;
+        };
+        const auto& writer = module.functions.at(write);
+        Expect(writer.calls.size() == 1u && callsTo(writer, pieces) == 1u, "write_bda calls " + std::to_string(writer.calls.size()) + " functions, expected only one call of write_bda_bytes for its aligned dword and its bytes");
+        const auto& piecewise = module.functions.at(pieces);
+        Expect(piecewise.calls.size() == 3u && callsTo(piecewise, translate) == 1u && callsTo(piecewise, fault) == 1u && callsTo(piecewise, note) == 1u && piecewise.rolledLoops == 1u, "write_bda_bytes translates " + std::to_string(callsTo(piecewise, translate)) + " times, records faults " + std::to_string(callsTo(piecewise, fault)) + " times and notes written pages " + std::to_string(callsTo(piecewise, note)) + " times in " + std::to_string(piecewise.rolledLoops) + " loops kept rolled, expected one of each inside one loop over its pieces that the driver may not unroll");
         std::size_t spanReaders = 0;
         for (const auto& [id, function] : module.functions) {
             if (!function.name.starts_with("read_bda_span")) continue;
@@ -242,9 +263,8 @@ int main() {
             }
             if (function.name.starts_with("decode_format_layout_")) Expect((function.control & spv::FunctionControlDontInlineMask) != 0u && function.switches == 1u, function.name + " is not one DontInline switch over the formats of its layout");
             if (function.name.starts_with("store_buffer_x3")) {
-                const auto found = function.calls.find(write);
-                const auto writes = found == function.calls.end() ? 0u : found->second;
-                Expect(writes == 3u, function.name + " calls write_bda " + std::to_string(writes) + " times, expected once per component");
+                const auto writes = callsTo(function, write);
+                Expect(writes == 1u && function.loops == 1u && function.rolledLoops == 1u, function.name + " calls write_bda " + std::to_string(writes) + " times in " + std::to_string(function.loops) + " loops (" + std::to_string(function.rolledLoops) + " kept rolled), expected one call inside one loop over its components that the driver may not unroll");
             }
             const auto branched = module.branchedCallsFromMain.find(id);
             const bool access = function.name.starts_with("load_buffer_") || function.name.starts_with("store_buffer_") || function.name.starts_with("load_formatted_buffer_") || function.name.starts_with("buffer_atomic_address_");

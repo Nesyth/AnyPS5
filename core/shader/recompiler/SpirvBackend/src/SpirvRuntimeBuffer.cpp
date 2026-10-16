@@ -603,18 +603,39 @@ std::uint32_t selectFormatted(SpirvEmitterState& state, std::uint32_t components
     return composite(state, components, outputs);
 }
 
-void writeFormatted(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, const SpirvBufferFormatInfo& info, const FormattedLayout& layout, const std::array<std::uint32_t, 4>& encoded) {
-    auto& state = context.state;
+std::uint32_t packFormatted(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, const std::array<std::uint32_t, 4>& encoded) {
     const auto u32 = TypeU32(state);
     auto packed = ConstantU32(state, 0u);
-    for (std::uint32_t component = 0; component < info.componentCount; ++component) {
-        if (info.packedBitfield) {
-            packed = EmitOrU32(state, packed, Binary(state, spv::OpShiftLeftLogical, u32, EmitAndConstant(state, encoded[component], (1u << info.componentBits[component]) - 1u), ConstantU32(state, info.componentBitOffset[component])));
-        } else {
-            writeBuffer(context, instruction, resource, layout.addresses[component].guest, encoded[component], info.componentBits[component]);
-        }
+    for (std::uint32_t component = 0; component < info.componentCount; ++component) packed = EmitOrU32(state, packed, Binary(state, spv::OpShiftLeftLogical, u32, EmitAndConstant(state, encoded[component], (1u << info.componentBits[component]) - 1u), ConstantU32(state, info.componentBitOffset[component])));
+    return packed;
+}
+
+bool writesBda(SpirvValueEmitContext& context, const IrValue& instruction) {
+    return context.Memory(instruction).gpuDescriptor && context.state.linearStoreStaging == 0u;
+}
+
+void writeFormatted(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, const SpirvBufferFormatInfo& info, const FormattedLayout& layout, const std::array<std::uint32_t, 4>& encoded) {
+    auto& state = context.state;
+    if (info.packedBitfield) {
+        writeBuffer(context, instruction, resource, layout.addresses[0].guest, packFormatted(state, info, encoded));
+        return;
     }
-    if (info.packedBitfield) writeBuffer(context, instruction, resource, layout.addresses[0].guest, packed);
+    const bool uniform = std::all_of(info.componentBits, info.componentBits + info.componentCount, [&](std::uint32_t bits) { return bits == info.componentBits[0]; });
+    if (info.componentCount > 1u && uniform && writesBda(context, instruction)) {
+        const auto vector = state.module.AllocateId();
+        std::vector<std::uint32_t> construct{spv::OpCompositeConstruct, TypeU32Vector(state, info.componentCount), vector};
+        construct.insert(construct.end(), encoded.begin(), encoded.begin() + info.componentCount);
+        state.module.AddFunction(construct);
+        EmitCountedLoop(state, ConstantU32(state, info.componentCount), [&](std::uint32_t component) {
+            auto guest = layout.addresses[0].guest;
+            for (std::uint32_t slot = 1; slot < info.componentCount; ++slot) guest = Select(state, TypeScalarU64(state), equal(state, component, ConstantU32(state, slot)), layout.addresses[slot].guest, guest);
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpVectorExtractDynamic, TypeU32(state), value, vector, component);
+            writeBuffer(context, instruction, resource, guest, value, info.componentBits[0]);
+        });
+        return;
+    }
+    for (std::uint32_t component = 0; component < info.componentCount; ++component) writeBuffer(context, instruction, resource, layout.addresses[component].guest, encoded[component], info.componentBits[component]);
 }
 
 bool componentReadable(const SpirvBufferFormatInfo& info) {
@@ -1001,6 +1022,64 @@ bool tableFormatLoad(SpirvValueEmitContext& context, const IrValue& instruction,
     return !store && !memory.d16 && readable && runtimeFormatted(instruction, memory) && componentReads(context, instruction);
 }
 
+std::array<std::uint32_t, 4> encodeLayout(SpirvEmitterState& state, const MemoryInfo& memory, std::size_t index, std::uint32_t format, std::uint32_t components, const std::array<std::uint32_t, 4>& values) {
+    const auto& layouts = sharedFormatLayouts();
+    const auto info = GetFormatInfo(static_cast<IrBufferFormat>(layouts[index].front()));
+    const auto encoded = layouts[index].size() > 1u ? callCodec(state, state.formatEncoders, codecKey(index, memory.d16, components), format, std::span<const std::uint32_t>(values.data(), components), info.componentCount) : switchValues(state, format, formatMembers(index), true, std::vector<std::uint32_t>(info.componentCount, TypeU32(state)), [&](std::size_t member) {
+        std::vector<std::uint32_t> parts;
+        for (std::uint32_t component = 0; component < info.componentCount; ++component) parts.push_back(encodeFormatted(state, memory, GetFormatInfo(static_cast<IrBufferFormat>(layouts[index][member])), component, components, values));
+        return parts;
+    });
+    std::array<std::uint32_t, 4> parts{};
+    std::copy(encoded.begin(), encoded.end(), parts.begin());
+    return parts;
+}
+
+void runtimeFormatStore(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t components, std::uint32_t data, std::uint32_t format) {
+    auto& state = context.state;
+    const auto& memory = context.Memory(instruction);
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto& layouts = sharedFormatLayouts();
+    const auto values = storeValues(state, data, components);
+    std::vector<std::uint32_t> types{u32, u32, TypeBool(state)};
+    types.insert(types.end(), 4u, u64);
+    types.insert(types.end(), 4u, u32);
+    const auto plan = switchValues(state, format, layouts, false, types, [&](std::size_t index) {
+        std::vector<std::uint32_t> planned{ConstantU32(state, 0u), ConstantU32(state, 0u), ConstantBool(state, false)};
+        planned.insert(planned.end(), 4u, BdaConstant(state, 0u));
+        planned.insert(planned.end(), 4u, ConstantU32(state, 0u));
+        if (index == layouts.size()) {
+            RecordBdaFault(state, resource.base, ConstantU32(state, 0u), BdaInstructionPc(state, instruction), BdaAbi::FaultReason::InvalidDescriptor);
+            return planned;
+        }
+        const auto info = GetFormatInfo(static_cast<IrBufferFormat>(layouts[index].front()));
+        const auto layout = formattedLayout(context, instruction, resource, info, components, true);
+        const auto encoded = encodeLayout(state, memory, index, format, components, values);
+        const auto pieces = info.packedBitfield ? 1u : info.componentCount;
+        planned[0] = ConstantU32(state, pieces);
+        planned[1] = ConstantU32(state, info.packedBitfield ? 4u : info.componentBits[0] / 8u);
+        planned[2] = layout.inBounds;
+        for (std::uint32_t piece = 0; piece < pieces; ++piece) {
+            planned[3u + piece] = layout.addresses[piece].guest;
+            planned[7u + piece] = info.packedBitfield ? packFormatted(state, info, encoded) : encoded[piece];
+        }
+        return planned;
+    });
+    EmitIfCondition(state, plan[2], [&] {
+        EmitCountedLoop(state, plan[0], [&](std::uint32_t piece) {
+            auto guest = plan[3];
+            auto value = plan[7];
+            for (std::uint32_t slot = 1; slot < 4u; ++slot) {
+                const auto chosen = equal(state, piece, ConstantU32(state, slot));
+                guest = Select(state, u64, chosen, plan[3u + slot], guest);
+                value = Select(state, u32, chosen, plan[7u + slot], value);
+            }
+            EmitBdaWriteBytes(context, instruction, guest, value, plan[1], ConstantBool(state, true));
+        });
+    });
+}
+
 std::uint32_t formatSwitch(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t components, bool store, std::uint32_t data) {
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
@@ -1011,6 +1090,10 @@ std::uint32_t formatSwitch(SpirvValueEmitContext& context, const IrValue& instru
     const auto zero = store || components == 1u ? ConstantU32(state, 0u) : ConstantU32CompositeZero(state, components);
     const auto members = [&](std::size_t layout) { return formatMembers(layout); };
     if (tableFormatLoad(context, instruction, store)) return runtimeFormatLoad(context, instruction, resource, components, format);
+    if (store && writesBda(context, instruction)) {
+        runtimeFormatStore(context, instruction, resource, components, data, format);
+        return ConstantU32(state, 0u);
+    }
     const auto result = switchValues(state, format, layouts, false, store ? std::vector<std::uint32_t>{} : std::vector<std::uint32_t>{type}, [&](std::size_t index) -> std::vector<std::uint32_t> {
         if (index == layouts.size()) {
             if (memory.gpuDescriptor) RecordBdaFault(state, resource.base, ConstantU32(state, 0u), BdaInstructionPc(state, instruction), BdaAbi::FaultReason::InvalidDescriptor);
@@ -1021,16 +1104,7 @@ std::uint32_t formatSwitch(SpirvValueEmitContext& context, const IrValue& instru
         const auto memberInfo = [&](std::size_t member) { return GetFormatInfo(static_cast<IrBufferFormat>(layouts[index][member])); };
         if (store) {
             const auto values = storeValues(state, data, components);
-            EmitIfCondition(state, layout.inBounds, [&] {
-                const auto encoded = layouts[index].size() > 1u ? callCodec(state, state.formatEncoders, codecKey(index, memory.d16, components), format, std::span<const std::uint32_t>(values.data(), components), info.componentCount) : switchValues(state, format, members(index), true, std::vector<std::uint32_t>(info.componentCount, u32), [&](std::size_t member) {
-                    std::vector<std::uint32_t> parts;
-                    for (std::uint32_t component = 0; component < info.componentCount; ++component) parts.push_back(encodeFormatted(state, memory, memberInfo(member), component, components, values));
-                    return parts;
-                });
-                std::array<std::uint32_t, 4> parts{};
-                std::copy(encoded.begin(), encoded.end(), parts.begin());
-                writeFormatted(context, instruction, resource, info, layout, parts);
-            });
+            EmitIfCondition(state, layout.inBounds, [&] { writeFormatted(context, instruction, resource, info, layout, encodeLayout(state, memory, index, format, components, values)); });
             return {};
         }
         std::array<std::uint32_t, 4> read{};
@@ -1147,6 +1221,22 @@ void rawStore(SpirvValueEmitContext& context, const IrValue& instruction, std::u
     const auto& memory = context.Memory(instruction);
     EmitIfCondition(state, active, [&] {
         const auto resource = descriptor(context, instruction, operands);
+        if (components > 1u && writesBda(context, instruction)) {
+            const auto u32 = TypeU32(state);
+            auto vector = data;
+            if (components == 2u) {
+                const auto pair = storeValues(state, data, components);
+                vector = state.module.AllocateId();
+                state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2u), vector, pair[0], pair[1]);
+            }
+            EmitCountedLoop(state, ConstantU32(state, components), [&](std::uint32_t component) {
+                const auto value = state.module.AllocateId();
+                state.module.AddFunction(spv::OpVectorExtractDynamic, u32, value, vector, component);
+                const auto access = runtimeAddress(context, instruction, resource, Binary(state, spv::OpShiftLeftLogical, u32, component, ConstantU32(state, 2u)), ConstantU32(state, memory.dataBits / 8u));
+                EmitBdaWrite(context, instruction, access.guest, value, memory.dataBits, access.inBounds);
+            });
+            return;
+        }
         const auto values = storeValues(state, data, components);
         for (std::uint32_t component = 0; component < components; ++component) {
             const auto access = address(context, instruction, resource, component * 4u, memory.dataBits / 8u);
