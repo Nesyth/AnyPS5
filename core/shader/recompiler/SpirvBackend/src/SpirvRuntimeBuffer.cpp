@@ -195,7 +195,7 @@ ElementTerms elementTerms(SpirvEmitterState& state, const RuntimeDescriptor& res
     return element;
 }
 
-RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& instruction, const BufferValues& values, std::uint32_t checkedSelectors = 0u) {
+RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& instruction, const BufferValues& values, std::uint32_t tableOutputs = 0u) {
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
     const bool runtime = runtimeWords(state, memory);
@@ -219,7 +219,7 @@ RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& inst
     }
     const auto mapped = memory.gpuDescriptor ? Binary(state, spv::OpINotEqual, TypeBool(state), base, BdaConstant(state, 0u)) : 0u;
     if (memory.gpuDescriptor) {
-        const auto faulted = checkedSelectors == 0u ? invalid : Binary(state, spv::OpLogicalOr, TypeBool(state), invalid, both(state, mapped, malformedFormat(state, word3, checkedSelectors)));
+        const auto faulted = tableOutputs == 0u ? invalid : Binary(state, spv::OpLogicalOr, TypeBool(state), invalid, both(state, mapped, malformedFormat(state, word3, tableOutputs)));
         faultIf(context, instruction, faulted, base, 0u, BdaAbi::FaultReason::InvalidDescriptor);
     }
     const auto stride = field(state, word1, 16u, 14u);
