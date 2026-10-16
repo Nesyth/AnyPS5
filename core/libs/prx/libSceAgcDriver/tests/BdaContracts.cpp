@@ -68,5 +68,7 @@ void RunBdaContractTests() {
         }
     }
     static_cast<void>(MakeBdaCachedReadTestShader({{0x7fff12340000ull, 1u}, {0x7fff12340004ull, 3u}}));
+    static_cast<void>(MakeBdaHeldFaultTestShader(0x7fff12340041ull, 2u, 0x5678u, 0x7fff12340000ull, 8u));
+    static_cast<void>(MakeBdaHeldFaultTestShader(0x7fff12340041ull, 2u, 0x5678u, ~0ull - 1u, 32u));
     if (!BdaByteReadsForced()) static_cast<void>(MakeBdaSegmentTestShader(1u));
 }

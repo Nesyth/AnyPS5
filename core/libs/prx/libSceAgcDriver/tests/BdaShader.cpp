@@ -192,6 +192,19 @@ std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_
     });
 }
 
+std::vector<std::uint32_t> MakeBdaHeldFaultTestShader(std::uint64_t heldAddress, std::uint32_t heldBytes, std::uint32_t heldPc, std::uint64_t address, std::uint32_t bits) {
+    using namespace ShaderRecompiler;
+    auto shader = MakeShader(address, false, true, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
+        auto& state = ctx.state;
+        RecordBdaFault(state, BdaConstant(state, heldAddress), ConstantU32(state, heldBytes), ConstantU32(state, heldPc), BdaAbi::FaultReason::Unmapped);
+        return std::vector<std::uint32_t>{EmitBdaRead(ctx, instruction, base, bits)};
+    });
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    shader = ValidateAndOptimizeSpirv(shader, VK_API_VERSION_1_1, shader[1], false, false);
+#endif
+    return shader;
+}
+
 std::vector<std::uint32_t> MakeBdaSpanReadTestShader(std::uint64_t address, std::uint32_t offset, std::uint32_t extracted, bool coherent, bool stops) {
     using namespace ShaderRecompiler;
     auto shader = MakeShader(address, coherent, stops, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {

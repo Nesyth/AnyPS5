@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iostream>
@@ -39,6 +40,7 @@ struct Module {
     std::size_t mainBufferMemoryLoads = 0;
     std::map<std::uint32_t, std::size_t> mainBuiltinLoads;
     std::size_t mainPrivateWideLoads = 0;
+    std::size_t mainExits = 0;
 };
 
 std::vector<std::uint32_t> Recompiled(std::span<const std::uint32_t> code) {
@@ -132,6 +134,7 @@ Module Parse(std::span<const std::uint32_t> words) {
             if ((op == spv::OpLoad || op == spv::OpAtomicLoad) && physicalPointers.contains(operands[2])) ++module.mainBufferMemoryLoads;
             if (op == spv::OpLoad && builtins.contains(operands[2])) ++module.mainBuiltinLoads[builtins.at(operands[2])];
             if (op == spv::OpLoad && privateWide.contains(operands[2])) ++module.mainPrivateWideLoads;
+            if (op == spv::OpReturn || op == spv::OpKill) ++module.mainExits;
         }
         cursor += count;
     }
@@ -237,7 +240,8 @@ int main() {
         std::uint32_t recordCalls = 0;
         for (const auto& [id, function] : module.functions) recordCalls += callsTo(function, fault);
         const auto mainRecords = module.callsFromMain.contains(fault) ? module.callsFromMain.at(fault) : 0u;
-        Expect(fault != 0u && mainRecords != 0u && recordCalls == mainRecords, "record_bda_fault is called " + std::to_string(recordCalls) + " times, " + std::to_string(mainRecords) + " of them from main, expected every fault held and recorded only where main ends the invocation");
+        const bool loopGuarded = std::getenv("APS5_LOOP_GUARD") != nullptr;
+        Expect(fault != 0u && mainRecords != 0u && recordCalls == mainRecords && (loopGuarded || mainRecords == module.mainExits), "record_bda_fault is called " + std::to_string(recordCalls) + " times, " + std::to_string(mainRecords) + " of them from main, which ends the invocation at " + std::to_string(module.mainExits) + " returns, expected every fault held and recorded once in front of each return of main");
         std::size_t spanReaders = 0;
         for (const auto& [id, function] : module.functions) {
             if (!function.name.starts_with("read_bda_span")) continue;

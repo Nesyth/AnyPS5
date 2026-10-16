@@ -322,6 +322,24 @@ static void RunBdaReadTests(const Context& context, bool paged) {
     run(guest, 8, 0, Abi::FaultReason::InvalidTable, 1);
     run(std::numeric_limits<std::uint64_t>::max() - 2, 8, 0, Abi::FaultReason::Overflow, 0, 1, 4);
     run(1, 8, 0, Abi::FaultReason::Overflow, 0, 1, -4);
+    const auto held = [&](const char* name, std::uint64_t address, std::uint32_t bits) {
+        const auto pages = PagesFor(context, paged, ranges);
+        const auto table = MakeBinding(context, paged, pages, ranges);
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        const std::uint32_t sentinel = 0xdeadbeef;
+        std::memcpy(output.Bytes().data(), &sentinel, sizeof(sentinel));
+        Pipeline pipeline(context, MakeBdaHeldFaultTestShader(guest + 0x40, 2, 0x5678, address, bits), {table.get(), &fault, &output});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::uint32_t result = 0;
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        std::memcpy(&result, output.Bytes().data(), sizeof(result));
+        const std::string label = std::string("a BDA ") + name + (paged ? " (paged) " : " ");
+        Require(report.state == Abi::FaultState::Ready && report.reason == Abi::FaultReason::Unmapped && report.address == guest + 0x40 && report.bytes == 2 && report.stage == static_cast<std::uint32_t>(ShaderRecompiler::IrShaderStage::Compute) && report.instruction == 0x5678 && report.reserved == 0, label + "that stopped its invocation published reason " + std::to_string(static_cast<std::uint32_t>(report.reason)) + " at guest + " + std::to_string(report.address - guest) + " bytes " + std::to_string(report.bytes) + " pc " + std::to_string(report.instruction) + ", expected the unmapped fault the invocation held before it");
+        Require(result == sentinel, label + "that stopped behind a held fault continued to output a value");
+    };
+    held("unmapped byte read", guest - 1, 8);
+    held("dword read past the top of memory", std::numeric_limits<std::uint64_t>::max() - 1, 32);
     Buffer words(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const auto read = [&](std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops, std::uint32_t value, bool faults) {
         const auto pages = PagesFor(context, paged, ranges);
