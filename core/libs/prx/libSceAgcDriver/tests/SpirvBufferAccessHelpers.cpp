@@ -183,7 +183,7 @@ int main() {
         const auto stores = Calls(module, "store_buffer_");
         Expect(stores.size() == 1u && stores[0] == 4u, "expected one store helper called by the four dwordx3 stores, found " + Describe(stores));
         const auto scalars = Calls(module, "load_scalar_buffer_");
-        Expect(scalars.size() == 1u && scalars[0] == 3u, "expected one scalar load helper called by the three s_buffer_load_dword, found " + Describe(scalars));
+        Expect(scalars.empty(), "expected the three s_buffer_load_dword read as one group without a per-dword helper, found " + Describe(scalars));
         const auto atomics = Calls(module, "buffer_atomic_address_");
         Expect(atomics.size() == 1u && atomics[0] == 2u, "expected one atomic address helper called by the two buffer_atomic_add, found " + Describe(atomics));
         const auto formatted = Calls(module, "load_formatted_buffer_");
@@ -193,8 +193,8 @@ int main() {
             const auto loads = found == module.mainBuiltinLoads.end() ? 0u : found->second;
             Expect(loads <= 1u, "main loads built-in " + std::to_string(builtin) + " " + std::to_string(loads) + " times, expected once at its entry");
         }
-        Expect(module.mainPrivateWideLoads == 3u, "main loads the read cache " + std::to_string(module.mainPrivateWideLoads) + " times, expected one probe of its begin, end and offset for the three consecutive s_buffer_load_dword");
-        Expect(module.mainBufferMemoryLoads == 1u, "main loads buffer memory " + std::to_string(module.mainBufferMemoryLoads) + " times, expected one vector load for the three consecutive s_buffer_load_dword, through their cached translation, with the refill left to the helper");
+        Expect(module.mainPrivateWideLoads == 6u, "main loads the read cache " + std::to_string(module.mainPrivateWideLoads) + " times, expected one probe of its begin, end and offset for the three consecutive s_buffer_load_dword and one read of them for the refill");
+        Expect(module.mainBufferMemoryLoads == 2u, "main loads buffer memory " + std::to_string(module.mainBufferMemoryLoads) + " times, expected one vector load for the three consecutive s_buffer_load_dword through their cached translation and one through the refilled one");
         std::uint32_t write = 0;
         for (const auto& [id, function] : module.functions) {
             if (function.name == "write_bda") write = id;

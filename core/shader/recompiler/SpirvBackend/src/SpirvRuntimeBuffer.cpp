@@ -1625,10 +1625,41 @@ std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const 
             const auto count = static_cast<std::uint32_t>(members.size());
             const auto u32 = TypeU32(state);
             const auto type = state.module.Type(spv::OpTypeArray, u32, ConstantU32(state, count));
-            const auto span = scalarAccess(context, instruction, instructionValues(context, instruction, true), count * 4u);
-            const auto values = EmitBdaCachedDwords(context, instruction, scalarGuestAddress(state, span), span.inBounds, count, type, [&] {
+            const auto operands = instructionValues(context, instruction, true);
+            const auto span = scalarAccess(context, instruction, operands, count * 4u);
+            const auto guest = scalarGuestAddress(state, span);
+            const bool masked = BdaMaskedDwordReadsAvailable(state, instruction);
+            const auto values = EmitBdaCachedDwords(context, instruction, guest, span.inBounds, count, type, [&] {
                 std::vector<std::uint32_t> construct{spv::OpCompositeConstruct, type, state.module.AllocateId()};
-                for (const auto* member : members) construct.push_back(scalarBufferLoad(context, *member, true));
+                if (!masked) {
+                    for (const auto* member : members) construct.push_back(scalarBufferLoad(context, *member, true));
+                    state.module.AddFunction(construct);
+                    return construct[2];
+                }
+                const struct Stops {
+                    SpirvEmitterState& state;
+                    bool stops;
+                    ~Stops() { state.bdaStopsInvocations = stops; }
+                } stops{state, state.bdaStopsInvocations};
+                state.bdaStopsInvocations = false;
+                const auto u64 = TypeScalarU64(state);
+                const auto boolean = TypeBool(state);
+                const auto& resource = span.resource;
+                const auto size = Select(state, u64, equal(state, resource.stride, ConstantU32(state, 0u)), Unary(state, spv::OpUConvert, u64, resource.records), Binary(state, spv::OpIMul, u64, Unary(state, spv::OpUConvert, u64, resource.stride), Unary(state, spv::OpUConvert, u64, resource.records)));
+                for (std::uint32_t first = 0; first < count; first += 4u) {
+                    const auto chunk = std::min(4u, count - first);
+                    auto used = ConstantU32(state, 0u);
+                    for (std::uint32_t index = 0; index < chunk; ++index) {
+                        const auto address = EmitAddU32(state, operands.offset, ConstantU32(state, context.Memory(*members[first + index]).offset));
+                        const auto noCarry = Binary(state, spv::OpUGreaterThanEqual, boolean, address, operands.offset);
+                        const auto offset = Unary(state, spv::OpUConvert, u64, EmitAndConstant(state, address, ~3u));
+                        const auto inBounds = both(state, noCarry, both(state, resource.valid, Binary(state, spv::OpULessThanEqual, boolean, Binary(state, spv::OpIAdd, u64, offset, BdaConstant(state, 4u)), size)));
+                        used = Binary(state, spv::OpBitwiseOr, u32, used, Select(state, u32, inBounds, ConstantU32(state, 1u << index), ConstantU32(state, 0u)));
+                    }
+                    const auto start = first == 0u ? guest : Binary(state, spv::OpIAdd, u64, guest, BdaConstant(state, first * 4u));
+                    const auto loaded = EmitBdaMaskedDwordReads(context, instruction, start, used);
+                    construct.insert(construct.end(), loaded.begin(), loaded.begin() + chunk);
+                }
                 state.module.AddFunction(construct);
                 return construct[2];
             });
