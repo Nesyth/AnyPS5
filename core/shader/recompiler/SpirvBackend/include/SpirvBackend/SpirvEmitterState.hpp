@@ -131,6 +131,7 @@ struct SpirvEmitterState {
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
+    bool bdaRangeList = true;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     std::uint32_t spirvVersion = 0x00010300u;
@@ -150,6 +151,7 @@ struct SpirvEmitterState {
     std::uint32_t bdaSegmentFunction = 0;
     std::array<std::uint32_t, 3> bdaReadCache {};
     std::array<std::uint32_t, 3> bdaVectorCache {};
+    std::array<std::uint32_t, 3> bdaTableVariables {};
     std::uint32_t bdaPointerFunction = 0;
     // The lookup without fault recording that wide reads try first (see EmitBdaDwordReads); 0 when
     // every read takes the byte path.
