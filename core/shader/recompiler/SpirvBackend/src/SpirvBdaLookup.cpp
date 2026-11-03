@@ -87,12 +87,16 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         {binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow},
         {binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow},
     });
+    auto searchLow = constant(0);
     auto searchHigh = count;
     if (state.devicePageTable) {
         const auto empty = binary(spv::OpIEqual, boolean, count, constant(0));
-        const auto lastEnd = Select(state, u32, empty, constant(0), binary(spv::OpIAdd, u32, constant(6), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, count, constant(1)), constant(8))));
-        const auto outside = binary(spv::OpLogicalOr, boolean, empty, binary(spv::OpLogicalOr, boolean, binary(spv::OpULessThan, boolean, address, BdaLoadAddress(state, constant(4))), binary(spv::OpUGreaterThanEqual, boolean, address, BdaLoadAddress(state, lastEnd))));
-        searchHigh = Select(state, u32, binary(spv::OpLogicalAnd, boolean, pageTable, outside), constant(0), count);
+        const auto firstBegin = BdaLoadAddress(state, Select(state, u32, empty, constant(0), constant(4)));
+        const auto lastEnd = BdaLoadAddress(state, Select(state, u32, empty, constant(0), binary(spv::OpIAdd, u32, constant(6), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, count, constant(1)), constant(8)))));
+        const auto below = binary(spv::OpLogicalAnd, boolean, pageTable, binary(spv::OpLogicalOr, boolean, empty, binary(spv::OpULessThan, boolean, address, firstBegin)));
+        const auto above = binary(spv::OpLogicalAnd, boolean, binary(spv::OpLogicalAnd, boolean, pageTable, Unary(state, spv::OpLogicalNot, boolean, empty)), binary(spv::OpUGreaterThanEqual, boolean, address, lastEnd));
+        searchLow = Select(state, u32, above, count, constant(0));
+        searchHigh = Select(state, u32, binary(spv::OpLogicalOr, boolean, below, above), searchLow, count);
     }
     const auto header = state.module.AllocateId();
     const auto body = state.module.AllocateId();
@@ -105,7 +109,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto upper = state.module.AllocateId();
     const auto newLow = state.module.AllocateId();
     const auto newHigh = state.module.AllocateId();
-    state.module.AddFunction(spv::OpPhi, u32, lower, constant(0), entryLabel, newLow, continuation);
+    state.module.AddFunction(spv::OpPhi, u32, lower, searchLow, entryLabel, newLow, continuation);
     state.module.AddFunction(spv::OpPhi, u32, upper, searchHigh, entryLabel, newHigh, continuation);
     const auto search = binary(spv::OpULessThan, boolean, lower, upper);
     state.module.AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlMaskNone);
@@ -139,7 +143,10 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         };
         const auto none = binary(spv::OpIEqual, boolean, index, constant(0));
         const auto previousEnd = Select(state, u32, none, constant(0), binary(spv::OpIAdd, u32, constant(6), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, index, constant(1)), constant(8))));
-        const auto outside = binary(spv::OpLogicalOr, boolean, none, binary(spv::OpUGreaterThanEqual, boolean, address, BdaLoadAddress(state, previousEnd)));
+        const auto gapBegin = Select(state, u64, none, BdaConstant(state, 0u), BdaLoadAddress(state, previousEnd));
+        const auto later = binary(spv::OpULessThan, boolean, index, count);
+        const auto gapEnd = Select(state, u64, later, BdaLoadAddress(state, Select(state, u32, later, binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, index, constant(8))), constant(0))), BdaConstant(state, ~std::uint64_t{0}));
+        const auto outside = binary(spv::OpLogicalOr, boolean, none, binary(spv::OpUGreaterThanEqual, boolean, address, gapBegin));
         const auto walks = binary(spv::OpLogicalAnd, boolean, pageTable, outside);
         const auto walk = state.module.AllocateId();
         const auto overlaid = state.module.AllocateId();
@@ -197,14 +204,18 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
             {binary(spv::OpINotEqual, boolean, kind, segment), BdaAbi::FaultReason::Unmapped},
             {binary(spv::OpLogicalOr, boolean, binary(spv::OpULessThan, boolean, offset, first), binary(spv::OpUGreaterThanEqual, boolean, offset, limit)), BdaAbi::FaultReason::Unmapped},
             {binary(spv::OpUGreaterThan, boolean, binary(spv::OpIAdd, u64, offset, widen(bytes)), limit), BdaAbi::FaultReason::Unmapped},
+            {binary(spv::OpUGreaterThan, boolean, end, gapEnd), BdaAbi::FaultReason::Unmapped},
             {binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, permissions, constant(permission)), constant(permission)), BdaAbi::FaultReason::Permission},
         });
         const auto delta = pair(component(current, 0u), component(current, 1u));
         if (rangeResult) {
             const auto nodeBase = binary(spv::OpISub, u64, address, offset);
             const auto segmentBegin = binary(spv::OpIAdd, u64, nodeBase, first);
+            const auto segmentEnd = binary(spv::OpIAdd, u64, nodeBase, limit);
+            const auto clippedBegin = Select(state, u64, binary(spv::OpULessThan, boolean, segmentBegin, gapBegin), gapBegin, segmentBegin);
+            const auto clippedEnd = Select(state, u64, binary(spv::OpULessThan, boolean, gapEnd, segmentEnd), gapEnd, segmentEnd);
             const auto range = state.module.AllocateId();
-            state.module.AddFunction(spv::OpCompositeConstruct, rangeType, range, segmentBegin, binary(spv::OpIAdd, u64, nodeBase, limit), binary(spv::OpIAdd, u64, segmentBegin, delta));
+            state.module.AddFunction(spv::OpCompositeConstruct, rangeType, range, clippedBegin, clippedEnd, binary(spv::OpIAdd, u64, clippedBegin, delta));
             leave(range);
         } else {
             leave(binary(spv::OpIAdd, u64, address, delta));
@@ -221,6 +232,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto offset = binary(spv::OpISub, u64, address, begin);
     const auto result = binary(spv::OpIAdd, u64, base, offset);
     const auto deviceEnd = binary(spv::OpIAdd, u64, result, Unary(state, spv::OpUConvert, u64, bytes));
+    if (state.devicePageTable) fail(binary(spv::OpLogicalAnd, boolean, pageTable, binary(spv::OpIEqual, boolean, BdaLoadWord(state, at(7)), constant(BdaAbi::OverlayHole))), BdaAbi::FaultReason::Unmapped);
     failFirst({
         {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, at(7)), constant(0)), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpUGreaterThanEqual, boolean, begin, finish), BdaAbi::FaultReason::InvalidTable},

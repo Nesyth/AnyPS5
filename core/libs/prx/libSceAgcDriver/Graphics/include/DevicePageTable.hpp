@@ -58,6 +58,7 @@ private:
     std::optional<Job> pending;
     std::optional<Job> running;
     std::vector<Entry> entries;
+    std::vector<std::pair<VkDevice, Key>> refusedKeys;
     Counts counts;
     std::thread worker;
     bool stopping = false;

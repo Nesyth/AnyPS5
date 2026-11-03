@@ -8,7 +8,7 @@
 #include <vector>
 
 std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_t bits, std::int64_t offset = 0, bool pageTable = false);
-std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops);
+std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops, bool pageTable = false);
 std::vector<std::uint32_t> MakeBdaSpanReadTestShader(std::uint64_t address, std::uint32_t offset, std::uint32_t extracted, bool coherent, bool stops);
 std::vector<std::uint32_t> MakeBdaFaultSequenceTestShader(std::initializer_list<ShaderRecompiler::BdaAbi::FaultReason> reasons, std::uint64_t address = 0);
 std::vector<std::uint32_t> MakeBdaDwordWriteTestShader(std::uint64_t address, std::uint32_t dwords, const std::uint32_t* values);

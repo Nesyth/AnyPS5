@@ -362,7 +362,15 @@ bool BdaResources::servePageTable(const Context& context, const GuestBufferMemor
         serving.waiting.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    if (!Abi::RangesOrdered(buildRanges.data(), buildRanges.size())) {
+        serving.waiting.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     const auto overlay = DevicePageTable::Overlay(spaceRanges, buildRanges);
+    if (std::any_of(overlay.begin(), overlay.end(), [](const Abi::Range& range) { return (range.permissions & Abi::Write) != 0 && range.end > Abi::WrittenAddressLimit; })) {
+        serving.waiting.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     const auto bytes = Abi::PageTableBytes(overlay.size());
     if (overlay.size() > std::numeric_limits<std::uint32_t>::max() || bytes > context.limits.maxStorageBufferRange) {
         serving.waiting.fetch_add(1, std::memory_order_relaxed);

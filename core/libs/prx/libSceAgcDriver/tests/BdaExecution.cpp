@@ -500,6 +500,41 @@ static void RunBdaPageTableTests(const Context& context) {
     run(overlaid, true, guest + 2, 16, 0x44c3, none);
     run(overlaid, true, distant + 1, 8, 0, Abi::FaultReason::Permission);
     run(overlaid, true, guest + 5, 8, 0, Abi::FaultReason::Unmapped);
+    Buffer wide(context, 0x40, usage);
+    Buffer shadow(context, 0x10, usage);
+    for (std::uint32_t at = 0; at < 0x40u; ++at) wide.Bytes()[at] = static_cast<std::byte>(0x40u + at);
+    for (std::uint32_t at = 0; at < 0x10u; ++at) shadow.Bytes()[at] = static_cast<std::byte>(0xa0u + at);
+    constexpr std::uint64_t spaced = 0x7ffe00000100ULL;
+    const std::array<Abi::Range, 1> spaceRange{{{spaced, spaced + 0x40, wide.DeviceAddress(), Abi::Read, 0}}};
+    const auto spacePages = BdaPageTable::Build(context, spaceRange);
+    const std::array<Abi::Range, 2> pieces{{
+        {spaced + 0x10, spaced + 0x18, shadow.DeviceAddress(), Abi::Read, 0},
+        {spaced + 0x30, spaced + 0x34, wide.DeviceAddress() + 0x30, 0, Abi::OverlayHole},
+    }};
+    const auto split = PageTableImage(spacePages->Address(), pieces);
+    run(split, true, spaced + 0xf, 8, 0x4f, none);
+    run(split, true, spaced + 0xf, 16, 0xa04f, none);
+    run(split, true, spaced + 0x10, 8, 0xa0, none);
+    run(split, true, spaced + 0x17, 16, 0x58a7, none);
+    run(split, true, spaced + 0x18, 8, 0x58, none);
+    run(split, true, spaced + 0x2f, 16, 0, Abi::FaultReason::Unmapped);
+    run(split, true, spaced + 0x30, 8, 0, Abi::FaultReason::Unmapped);
+    run(split, true, spaced + 0x34, 8, 0x74, none);
+    {
+        Buffer table(context, split.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memcpy(table.Bytes().data(), split.data(), split.size());
+        Buffer words(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        std::memset(words.Bytes().data(), 0xcd, words.Bytes().size());
+        Pipeline pipeline(context, MakeBdaDwordReadTestShader(spaced + 0x8, 4, false, true, true), {&table, &fault, &words});
+        pipeline.Run(1);
+        std::array<std::uint32_t, 4> read{};
+        std::memcpy(read.data(), words.Bytes().data(), sizeof(read));
+        const std::array<std::uint32_t, 4> expected{0x4b4a4948u, 0x4f4e4d4cu, 0xa3a2a1a0u, 0xa7a6a5a4u};
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        Require(report.state == Abi::FaultState::Empty && read == expected, "a page-walking dword read across the start of an overlay piece read " + Hex(read[2]) + " " + Hex(read[3]) + " past the piece's start instead of the piece");
+    }
     run(rangeImage, false, guest + 1, 32, 0x55443322, none);
     run(pageTable, false, guest, 8, 0, Abi::FaultReason::InvalidTable);
     run(PageTableImage(0, {}), true, guest, 8, 0, Abi::FaultReason::InvalidTable);
@@ -530,7 +565,7 @@ static void RunDevicePageTableTests(const Context& context) {
         {0x8000, 0x9000, 0x300000, Abi::Read, 0},
         {0x18000, 0x20000, 0x908000, Abi::Read, 0},
         {0x20000, 0x30000, 0x777000, Abi::Read, 0},
-        {0x48000, 0x50000, 0xa08000, 0, 0},
+        {0x48000, 0x50000, 0xa08000, 0, Abi::OverlayHole},
     }};
     Require(overlay.size() == expected.size() && std::equal(overlay.begin(), overlay.end(), expected.begin(), same), "a build overlay does not hold exactly the pieces that differ from the space (" + std::to_string(overlay.size()) + " pieces)");
     constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;

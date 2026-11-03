@@ -26,6 +26,7 @@ DevicePageTable::Table DevicePageTable::Find(const Context& context, Key key, st
     if (ranges.empty() || stopping) return {};
     const auto queued = [&](const std::optional<Job>& job) { return job.has_value() && job->context.device == context.device && job->key == key; };
     if (queued(pending) || queued(running)) return {};
+    if (std::find(refusedKeys.begin(), refusedKeys.end(), std::pair{context.device, key}) != refusedKeys.end()) return {};
     if (pending.has_value()) ++counts.superseded;
     pending.emplace(Job{context, key, std::vector<Range>(ranges.begin(), ranges.end())});
     if (!worker.joinable()) worker = std::thread([this] { work(); });
@@ -57,6 +58,8 @@ void DevicePageTable::work() {
         counts.buildNanoseconds += elapsed;
         if (table == nullptr) {
             ++counts.refused;
+            refusedKeys.emplace_back(running->context.device, running->key);
+            if (refusedKeys.size() > KeptTables) refusedKeys.erase(refusedKeys.begin());
         } else {
             ++counts.built;
             entries.insert(entries.begin(), Entry{running->context.device, running->key, std::move(table)});
@@ -69,8 +72,8 @@ void DevicePageTable::work() {
 
 std::vector<DevicePageTable::Range> DevicePageTable::Overlay(std::span<const Range> space, std::span<const Range> build) {
     std::vector<Range> overlay;
-    const auto piece = [&](const Range& range, std::uint64_t begin, std::uint64_t end, std::uint32_t permissions) {
-        overlay.push_back({begin, end, range.deviceAddress + (begin - range.begin), permissions, permissions != 0u ? range.reserved : 0u});
+    const auto piece = [&](const Range& range, std::uint64_t begin, std::uint64_t end, std::uint32_t permissions, std::uint32_t reserved) {
+        overlay.push_back({begin, end, range.deviceAddress + (begin - range.begin), permissions, reserved});
     };
     auto at = space.begin();
     for (const auto& range : build) {
@@ -78,12 +81,12 @@ std::vector<DevicePageTable::Range> DevicePageTable::Overlay(std::span<const Ran
             while (at != space.end() && at->end <= cursor) ++at;
             if (at == space.end() || at->begin > cursor) {
                 const auto stop = at == space.end() ? range.end : std::min(range.end, at->begin);
-                piece(range, cursor, stop, range.permissions);
+                piece(range, cursor, stop, range.permissions, range.reserved);
                 cursor = stop;
                 continue;
             }
             const auto stop = std::min(range.end, at->end);
-            if (at->deviceAddress - at->begin != range.deviceAddress - range.begin || at->permissions != range.permissions || at->reserved != range.reserved) piece(range, cursor, stop, range.permissions);
+            if (at->deviceAddress - at->begin != range.deviceAddress - range.begin || at->permissions != range.permissions || at->reserved != range.reserved) piece(range, cursor, stop, range.permissions, range.reserved);
             cursor = stop;
         }
     }
@@ -96,7 +99,7 @@ std::vector<DevicePageTable::Range> DevicePageTable::Overlay(std::span<const Ran
                 continue;
             }
             const auto stop = held == build.end() ? range.end : std::min(range.end, held->begin);
-            piece(range, cursor, stop, 0u);
+            piece(range, cursor, stop, 0u, ShaderRecompiler::BdaAbi::OverlayHole);
             cursor = stop;
         }
     }
@@ -114,6 +117,7 @@ void DevicePageTable::Release(VkDevice device) {
     if (pending.has_value() && pending->context.device == device) pending.reset();
     idle.wait(lock, [&] { return !running.has_value() || running->context.device != device; });
     std::erase_if(entries, [&](const Entry& entry) { return entry.device == device; });
+    std::erase_if(refusedKeys, [&](const auto& refused) { return refused.first == device; });
 }
 
 DevicePageTable::Counts DevicePageTable::Totals() const {

@@ -75,6 +75,7 @@ constexpr PageEntry SplitEntry(std::uint64_t children) {
 
 inline constexpr std::uint32_t PageTableVersion = 2;
 inline constexpr std::uint32_t PageTableRootWords = sizeof(std::uint64_t) / sizeof(std::uint32_t);
+inline constexpr std::uint32_t OverlayHole = 1;
 
 constexpr std::size_t PageTableBytes(std::size_t overlayRanges) {
     return sizeof(Header) + overlayRanges * sizeof(Range) + sizeof(std::uint64_t);

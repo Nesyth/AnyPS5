@@ -103,12 +103,12 @@ std::vector<std::uint32_t> MakeBdaDwordWriteTestShader(std::uint64_t address, st
     }, 0u, true);
 }
 
-std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops) {
+std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops, bool pageTable) {
     using namespace ShaderRecompiler;
     return MakeShader(address, coherent, stops, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
         const auto values = EmitBdaDwordReads(ctx, instruction, base, 0u, dwords, true);
         return std::vector<std::uint32_t>(values.begin(), values.begin() + dwords);
-    });
+    }, 0u, false, pageTable);
 }
 
 std::vector<std::uint32_t> MakeBdaStoreTestShader(std::uint64_t address, std::uint32_t value, std::uint32_t bits, bool coherent) {
