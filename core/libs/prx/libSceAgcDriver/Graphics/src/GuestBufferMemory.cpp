@@ -7325,4 +7325,26 @@ HostImportsProof HostImportsIdentity(const Context& context) {
     return {state.device, state.epoch, state.refreshedGeneration, state.inserted};
 }
 
+HostImportSnapshot HostImportRanges(const Context& context) {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    HostImportSnapshot snapshot;
+    if (importsStale(context, state)) return snapshot;
+    snapshot.proof = {state.device, state.epoch, state.refreshedGeneration, state.inserted};
+    snapshot.ranges.reserve(state.imports.size());
+    std::uint64_t covered = 0;
+    for (const auto& [base, import] : state.imports) {
+        if (import.address == 0 || import.bytes == 0) continue;
+        const auto end = import.base + import.bytes;
+        if (end <= covered) continue;
+        const auto begin = std::max(import.base, covered);
+        bool writable = import.range != nullptr ? import.range->writable : !import.ranges.empty();
+        for (const auto& piece : import.ranges) writable = writable && piece != nullptr && piece->writable;
+        const std::uint32_t permissions = ShaderRecompiler::BdaAbi::Read | (writable ? ShaderRecompiler::BdaAbi::Write : 0u);
+        snapshot.ranges.push_back({begin, end, import.address + HostImportOffset(import, begin), permissions, 0u});
+        covered = end;
+    }
+    return snapshot;
+}
+
 }

@@ -207,6 +207,11 @@ bool HostImportsReconciledUnchanged(const Context& context, const HostImportsPro
 HostImportsProof HostImportsIdentity(const Context& context);
 void SetDeviceLocalFullForTests(bool full);
 std::uint64_t StagingShadowsRefused();
+struct HostImportSnapshot {
+    HostImportsProof proof;
+    std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+};
+HostImportSnapshot HostImportRanges(const Context& context);
 
 // Identity of the read-only image mirror serving [address, address + bytes) (the counterpart of
 // HostImportSerial for main-image ranges, which no import serves): a serial unique for the life of
