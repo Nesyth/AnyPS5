@@ -40,8 +40,6 @@ inline constexpr std::uint32_t FirstMask = 0x1ffffu;
 inline constexpr std::uint32_t LimitHighShift = 17;
 inline constexpr std::uint32_t PermissionShift = 18;
 inline constexpr std::uint32_t KindShift = 30;
-inline constexpr std::uint32_t MirroredShift = 20;
-inline constexpr std::uint32_t RangeMirrored = 1;
 
 enum class PageKind : std::uint32_t { None, Segment, Split };
 
@@ -85,11 +83,6 @@ constexpr std::size_t PageTableBytes(std::size_t overlayRanges) {
 constexpr bool Supported(std::uint32_t version) {
     return version == Version || version == PageTableVersion;
 }
-
-struct Grant {
-    std::uint64_t begin;
-    std::uint64_t end;
-};
 
 inline bool RangesOrdered(const Range* ranges, std::size_t count) {
     for (std::size_t index = 1; index < count; ++index) {

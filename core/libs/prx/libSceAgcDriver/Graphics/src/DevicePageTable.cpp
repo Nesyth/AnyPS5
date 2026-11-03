@@ -48,7 +48,6 @@ void DevicePageTable::work() {
         Table table;
         try {
             table = BdaPageTable::Build(running->context, running->ranges, std::span(&previous, previous != nullptr ? 1u : 0u));
-            if (table->NeedsUploads(0)) table.reset();
         } catch (const std::exception&) {
             table.reset();
         }

@@ -87,6 +87,13 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         {binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow},
         {binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow},
     });
+    auto searchHigh = count;
+    if (state.devicePageTable) {
+        const auto empty = binary(spv::OpIEqual, boolean, count, constant(0));
+        const auto lastEnd = Select(state, u32, empty, constant(0), binary(spv::OpIAdd, u32, constant(6), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, count, constant(1)), constant(8))));
+        const auto outside = binary(spv::OpLogicalOr, boolean, empty, binary(spv::OpLogicalOr, boolean, binary(spv::OpULessThan, boolean, address, BdaLoadAddress(state, constant(4))), binary(spv::OpUGreaterThanEqual, boolean, address, BdaLoadAddress(state, lastEnd))));
+        searchHigh = Select(state, u32, binary(spv::OpLogicalAnd, boolean, pageTable, outside), constant(0), count);
+    }
     const auto header = state.module.AllocateId();
     const auto body = state.module.AllocateId();
     const auto continuation = state.module.AllocateId();
@@ -99,7 +106,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto newLow = state.module.AllocateId();
     const auto newHigh = state.module.AllocateId();
     state.module.AddFunction(spv::OpPhi, u32, lower, constant(0), entryLabel, newLow, continuation);
-    state.module.AddFunction(spv::OpPhi, u32, upper, count, entryLabel, newHigh, continuation);
+    state.module.AddFunction(spv::OpPhi, u32, upper, searchHigh, entryLabel, newHigh, continuation);
     const auto search = binary(spv::OpULessThan, boolean, lower, upper);
     state.module.AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlMaskNone);
     state.module.AddFunction(spv::OpBranchConditional, search, body, merge);

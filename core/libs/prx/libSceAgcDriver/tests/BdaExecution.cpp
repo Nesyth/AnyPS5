@@ -445,13 +445,6 @@ static void RunBdaPageTableTests(const Context& context) {
         {closed, closed + 4, far.DeviceAddress(), 0, 0},
     }};
     const auto pages = BdaPageTable::Build(context, ranges);
-    {
-        CommandBatch batch(context);
-        pages->RecordUploads(context, batch.Handle(), BdaPageTable::EveryStream);
-        const VkMemoryBarrier uploaded{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
-        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &uploaded, 0, nullptr, 0, nullptr);
-        batch.SubmitAndWait();
-    }
     Buffer fault(context, sizeof(Abi::Fault), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::vector<std::byte> rangeImage(sizeof(Abi::Header) + sizeof(ranges));

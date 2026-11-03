@@ -28,28 +28,25 @@ inline Translation Fault(Abi::FaultReason reason) {
     return {0u, static_cast<std::uint32_t>(reason)};
 }
 
-inline bool Permitted(std::uint32_t permissions, std::uint32_t permission, std::span<const Abi::Grant> grants, std::uint64_t address, std::uint64_t end) {
-    if ((permissions & permission) == permission) return true;
-    if (((permissions | Abi::Write) & permission) != permission) return false;
-    const auto found = std::upper_bound(grants.begin(), grants.end(), address, [](std::uint64_t value, const Abi::Grant& grant) { return value < grant.begin; });
-    return found != grants.begin() && end <= std::prev(found)->end;
+inline bool Permitted(std::uint32_t permissions, std::uint32_t permission) {
+    return (permissions & permission) == permission;
 }
 
-inline Translation LookupList(std::span<const Abi::Range> ranges, std::uint64_t address, std::uint32_t bytes, std::uint32_t permission, std::span<const Abi::Grant> grants = {}) {
+inline Translation LookupList(std::span<const Abi::Range> ranges, std::uint64_t address, std::uint32_t bytes, std::uint32_t permission) {
     const auto end = address + bytes;
     const auto found = std::upper_bound(ranges.begin(), ranges.end(), address, [](std::uint64_t value, const Abi::Range& range) { return value < range.begin; });
     if (found == ranges.begin()) return Fault(Abi::FaultReason::Unmapped);
     const auto& range = *std::prev(found);
     if (range.reserved != 0u || range.begin >= range.end) return Fault(Abi::FaultReason::InvalidTable);
     if (end > range.end) return Fault(Abi::FaultReason::Unmapped);
-    if (!Permitted(range.permissions, permission, grants, address, end)) return Fault(Abi::FaultReason::Permission);
+    if (!Permitted(range.permissions, permission)) return Fault(Abi::FaultReason::Permission);
     if (range.deviceAddress == 0u) return Fault(Abi::FaultReason::InvalidTable);
     const auto device = range.deviceAddress + (address - range.begin);
     if (device < range.deviceAddress || device + bytes <= device) return Fault(Abi::FaultReason::Overflow);
     return {device, 0u};
 }
 
-inline std::optional<Translation> WalkPages(const Leaves& leaves, std::uint64_t address, std::uint32_t bytes, std::uint32_t permission, std::span<const Abi::Grant> grants = {}) {
+inline std::optional<Translation> WalkPages(const Leaves& leaves, std::uint64_t address, std::uint32_t bytes, std::uint32_t permission) {
     if (address >= Abi::PageTableEnd) return std::nullopt;
     const auto leaf = leaves.find(static_cast<std::uint32_t>(address >> Abi::WindowShift));
     if (leaf == leaves.end()) return std::nullopt;
@@ -67,14 +64,14 @@ inline std::optional<Translation> WalkPages(const Leaves& leaves, std::uint64_t 
     const bool held = kind == Abi::PageKind::Segment && offset >= Abi::FirstOf(entry) && offset < limit;
     if (!held) return std::nullopt;
     if (offset + bytes > limit) return Fault(Abi::FaultReason::Unmapped);
-    if (!Permitted(Abi::PermissionsOf(entry), permission, grants, address, address + bytes)) return Fault(Abi::FaultReason::Permission);
+    if (!Permitted(Abi::PermissionsOf(entry), permission)) return Fault(Abi::FaultReason::Permission);
     return Translation{address + entry.target, 0u};
 }
 
-inline Translation Translate(const Leaves& leaves, std::span<const Abi::Range> ranges, std::uint64_t address, std::uint32_t bytes, std::uint32_t permission, std::span<const Abi::Grant> grants = {}) {
+inline Translation Translate(const Leaves& leaves, std::span<const Abi::Range> ranges, std::uint64_t address, std::uint32_t bytes, std::uint32_t permission) {
     if (bytes == 0u || address + bytes <= address) return Fault(Abi::FaultReason::Overflow);
-    if (const auto walked = WalkPages(leaves, address, bytes, permission, grants)) return *walked;
-    return LookupList(ranges, address, bytes, permission, grants);
+    if (const auto walked = WalkPages(leaves, address, bytes, permission)) return *walked;
+    return LookupList(ranges, address, bytes, permission);
 }
 
 inline std::vector<Abi::Range> Without(std::span<const Abi::Range> ranges, std::span<const Abi::Range> held) {
@@ -83,25 +80,6 @@ inline std::vector<Abi::Range> Without(std::span<const Abi::Range> ranges, std::
         if (std::none_of(held.begin(), held.end(), [&](const Abi::Range& other) { return other.begin == range.begin && other.end == range.end && other.deviceAddress == range.deviceAddress && other.permissions == range.permissions; })) rest.push_back(range);
     }
     return rest;
-}
-
-inline std::vector<Abi::Grant> RandomGrants(std::mt19937_64& random, std::span<const Abi::Range> ranges, std::size_t count) {
-    std::vector<Abi::Grant> grants;
-    if (ranges.empty()) return grants;
-    for (std::size_t index = 0; index < count; ++index) {
-        const auto& range = ranges[random() % ranges.size()];
-        const auto size = range.end - range.begin;
-        const auto begin = range.begin + (size > 1u ? random() % size : 0u) - (random() % 3u == 0u ? random() % 64u : 0u);
-        const auto end = begin + 1u + random() % (random() % 2u == 0u ? 64u : 0x30000u);
-        grants.push_back({begin, end});
-    }
-    std::sort(grants.begin(), grants.end(), [](const Abi::Grant& left, const Abi::Grant& right) { return left.begin < right.begin; });
-    std::vector<Abi::Grant> merged;
-    for (const auto& grant : grants) {
-        if (!merged.empty() && grant.begin <= merged.back().end) merged.back().end = std::max(merged.back().end, grant.end);
-        else merged.push_back(grant);
-    }
-    return merged;
 }
 
 template<typename TEncode>

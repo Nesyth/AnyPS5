@@ -316,7 +316,7 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
 namespace {
 
 struct PageTableServing {
-    std::atomic<std::uint64_t> served{0}, waiting{0}, filtered{0}, uncached{0};
+    std::atomic<std::uint64_t> served{0}, waiting{0}, filtered{0}, uncached{0}, overlaid{0}, largestOverlay{0};
     std::atomic<std::int64_t> reported{0};
 };
 
@@ -334,7 +334,10 @@ void reportServing() {
     if (last == 0) serving.reported.compare_exchange_strong(last, now, std::memory_order_relaxed);
     if (last == 0 || now - last < 10 || !serving.reported.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
     const auto totals = GuestPageTable().Totals();
-    AgcDriver::ProfilePrint_nid_no_patch("[page-table] (10 s) address-based builds: %llu walked a page table, %llu took the range table while theirs was built, %llu had no address space; %llu had multisample targets left out; tables (cumulative): %llu built in %.1f ms, %llu superseded before a build, %llu refused\n", static_cast<unsigned long long>(serving.served.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.waiting.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.uncached.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.filtered.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(totals.built), static_cast<double>(totals.buildNanoseconds) / 1e6, static_cast<unsigned long long>(totals.superseded), static_cast<unsigned long long>(totals.refused));
+    const auto served = serving.served.exchange(0, std::memory_order_relaxed);
+    const auto overlaid = serving.overlaid.exchange(0, std::memory_order_relaxed);
+    const auto windows = BdaPageTable::Totals();
+    AgcDriver::ProfilePrint_nid_no_patch("[page-table] (10 s) address-based builds: %llu walked a page table (overlay %.1f ranges on average, %llu at most), %llu took the range table while theirs was built, %llu had no address space; %llu had multisample targets left out; tables (cumulative): %llu built in %.1f ms (%llu windows encoded, %llu shared), %llu superseded before a build, %llu refused\n", static_cast<unsigned long long>(served), served != 0 ? static_cast<double>(overlaid) / static_cast<double>(served) : 0.0, static_cast<unsigned long long>(serving.largestOverlay.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.waiting.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.uncached.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.filtered.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(totals.built), static_cast<double>(totals.buildNanoseconds) / 1e6, static_cast<unsigned long long>(windows.encodedWindows), static_cast<unsigned long long>(windows.sharedWindows), static_cast<unsigned long long>(totals.superseded), static_cast<unsigned long long>(totals.refused));
 }
 
 }
@@ -373,6 +376,8 @@ bool BdaResources::servePageTable(const Context& context, const GuestBufferMemor
     if (!overlay.empty()) std::memcpy(data + sizeof(header), overlay.data(), overlay.size() * sizeof(Abi::Range));
     std::memcpy(data + sizeof(header) + overlay.size() * sizeof(Abi::Range), &root, sizeof(root));
     serving.served.fetch_add(1, std::memory_order_relaxed);
+    serving.overlaid.fetch_add(overlay.size(), std::memory_order_relaxed);
+    for (auto largest = serving.largestOverlay.load(std::memory_order_relaxed); largest < overlay.size() && !serving.largestOverlay.compare_exchange_weak(largest, overlay.size(), std::memory_order_relaxed);) {}
     pages = std::move(walked);
     tableBytes = bytes;
     return true;
