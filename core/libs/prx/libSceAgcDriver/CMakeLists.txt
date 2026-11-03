@@ -444,6 +444,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MapImportGate.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidentMirror.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ReferenceStorage.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaPageTable.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferAddress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderValidation.cpp
