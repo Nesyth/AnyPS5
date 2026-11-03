@@ -239,6 +239,10 @@ void RunBdaContractTests() {
     ValidateBdaTarget(program, target);
     target.bdaAbiVersion = 0;
     reject([&] { ValidateBdaTarget(program, target); }, "ABI version");
+    target.bdaAbiVersion = BdaAbi::PageTableVersion;
+    ValidateBdaTarget(program, target);
+    target.bdaAbiVersion = BdaAbi::PageTableVersion + 1u;
+    reject([&] { ValidateBdaTarget(program, target); }, "ABI version");
     target.bdaAbiVersion = BdaAbi::Version;
     target.supportedCapabilities = {};
     reject([&] { ValidateBdaTarget(program, target); }, "capability");

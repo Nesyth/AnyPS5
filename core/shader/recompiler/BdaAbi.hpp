@@ -75,6 +75,21 @@ constexpr PageEntry SplitEntry(std::uint64_t children) {
     return {children, static_cast<std::uint32_t>(PageKind::Split) << KindShift, 0u};
 }
 
+inline constexpr std::uint32_t PageTableVersion = 2;
+
+struct PageTableHeader {
+    Header header;
+    std::uint64_t root;
+};
+
+inline constexpr std::uint32_t PageTableRootWord = offsetof(PageTableHeader, root) / sizeof(std::uint32_t);
+inline constexpr std::uint32_t PageTableHeaderWords = sizeof(PageTableHeader) / sizeof(std::uint32_t);
+static_assert(std::is_standard_layout_v<PageTableHeader> && sizeof(PageTableHeader) == 24 && PageTableRootWord == 4);
+
+constexpr bool Supported(std::uint32_t version) {
+    return version == Version || version == PageTableVersion;
+}
+
 struct Grant {
     std::uint64_t begin;
     std::uint64_t end;

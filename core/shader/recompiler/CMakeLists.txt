@@ -242,6 +242,7 @@ function(add_shader_recompiler target runtimeTarget)
     endif()
     set(shaderCacheReviewedNames
             BdaAbi::RangesOrdered
+            BdaAbi::Supported
             BuildBarycentricGeometryShader
             BuildBarycentricTessellationShaders
             BuildPreparedShaderKey
