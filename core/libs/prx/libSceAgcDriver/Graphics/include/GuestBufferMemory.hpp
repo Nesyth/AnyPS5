@@ -207,11 +207,6 @@ bool HostImportsReconciledUnchanged(const Context& context, const HostImportsPro
 HostImportsProof HostImportsIdentity(const Context& context);
 void SetDeviceLocalFullForTests(bool full);
 std::uint64_t StagingShadowsRefused();
-struct HostImportSnapshot {
-    HostImportsProof proof;
-    std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
-};
-HostImportSnapshot HostImportRanges(const Context& context);
 
 // Identity of the read-only image mirror serving [address, address + bytes) (the counterpart of
 // HostImportSerial for main-image ranges, which no import serves): a serial unique for the life of
@@ -390,6 +385,7 @@ public:
         const std::vector<ShaderRecompiler::BdaAbi::Range>* ranges;
     };
     std::optional<CachedTable> CachedAddressTable() const;
+    std::optional<CachedTable> SpaceTable() const;
     // The registered memory an address-based build maps, shared by consecutive builds (see
     // GuestBufferMemory.cpp): its lease and the sorted, immutable regions of the ranges served in
     // place by imports and mirrors. Opaque outside GuestBufferMemory.cpp.

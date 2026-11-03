@@ -2,12 +2,15 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DEVICEPAGETABLE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/BdaPageTable.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
-#include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -15,43 +18,49 @@ namespace AgcDriver::Graphics {
 class DevicePageTable {
 public:
     using Range = ShaderRecompiler::BdaAbi::Range;
-    enum class Cover : std::uint8_t { Covered, Missing, OtherAddress, Narrower };
-    struct Snapshot {
-        std::shared_ptr<const BdaPageTable> table;
-        std::shared_ptr<const std::vector<Range>> ranges;
-        std::shared_ptr<Buffer> header;
-    };
+    using Key = std::pair<std::uint64_t, std::uint64_t>;
+    using Table = std::shared_ptr<const BdaPageTable>;
     struct Counts {
-        std::uint64_t builds = 0;
-        std::uint64_t reuses = 0;
-        std::uint64_t ranges = 0;
-        std::uint64_t uploads = 0;
-        std::uint64_t deferred = 0;
-        std::uint64_t spaceBuilds = 0;
-        std::uint64_t spaceReuses = 0;
+        std::uint64_t built = 0;
+        std::uint64_t served = 0;
+        std::uint64_t missed = 0;
+        std::uint64_t superseded = 0;
         std::uint64_t refused = 0;
+        std::uint64_t buildNanoseconds = 0;
     };
+    static constexpr std::size_t KeptTables = 8;
 
-    Snapshot Current(const Context& context);
-    Snapshot ForRanges(const Context& context, std::uint64_t serial, std::uint64_t guard, std::span<const Range> ranges);
+    DevicePageTable() = default;
+    ~DevicePageTable();
+    DevicePageTable(const DevicePageTable&) = delete;
+    DevicePageTable& operator=(const DevicePageTable&) = delete;
+    Table Find(const Context& context, Key key, std::span<const Range> ranges);
+    static std::vector<Range> Overlay(std::span<const Range> space, std::span<const Range> build);
+    void WaitIdle();
     void Release(VkDevice device);
     Counts Totals() const;
-    static Cover Compare(std::span<const Range> table, std::span<const Range> build);
 
 private:
-    mutable std::mutex mutex;
-    HostImportsProof proof;
-    Snapshot snapshot;
-    Counts counts;
-    std::chrono::steady_clock::time_point built{};
-    struct Space {
-        VkDevice device = VK_NULL_HANDLE;
-        std::uint64_t serial = 0;
-        std::uint64_t guard = 0;
-        Snapshot snapshot;
+    struct Job {
+        Context context;
+        Key key;
+        std::vector<Range> ranges;
     };
-    std::vector<Space> spaces;
-    Snapshot finish(const Context& context, std::shared_ptr<const BdaPageTable> table, std::vector<Range> ranges);
+    struct Entry {
+        VkDevice device = VK_NULL_HANDLE;
+        Key key;
+        Table table;
+    };
+    void work();
+    mutable std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable idle;
+    std::optional<Job> pending;
+    std::optional<Job> running;
+    std::vector<Entry> entries;
+    Counts counts;
+    std::thread worker;
+    bool stopping = false;
 };
 
 DevicePageTable& GuestPageTable();

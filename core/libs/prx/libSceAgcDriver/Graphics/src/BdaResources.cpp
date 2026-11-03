@@ -316,7 +316,7 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
 namespace {
 
 struct PageTableServing {
-    std::atomic<std::uint64_t> served{0}, multisample{0}, absent{0}, uncached{0};
+    std::atomic<std::uint64_t> served{0}, waiting{0}, filtered{0}, uncached{0};
     std::atomic<std::int64_t> reported{0};
 };
 
@@ -334,29 +334,47 @@ void reportServing() {
     if (last == 0) serving.reported.compare_exchange_strong(last, now, std::memory_order_relaxed);
     if (last == 0 || now - last < 10 || !serving.reported.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
     const auto totals = GuestPageTable().Totals();
-    AgcDriver::ProfilePrint_nid_no_patch("[page-table] (10 s) builds served %llu; of them without multisample targets %llu; range tables: no table %llu, uncached ranges %llu; space tables built %llu, reused %llu, refused %llu, uploads %llu (cumulative)\n", static_cast<unsigned long long>(serving.served.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.multisample.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.absent.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.uncached.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(totals.spaceBuilds), static_cast<unsigned long long>(totals.spaceReuses), static_cast<unsigned long long>(totals.refused), static_cast<unsigned long long>(totals.uploads));
+    AgcDriver::ProfilePrint_nid_no_patch("[page-table] (10 s) address-based builds: %llu walked a page table, %llu took the range table while theirs was built, %llu had no address space; %llu had multisample targets left out; tables (cumulative): %llu built in %.1f ms, %llu superseded before a build, %llu refused\n", static_cast<unsigned long long>(serving.served.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.waiting.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.uncached.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.filtered.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(totals.built), static_cast<double>(totals.buildNanoseconds) / 1e6, static_cast<unsigned long long>(totals.superseded), static_cast<unsigned long long>(totals.refused));
 }
 
 }
 
-bool BdaResources::servePageTable(const Context& context, std::uint64_t serial, std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::uint64_t guardSerial) {
+bool BdaResources::servePageTable(const Context& context, const GuestBufferMemory& memory, std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::uint64_t guardSerial) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
     auto& serving = Serving();
     reportServing();
-    if (serial == 0) {
+    const auto space = memory.SpaceTable();
+    if (!space.has_value()) {
         serving.uncached.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    const auto filtered = ExcludeMultisampleTargetRanges(context.device, ranges, guardSerial);
-    if (filtered.has_value()) serving.multisample.fetch_add(1, std::memory_order_relaxed);
-    auto snapshot = GuestPageTable().ForRanges(context, serial, filtered.has_value() ? guardSerial + 1u : 0u, filtered.has_value() ? std::span<const ShaderRecompiler::BdaAbi::Range>(*filtered) : ranges);
-    if (snapshot.table == nullptr || snapshot.header == nullptr) {
-        serving.absent.fetch_add(1, std::memory_order_relaxed);
+    auto spaceGuard = guardSerial;
+    const auto filteredSpace = ExcludeMultisampleTargetRanges(context.device, *space->ranges, spaceGuard);
+    const auto filteredBuild = ExcludeMultisampleTargetRanges(context.device, ranges, guardSerial);
+    if (filteredSpace.has_value() || filteredBuild.has_value()) serving.filtered.fetch_add(1, std::memory_order_relaxed);
+    const std::span<const Abi::Range> spaceRanges = filteredSpace.has_value() ? std::span<const Abi::Range>(*filteredSpace) : std::span<const Abi::Range>(*space->ranges);
+    const std::span<const Abi::Range> buildRanges = filteredBuild.has_value() ? std::span<const Abi::Range>(*filteredBuild) : ranges;
+    auto walked = GuestPageTable().Find(context, {space->serial, filteredSpace.has_value() ? spaceGuard + 1u : 0u}, spaceRanges);
+    if (walked == nullptr) {
+        serving.waiting.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    const auto overlay = DevicePageTable::Overlay(spaceRanges, buildRanges);
+    const auto bytes = Abi::PageTableBytes(overlay.size());
+    if (overlay.size() > std::numeric_limits<std::uint32_t>::max() || bytes > context.limits.maxStorageBufferRange) {
+        serving.waiting.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    table = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const Abi::Header header{Abi::PageTableVersion, static_cast<std::uint32_t>(overlay.size()), sizeof(Abi::Range), 0};
+    const auto root = walked->Address();
+    auto* data = table->Bytes().data();
+    std::memcpy(data, &header, sizeof(header));
+    if (!overlay.empty()) std::memcpy(data + sizeof(header), overlay.data(), overlay.size() * sizeof(Abi::Range));
+    std::memcpy(data + sizeof(header) + overlay.size() * sizeof(Abi::Range), &root, sizeof(root));
     serving.served.fetch_add(1, std::memory_order_relaxed);
-    pages = std::move(snapshot.table);
-    table = std::move(snapshot.header);
-    tableBytes = sizeof(ShaderRecompiler::BdaAbi::PageTableHeader);
+    pages = std::move(walked);
+    tableBytes = bytes;
     return true;
 }
 
@@ -367,7 +385,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     const auto& addressRanges = cached.has_value() ? *cached->ranges : built;
     const auto serial = cached.has_value() ? cached->serial : 0;
     auto guardSerial = MultisampleTargetRangeGeneration();
-    if (pageTables && servePageTable(context, serial, addressRanges, guardSerial)) return;
+    if (pageTables && servePageTable(context, memory, addressRanges, guardSerial)) return;
     if (tableCacheEnabled() && serial != 0) {
         auto& cache = Tables();
         std::lock_guard lock(cache.mutex);

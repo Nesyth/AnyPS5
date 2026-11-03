@@ -83,7 +83,7 @@ private:
     void markWrittenPages(const BdaResources& record) const;
     void checkSrtGuard(const BdaResources& faults) const;
     std::span<std::byte> faultBytes() const;
-    bool servePageTable(const Context& context, std::uint64_t serial, std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::uint64_t guardSerial);
+    bool servePageTable(const Context& context, const GuestBufferMemory& memory, std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::uint64_t guardSerial);
     std::shared_ptr<const BdaPageTable> pages;
     std::shared_ptr<Buffer> table;
     VkDevice faultDevice = VK_NULL_HANDLE;

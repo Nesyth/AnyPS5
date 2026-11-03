@@ -76,15 +76,11 @@ constexpr PageEntry SplitEntry(std::uint64_t children) {
 }
 
 inline constexpr std::uint32_t PageTableVersion = 2;
+inline constexpr std::uint32_t PageTableRootWords = sizeof(std::uint64_t) / sizeof(std::uint32_t);
 
-struct PageTableHeader {
-    Header header;
-    std::uint64_t root;
-};
-
-inline constexpr std::uint32_t PageTableRootWord = offsetof(PageTableHeader, root) / sizeof(std::uint32_t);
-inline constexpr std::uint32_t PageTableHeaderWords = sizeof(PageTableHeader) / sizeof(std::uint32_t);
-static_assert(std::is_standard_layout_v<PageTableHeader> && sizeof(PageTableHeader) == 24 && PageTableRootWord == 4);
+constexpr std::size_t PageTableBytes(std::size_t overlayRanges) {
+    return sizeof(Header) + overlayRanges * sizeof(Range) + sizeof(std::uint64_t);
+}
 
 constexpr bool Supported(std::uint32_t version) {
     return version == Version || version == PageTableVersion;
