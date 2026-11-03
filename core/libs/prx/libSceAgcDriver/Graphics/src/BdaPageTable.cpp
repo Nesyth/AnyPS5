@@ -376,6 +376,15 @@ VkDeviceAddress BdaPageTable::LeafAddress(std::uint32_t window) const {
 }
 
 void BdaPageTable::stage(const Context& context, Upload& upload, const void* bytes, std::size_t size) {
+    upload.bytes = size;
+    try {
+        upload.buffer = std::make_shared<Buffer>(context, size, TableUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        std::memcpy(upload.buffer->Bytes().data(), bytes, size);
+        upload.streams.store(~0u, std::memory_order_relaxed);
+        return;
+    } catch (const std::exception&) {
+        upload.buffer.reset();
+    }
     upload.buffer = std::make_shared<Buffer>(context, size, TableUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     upload.staging = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     upload.bytes = size;
@@ -383,6 +392,7 @@ void BdaPageTable::stage(const Context& context, Upload& upload, const void* byt
 }
 
 bool BdaPageTable::recordUpload(const Context& context, VkCommandBuffer commands, const Upload& upload, std::uint32_t stream) {
+    if (upload.staging == nullptr) return false;
     if (stream != EveryStream) {
         Require(stream < 32u, "a BDA page table upload names a stream past its upload mask");
         const auto bit = 1u << stream;
@@ -396,7 +406,7 @@ bool BdaPageTable::recordUpload(const Context& context, VkCommandBuffer commands
 bool BdaPageTable::NeedsUploads(std::uint32_t stream) const {
     if (stream == EveryStream) return true;
     const auto bit = 1u << stream;
-    const auto missing = [&](const Upload& upload) { return (upload.streams.load(std::memory_order_relaxed) & bit) == 0u; };
+    const auto missing = [&](const Upload& upload) { return upload.staging != nullptr && (upload.streams.load(std::memory_order_relaxed) & bit) == 0u; };
     return missing(first) || std::any_of(leaves.begin(), leaves.end(), [&](const auto& leaf) { return missing(leaf->table); });
 }
 

@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DevicePageTable.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
+#include <cstring>
 
 namespace AgcDriver::Graphics {
 
@@ -9,20 +11,70 @@ DevicePageTable::Snapshot DevicePageTable::Current(const Context& context) {
         ++counts.reuses;
         return snapshot;
     }
+    const auto now = std::chrono::steady_clock::now();
+    if (snapshot.ranges != nullptr && proof.device == context.device && now - built < std::chrono::milliseconds(250)) {
+        ++counts.deferred;
+        return {};
+    }
     auto imports = HostImportRanges(context);
     if (imports.proof.device == VK_NULL_HANDLE) return {};
+    built = now;
     std::shared_ptr<const BdaPageTable> previous = proof.device == imports.proof.device ? snapshot.table : nullptr;
     std::shared_ptr<const BdaPageTable> table;
     if (!imports.ranges.empty()) table = BdaPageTable::Build(context, imports.ranges, std::span(&previous, previous != nullptr ? 1u : 0u));
     counts.ranges = imports.ranges.size();
     ++counts.builds;
-    snapshot = {std::move(table), std::make_shared<const std::vector<Range>>(std::move(imports.ranges))};
+    snapshot = finish(context, std::move(table), std::move(imports.ranges));
     proof = imports.proof;
     return snapshot;
 }
 
+DevicePageTable::Snapshot DevicePageTable::finish(const Context& context, std::shared_ptr<const BdaPageTable> table, std::vector<Range> ranges) {
+    std::shared_ptr<Buffer> header;
+    if (table != nullptr) {
+        if (table->NeedsUploads(0)) {
+            CommandBatch batch(context);
+            table->RecordUploads(context, batch.Handle(), 0);
+            const VkMemoryBarrier uploaded{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+            context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &uploaded, 0, nullptr, 0, nullptr);
+            batch.SubmitAndWait();
+            ++counts.uploads;
+        }
+        const ShaderRecompiler::BdaAbi::PageTableHeader words{{ShaderRecompiler::BdaAbi::PageTableVersion, 0, sizeof(ShaderRecompiler::BdaAbi::PageEntry), 0}, table->Address()};
+        header = std::make_shared<Buffer>(context, sizeof(words), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memcpy(header->Bytes().data(), &words, sizeof(words));
+    }
+    return {std::move(table), std::make_shared<const std::vector<Range>>(std::move(ranges)), std::move(header)};
+}
+
+DevicePageTable::Snapshot DevicePageTable::ForRanges(const Context& context, std::uint64_t serial, std::uint64_t guard, std::span<const Range> ranges) {
+    std::lock_guard lock(mutex);
+    const auto found = std::find_if(spaces.begin(), spaces.end(), [&](const Space& space) { return space.device == context.device && space.serial == serial && space.guard == guard; });
+    if (found != spaces.end()) {
+        ++counts.spaceReuses;
+        if (found != spaces.begin()) std::rotate(spaces.begin(), found, std::next(found));
+        return spaces.front().snapshot;
+    }
+    if (ranges.empty()) return {};
+    std::shared_ptr<const BdaPageTable> previous;
+    if (!spaces.empty() && spaces.front().device == context.device) previous = spaces.front().snapshot.table;
+    Snapshot built;
+    try {
+        built = finish(context, BdaPageTable::Build(context, ranges, std::span(&previous, previous != nullptr ? 1u : 0u)), std::vector<Range>(ranges.begin(), ranges.end()));
+    } catch (const std::exception&) {
+        ++counts.refused;
+        return {};
+    }
+    ++counts.spaceBuilds;
+    spaces.insert(spaces.begin(), Space{context.device, serial, guard, built});
+    constexpr std::size_t keptSpaces = 4;
+    if (spaces.size() > keptSpaces) spaces.resize(keptSpaces);
+    return built;
+}
+
 void DevicePageTable::Release(VkDevice device) {
     std::lock_guard lock(mutex);
+    std::erase_if(spaces, [&](const Space& space) { return space.device == device; });
     if (proof.device != device) return;
     snapshot = {};
     proof = {};

@@ -617,6 +617,7 @@ private:
     std::unique_ptr<BdaResources> bda;
     std::vector<BdaResources::SrtGuardFaults> srtGuardFaults;
     bool usesBda = false;
+    bool walksPageTables = true;
     bool bdaReadOnly = true;
     bool spaceReuse = false;
     bool faultReportOnly = true;

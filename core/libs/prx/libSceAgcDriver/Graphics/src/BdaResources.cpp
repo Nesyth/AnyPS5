@@ -1,4 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DevicePageTable.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include <chrono>
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "ImageTableAbi.hpp"
@@ -310,13 +313,61 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
     return true;
 }
 
-BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly) : BdaResources(context, reportOnly) {
+namespace {
+
+struct PageTableServing {
+    std::atomic<std::uint64_t> served{0}, multisample{0}, absent{0}, uncached{0};
+    std::atomic<std::int64_t> reported{0};
+};
+
+PageTableServing& Serving() {
+    static PageTableServing serving;
+    return serving;
+}
+
+void reportServing() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& serving = Serving();
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = serving.reported.load(std::memory_order_relaxed);
+    if (last == 0) serving.reported.compare_exchange_strong(last, now, std::memory_order_relaxed);
+    if (last == 0 || now - last < 10 || !serving.reported.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    const auto totals = GuestPageTable().Totals();
+    AgcDriver::ProfilePrint_nid_no_patch("[page-table] (10 s) builds served %llu; of them without multisample targets %llu; range tables: no table %llu, uncached ranges %llu; space tables built %llu, reused %llu, refused %llu, uploads %llu (cumulative)\n", static_cast<unsigned long long>(serving.served.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.multisample.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.absent.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.uncached.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(totals.spaceBuilds), static_cast<unsigned long long>(totals.spaceReuses), static_cast<unsigned long long>(totals.refused), static_cast<unsigned long long>(totals.uploads));
+}
+
+}
+
+bool BdaResources::servePageTable(const Context& context, std::uint64_t serial, std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::uint64_t guardSerial) {
+    auto& serving = Serving();
+    reportServing();
+    if (serial == 0) {
+        serving.uncached.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const auto filtered = ExcludeMultisampleTargetRanges(context.device, ranges, guardSerial);
+    if (filtered.has_value()) serving.multisample.fetch_add(1, std::memory_order_relaxed);
+    auto snapshot = GuestPageTable().ForRanges(context, serial, filtered.has_value() ? guardSerial + 1u : 0u, filtered.has_value() ? std::span<const ShaderRecompiler::BdaAbi::Range>(*filtered) : ranges);
+    if (snapshot.table == nullptr || snapshot.header == nullptr) {
+        serving.absent.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    serving.served.fetch_add(1, std::memory_order_relaxed);
+    pages = std::move(snapshot.table);
+    table = std::move(snapshot.header);
+    tableBytes = sizeof(ShaderRecompiler::BdaAbi::PageTableHeader);
+    return true;
+}
+
+BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly, bool pageTables) : BdaResources(context, reportOnly) {
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
     const auto& addressRanges = cached.has_value() ? *cached->ranges : built;
     const auto serial = cached.has_value() ? cached->serial : 0;
     auto guardSerial = MultisampleTargetRangeGeneration();
+    if (pageTables && servePageTable(context, serial, addressRanges, guardSerial)) return;
     if (tableCacheEnabled() && serial != 0) {
         auto& cache = Tables();
         std::lock_guard lock(cache.mutex);
