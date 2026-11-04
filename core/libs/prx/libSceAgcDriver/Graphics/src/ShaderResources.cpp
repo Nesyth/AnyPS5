@@ -4161,6 +4161,34 @@ std::uint64_t ShaderResources::FastProofStampsTaken() {
 }
 
 namespace {
+std::array<std::atomic<std::uint64_t>, 6> epochMisses{};
+
+void noteEpochMiss(std::uint64_t provedEpoch, std::uint64_t provedProof, std::uint64_t provedPending, std::uint64_t epoch, std::uint64_t proof, std::uint64_t pending) {
+    static const bool stats = std::getenv("APS5_STAGE_STATS") != nullptr;
+    if (!stats) return;
+    std::size_t reason = 0;
+    if (provedEpoch == 0) reason = 0;
+    else if (epoch == 0) reason = 1;
+    else if (provedEpoch != epoch) reason = 2;
+    else if (provedProof != proof && provedPending != pending) reason = 3;
+    else if (provedProof != proof) reason = 4;
+    else reason = 5;
+    epochMisses[reason].fetch_add(1, std::memory_order_relaxed);
+}
+}
+
+std::string ShaderResources::TakeEpochMissReport() {
+    static constexpr std::array<const char*, 6> names{"unproved", "no epoch", "epoch moved", "proof and pending moved", "proof serial moved", "pending serial moved"};
+    std::string text;
+    char item[64];
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        std::snprintf(item, sizeof(item), "%s %s %llu", index == 0 ? "" : ",", names[index], static_cast<unsigned long long>(epochMisses[index].exchange(0, std::memory_order_relaxed)));
+        text += item;
+    }
+    return text;
+}
+
+namespace {
 void noteEpochProof(bool reused, bool verified, bool failed) {
     static std::atomic<std::uint64_t> reuses{0}, proofs{0}, checks{0}, failures{0};
     if (verified) checks.fetch_add(1, std::memory_order_relaxed);
@@ -4170,6 +4198,26 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
     if (!report) return;
     if (count % 262144u == 0u || (count & (count - 1u)) == 0u) std::fprintf(stderr, "[epoch-proofs] resource proofs: %llu reused the epoch's, %llu proved; verify: %llu checked, %llu failed; storage refreshes reused %llu\n", static_cast<unsigned long long>(reuses.load()), static_cast<unsigned long long>(proofs.load()), static_cast<unsigned long long>(checks.load()), static_cast<unsigned long long>(failures.load()), static_cast<unsigned long long>(StorageTexture::epochRefreshes.load()));
 }
+}
+
+const std::vector<std::pair<std::uint64_t, std::uint64_t>>* ShaderResources::rangedProofRanges() {
+    if (!proofRangesBuilt) {
+        proofRangesBuilt = true;
+        // Address-based and table-driven builds read memory the template does not list.
+        proofRangesKnown = bda == nullptr && tableStages.empty() && !UsesAddressTable();
+        if (proofRangesKnown) {
+            for (const auto& region : directRegions) proofRanges.emplace_back(region.begin, region.regionEnd != 0 ? std::max(region.end, region.regionEnd) : region.end);
+            for (const auto& range : describedRanges) {
+                proofRanges.emplace_back(range.address, range.address + range.bytes);
+                if (range.dccAddress != 0) proofRanges.emplace_back(range.dccAddress, range.dccAddress + DccKeyBytes(range.bytes));
+            }
+            for (const auto& image : storageTextures) {
+                proofRanges.emplace_back(image->Descriptor().baseAddress, image->Descriptor().baseAddress + image->GuestBytes());
+                if (image->Descriptor().dccAddress != 0) proofRanges.emplace_back(image->Descriptor().dccAddress, image->Descriptor().dccAddress + DccKeyBytes(image->GuestBytes()));
+            }
+        }
+    }
+    return proofRangesKnown ? &proofRanges : nullptr;
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
@@ -4182,7 +4230,17 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         const auto epoch = GuestMemory::CollectEpoch();
         const auto proof = GuestMemory::ProofSerial();
         const auto pending = StorageTexture::PendingSerial();
-        if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending) {
+        const auto release = TextureReleaseSerial().load(std::memory_order_acquire);
+        const auto ranged = [&] {
+            if (provedProof == proof || !GuestMemory::RangeProofs() || provedRelease != release) return false;
+            const auto* ranges = rangedProofRanges();
+            return ranges != nullptr && GuestMemory::RangeProofHolds(provedProof, *ranges);
+        };
+        if (epoch != 0 && provedEpoch == epoch && provedPending == pending && (provedProof == proof || ranged())) {
+            provedProof = proof;
+            for (const auto& texture : textures) {
+                if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
+            }
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
             thread_local std::uint64_t reuses = 0;
             if (verify && ++reuses % 64u == 0u) {
@@ -4194,12 +4252,14 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             noteEpochProof(true, false, false);
             return true;
         }
+        noteEpochMiss(provedEpoch, provedProof, provedPending, epoch, proof, pending);
         const bool ok = revalidateFull(shaders, report);
         noteEpochProof(false, false, false);
         if (ok) {
             provedEpoch = epoch;
             provedProof = proof;
             provedPending = pending;
+            provedRelease = release;
         } else {
             provedEpoch = 0;
         }
@@ -7456,7 +7516,7 @@ void ShaderResources::WriteBack() {
     } catch (const BdaUnalignedAccess&) {
         unaligned = std::current_exception();
     }
-    if (!guestMemory.Writes().empty() || std::find(storageWritten.begin(), storageWritten.end(), true) != storageWritten.end() || (usesBda && !bdaReadOnly)) GuestMemory::BreakProofs();
+    if (!guestMemory.Writes().empty() || std::find(storageWritten.begin(), storageWritten.end(), true) != storageWritten.end() || (usesBda && !bdaReadOnly)) GuestMemory::BreakProofs(GuestMemory::ProofBreak::BuildWrites);
     if (!SkipWriteBack()) {
         for (std::size_t index = 0; index < storageTextures.size(); ++index) {
             if (!storageWritten[index] || storageTextures[index] == nullptr) continue;

@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include <string>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -116,7 +117,17 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 void BumpCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
-void BreakProofs();
+// Why proofs were broken: APS5_STAGE_STATS counts BreakProofs by site, and a GPU lock taken off the
+// proof threads by the GpuLockSite its taker tagged ([proof-breaks] line).
+enum class ProofBreak : std::uint8_t { Other = 0, GpuLock, NonDrawItem, StoreOwn, MarkWritten, WriteChanged, Draw, Recorder, BuildWrites, ImportRetire, Count };
+void BreakProofs(ProofBreak site = ProofBreak::Other);
+// Range proofs (on unless APS5_NO_RANGE_PROOFS is set): a break that names the guest range it wrote is logged, and a
+// proof taken at serial S still holds while every break since S is logged and misses its ranges.
+// Unranged breaks (and a log that wrapped past S) break every proof as before.
+void BreakProofs(ProofBreak site, std::uint64_t begin, std::uint64_t end);
+bool RangeProofs();
+bool RangeProofHolds(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+std::string TakeProofBreakReport();
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();

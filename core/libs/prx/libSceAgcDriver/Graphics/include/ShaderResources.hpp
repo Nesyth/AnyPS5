@@ -356,6 +356,8 @@ public:
     // Objects whose fast proof came from another template's stamp (FastProofStamp), so far.
     static std::uint64_t FastProofStampsTaken();
     static bool EpochProofs();
+    // Why Revalidate's epoch shortcut missed since the last call (APS5_STAGE_STATS).
+    static std::string TakeEpochMissReport();
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }
@@ -803,6 +805,12 @@ private:
     std::uint64_t provedEpoch = 0;
     std::uint64_t provedProof = 0;
     std::uint64_t provedPending = 0;
+    // Range proofs (on unless APS5_NO_RANGE_PROOFS is set): the guest ranges the proof read and the release serial it saw.
+    std::uint64_t provedRelease = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> proofRanges;
+    bool proofRangesBuilt = false;
+    bool proofRangesKnown = false;
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>>* rangedProofRanges();
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;

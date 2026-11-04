@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -14,6 +15,7 @@
 #include <array>
 #include <chrono>
 #include <atomic>
+#include <utility>
 #include <algorithm>
 #include <bit>
 #include <emmintrin.h>
@@ -1925,14 +1927,104 @@ std::uint64_t CollectEpochBumps() {
 namespace {
 std::atomic<std::uint64_t> proofSerial{1};
 thread_local bool proofThread = false;
+thread_local std::uint8_t proofBreakLockSite = 0;
+thread_local GpuLockSite proofLockSite = GpuLockSite::Other;
+bool proofBreakStats() {
+    static const bool on = std::getenv("APS5_STAGE_STATS") != nullptr;
+    return on;
+}
+std::array<std::atomic<std::uint64_t>, 16> proofBreaks{};
+std::array<std::atomic<std::uint64_t>, 16> proofBreakLocks{};
+std::atomic<std::uint64_t> unrangedProofSerial{1};
+struct ProofWrite {
+    std::uint64_t serial = 0, begin = 0, end = 0;
+};
+struct ProofLog {
+    static constexpr std::size_t Size = 4096;
+    std::mutex mutex;
+    std::array<ProofWrite, Size> entries{};
+    std::uint64_t written = 0;
+};
+ProofLog& proofLog() {
+    static ProofLog log;
+    return log;
+}
+void countProofBreak(ProofBreak site) {
+    if (!proofBreakStats()) return;
+    proofBreaks[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+    if (site == ProofBreak::GpuLock) proofBreakLocks[proofBreakLockSite % proofBreakLocks.size()].fetch_add(1, std::memory_order_relaxed);
+}
 }
 
 std::uint64_t ProofSerial() {
     return proofSerial.load(std::memory_order_acquire);
 }
 
-void BreakProofs() {
-    proofSerial.fetch_add(1, std::memory_order_acq_rel);
+void BreakProofs(ProofBreak site) {
+    const auto serial = proofSerial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    auto unranged = unrangedProofSerial.load(std::memory_order_relaxed);
+    while (unranged < serial && !unrangedProofSerial.compare_exchange_weak(unranged, serial, std::memory_order_acq_rel)) {}
+    countProofBreak(site);
+}
+
+void BreakProofs(ProofBreak site, std::uint64_t begin, std::uint64_t end) {
+    auto& log = proofLog();
+    {
+        std::lock_guard lock(log.mutex);
+        const auto serial = proofSerial.fetch_add(1, std::memory_order_acq_rel) + 1;
+        log.entries[log.written % ProofLog::Size] = {serial, begin, end};
+        ++log.written;
+    }
+    countProofBreak(site);
+}
+
+bool RangeProofs() {
+    return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoRangeProofs);
+}
+
+bool RangeProofHolds(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    if (serial == 0 || unrangedProofSerial.load(std::memory_order_acquire) > serial) return false;
+    auto& log = proofLog();
+    {
+        std::lock_guard lock(log.mutex);
+        // Newest first, down to the proof's serial; a log that no longer reaches it proves nothing.
+        std::uint64_t index = log.written;
+        bool reached = false;
+        while (index != 0 && log.written - index < ProofLog::Size) {
+            const auto& entry = log.entries[(index - 1) % ProofLog::Size];
+            if (entry.serial <= serial) {
+                reached = true;
+                break;
+            }
+            for (const auto& [begin, end] : ranges) {
+                if (entry.begin < end && begin < entry.end) return false;
+            }
+            --index;
+        }
+        if (!reached && index != 0) return false;
+    }
+    return unrangedProofSerial.load(std::memory_order_acquire) <= serial;
+}
+
+std::string TakeProofBreakReport() {
+    static constexpr std::array<const char*, static_cast<std::size_t>(ProofBreak::Count)> sites{"other", "gpu lock", "non-draw item", "store own", "mark written", "write changed", "draw", "recorder", "build writes", "import retire"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(GpuLockSite::Count)> locks{"other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try"};
+    std::string text;
+    char item[64];
+    for (std::size_t index = 0; index < sites.size(); ++index) {
+        const auto count = proofBreaks[index].exchange(0, std::memory_order_relaxed);
+        if (count == 0) continue;
+        std::snprintf(item, sizeof(item), " %s %llu", sites[index], static_cast<unsigned long long>(count));
+        text += item;
+    }
+    text += "; gpu lock breaks by site:";
+    for (std::size_t index = 0; index < locks.size(); ++index) {
+        const auto count = proofBreakLocks[index].exchange(0, std::memory_order_relaxed);
+        if (count == 0) continue;
+        std::snprintf(item, sizeof(item), " %s %llu", locks[index], static_cast<unsigned long long>(count));
+        text += item;
+    }
+    return text;
 }
 
 void MarkProofThread() {
@@ -2212,7 +2304,7 @@ static GuestAllocations::Lease::Ranges pinStoreRanges(std::uint64_t address, std
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store, bool complete = true) {
     if (bytes == 0) return 0;
     const auto pinned = pinStoreRanges(address, bytes);
-    BreakProofs();
+    BreakProofs(ProofBreak::StoreOwn, address, address + bytes);
     const auto stampStored = [complete](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
@@ -2259,7 +2351,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete) {
-    BreakProofs();
+    BreakProofs(ProofBreak::MarkWritten, address, address + bytes);
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -2631,9 +2723,17 @@ bool GpuMutexType::tryEnter() {
 
 void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
+    // The tag belongs to this acquisition only, nested or not.
+    const auto site = std::exchange(proofLockSite, GpuLockSite::Other);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
-        if (!proofThread) BreakProofs();
+        // Range proofs leave out other threads' GPU locks whose changes break proofs where they
+        // happen: the flush hook, waits, flushes and boundary reaps store and complete through the
+        // ranged sites, and the presenter only reads. Dispatches, indirect work, inline draws,
+        // labels, fills, copies and untagged holds still break every proof.
+        const bool selfBreaking = site == GpuLockSite::Hook || site == GpuLockSite::Wait || site == GpuLockSite::Flush || site == GpuLockSite::Present || site == GpuLockSite::Try;
+        if (!proofThread && !(RangeProofs() && selfBreaking)) BreakProofs(ProofBreak::GpuLock);
+        proofBreakLockSite = 0;
     }
 }
 
@@ -2803,6 +2903,8 @@ void GpuMutexType::lock() {
 }
 
 void TagGpuLockSite(GpuLockSite site) {
+    proofLockSite = site;
+    if (proofBreakStats()) proofBreakLockSite = static_cast<std::uint8_t>(site);
     // Off the profiled path the tag is never read, so the thread-local is not touched either.
     if (!GpuLockProfiled() && !PerformanceTrace::Recording()) return;
     LockStats().nextSite = site;
@@ -3083,7 +3185,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 
 static void writeChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint32_t byteStoreLimit, bool keepGuest) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
-    BreakProofs();
+    BreakProofs(ProofBreak::WriteChanged, address, address + current.size());
     if (current.empty()) return;
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
     // site above it was doing (the [hooksync] line counts stores apart).
@@ -3143,7 +3245,7 @@ static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free && std::atomic
 
 std::size_t WriteChangedIfHeld(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint64_t unchangedSince) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
-    BreakProofs();
+    BreakProofs(ProofBreak::WriteChanged, address, address + current.size());
     if (current.empty()) return 0;
     const ReadSiteScope site(ReadSite::Store);
     FlushGpuWrites(address, current.size());

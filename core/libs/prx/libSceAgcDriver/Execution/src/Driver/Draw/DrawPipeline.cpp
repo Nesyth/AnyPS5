@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -419,6 +420,8 @@ void DrawPipeline::run() {
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
+        bool rangedItem = false;
+        std::vector<Range> itemRanges;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -428,6 +431,11 @@ void DrawPipeline::run() {
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
+            rangedItem = !isDraw && GuestMemory::RangeProofs();
+            if (rangedItem) {
+                itemRanges = items.front().writes;
+                if (items.front().labelAddress != 0 && !items.front().labelBytes.empty()) itemRanges.emplace_back(items.front().labelAddress, items.front().labelAddress + items.front().labelBytes.size());
+            }
         }
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
@@ -435,7 +443,11 @@ void DrawPipeline::run() {
         bool shutdown = false;
         try {
             if (commit != nullptr) (*commit)();
-            if (!isDraw) GuestMemory::BreakProofs();
+            if (rangedItem) {
+                for (const auto& [begin, end] : itemRanges) GuestMemory::BreakProofs(GuestMemory::ProofBreak::NonDrawItem, begin, end);
+            } else if (!isDraw) {
+                GuestMemory::BreakProofs(GuestMemory::ProofBreak::NonDrawItem);
+            }
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();
