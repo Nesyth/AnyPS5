@@ -2761,6 +2761,7 @@ struct StalePlanes {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     std::atomic<std::uint64_t> begin{std::numeric_limits<std::uint64_t>::max()};
     std::atomic<std::uint64_t> end{0};
+    std::atomic<std::uint64_t> serial{0};
 };
 
 StalePlanes& stalePlanes() {
@@ -2777,6 +2778,7 @@ void publishStaleHull(StalePlanes& planes) {
     }
     planes.begin.store(begin, std::memory_order_release);
     planes.end.store(end, std::memory_order_release);
+    planes.serial.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void noteStalePlane(std::uint64_t begin, std::uint64_t end) {
@@ -2962,6 +2964,10 @@ void retireStoringStale(DepthSurface& surface) {
     const auto [begin, end] = surface.UnitHull(units, planeBytes);
     if (StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "depth plane store")) surface.NoteStored(units, GuestMemory::TrackerGeneration());
 }
+}
+
+std::uint64_t StaleDepthPlanesSerial() {
+    return stalePlanes().serial.load(std::memory_order_acquire);
 }
 
 std::uint64_t DepthSurfacesSerial() {

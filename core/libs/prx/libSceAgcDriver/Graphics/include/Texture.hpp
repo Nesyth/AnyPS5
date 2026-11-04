@@ -61,6 +61,28 @@ struct OwnedImage {
     ImageAllocation allocation;
 };
 
+// The last clean fast proof of a sampled view or a storage image (ShaderResources::fastRevalidate):
+// the committer's collect epoch and the serials the proof ran under, the surface it covered and
+// what it found. Another template of the same object in the same epoch takes the stamp instead of
+// proving the object again while none of the serials moved; the template-level checks (imports,
+// regions, staging) still run per template. Written and read under GuestMemory::GpuMutex.
+struct FastProofStamp {
+    std::uint64_t epoch = 0;
+    std::uint64_t proof = 0;
+    std::uint64_t pending = 0;
+    std::uint64_t release = 0;
+    std::uint64_t unwatched = 0;
+    std::uint64_t mapping = 0;
+    std::uint64_t depthSurfaces = 0;
+    std::uint64_t depthReleased = 0;
+    std::uint64_t stalePlanes = 0;
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    const void* source = nullptr;
+    std::uint64_t generation = 0;
+    DccKeys keys = DccKeys::Uncompressed;
+};
+
 class Texture : public HeapSlotOwner {
 public:
     Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false, bool layerRows = false, const VkClearColorValue* clear = nullptr);
@@ -125,8 +147,10 @@ public:
     void MarkRefreshedPerUse() { perUseCopy = PerUseCopy::RemadePerUse; }
     bool Released() const { return released.load(std::memory_order_acquire); }
     void MarkReleased() { released.store(true, std::memory_order_release); }
+    FastProofStamp& FastProof() const { return fastProof; }
 
 private:
+    mutable FastProofStamp fastProof;
     void release() noexcept;
     bool refreshBlockCopy();
     bool refreshSrgbExpand();
@@ -402,6 +426,7 @@ public:
     // clear before the eviction's flush): what a lookup of its surface would return.
     bool Cached() const { return cached.load(std::memory_order_acquire); }
     void SetCached(bool value) { cached.store(value, std::memory_order_release); }
+    FastProofStamp& FastProof() const { return fastProof; }
     // The pending image whose surface starts at `address` and covers at least `bytes` (a mip chain
     // contains a descriptor of its first mips), if any; the caller decides whether the geometry fits
     // (Texture::CanCopyFrom, ResidentPresentable).
@@ -512,6 +537,7 @@ public:
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
 
 private:
+    mutable FastProofStamp fastProof;
     std::atomic<std::uint64_t> provedEpoch{0};
     std::atomic<std::uint64_t> provedProof{0};
     std::atomic<std::uint64_t> provedPending{0};

@@ -353,6 +353,8 @@ public:
         bool audited = false;
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
+    // Objects whose fast proof came from another template's stamp (FastProofStamp), so far.
+    static std::uint64_t FastProofStampsTaken();
     static bool EpochProofs();
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
@@ -607,6 +609,7 @@ private:
     };
     bool keepsTemplateRecords() const;
     void captureValidation();
+    static void noteStampTaken();
     // A surface of this object the fast proof found a foreign image pending over: the element
     // (index into textures, or into storageTextures when `storage`) whose own object stands in for
     // the full walk's lookup (refreshOwnObjects). `viewUncompressed`: a storage-sourced view under

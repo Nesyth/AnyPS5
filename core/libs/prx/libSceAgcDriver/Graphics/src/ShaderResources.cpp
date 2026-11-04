@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
@@ -260,9 +261,16 @@ std::atomic<bool>& TexturesReleased() {
     return released;
 }
 
+// Moves at every release of a cached texture (the fast proof stamps compare it).
+std::atomic<std::uint64_t>& TextureReleaseSerial() {
+    static std::atomic<std::uint64_t> serial{1};
+    return serial;
+}
+
 void noteReleased(const std::shared_ptr<Texture>& texture) {
     texture->MarkReleased();
     TexturesReleased().store(true, std::memory_order_release);
+    TextureReleaseSerial().fetch_add(1, std::memory_order_acq_rel);
 }
 
 bool SamplerCacheDisabled() {
@@ -3703,6 +3711,29 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         pending.push_back({begin, end, except, identity, false});
         owners.push_back(owner);
     };
+    // An object another template proved cleanly under the same collect epoch and serials
+    // (FastProofStamp) is taken as proved. The T1 rerun (`refreshed`) proves everything itself, and
+    // untracked surfaces keep their per-template stamps (untrackedRangeStamp).
+    const bool stamps = !RuntimeSwitches::Set(RuntimeSwitch::NoTextureProofStamps) && refreshed.empty();
+    FastProofStamp now{};
+    if (stamps) {
+        now.epoch = GuestMemory::CollectEpoch();
+        now.proof = GuestMemory::ProofSerial();
+        now.pending = serialBefore;
+        now.release = TextureReleaseSerial().load(std::memory_order_acquire);
+        now.unwatched = GuestMemory::UnwatchSerial();
+        now.mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        now.depthSurfaces = DepthSurfacesSerial();
+        now.depthReleased = DepthSurfacesReleased();
+        now.stalePlanes = StaleDepthPlanesSerial();
+    }
+    const auto stamped = [&](const FastProofStamp& stamp, std::uint64_t address, std::uint64_t bytes, const void* source) {
+        return stamps && now.epoch != 0 && stamp.epoch == now.epoch && stamp.proof == now.proof && stamp.pending == now.pending && stamp.release == now.release && stamp.unwatched == now.unwatched && stamp.mapping == now.mapping && stamp.depthSurfaces == now.depthSurfaces && stamp.depthReleased == now.depthReleased && stamp.stalePlanes == now.stalePlanes && stamp.address == address && stamp.bytes == bytes && stamp.source == source;
+    };
+    // Per texture, then per storage image: 0 proved here, 1 taken from a stamp, 2 untracked.
+    thread_local std::vector<std::uint8_t>* takenSlot = nullptr;
+    auto& taken = ShaderRecompiler::ThreadOwned(takenSlot);
+    taken.assign(textures.size() + storageTextures.size(), 0);
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
         if (!surface.valid) return fail(FastFail::NoRecord);
@@ -3713,6 +3744,14 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (textures[i]->Released()) return fail(FastFail::Replaced);
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
+        if (const auto& stamp = textures[i]->FastProof(); stamped(stamp, address, bytes, surface.source)) {
+            if (surface.source != nullptr && !surface.source->Cached()) return fail(FastFail::Evicted);
+            surface.collected = stamp.generation;
+            scannedKeys[i] = stamp.keys;
+            taken[i] = 1;
+            noteStampTaken();
+            continue;
+        }
         if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         bool untracked = false;
@@ -3733,6 +3772,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
                 }
             }
             untracked = true;
+            taken[i] = 2;
         }
         const auto* source = surface.source;
         if (!keyProofs) {
@@ -3786,6 +3826,12 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto& own = image->Descriptor();
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
+        if (stamped(image->FastProof(), address, bytes, image)) {
+            if (!image->Cached()) return fail(FastFail::Evicted);
+            taken[textures.size() + i] = 1;
+            noteStampTaken();
+            continue;
+        }
         if (DepthSurfaceOverlaps(context.device, address, bytes)) {
             depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
             return fail(FastFail::Depth);
@@ -3797,6 +3843,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
                 return fail(FastFail::Collect);
             }
             untracked = true;
+            taken[textures.size() + i] = 2;
         }
         if (own.dccAddress != 0) {
             // Refresh's unchanged branch (its key compare against the keys the content was
@@ -3877,6 +3924,28 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         auto& surface = validatedTextures[i];
         if (surface.source == nullptr) surface.generation = surface.collected;
         surface.keys = scannedKeys[i];
+    }
+    if (stamps && now.epoch != 0 && !accepted) {
+        for (std::size_t i = 0; i < textures.size(); ++i) {
+            const auto& surface = validatedTextures[i];
+            if (surface.depth || taken[i] != 0 || surface.collected == 0) continue;
+            auto stamp = now;
+            stamp.address = surface.resource.baseAddress;
+            stamp.bytes = surface.bytes;
+            stamp.source = surface.source;
+            stamp.generation = surface.collected;
+            stamp.keys = scannedKeys[i];
+            textures[i]->FastProof() = stamp;
+        }
+        for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+            const auto* image = storageTextures[i].get();
+            if (image == nullptr || taken[textures.size() + i] != 0 || (i != 0 && storageTextures[i] == storageTextures[i - 1])) continue;
+            auto stamp = now;
+            stamp.address = image->Descriptor().baseAddress;
+            stamp.bytes = image->GuestBytes();
+            stamp.source = image;
+            image->FastProof() = stamp;
+        }
     }
     return true;
 }
@@ -4077,6 +4146,18 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
 
 bool ShaderResources::EpochProofs() {
     return DrawPipelineEnabled();
+}
+
+namespace {
+std::atomic<std::uint64_t> stampsTaken{0};
+}
+
+void ShaderResources::noteStampTaken() {
+    stampsTaken.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t ShaderResources::FastProofStampsTaken() {
+    return stampsTaken.load(std::memory_order_relaxed);
 }
 
 namespace {
