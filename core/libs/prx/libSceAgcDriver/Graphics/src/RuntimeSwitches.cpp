@@ -22,6 +22,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_RANGE_PROOFS",
     "APS5_NO_LEAN_RUNS",
     "APS5_NO_PASS_ACCESS_MEMO",
+    "APS5_NO_RANGED_DISPATCH_BREAKS",
 };
 
 struct SwitchValues {
@@ -33,6 +34,7 @@ struct SwitchValues {
             std::getenv("APS5_NO_RANGE_PROOFS") != nullptr,
             std::getenv("APS5_NO_LEAN_RUNS") != nullptr,
             std::getenv("APS5_NO_PASS_ACCESS_MEMO") != nullptr,
+            std::getenv("APS5_NO_RANGED_DISPATCH_BREAKS") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

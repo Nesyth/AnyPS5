@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <atomic>
@@ -612,6 +613,17 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
     }
     bool captureChecked = fromAhead;
+    // Under range proofs a direct dispatch whose writes are all known breaks template proofs over
+    // those writes and the labels it records, instead of every proof through its GPU lock
+    // (APS5_NO_RANGED_DISPATCH_BREAKS turns it off). The copied write-backs and storage results land
+    // inside those ranges, and their completions break where they store. Depth plane, HTILE and DCC
+    // key clears change surface state outside the ranges, so they keep the full break, as do
+    // dispatches whose writes are not bounded and indirect ones.
+    std::vector<DrawPipeline::Range> rangedBreaks;
+    bool rangedDispatch = false;
+    if (indirectArguments == 0 && GuestMemory::RangeProofs() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoRangedDispatchBreaks) && !htileClearCompletion.has_value() && htileMask.bytes == 0u && !depthPlaneClear.has_value() && !keysFill) {
+        rangedBreaks = DispatchWriteRanges(compiled, rangedDispatch);
+    }
 
     for (;;) {
 
@@ -639,7 +651,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 phaseMs[PhasePrepareOther] += std::max(0.0, prepareMs - parts);
             }
         }
-        GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
+        GuestMemory::TagGpuLockSite(rangedDispatch ? GuestMemory::GpuLockSite::RangedDispatch : indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
         std::unique_lock gpuLock(GuestMemory::GpuMutex());
         phaseTiming.Phase(PhaseLockWait);
         if (!captureChecked) {
@@ -653,6 +665,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             }
         }
 
+        if (rangedDispatch) {
+            for (const auto& label : deferredLabels().labels) rangedBreaks.emplace_back(label.address, label.address + label.size);
+        }
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(PhaseLabels);
         if (noteWrites && writerKeyedEvidence() && !writersNoted) {
@@ -680,7 +695,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : (attachTo != nullptr ? &builtRecipe : nullptr), htileClearCompletion, registeredViews);
             }
         } catch (const std::exception& error) {
+            // A failed dispatch may have changed more than its writes before it threw.
+            if (rangedDispatch) GuestMemory::BreakProofs(GuestMemory::ProofBreak::Dispatch);
             if (rethrow(error)) return;
+        }
+        if (rangedDispatch) {
+            for (const auto& [begin, end] : rangedBreaks) GuestMemory::BreakProofs(GuestMemory::ProofBreak::Dispatch, begin, end);
         }
         if (keysRecorder != nullptr && keysRecorder == Graphics::Recorder::Active()) {
             const auto note = keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes);

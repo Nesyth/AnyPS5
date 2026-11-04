@@ -2007,8 +2007,8 @@ bool RangeProofHolds(std::uint64_t serial, std::span<const std::pair<std::uint64
 }
 
 std::string TakeProofBreakReport() {
-    static constexpr std::array<const char*, static_cast<std::size_t>(ProofBreak::Count)> sites{"other", "gpu lock", "non-draw item", "store own", "mark written", "write changed", "draw", "recorder", "build writes", "import retire"};
-    static constexpr std::array<const char*, static_cast<std::size_t>(GpuLockSite::Count)> locks{"other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(ProofBreak::Count)> sites{"other", "gpu lock", "non-draw item", "store own", "mark written", "write changed", "draw", "recorder", "build writes", "import retire", "dispatch"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(GpuLockSite::Count)> locks{"other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try", "ranged dispatch"};
     std::string text;
     char item[64];
     for (std::size_t index = 0; index < sites.size(); ++index) {
@@ -2572,7 +2572,7 @@ namespace {
 // Per-thread GpuMutex wait accounting (APS5_PROFILE_DRAW): a queue worker tags its thread, other
 // threads (the presenter) report untagged.
 constexpr std::size_t GpuLockSiteCount = static_cast<std::size_t>(GpuLockSite::Count);
-constexpr const char* GpuLockSiteNames[GpuLockSiteCount] = {"other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try"};
+constexpr const char* GpuLockSiteNames[GpuLockSiteCount] = {"other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try", "ranged dispatch"};
 
 // Hold-side holder matrix: nanoseconds held per (holder thread, site), added by EndHold. Column 0
 // is every untagged thread (the presenter, game threads); the queue workers take a column each on
@@ -2729,9 +2729,10 @@ void GpuMutexType::acquired() {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
         // Range proofs leave out other threads' GPU locks whose changes break proofs where they
         // happen: the flush hook, waits, flushes and boundary reaps store and complete through the
-        // ranged sites, and the presenter only reads. Dispatches, indirect work, inline draws,
-        // labels, fills, copies and untagged holds still break every proof.
-        const bool selfBreaking = site == GpuLockSite::Hook || site == GpuLockSite::Wait || site == GpuLockSite::Flush || site == GpuLockSite::Present || site == GpuLockSite::Try;
+        // ranged sites, the presenter only reads, and a ranged dispatch breaks over its own writes
+        // and labels. Other dispatches, indirect work, inline draws, labels, fills, copies and
+        // untagged holds still break every proof.
+        const bool selfBreaking = site == GpuLockSite::Hook || site == GpuLockSite::Wait || site == GpuLockSite::Flush || site == GpuLockSite::Present || site == GpuLockSite::Try || site == GpuLockSite::RangedDispatch;
         if (!proofThread && !(RangeProofs() && selfBreaking)) BreakProofs(ProofBreak::GpuLock);
         proofBreakLockSite = 0;
     }

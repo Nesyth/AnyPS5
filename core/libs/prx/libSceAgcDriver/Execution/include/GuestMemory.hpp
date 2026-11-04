@@ -119,7 +119,7 @@ void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
 // Why proofs were broken: APS5_STAGE_STATS counts BreakProofs by site, and a GPU lock taken off the
 // proof threads by the GpuLockSite its taker tagged ([proof-breaks] line).
-enum class ProofBreak : std::uint8_t { Other = 0, GpuLock, NonDrawItem, StoreOwn, MarkWritten, WriteChanged, Draw, Recorder, BuildWrites, ImportRetire, Count };
+enum class ProofBreak : std::uint8_t { Other = 0, GpuLock, NonDrawItem, StoreOwn, MarkWritten, WriteChanged, Draw, Recorder, BuildWrites, ImportRetire, Dispatch, Count };
 void BreakProofs(ProofBreak site = ProofBreak::Other);
 // Range proofs (on unless APS5_NO_RANGE_PROOFS is set): a break that names the guest range it wrote is logged, and a
 // proof taken at serial S still holds while every break since S is logged and misses its ranges.
@@ -212,8 +212,9 @@ std::uint32_t GpuLockThreadTag();
 // hook, and an acquisition nobody tagged counts as "other". Try-only acquisitions are not counted
 // as acquisitions; the hold they start is timed under "try". Holds are timed per site as well (the
 // outermost acquisition of a thread until its unlock; APS5_NO_HOLD_PROFILE=1 turns that off), so
-// the line shows who holds the mutex, not only who waits for it.
-enum class GpuLockSite : std::uint8_t { Other = 0, Dispatch, Indirect, Draw, Hook, Wait, Label, Flush, Present, Fill, Copy, End, Try, Count };
+// the line shows who holds the mutex, not only who waits for it. A RangedDispatch hold breaks
+// template proofs over the dispatch's own writes and labels instead of through the lock.
+enum class GpuLockSite : std::uint8_t { Other = 0, Dispatch, Indirect, Draw, Hook, Wait, Label, Flush, Present, Fill, Copy, End, Try, RangedDispatch, Count };
 void TagGpuLockSite(GpuLockSite site);
 // A GPU wait (a fence or timeline wait that found its work unfinished) made while the calling
 // thread holds GpuMutex: counted on the thread's [lock] line as 'locked GPU waits' (APS5_PROFILE_DRAW).
