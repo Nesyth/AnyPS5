@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/HeapStages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
@@ -192,6 +194,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         localDevice->ComputeTarget((packet[4] & 0x8000u) != 0 ? 32u : 64u),
         {0, 0, 0, threadGroup != std::array<std::uint32_t, 3>{} ? 0u : 128u}
     };
+    const std::size_t computeHeapKey = HeapFragmentKey(codeOffset, HeapKeyClass::Compute);
+    if (request.target.gpuResolvedImages && (HeapRefused() || HeapStageExcluded(ShaderRecompiler::ShaderStage::Compute) || HeapFragmentKnown(&snapshot, computeHeapKey) == std::optional(false))) request.target.gpuResolvedImages = false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static std::atomic<double> captureMs{0}, keyMs{0}, recompileMs{0}, deviceMs{0};
     static std::atomic<std::uint64_t> cacheHits{0};
@@ -301,6 +305,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
 
     mix(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+    mix(request.target.gpuResolvedImages);
     if (fromAhead && key != ahead.key) {
         fromAhead = false;
         ++groupStats.keyMismatches;
@@ -400,6 +405,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
             timing.Mark("capture_resources");
             compiledResult = invocation.Materialize(*capture);
+            if (compiledResult->gpuResolvedImages && !HeapStageMappable(*compiledResult, compiledResult->workgroupMemoryDwords != 0)) {
+                Graphics::NoteHeapFallback(Graphics::HeapFallback::DispatchUnmapped);
+                NoteHeapFragment(&snapshot, computeHeapKey, false);
+                request.target.gpuResolvedImages = false;
+                invocation = InvocationFor(snapshot, codeOffset, request);
+                capture = shaderMemory->Capture(invocation);
+                captured = shaderMemory->Regions();
+                request.context.memory = captured;
+                compiledResult = invocation.Materialize(*capture);
+            }
             timing.Mark("materialize");
             if (profile && compiledResult->cacheHit) cacheHits.fetch_add(1, std::memory_order_relaxed);
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();

@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MapImportGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/AdaptiveStaging.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "ThreadOwned.hpp"
@@ -69,6 +70,7 @@ constexpr unsigned long UDMABUF_CREATE_LIST = 0;
 #include <iterator>
 #include <list>
 #include <map>
+#include <unordered_set>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -676,8 +678,7 @@ const char* bindImport(const Context& context, HostImport& entry, VkExternalMemo
     allocated = true;
     entry.memoryType = allocation.memoryTypeIndex;
     if (const auto result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, entry.buffer, entry.memory, 0); result != VK_SUCCESS) return failed("vkBindBufferMemory", result);
-    const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, entry.buffer};
-    entry.address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
+    entry.address = BufferDeviceAddress(context, entry.buffer);
     if (entry.address == 0) return failed("vkGetBufferDeviceAddressKHR", VK_ERROR_UNKNOWN);
     return nullptr;
 }
@@ -901,10 +902,9 @@ const char* createChunkedDmaBufImport(const Context& context, HostImport& entry,
         failure = result;
         return "vkBindBufferMemory";
     }
-    const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, buffer};
     entry.buffer = buffer;
     entry.memory = VK_NULL_HANDLE;
-    entry.address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
+    entry.address = BufferDeviceAddress(context, buffer);
     entry.chunk = std::move(chunk);
     entry.dmaBuf = true;
     return nullptr;
@@ -1010,8 +1010,7 @@ bool createSparseDmaBufImport(const Context& context, HostImport& entry, int fil
     context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     if (bound != VK_SUCCESS) fail("vkQueueBindSparse", bound);
     if (waited != VK_SUCCESS) fail("vkWaitForFences", waited);
-    const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, buffer};
-    const auto address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
+    const auto address = BufferDeviceAddress(context, buffer);
     if (address == 0) fail("vkGetBufferDeviceAddressKHR", VK_ERROR_UNKNOWN);
     entry.buffer = buffer;
     entry.memory = VK_NULL_HANDLE;
@@ -1176,6 +1175,7 @@ const char* settleImport(const Context& context, HostImports& state, const HostI
         if ((result = context.Function<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(settle.settleCommands, 0)) != VK_SUCCESS) return "vkResetCommandBuffer (settle)";
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        NoteCommandBufferBegun(settle.settleCommands);
         if ((result = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(settle.settleCommands, &begin)) != VK_SUCCESS) return "vkBeginCommandBuffer (settle)";
         const VkBufferCopy region{0, 0, 4};
         context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(settle.settleCommands, source, settle.settleTarget, 1, &region);
@@ -1270,6 +1270,7 @@ void submitSettleBatch(const Context& context, HostImports& state) {
     if ((result = context.Function<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(batch.commands, 0)) != VK_SUCCESS) return fail("vkResetCommandBuffer (settle batch)");
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    NoteCommandBufferBegun(batch.commands);
     if ((result = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(batch.commands, &begin)) != VK_SUCCESS) return fail("vkBeginCommandBuffer (settle batch)");
     const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
     RecordMemoryBarrier(context, batch.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -3314,6 +3315,13 @@ std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBu
     return checked;
 }
 
+void refreshWritableMirrors(const GuestBufferMemory::AddressSpace& space, std::vector<RefreshBlock>& blocks) {
+    for (const auto index : space.writableMirrors) {
+        const auto& region = space.base[index];
+        if (prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
+    }
+}
+
 bool heapMirrorWatched(ImageMirror& mirror) {
     const auto serial = GuestMemory::UnwatchSerial();
     if (mirror.watchedSerial.load(std::memory_order_relaxed) == serial) return true;
@@ -4097,11 +4105,13 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         allocate.commandBufferCount = 3;
         if ((probe.result = context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocate, commands)) != VK_SUCCESS) return "vkAllocateCommandBuffers";
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        NoteCommandBufferBegun(commands[0]);
         if ((probe.result = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands[0], &begin)) != VK_SUCCESS) return "vkBeginCommandBuffer";
         const VkBufferCopy region{0, 0, bytes};
         context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands[0], import.buffer, destination, 1, &region);
         if ((probe.result = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands[0])) != VK_SUCCESS) return "vkEndCommandBuffer";
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        NoteCommandBufferBegun(commands[1]);
         if ((probe.result = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands[1], &begin)) != VK_SUCCESS) return "vkBeginCommandBuffer";
         context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands[1], import.buffer, 0, bytes, 0x02020202u);
         if ((probe.result = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands[1])) != VK_SUCCESS) return "vkEndCommandBuffer";
@@ -4868,10 +4878,7 @@ void GuestBufferMemory::AcquireRegistered() {
             // before any of them is dereferenced.
             served = true;
             mirrored = space->mirrored;
-            for (const auto index : space->writableMirrors) {
-                const auto& region = space->base[index];
-                if (prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
-            }
+            refreshWritableMirrors(*space, blocks);
             lap(timing.mirrorsUs, at);
         }
     }
@@ -5477,10 +5484,7 @@ bool GuestBufferMemory::RetakeSpace() {
     if (reuse) {
         noteEpochMirrors(true, *space);
     } else {
-        for (const auto index : space->writableMirrors) {
-            const auto& region = space->base[index];
-            if (prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
-        }
+        refreshWritableMirrors(*space, blocks);
         if (epochMirrors()) noteEpochMirrors(false, *space);
     }
     const auto checked = refreshHeapRuns(*space, blocks);
@@ -6441,6 +6445,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         readBytes += region.snapshot.size();
     }
     region.snapshot.clear();
+    NoteCpuBufferCopy(readBytes);
     if (profile) readUs.fetch_add(microsecondsSince(readStart), std::memory_order_relaxed);
     if (profile) {
         static AgcDriver::Mutex reasonsMutex;
