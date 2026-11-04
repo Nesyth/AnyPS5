@@ -654,6 +654,7 @@ private:
     void addDrawnRect(DrawnRect rect);
     void forgetDrawn();
     void noteStore(std::uint64_t note);
+    void noteOwnStore(const void* recorder, std::uint64_t note);
     // Per-layer validity (thin array surfaces whose layers are 64 KiB-aligned guest slices; every
     // other surface is one tracked layer): a layer's generation is the write generation its guest
     // bytes were last known to match the image at, and a pending layer holds results (a clear, a
@@ -835,6 +836,7 @@ private:
     bool pendingFromOthers = false;
     std::vector<DrawnRect> drawnRects;
     std::vector<std::uint64_t> storeNotes;
+    std::vector<std::pair<const void*, std::uint64_t>> ownStoreNotes;
     std::uint64_t writtenFlip = 0;
     std::atomic<bool> writtenOccasionally{false};
     std::uint64_t version = 0;

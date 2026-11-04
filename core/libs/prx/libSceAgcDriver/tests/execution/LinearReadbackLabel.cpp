@@ -49,6 +49,9 @@ constexpr std::uint32_t Format32Uint = 20;
 constexpr std::uint32_t TileR64KBX = 0x1b;
 constexpr std::size_t TiledOffset = 0x10000;
 constexpr std::size_t TiledLabelOffset = 0x8100;
+constexpr std::size_t RestoredOffset = 0x4000;
+constexpr std::size_t RestoredFirstLabelOffset = 0x8300;
+constexpr std::size_t RestoredLabelOffset = 0x8400;
 constexpr std::uint32_t Untouched = 0xdeadbeefu;
 constexpr std::uint32_t Written = 0x12345678u;
 constexpr std::uint32_t Rewritten = 0x0badcafeu;
@@ -235,6 +238,22 @@ std::uint32_t CountHolding(const std::uint32_t* texels, std::size_t bytes, std::
     return count;
 }
 
+void ReadRestoredAfterSecondLabel(std::uint8_t* block) {
+    auto* texels = reinterpret_cast<std::uint32_t*>(block + RestoredOffset);
+    auto* firstLabel = reinterpret_cast<std::uint32_t*>(block + RestoredFirstLabelOffset);
+    auto* label = reinterpret_cast<std::uint32_t*>(block + RestoredLabelOffset);
+    auto userData = TiledUserData(texels);
+    userData[11] &= ~(0x1fu << 20u);
+    const auto bytes = AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(std::span<const std::uint32_t>(userData).subspan(8, 8))).guestBytes;
+    Require(bytes <= RestoredFirstLabelOffset - RestoredOffset, "restored readback label: the linear test image overlaps its labels");
+    std::fill(texels, texels + bytes / 4u, Untouched);
+    auto words = Commands(TiledStoreCode, TiledThreads, userData, firstLabel);
+    const auto again = Commands(RewriteStoreCode, TiledThreads, userData, label);
+    words.insert(words.end(), again.begin(), again.end());
+    SubmitAndWait(std::move(words), label, "restored readback label");
+    Require(CountHolding(texels, bytes, Rewritten) == TiledThreads, "restored readback label: " + std::to_string(CountHolding(texels, bytes, Written)) + " texels of a linear image read after its second label in one submission hold the value its first label stored, expected the second dispatch's value in " + std::to_string(TiledThreads));
+}
+
 void ReadOccasionalAfterLabel(std::uint8_t* block) {
     using AgcDriver::Graphics::StorageTexture;
     auto* texels = reinterpret_cast<std::uint32_t*>(block + OccasionalOffset);
@@ -270,6 +289,7 @@ int main() {
         ReadAfterLabel(block.Data());
         ReadTiledAfterLabel(block.Data());
         ReadOccasionalAfterLabel(block.Data());
+        ReadRestoredAfterSecondLabel(block.Data());
         AgcDriverWaitIdle_nid_postfix();
         AgcDriverShutdown_nid_postfix();
         std::puts("linear readback label tests passed");

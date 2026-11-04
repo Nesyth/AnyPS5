@@ -270,6 +270,11 @@ bool BlockWriteBackEach() {
     return each;
 }
 
+bool OwnStoreNotesEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_OWN_STORE_NOTES") != nullptr;
+    return !disabled;
+}
+
 bool StorageBlockUnits(const GuestTextureResource& descriptor, const SurfaceGeometry& geometry) {
     return LayerTrackingEnabled() && BlockTrackingEnabled() && !geometry.thick && descriptor.tileMode != TextureTileMode::kLinear && descriptor.baseAddress % 65536 == 0
         && std::none_of(geometry.mips.begin(), geometry.mips.end(), [](const TileMipLayout& mip) { return mip.gcnSplitStride != 0; });
@@ -4341,6 +4346,14 @@ void StorageTexture::noteStore(std::uint64_t note) {
     if (storeNotes.size() > 8) storeNotes.erase(storeNotes.begin());
 }
 
+void StorageTexture::noteOwnStore(const void* recorder, std::uint64_t note) {
+    if (note == 0) return;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    ownStoreNotes.emplace_back(recorder, note);
+    if (ownStoreNotes.size() > 8) ownStoreNotes.erase(ownStoreNotes.begin());
+}
+
 StorageTexture::DrawnArea StorageTexture::drawnArea() const {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
@@ -4616,6 +4629,8 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     // another thread releases outside the GPU mutex once the batch completed.
     std::vector<std::shared_ptr<StorageTexture>> flush;
     std::vector<std::uint64_t> ownNotes;
+    const bool ownStores = OwnStoreNotesEnabled();
+    const void* ownRecorder = ownStores ? Recorder::Active() : nullptr;
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
@@ -4661,6 +4676,11 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         if (!flush.empty()) BumpPendingSerial();
         for (const auto& texture : flush) {
             if (texture->drawnListed) ownNotes.insert(ownNotes.end(), texture->storeNotes.begin(), texture->storeNotes.end());
+            else if (ownStores) {
+                for (const auto& [owner, note] : texture->ownStoreNotes) {
+                    if (owner == ownRecorder) ownNotes.push_back(note);
+                }
+            }
         }
     }
     if (flush.empty()) {
@@ -6956,7 +6976,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         backToGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         backToGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         backToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        const VkMemoryBarrier stored{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT};
+        const VkMemoryBarrier stored{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT};
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &stored, 0, nullptr, 1, &backToGeneral);
         if (batch) {
             batch->SubmitAndWait();
@@ -6965,6 +6985,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             recorder->MarkShaderReadsCovered();
             recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
             if (drawn.drawn) noteStore(recorder->LastWriteNote(firstStored, static_cast<std::size_t>(lastStored - firstStored)));
+            else if (OwnStoreNotesEnabled()) noteOwnStore(recorder, recorder->LastWriteNote(firstStored, static_cast<std::size_t>(lastStored - firstStored)));
         }
         countStorageWriteBack(storedBytes, true, drawn.drawn);
         if (profile) Profile().storageGpu += timer.lap();
