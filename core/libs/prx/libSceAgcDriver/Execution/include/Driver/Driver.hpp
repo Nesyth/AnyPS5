@@ -223,7 +223,7 @@ private:
     static bool drawCacheIndirect();
     void accountDrawVariant(const DispatchVariant& variant, bool added);
     void insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape = 0, bool replaceShape = false);
-    bool admitDrawKey(std::uint64_t key, std::uint64_t shape);
+    bool admitDrawKey(std::uint64_t key, std::uint64_t shape, const DrawRelocationPending* own = nullptr);
     void eraseDrawEntry(std::uint64_t key, const std::shared_ptr<DrawEntry>& expected);
     std::shared_ptr<const DrawRecipe> findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
     void attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe);
@@ -236,7 +236,9 @@ private:
     void traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, bool cacheMiss);
     static std::uint64_t drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry);
     static bool drawRelocationEnabled();
+    static bool drawRelocationDrain();
     void learnPendingRelocation();
+    void learnRelocation(const DrawRelocationPending& pending);
     void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);
     void reportDrawRelocation();
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
@@ -249,7 +251,7 @@ private:
     HeapDirect materializeHeapDirect(const DrawStageContext& context, std::size_t i, const ShaderRecompiler::PreparedShaderInvocation& invocation, const ShaderRecompiler::RecompileRequest& request, PerformanceTimer& timing);
     static std::runtime_error stageFailure(const DrawProgram& program, const ShaderRecompiler::RecompileRequest& request, const std::exception& error, std::span<const ShaderRecompiler::MemoryRegion> regions);
     static void recordStageDataPositions(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture, const std::vector<Graphics::DecodeRead>& decodeReads);
-    void cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<StageDataHit>& stageData, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, bool shapeNeedsEntry = false);
+    void cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<StageDataHit>& stageData, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, bool shapeNeedsEntry = false, const DrawRelocationPending* relocationPending = nullptr);
     static bool drawPrecheck();
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::size_t packetOffset, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect);
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);

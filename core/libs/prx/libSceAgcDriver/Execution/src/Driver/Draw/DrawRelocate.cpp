@@ -33,6 +33,11 @@ bool Driver::drawRelocationEnabled() {
     return enabled;
 }
 
+bool Driver::drawRelocationDrain() {
+    static const bool drain = std::getenv("APS5_RELOCATION_DRAIN") != nullptr;
+    return drain;
+}
+
 std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::uint32_t value, bool& readable) {
     std::uint64_t hash = 0x9e3779b97f4a7c15ull;
     const auto mix = [&](std::uint64_t mixed) {
@@ -218,6 +223,10 @@ std::size_t dropEveryOther(TMap& map) {
 void Driver::learnPendingRelocation() {
     const auto pending = drawRelocationPending;
     drawRelocationPending = {};
+    learnRelocation(pending);
+}
+
+void Driver::learnRelocation(const DrawRelocationPending& pending) {
     if (pending.key == 0) return;
     const auto inserted = drawCache.find(pending.key);
     if (inserted == drawCache.end() || inserted->second->decode == nullptr) return;
