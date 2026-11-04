@@ -3674,6 +3674,26 @@ std::size_t ShaderResources::LookupLogCapacity() {
 // registry mutex), so the pending-image checks are skipped; otherwise one scan answers them for
 // every surface at once. The stamp checks go through one tracker lock, the cache checks through
 // the images' cached flags and one touch of the cache.
+namespace {
+// APS5_VERIFY_TEMPLATE_PROOFS: every fast proof that took a stamp proves again without stamps, and
+// every epoch shortcut that held only through range proofs proves in full; the draw takes that
+// answer, and the ones that disagree are counted ([template-proof-verify] on stderr).
+bool TemplateProofVerify() {
+    static const bool on = std::getenv("APS5_VERIFY_TEMPLATE_PROOFS") != nullptr;
+    return on;
+}
+
+thread_local bool stampVerifying = false;
+
+void noteTemplateProofCheck(bool stamp, bool failed) {
+    static std::atomic<std::uint64_t> stampChecks{0}, stampFailures{0}, rangeChecks{0}, rangeFailures{0};
+    if (failed) (stamp ? stampFailures : rangeFailures).fetch_add(1, std::memory_order_relaxed);
+    (stamp ? stampChecks : rangeChecks).fetch_add(1, std::memory_order_relaxed);
+    const auto count = stampChecks.load(std::memory_order_relaxed) + rangeChecks.load(std::memory_order_relaxed);
+    if (failed || count % 262144u == 0u || (count & (count - 1u)) == 0u) std::fprintf(stderr, "[template-proof-verify] stamps: %llu checked, %llu failed; range proofs: %llu checked, %llu failed\n", static_cast<unsigned long long>(stampChecks.load()), static_cast<unsigned long long>(stampFailures.load()), static_cast<unsigned long long>(rangeChecks.load()), static_cast<unsigned long long>(rangeFailures.load()));
+}
+}
+
 bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted, bool compares) {
     reason = FastFail::Count;
     overlapping.clear();
@@ -3714,7 +3734,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     // An object another template proved cleanly under the same collect epoch and serials
     // (FastProofStamp) is taken as proved. The T1 rerun (`refreshed`) proves everything itself, and
     // untracked surfaces keep their per-template stamps (untrackedRangeStamp).
-    const bool stamps = !RuntimeSwitches::Set(RuntimeSwitch::NoTextureProofStamps) && refreshed.empty();
+    const bool stamps = !stampVerifying && !RuntimeSwitches::Set(RuntimeSwitch::NoTextureProofStamps) && refreshed.empty();
     FastProofStamp now{};
     if (stamps) {
         now.epoch = GuestMemory::CollectEpoch();
@@ -3946,6 +3966,15 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             stamp.source = image;
             image->FastProof() = stamp;
         }
+    }
+    if (stamps && TemplateProofVerify() && std::find(taken.begin(), taken.end(), std::uint8_t{1}) != taken.end()) {
+        struct Verifying {
+            Verifying() { stampVerifying = true; }
+            ~Verifying() { stampVerifying = false; }
+        } verifying;
+        const bool ok = fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted, compares);
+        noteTemplateProofCheck(true, !ok);
+        return ok;
     }
     return true;
 }
@@ -4237,9 +4266,16 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             return ranges != nullptr && GuestMemory::RangeProofHolds(provedProof, *ranges);
         };
         if (epoch != 0 && provedEpoch == epoch && provedPending == pending && (provedProof == proof || ranged())) {
+            const bool throughRanges = provedProof != proof;
             provedProof = proof;
             for (const auto& texture : textures) {
                 if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
+            }
+            if (throughRanges && TemplateProofVerify()) {
+                const bool ok = revalidateFull(shaders, report);
+                noteTemplateProofCheck(false, !ok);
+                if (!ok) provedEpoch = 0;
+                return ok;
             }
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
             thread_local std::uint64_t reuses = 0;

@@ -2673,6 +2673,20 @@ PassAccessMemo& passAccessMemo() {
     return HostThreadLocal<PassAccessMemo, PassAccessMemoStorage>();
 }
 
+// APS5_VERIFY_PASS_ACCESS_MEMO: every draw the memo would serve derives its access again and records
+// with it; the ones whose kept access differs are counted ([pass-access-verify] on stderr).
+bool PassAccessMemoVerify() {
+    static const bool on = std::getenv("APS5_VERIFY_PASS_ACCESS_MEMO") != nullptr;
+    return on;
+}
+
+void notePassAccessCheck(bool differed) {
+    static std::atomic<std::uint64_t> checks{0}, differences{0};
+    if (differed) differences.fetch_add(1, std::memory_order_relaxed);
+    const auto count = checks.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (differed || count % 262144u == 0u || (count & (count - 1u)) == 0u) std::fprintf(stderr, "[pass-access-verify] %llu checked, %llu differed\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differences.load()));
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
@@ -2688,7 +2702,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const auto passKey = DrawRenderPassKey(context, state, record.targetViews);
     auto& memo = passAccessMemo();
     const bool memoUsable = !resources.HoldsLease() && !resources.UsesAddressTable() && !RuntimeSwitches::Set(RuntimeSwitch::NoPassAccessMemo);
-    const bool memoHit = memoUsable && memo.recorder == recorder && memo.generation == recorder->RenderPassGeneration() && memo.resources == &resources && std::ranges::equal(memo.targets, record.targets, [](const StorageTexture* kept, const std::shared_ptr<StorageTexture>& target) { return kept == target.get(); });
+    const bool memoMatched = memoUsable && memo.recorder == recorder && memo.generation == recorder->RenderPassGeneration() && memo.resources == &resources && std::ranges::equal(memo.targets, record.targets, [](const StorageTexture* kept, const std::shared_ptr<StorageTexture>& target) { return kept == target.get(); });
+    const bool memoHit = memoMatched && !PassAccessMemoVerify();
     const bool readsTarget = memoHit ? memo.readsTarget : std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
     // address-based build), or over its GPU-side records, lands before it, as before a dispatch
@@ -2769,6 +2784,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passWriteOnly = writeOnly;
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
+    if (memoMatched && !memoHit) {
+        const bool same = memo.readsTarget == readsTarget && std::ranges::equal(memo.reads, std::span(passReads).first(ownReads)) && std::ranges::equal(memo.writes, passWrites) && std::ranges::equal(memo.writeOnly, passWriteOnly) && std::ranges::equal(memo.images, passImages);
+        notePassAccessCheck(!same);
+    }
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     resources.RequireGuestBuffers();
     if (UsesMeshWindow(shaders)) PrepareMeshWindow(context);
