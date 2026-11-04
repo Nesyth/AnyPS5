@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -9,6 +10,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
+#include <mutex>
+#include <optional>
 #include <array>
 #include <limits>
 #include <string>
@@ -421,6 +424,14 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     StartCommitterSampler();
+    // A run of draws under one GPU lock hold (APS5_NO_LEAN_RUNS turns it off): the hold that
+    // commits one draw stays for the next while the next item is a draw already queued, up to
+    // LeanRunCap draws and while no other thread is blocked on the lock. A non-draw item, an empty
+    // queue, a failure and a waiting thread end the run. Each draw still takes its own (nested)
+    // hold, labels and submit check in commitDraw.
+    constexpr std::size_t LeanRunCap = 32;
+    std::optional<std::unique_lock<GuestMemory::GpuMutexType>> runHold;
+    std::size_t runLength = 0;
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
@@ -445,6 +456,13 @@ void DrawPipeline::run() {
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
+        if (!isDraw || commit == nullptr || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLeanRuns)) {
+            runHold.reset();
+        } else if (!runHold) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+            runHold.emplace(GuestMemory::GpuMutex());
+            runLength = 0;
+        }
         try {
             if (commit != nullptr) (*commit)();
             if (rangedItem) {
@@ -462,22 +480,29 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         }
         const auto spent = elapsedNs(start);
+        if (fatal != nullptr) runHold.reset();
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
-        std::lock_guard lock(mutex);
-        countWrites(items.front().writes, false);
-        retired.push_back(std::move(items.front()));
-        items.pop_front();
-        retiredItems.fetch_add(1, std::memory_order_release);
-        ++commits;
-        commitNs += spent;
-        if (failed) ++commitErrors;
-        if (fatal != nullptr && failure == nullptr) failure = fatal;
-        outstanding.fetch_sub(1, std::memory_order_release);
-        if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
+        bool keepRun = false;
+        {
+            std::lock_guard lock(mutex);
+            countWrites(items.front().writes, false);
+            retired.push_back(std::move(items.front()));
+            items.pop_front();
+            retiredItems.fetch_add(1, std::memory_order_release);
+            ++commits;
+            commitNs += spent;
+            if (failed) ++commitErrors;
+            if (fatal != nullptr && failure == nullptr) failure = fatal;
+            outstanding.fetch_sub(1, std::memory_order_release);
+            if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
+            keepRun = runHold.has_value() && !stopped && !closing && !items.empty() && items.front().draw && ++runLength < LeanRunCap && idleWaiters == 0;
+        }
+        if (runHold && (!keepRun || GuestMemory::GpuMutex().HasWaiters())) runHold.reset();
     }
+    runHold.reset();
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
 

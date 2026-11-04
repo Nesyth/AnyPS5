@@ -176,6 +176,9 @@ public:
     // current acquisition is the outermost, so code that releases the mutex around a wait
     // (Recorder::SyncThrough for the flush hook) gives up no caller's hold.
     std::uint32_t DepthOnThisThread() const;
+    // Whether another thread is blocked on the mutex: a holder that could let it go between two
+    // pieces of work does so (the committer's runs of draws).
+    bool HasWaiters() const { return mutex.HasWaiters(); }
 
 private:
     void enter();
