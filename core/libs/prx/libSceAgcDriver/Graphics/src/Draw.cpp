@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
@@ -2648,6 +2649,30 @@ bool WriteOnlyPasses() {
     return enabled;
 }
 
+// The template's own part of a draw's pass access (APS5_NO_PASS_ACCESS_MEMO turns it off): its
+// device reads after the write-only filter, its hazard writes and write-only ranges, its storage
+// images and whether it reads one of its targets. The same template drawn into the same targets
+// within the same render pass takes them from here instead of deriving them again; the draw's own
+// reads (in-place vertex and index ranges, GPU-side indirect records) are added per draw. The
+// pass keeps the template alive, so the pointer cannot name another object while it lasts.
+// Address-based and address-table builds never use it.
+struct PassAccessMemo {
+    const Recorder* recorder = nullptr;
+    std::uint64_t generation = 0;
+    const ShaderResources* resources = nullptr;
+    std::vector<const StorageTexture*> targets;
+    bool readsTarget = false;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writeOnly;
+    std::vector<std::pair<VkImage, bool>> images;
+};
+struct PassAccessMemoStorage {};
+
+PassAccessMemo& passAccessMemo() {
+    return HostThreadLocal<PassAccessMemo, PassAccessMemoStorage>();
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
@@ -2661,7 +2686,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // draw neither reads its attachments (a barrier would be owed, which no pass allows) nor
     // records anything outside a pass (an indirect draw's argument barrier and scratch copies).
     const auto passKey = DrawRenderPassKey(context, state, record.targetViews);
-    const bool readsTarget = std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
+    auto& memo = passAccessMemo();
+    const bool memoUsable = !resources.HoldsLease() && !resources.UsesAddressTable() && !RuntimeSwitches::Set(RuntimeSwitch::NoPassAccessMemo);
+    const bool memoHit = memoUsable && memo.recorder == recorder && memo.generation == recorder->RenderPassGeneration() && memo.resources == &resources && std::ranges::equal(memo.targets, record.targets, [](const StorageTexture* kept, const std::shared_ptr<StorageTexture>& target) { return kept == target.get(); });
+    const bool readsTarget = memoHit ? memo.readsTarget : std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
     // address-based build), or over its GPU-side records, lands before it, as before a dispatch
     // (VulkanDevice::dispatch); the flush ends an open pass, so it comes before the decision.
@@ -2687,14 +2715,17 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* passReadsSlot = nullptr;
     auto& passReads = ShaderRecompiler::ThreadOwned(passReadsSlot);
     passReads.clear();
-    if (!addressBased) resources.DeviceReads(passReads);
+    if (memoHit) passReads.assign(memo.reads.begin(), memo.reads.end());
+    else if (!addressBased) resources.DeviceReads(passReads);
     const auto deviceReads = passReads.size();
     if (gpuIndirect) {
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
     passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
-    const auto passImages = resources.StorageImages();
+    std::vector<std::pair<VkImage, bool>> ownImages;
+    if (!memoHit) ownImages = resources.StorageImages();
+    const std::span<const std::pair<VkImage, bool>> passImages = memoHit ? std::span<const std::pair<VkImage, bool>>(memo.images) : std::span<const std::pair<VkImage, bool>>(ownImages);
     std::vector<std::pair<VkImage, bool>> passAttachments;
     passAttachments.reserve(record.targets.size());
     for (const auto& target : record.targets) {
@@ -2711,8 +2742,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownWrites = ((addressBased || resources.UsesAddressTable()) && !readOnlyBda) || resources.HasCopiedWrites();
     GuestRangeList passWrites = resources.GpuWrites();
     GuestRangeList passWriteOnly{};
+    std::size_t ownReads = deviceReads;
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* hazardWritesSlot = nullptr;
-    if (const auto& writeOnly = resources.WriteOnlyRanges(); !writeOnly.empty() && !unknownMemory && WriteOnlyPasses()) {
+    if (memoHit) {
+        passWrites = memo.writes;
+        passWriteOnly = memo.writeOnly;
+    } else if (const auto& writeOnly = resources.WriteOnlyRanges(); !writeOnly.empty() && !unknownMemory && WriteOnlyPasses()) {
         const auto listed = [&](const std::pair<std::uint64_t, std::uint64_t>& range, bool aligned) {
             return std::any_of(writeOnly.begin(), writeOnly.end(), [&](const auto& only) {
                 if (!aligned) return only == range;
@@ -2721,8 +2756,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
                 return range.first == begin && range.second == end;
             });
         };
-        const auto ownReads = passReads.begin() + static_cast<std::ptrdiff_t>(deviceReads);
-        passReads.erase(std::remove_if(passReads.begin(), ownReads, [&](const auto& range) { return listed(range, true); }), ownReads);
+        const auto ownEnd = passReads.begin() + static_cast<std::ptrdiff_t>(deviceReads);
+        const auto kept = std::remove_if(passReads.begin(), ownEnd, [&](const auto& range) { return listed(range, true); });
+        ownReads = static_cast<std::size_t>(kept - passReads.begin());
+        passReads.erase(kept, ownEnd);
         auto& hazardWrites = ShaderRecompiler::ThreadOwned(hazardWritesSlot);
         hazardWrites.clear();
         for (const auto& range : resources.GpuWrites()) {
@@ -2736,6 +2773,19 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     resources.RequireGuestBuffers();
     if (UsesMeshWindow(shaders)) PrepareMeshWindow(context);
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || captured || !record.staged.empty() || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
+    // The memo names the pass the draw now records in.
+    if (memoUsable && !memoHit) {
+        memo.recorder = recorder;
+        memo.resources = &resources;
+        memo.targets.clear();
+        for (const auto& target : record.targets) memo.targets.push_back(target.get());
+        memo.readsTarget = readsTarget;
+        memo.reads.assign(passReads.begin(), passReads.begin() + static_cast<std::ptrdiff_t>(ownReads));
+        memo.writes.assign(passWrites.begin(), passWrites.end());
+        memo.writeOnly.assign(passWriteOnly.begin(), passWriteOnly.end());
+        memo.images.assign(passImages.begin(), passImages.end());
+    }
+    if (memoUsable) memo.generation = recorder->RenderPassGeneration();
     if (record.spaceKeep != nullptr) *record.spaceKeep = reserveSpaceKeep(*recorder, resources);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
