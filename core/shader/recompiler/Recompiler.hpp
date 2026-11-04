@@ -369,6 +369,7 @@ struct SpirvTarget {
     bool hostInterpolationFirst = false;
     bool shaderImageMinLod = false;
     bool deviceImageTables = false;
+    bool float16HostNans = false;
 };
 
 struct BindingLayout {
