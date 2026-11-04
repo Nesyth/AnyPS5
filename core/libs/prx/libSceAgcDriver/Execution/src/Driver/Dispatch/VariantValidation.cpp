@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -45,6 +46,25 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::patchDataWords(
         if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = words[variant.dataPositions[k]];
     }
     return patched;
+}
+
+void Driver::takeStageData(StageDataHit& hit, const DispatchVariant& variant) {
+    const auto& compiled = *variant.compiled;
+    const bool side = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoStageDataSideCars) && variant.ringTemplate == nullptr && !compiled.gpuResolvedImages && compiled.heapTemplateId == 0 && variant.flatBinding < compiled.bindings.size();
+    if (!side) {
+        hit.compiled = patchDataWords(variant, hit.words);
+        hit.side = nullptr;
+        return;
+    }
+    auto words = std::make_shared<ShaderRecompiler::HeapStageWords>();
+    words->bindings.resize(compiled.bindings.size());
+    auto& descriptor = words->bindings[variant.flatBinding];
+    descriptor = compiled.bindings[variant.flatBinding].guestDescriptor;
+    for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
+        if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = hit.words[variant.dataPositions[k]];
+    }
+    hit.compiled = variant.compiled;
+    hit.side = std::move(words);
 }
 
 bool Driver::syncPendingRuns(std::uint64_t program, std::uint32_t queue, const ShaderRecompiler::RecompileResult& compiled, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& synced, PendingView& pending, std::optional<SampledReadScope>& sampling, std::span<const VouchedRegions> skipped) {

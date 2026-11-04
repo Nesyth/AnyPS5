@@ -167,7 +167,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             for (const auto& [position, value] : liveData) hit.words[position] = value;
                             regions.clear();
                             appendEntryRegions(*variant, regions, &hit.words);
-                            hit.compiled = patchDataWords(*variant, hit.words);
+                            takeStageData(hit, *variant);
                             ++dataStages;
                             dataWords += liveData.size();
                         }

@@ -84,9 +84,14 @@ struct DrawEntry {
 
 using DrawDataCandidates = std::vector<std::vector<std::pair<std::shared_ptr<DispatchVariant>, std::vector<ShaderRecompiler::MemoryRegion>>>>;
 
+// A stage that matched its variant except for data words. `compiled` is the stage the draw
+// records: a copy of the variant's with the flattened SRT words patched, or, with a side car, the
+// variant's own, while `side` holds the patched words for DrawGuestWords (non-heap stages without a
+// ring template; APS5_NO_STAGE_DATA_SIDE_CARS turns it off).
 struct StageDataHit {
     std::vector<std::uint32_t> words;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+    std::shared_ptr<const ShaderRecompiler::HeapStageWords> side;
 };
 
 enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };

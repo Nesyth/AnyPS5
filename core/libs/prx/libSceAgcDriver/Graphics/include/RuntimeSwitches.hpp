@@ -17,6 +17,7 @@ enum class RuntimeSwitch : std::size_t {
     NoLeanRuns,
     NoPassAccessMemo,
     NoRangedDispatchBreaks,
+    NoStageDataSideCars,
     Count,
 };
 
