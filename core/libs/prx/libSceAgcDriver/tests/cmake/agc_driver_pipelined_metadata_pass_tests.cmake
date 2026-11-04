@@ -1,5 +1,5 @@
 if(BUILD_TESTING)
-    agc_add_draw_pipeline_test(agc_driver_pipelined_metadata_pass)
+    agc_add_draw_pipeline_test(agc_driver_pipelined_metadata_pass PIPELINE_ONLY)
 endif()
 
 if(BUILD_TESTING)
