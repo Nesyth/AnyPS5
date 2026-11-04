@@ -408,6 +408,10 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held, %llu decode drains", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(decodeDrainCount - reportedDecodeDrains));
     reportedDecodeDrains = decodeDrainCount;
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
+    // The census of what moves template proofs (APS5_STAGE_STATS counts them): breaks by site, why
+    // the epoch shortcut missed, and the objects taken from another template's proof.
+    static const bool census = std::getenv("APS5_STAGE_STATS") != nullptr;
+    if (census) AgcDriver::ProfilePrint_nid_no_patch("[proof-breaks] 10 s: BreakProofs by site:%s; epoch shortcut misses: %s; fast-proof stamps taken so far %llu\n", GuestMemory::TakeProofBreakReport().c_str(), Graphics::ShaderResources::TakeEpochMissReport().c_str(), static_cast<unsigned long long>(Graphics::ShaderResources::FastProofStampsTaken()));
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     drains = {};
     drainWaitNs = {};
