@@ -7,6 +7,7 @@
 #include <array>
 #ifdef APS5_COUNT_MAPPING_QUERIES
 #include <atomic>
+#include <chrono>
 #endif
 #include <cstdio>
 #include <cstddef>
@@ -275,6 +276,32 @@ public:
             if (pins != 0) --pins;
             invalidate(it->first, it->second);
         }
+    }
+
+    // Diagnostic: one read-only GetWriteWatch pass over every write-watched range, as a sweep per
+    // collect epoch would make it. out: private bytes, their written pages, watched resident bytes,
+    // their written pages, calls, nanoseconds (added to).
+    void SweepWriteWatch(std::uint64_t* out) {
+        std::lock_guard lock(mutex);
+        std::vector<void*> pages(65536);
+        const auto sweep = [&](std::uintptr_t begin, std::uintptr_t end, std::uint64_t& bytes, std::uint64_t& written) {
+            bytes += end - begin;
+            for (auto cursor = begin; cursor < end;) {
+                ULONG_PTR count = pages.size();
+                DWORD granularity = 0;
+                ++out[4];
+                if (GetWriteWatch(0, reinterpret_cast<void*>(cursor), end - cursor, pages.data(), &count, &granularity) != 0) return;
+                written += count;
+                if (count < pages.size()) return;
+                cursor = reinterpret_cast<std::uintptr_t>(pages[count - 1]) + 4096;
+            }
+        };
+        const auto start = std::chrono::steady_clock::now();
+        for (const auto& [begin, end] : privateAllocations) sweep(begin, end, out[0], out[1]);
+        for (const auto& [begin, run] : residentRuns) {
+            if (run.watched) sweep(begin, run.end, out[2], out[3]);
+        }
+        out[5] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
     }
 
     void DescribeViews(std::uintptr_t address, std::size_t bytes, std::uint64_t* out) {

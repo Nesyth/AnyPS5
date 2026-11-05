@@ -128,6 +128,9 @@ void BreakProofs(ProofBreak site, std::uint64_t begin, std::uint64_t end);
 bool RangeProofs();
 bool RangeProofHolds(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 std::string TakeProofBreakReport();
+// Diagnostic (APS5_STAGE_STATS): what one read-only write-watch sweep of the whole arena costs now,
+// and the collect epoch bumps since the last report ([proof-breaks] line).
+std::string SweepCostReport();
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();

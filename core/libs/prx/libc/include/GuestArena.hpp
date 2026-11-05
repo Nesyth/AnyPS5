@@ -71,6 +71,11 @@ void GuestArenaUnmapAlias_nid_postfix(void* alias);
 bool GuestArenaResidentSpan_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uintptr_t* start, std::uintptr_t* end);
 void GuestArenaCompareWhenShared_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void GuestArenaDescribeViews_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* out);
+void GuestArenaSweepWriteWatch_nid_no_patch(std::uint64_t* out);
+// Diagnostic (APS5_FAULT_SITES): the code addresses of write faults on armed guest pages, with counts
+// since start-up; at most `capacity` sites are taken.
+void GuestArenaNoteWriteFault_nid_no_patch(std::uintptr_t rip);
+std::size_t GuestArenaFaultSites_nid_no_patch(std::uintptr_t* rips, std::uint64_t* counts, std::size_t capacity, std::uint64_t* dropped);
 void GuestArenaCompareResidentWhenShared_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void GuestArenaComparedPages_nid_no_patch(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count);
 void GuestArenaTakeUnreportedPages_nid_no_patch(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count);

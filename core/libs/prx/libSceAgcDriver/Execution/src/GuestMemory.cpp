@@ -1762,11 +1762,19 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 }
 #endif
 
+// Diagnostic (APS5_STAGE_STATS, [proof-breaks] line): walks, the bytes they scan and the pages they
+// find written; byte compares and how many of them found a difference.
+std::array<std::atomic<std::uint64_t>, 8> writeRates{};
+
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr) {
     ++tracker.generation;
     StampRuns runs{tracker, kind, 0, window, {}};
 #ifdef _WIN32
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
+    writeRates[0].fetch_add(1, std::memory_order_relaxed);
+    writeRates[1].fetch_add(stop - first, std::memory_order_relaxed);
+    writeRates[2].fetch_add(runs.stamped, std::memory_order_relaxed);
+    if (runs.stamped != 0) writeRates[3].fetch_add(1, std::memory_order_relaxed);
 #else
     const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
     const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
@@ -2081,6 +2089,37 @@ std::string TakeProofBreakReport() {
 
 void MarkProofThread() {
     proofThread = true;
+}
+
+std::string SweepCostReport() {
+    static std::uint64_t reportedBumps = 0;
+    std::array<std::uint64_t, 6> out{};
+    GuestArena::GuestArenaSweepWriteWatch_nid_no_patch(out.data());
+    const auto bumps = collectEpochBumps.load(std::memory_order_relaxed);
+    std::array<unsigned long long, 8> rates{};
+    for (std::size_t index = 0; index < rates.size(); ++index) rates[index] = writeRates[index].exchange(0, std::memory_order_relaxed);
+    char text[512];
+    std::snprintf(text, sizeof(text), "write-watch sweep %.1f us in %llu calls over %.1f MiB private (%llu pages written) and %.1f MiB watched resident (%llu pages written); %llu epoch bumps since the last report; walks %llu over %.1f MiB found %llu pages written (%llu walks with any); compares %llu over %.1f MiB, %llu differed over %.1f MiB", static_cast<double>(out[5]) / 1e3, static_cast<unsigned long long>(out[4]), static_cast<double>(out[0]) / 1048576.0, static_cast<unsigned long long>(out[1]), static_cast<double>(out[2]) / 1048576.0, static_cast<unsigned long long>(out[3]), static_cast<unsigned long long>(bumps - reportedBumps), rates[0], static_cast<double>(rates[1]) / 1048576.0, rates[2], rates[3], rates[4], static_cast<double>(rates[5]) / 1048576.0, rates[6], static_cast<double>(rates[7]) / 1048576.0);
+    reportedBumps = bumps;
+#ifdef _WIN32
+    // APS5_FAULT_SITES=<file>: every write-fault site on armed pages so far, with the main module's base.
+    if (const char* path = std::getenv("APS5_FAULT_SITES"); path != nullptr && *path != 0) {
+        std::vector<std::uintptr_t> rips(4096);
+        std::vector<std::uint64_t> counts(4096);
+        std::uint64_t dropped = 0;
+        const auto taken = GuestArena::GuestArenaFaultSites_nid_no_patch(rips.data(), counts.data(), rips.size(), &dropped);
+        std::uint64_t total = 0;
+        for (std::size_t index = 0; index < taken; ++index) total += counts[index];
+        if (FILE* file = std::fopen(path, "w"); file != nullptr) {
+            std::fprintf(file, "# base 0x%llx sites %zu faults %llu dropped %llu\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))), taken, static_cast<unsigned long long>(total), static_cast<unsigned long long>(dropped));
+            for (std::size_t index = 0; index < taken; ++index) std::fprintf(file, "0x%llx %llu\n", static_cast<unsigned long long>(rips[index]), static_cast<unsigned long long>(counts[index]));
+            std::fclose(file);
+        }
+        const auto length = std::strlen(text);
+        std::snprintf(text + length, sizeof(text) - length, "; armed write faults so far %llu at %zu sites", static_cast<unsigned long long>(total), taken);
+    }
+#endif
+    return text;
 }
 
 std::uint64_t CollectEpoch() {
@@ -3187,7 +3226,14 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
     noteCompareKinds(address, bytes.size());
     FlushGpuWrites(address, bytes.size());
-    return EqualsCommittedUnsynced(address, bytes);
+    const bool equal = EqualsCommittedUnsynced(address, bytes);
+    writeRates[4].fetch_add(1, std::memory_order_relaxed);
+    writeRates[5].fetch_add(bytes.size(), std::memory_order_relaxed);
+    if (!equal) {
+        writeRates[6].fetch_add(1, std::memory_order_relaxed);
+        writeRates[7].fetch_add(bytes.size(), std::memory_order_relaxed);
+    }
+    return equal;
 }
 
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes) {

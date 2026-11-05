@@ -667,6 +667,39 @@ bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleWrite(address);
 }
 
+namespace {
+constexpr std::size_t FaultSiteSlots = 4096;
+std::array<std::atomic<std::uintptr_t>, FaultSiteSlots> faultSiteRips{};
+std::array<std::atomic<std::uint64_t>, FaultSiteSlots> faultSiteCounts{};
+std::atomic<std::uint64_t> faultSitesDropped{0};
+}
+
+void GuestArenaNoteWriteFault_nid_no_patch(std::uintptr_t rip) {
+    auto slot = static_cast<std::size_t>((rip * 0x9E3779B97F4A7C15ull) >> 52);
+    for (std::size_t probe = 0; probe < 64; ++probe, slot = (slot + 1) % FaultSiteSlots) {
+        auto current = faultSiteRips[slot].load(std::memory_order_relaxed);
+        if (current == 0 && faultSiteRips[slot].compare_exchange_strong(current, rip, std::memory_order_relaxed)) current = rip;
+        if (current == rip) {
+            faultSiteCounts[slot].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    faultSitesDropped.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::size_t GuestArenaFaultSites_nid_no_patch(std::uintptr_t* rips, std::uint64_t* counts, std::size_t capacity, std::uint64_t* dropped) {
+    std::size_t taken = 0;
+    for (std::size_t slot = 0; slot < FaultSiteSlots && taken < capacity; ++slot) {
+        const auto rip = faultSiteRips[slot].load(std::memory_order_relaxed);
+        if (rip == 0) continue;
+        rips[taken] = rip;
+        counts[taken] = faultSiteCounts[slot].load(std::memory_order_relaxed);
+        ++taken;
+    }
+    *dropped = faultSitesDropped.load(std::memory_order_relaxed);
+    return taken;
+}
+
 bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleRead(address);
 }
@@ -783,6 +816,10 @@ bool GuestArenaResidentSpan_nid_postfix(std::uintptr_t address, std::size_t byte
 
 void GuestArenaDescribeViews_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* out) {
     WindowsMappings::Get().DescribeViews(address, bytes, out);
+}
+
+void GuestArenaSweepWriteWatch_nid_no_patch(std::uint64_t* out) {
+    WindowsMappings::Get().SweepWriteWatch(out);
 }
 
 void GuestArenaCompareWhenShared_nid_no_patch(std::uintptr_t address, std::size_t bytes) {

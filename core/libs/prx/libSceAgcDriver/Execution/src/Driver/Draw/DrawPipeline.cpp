@@ -414,7 +414,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     // The census of what moves template proofs (APS5_STAGE_STATS counts them): breaks by site, why
     // the epoch shortcut missed, and the objects taken from another template's proof.
     static const bool census = std::getenv("APS5_STAGE_STATS") != nullptr;
-    if (census) AgcDriver::ProfilePrint_nid_no_patch("[proof-breaks] 10 s: BreakProofs by site:%s; epoch shortcut misses: %s; fast-proof stamps taken so far %llu\n", GuestMemory::TakeProofBreakReport().c_str(), Graphics::ShaderResources::TakeEpochMissReport().c_str(), static_cast<unsigned long long>(Graphics::ShaderResources::FastProofStampsTaken()));
+    if (census) AgcDriver::ProfilePrint_nid_no_patch("[proof-breaks] 10 s: BreakProofs by site:%s; epoch shortcut misses: %s; fast-proof stamps taken so far %llu; %s\n", GuestMemory::TakeProofBreakReport().c_str(), Graphics::ShaderResources::TakeEpochMissReport().c_str(), static_cast<unsigned long long>(Graphics::ShaderResources::FastProofStampsTaken()), GuestMemory::SweepCostReport().c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     drains = {};
     drainWaitNs = {};
