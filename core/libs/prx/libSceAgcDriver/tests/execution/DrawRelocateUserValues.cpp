@@ -121,8 +121,11 @@ void BufferValueWordsArePatchedInTheirBinding() {
     Require(variant->valueWords == ((1u << 4u) | (1u << 6u)), "the base and record words of a read-only V# in user data were not tagged (mask " + std::to_string(variant->valueWords) + ")");
     Require(variant->valueSlots.size() == 2u && variant->valueSlots[0] == std::array<std::uint32_t, 3>{4u, 0u, 0u} && variant->valueSlots[1] == std::array<std::uint32_t, 3>{6u, 0u, 2u}, "the tagged V# words do not name their binding words");
     variant->descriptorPatches = {{0u, 0u, descriptor[0] + 0x100u}, {0u, 2u, 7u}};
+    const auto donor = variant->compiled;
     Driver::applyShaderDataPatches(*variant);
-    const auto& patched = variant->compiled->bindings[0].guestDescriptor;
+    // With side cars (the default) the donor's stage stays and the patched words ride beside it.
+    const auto& patched = AgcDriver::Graphics::DrawGuestWords(*variant->compiled, variant->side.get(), variant->compiled->bindings[0]);
+    Require(variant->side == nullptr || (variant->compiled == donor && donor->bindings[0].guestDescriptor == descriptor), "the descriptor patches changed the donor's shared stage");
     Require(patched[0] == descriptor[0] + 0x100u && patched[1] == descriptor[1] && patched[2] == 7u && patched[3] == descriptor[3], "the descriptor patches did not move the bound V# base and record count");
     Require(variant->descriptorPatches.empty(), "the descriptor patches were kept after they were applied");
 

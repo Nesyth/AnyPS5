@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <source_location>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -43,8 +45,10 @@ constexpr char kLayerVersion23[] =
     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAACwAAABAAAABAAAAAAQYAAAAAAAAAAAAAAAAAADTvzasAAAA5"
     "AAAABAAAAAkAAAAAAXhWNBIBAQE5MAAAAAA=";
 
-void Require(bool condition) {
-    if (!condition) std::abort();
+void Require(bool condition, std::source_location where = std::source_location::current()) {
+    if (condition) return;
+    std::fprintf(stderr, "request serializer test failed at line %u\n", static_cast<unsigned>(where.line()));
+    std::abort();
 }
 
 template <typename TRange>
@@ -277,9 +281,24 @@ void VerifyHeapProfile(const ShaderRecompiler::RequestSerializer& serializer) {
     }
 }
 
+// The device image table flag is written only when set (version 58, one byte after version 55's).
+void VerifyDeviceImageTablesField(const ShaderRecompiler::RequestSerializer& serializer) {
+    const ShaderRecompiler::RecompileRequest defaults{};
+    const auto defaultBytes = DecodeBase64(serializer.Serialize(defaults));
+    Require(defaultBytes[4] == 55u);
+    ShaderRecompiler::RecompileRequest request{};
+    request.target.deviceImageTables = true;
+    const auto encoded = serializer.Serialize(request);
+    const auto bytes = DecodeBase64(encoded);
+    Require(bytes[4] == 58u && bytes.size() == defaultBytes.size() + 1u && bytes.back() == 1u);
+    const auto replay = serializer.Deserialize(encoded);
+    Require(replay.request.target.deviceImageTables && serializer.Serialize(replay.request) == encoded);
+    Require(!serializer.Deserialize(EncodeBase64(defaultBytes)).request.target.deviceImageTables);
+}
+
 void VerifyKeyedTargetFields(const ShaderRecompiler::RequestSerializer& serializer) {
     using Field = bool ShaderRecompiler::SpirvTarget::*;
-    constexpr std::array<Field, 7> fields{&ShaderRecompiler::SpirvTarget::deviceImageTables, &ShaderRecompiler::SpirvTarget::ldsLockFences, &ShaderRecompiler::SpirvTarget::meshWindowBuffer, &ShaderRecompiler::SpirvTarget::waveLdsMemoryBarriers, &ShaderRecompiler::SpirvTarget::deviceScopeLdsMemoryBarriers, &ShaderRecompiler::SpirvTarget::exactRobustLoads, &ShaderRecompiler::SpirvTarget::robustBufferAccess2};
+    constexpr std::array<Field, 6> fields{&ShaderRecompiler::SpirvTarget::ldsLockFences, &ShaderRecompiler::SpirvTarget::meshWindowBuffer, &ShaderRecompiler::SpirvTarget::waveLdsMemoryBarriers, &ShaderRecompiler::SpirvTarget::deviceScopeLdsMemoryBarriers, &ShaderRecompiler::SpirvTarget::exactRobustLoads, &ShaderRecompiler::SpirvTarget::robustBufferAccess2};
     const ShaderRecompiler::RecompileRequest defaults{};
     const auto defaultEncoded = serializer.Serialize(defaults);
     for (std::size_t chosen = 0; chosen <= fields.size(); ++chosen) {
@@ -775,7 +794,7 @@ int main() {
         const auto replay40 = serializer.Deserialize(EncodeBase64(version40));
         Require(!replay40.request.target.float32DenormPreserve && replay40.request.target.float32FlushToZero == !preserve);
         auto future = bytes;
-        future[4] = 58u;
+        future[4] = 56u;
         bool futureRejected = false;
         try {
             static_cast<void>(serializer.Deserialize(EncodeBase64(future)));
@@ -1000,7 +1019,7 @@ int main() {
         return false;
     };
     auto version46Dither = twoSample;
-    version46Dither.resize(version46Dither.size() - 13u);
+    version46Dither.resize(version46Dither.size() - 12u);
     version46Dither.pop_back();
     version46Dither.pop_back();
     version46Dither.pop_back();
@@ -1021,7 +1040,7 @@ int main() {
         auto bytes = WithoutHeapBufferDescriptors(DecodeBase64(encoded));
         Require(bytes.size() > 15u && bytes[4] == 55u && bytes[bytes.size() - 15u] == (subgroups ? 1u : 0u));
         Require(serializer.Deserialize(encoded).request.target.tessellationEvaluationSubgroups == subgroups);
-        bytes.resize(bytes.size() - 13u);
+        bytes.resize(bytes.size() - 12u);
         bytes.pop_back();
         bytes[4] = 52u;
         Require(serializer.Deserialize(EncodeBase64(bytes)).request.target.tessellationEvaluationSubgroups == subgroups);
@@ -1088,6 +1107,7 @@ int main() {
     request.target.shaderImageMinLod = false;
 
     VerifyHeapProfile(serializer);
+    VerifyDeviceImageTablesField(serializer);
     VerifyKeyedTargetFields(serializer);
     return 0;
 }
