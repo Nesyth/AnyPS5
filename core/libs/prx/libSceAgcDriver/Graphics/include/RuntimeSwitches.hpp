@@ -25,7 +25,6 @@ enum class RuntimeSwitch : std::size_t {
     NoPassAttachmentMemo,
     NoGuardSpans,
     NoHtileFixupCarry,
-    NoHeapBindingSkip,
     Count,
 };
 
