@@ -205,6 +205,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         thread = std::thread([this] {
             finisherThread = true;
             RaiseWorkerThreadPriority("draw finisher");
+            PlaceFinisherThread("draw finisher");
             run();
         });
         runningFinishers.fetch_add(1, std::memory_order_acq_rel);

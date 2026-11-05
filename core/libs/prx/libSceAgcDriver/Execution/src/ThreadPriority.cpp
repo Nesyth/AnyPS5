@@ -337,10 +337,17 @@ void RaiseWorkerThreadPriority(const char* role) {
     Raise(role);
 }
 
-void PlaceReservedThread(const char* role) {
 #ifdef _WIN32
-    if (std::getenv("APS5_NO_COMMITTER_CORE") != nullptr) return;
-    const char* text = std::getenv("APS5_COMMITTER_CPU");
+namespace {
+
+// Cores reserved for driver threads (CoreIndex values) and the threads that took them: a later
+// reservation keeps the earlier ones out of the process default and leaves their threads where they are.
+std::mutex reservationMutex;
+std::set<unsigned> reservedCores;
+std::set<DWORD> reservedThreads;
+
+void reserveCore(const char* role, const char* cpuVariable) {
+    const char* text = cpuVariable != nullptr ? std::getenv(cpuVariable) : nullptr;
     using GetInformation = BOOL(WINAPI*)(void*, ULONG, PULONG, HANDLE, ULONG);
     using SetCpuSets = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
     const auto kernel = GetModuleHandleW(L"kernel32.dll");
@@ -348,6 +355,7 @@ void PlaceReservedThread(const char* role) {
     const auto setDefault = reinterpret_cast<SetCpuSets>(reinterpret_cast<void*>(GetProcAddress(kernel, "SetProcessDefaultCpuSets")));
     const auto setSelected = reinterpret_cast<SetCpuSets>(reinterpret_cast<void*>(GetProcAddress(kernel, "SetThreadSelectedCpuSets")));
     if (getInformation == nullptr || setDefault == nullptr || setSelected == nullptr) return;
+    std::lock_guard lock(reservationMutex);
     ULONG bytes = 0;
     getInformation(nullptr, 0, &bytes, GetCurrentProcess(), 0);
     std::vector<unsigned char> buffer(bytes);
@@ -356,19 +364,26 @@ void PlaceReservedThread(const char* role) {
     // LogicalProcessorIndex at 14, CoreIndex at 15.
     const auto byteAt = [&](ULONG at) { return static_cast<unsigned>(buffer[at]); };
     const auto wordAt = [&](ULONG at) { ULONG value = 0; std::memcpy(&value, buffer.data() + at, sizeof(value)); return value; };
-    // Without APS5_COMMITTER_CPU: the first logical processor of the highest-numbered physical core, on a
-    // host with at least six cores (fewer would leave the title's spinning job workers too little room).
+    // Without the variable: the first logical processor of the highest-numbered physical core not reserved
+    // yet, on a host with at least six cores (fewer would leave the title's spinning job workers too little room).
     std::set<unsigned> cores;
     for (ULONG offset = 0; offset + 16 <= bytes && wordAt(offset) != 0; offset += wordAt(offset)) {
         if (wordAt(offset + 4) == 0) cores.insert(byteAt(offset + 15));
     }
     if (cores.empty() || ((text == nullptr || *text == 0) && cores.size() < 6)) return;
-    const unsigned lastCore = *cores.rbegin();
-    unsigned lastCoreFirst = 0x100;
-    for (ULONG offset = 0; offset + 16 <= bytes && wordAt(offset) != 0; offset += wordAt(offset)) {
-        if (wordAt(offset + 4) == 0 && byteAt(offset + 15) == lastCore) lastCoreFirst = std::min(lastCoreFirst, byteAt(offset + 14));
+    unsigned wanted = 0x100;
+    if (text != nullptr && *text != 0) {
+        wanted = static_cast<unsigned>(std::strtoul(text, nullptr, 10));
+    } else {
+        unsigned pick = 0x100;
+        for (auto it = cores.rbegin(); it != cores.rend() && pick == 0x100; ++it) {
+            if (!reservedCores.contains(*it)) pick = *it;
+        }
+        if (pick == 0x100) return;
+        for (ULONG offset = 0; offset + 16 <= bytes && wordAt(offset) != 0; offset += wordAt(offset)) {
+            if (wordAt(offset + 4) == 0 && byteAt(offset + 15) == pick) wanted = std::min(wanted, byteAt(offset + 14));
+        }
     }
-    const auto wanted = text != nullptr && *text != 0 ? static_cast<unsigned>(std::strtoul(text, nullptr, 10)) : lastCoreFirst;
     unsigned core = 0x100;
     ULONG own = 0;
     for (ULONG offset = 0; offset + 16 <= bytes && wordAt(offset) != 0; offset += wordAt(offset)) {
@@ -378,9 +393,11 @@ void PlaceReservedThread(const char* role) {
         }
     }
     if (core == 0x100) return;
+    reservedCores.insert(core);
+    reservedThreads.insert(GetCurrentThreadId());
     std::vector<ULONG> others;
     for (ULONG offset = 0; offset + 16 <= bytes && wordAt(offset) != 0; offset += wordAt(offset)) {
-        if (wordAt(offset + 4) == 0 && byteAt(offset + 15) != core) others.push_back(wordAt(offset + 8));
+        if (wordAt(offset + 4) == 0 && !reservedCores.contains(byteAt(offset + 15))) others.push_back(wordAt(offset + 8));
     }
     const bool process = setDefault(GetCurrentProcess(), others.data(), static_cast<ULONG>(others.size())) != 0;
     const bool thread = setSelected(GetCurrentThread(), &own, 1) != 0;
@@ -392,9 +409,8 @@ void PlaceReservedThread(const char* role) {
         THREADENTRY32 entry{};
         entry.dwSize = sizeof(entry);
         const DWORD processId = GetCurrentProcessId();
-        const DWORD self = GetCurrentThreadId();
         for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
-            if (entry.th32OwnerProcessID != processId || entry.th32ThreadID == self) continue;
+            if (entry.th32OwnerProcessID != processId || reservedThreads.contains(entry.th32ThreadID)) continue;
             if (const HANDLE other = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, entry.th32ThreadID); other != nullptr) {
                 if (setSelected(other, others.data(), static_cast<ULONG>(others.size()))) ++moved;
                 CloseHandle(other);
@@ -402,7 +418,25 @@ void PlaceReservedThread(const char* role) {
         }
         CloseHandle(snapshot);
     }
-    std::fprintf(stderr, "[placement] %s on logical %u (core %u reserved: process default %s, thread %s, %zu running threads moved; %zu other CPU sets)\n", role, wanted, core, process ? "set" : "failed", thread ? "set" : "failed", moved, others.size());
+    std::fprintf(stderr, "[placement] %s on logical %u (core %u reserved, %zu reserved in all: process default %s, thread %s, %zu running threads moved; %zu other CPU sets)\n", role, wanted, core, reservedCores.size(), process ? "set" : "failed", thread ? "set" : "failed", moved, others.size());
+}
+
+}
+#endif
+
+void PlaceReservedThread(const char* role) {
+#ifdef _WIN32
+    if (std::getenv("APS5_NO_COMMITTER_CORE") != nullptr) return;
+    reserveCore(role, "APS5_COMMITTER_CPU");
+#else
+    (void)role;
+#endif
+}
+
+void PlaceFinisherThread(const char* role) {
+#ifdef _WIN32
+    if (std::getenv("APS5_XP_FINISHER_CORE") == nullptr) return;
+    reserveCore(role, nullptr);
 #else
     (void)role;
 #endif
