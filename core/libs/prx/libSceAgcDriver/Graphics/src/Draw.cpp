@@ -3415,7 +3415,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     if (state.quadList || StripPatches(state, shaders)) recipeOut = nullptr;
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
-    if (AnyHeapShader(shaders)) recipeOut = nullptr;
+    // A GPU-mode (descriptor heap) draw gets a recipe only as a data recipe, whose hits write the
+    // draw's heap stage words as a template hit does (APS5_NO_HEAP_RECIPES turns it off).
+    if (AnyHeapShader(shaders) && (RuntimeSwitches::Set(RuntimeSwitch::NoHeapRecipes) || RuntimeSwitches::Set(RuntimeSwitch::NoDataRecipes))) recipeOut = nullptr;
     auto& timing = prepared.timing.emplace("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -4442,6 +4444,13 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
             return miss(DrawRecipeMiss::Moved);
         }
         moved = std::move(*found);
+    }
+    if (resources->HeapStage()) {
+        if (!recipe.perDrawMoves) {
+            timer.phase(PhaseLookup);
+            return miss(DrawRecipeMiss::Moved);
+        }
+        resources->RefreshHeapStage(shaders);
     }
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
     if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
