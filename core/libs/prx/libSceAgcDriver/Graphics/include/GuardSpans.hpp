@@ -40,6 +40,7 @@ enum class GuardSpanEvent : std::size_t { Clear, Refill, Overlap, Verified, Miss
 
 void NoteGuardSpans(GuardSpanEvent event);
 bool VerifyGuardSpans();
+void ReportGuardSpanMiss(const char* list, std::uint64_t address, std::uint64_t bytes);
 
 }
 

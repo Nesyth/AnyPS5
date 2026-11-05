@@ -262,8 +262,8 @@ std::atomic<std::uint64_t>& depthGuardGeneration() {
     return generation;
 }
 
-void publishDepthGuards() {
-    depthGuardGeneration().fetch_add(1, std::memory_order_release);
+void publishDepthGuards(bool changed) {
+    if (changed) depthGuardGeneration().fetch_add(1, std::memory_order_release);
     anyDepthGuard().store(!depthGuards().empty(), std::memory_order_release);
 }
 
@@ -283,9 +283,12 @@ bool mayOverlapDepthGuard(std::uint64_t address, std::uint64_t bytes) {
     NoteGuardSpans(GuardSpanEvent::Clear);
     if (!VerifyGuardSpans()) return false;
     std::shared_lock lock(depthGuardMutex());
-    const bool missed = std::ranges::any_of(depthGuards(), [&](const auto& range) { return address < range.address + range.bytes && range.address < address + bytes; });
-    NoteGuardSpans(missed ? GuardSpanEvent::Missed : GuardSpanEvent::Verified);
-    return missed;
+    const bool overlapped = std::ranges::any_of(depthGuards(), [&](const auto& range) { return address < range.address + range.bytes && range.address < address + bytes; });
+    const auto generation = depthGuardGeneration().load(std::memory_order_relaxed);
+    if (overlapped && generation != spans.Generation()) spans.Fill(generation, depthGuards());
+    if (overlapped && !spans.Overlaps(address, bytes)) ReportGuardSpanMiss("depth", address, bytes);
+    else NoteGuardSpans(GuardSpanEvent::Verified);
+    return overlapped;
 }
 
 struct DepthSamplingState {
@@ -3070,8 +3073,8 @@ void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t 
     for (const auto& range : depthGuards()) {
         if (overlaps(range) && !range.hostEverWritten->load(std::memory_order_acquire)) range.active->store(false, std::memory_order_release);
     }
-    std::erase_if(depthGuards(), [](const auto& range) { return !range.active->load(std::memory_order_acquire); });
-    publishDepthGuards();
+    const auto removed = std::erase_if(depthGuards(), [](const auto& range) { return !range.active->load(std::memory_order_acquire); });
+    publishDepthGuards(removed != 0);
 }
 
 void AppendHostWrittenDepthRanges(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
@@ -3128,8 +3131,8 @@ void RetireUnmappedDepth_nid_no_patch(std::uintptr_t address, std::size_t bytes)
     for (const auto& range : depthGuards()) {
         if (std::ranges::all_of(depthGuards(), [&](const auto& part) { return part.active != range.active || part.live.empty(); })) range.active->store(false, std::memory_order_release);
     }
-    std::erase_if(depthGuards(), [](const auto& range) { return !range.active->load(std::memory_order_acquire); });
-    publishDepthGuards();
+    const auto removed = std::erase_if(depthGuards(), [](const auto& range) { return !range.active->load(std::memory_order_acquire); });
+    publishDepthGuards(removed != 0);
 }
 
 bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples) {
@@ -3219,7 +3222,7 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
         if (target.samples != 1u && fresh.sampleable && fresh.sampling.refusal.empty()) {
             std::unique_lock guardLock(depthGuardMutex());
             for (const auto& range : fresh.sampling.initial) depthGuards().push_back({context.device, range.address, range.bytes, fresh.active, {{range.address, range.bytes, 0u}}, fresh.hostWritten, fresh.hostEverWritten});
-            publishDepthGuards();
+            publishDepthGuards(true);
             InstallResidentImageReadGuard_nid_no_patch();
             fresh.samplingActive = true;
         }
@@ -3660,8 +3663,8 @@ void ClearDepthSurfaces(VkDevice device) {
         std::erase_if(depthToStoragePasses(), [&](const auto& pass) { return pass->Device() == device; });
     }
     std::unique_lock guardLock(depthGuardMutex());
-    std::erase_if(depthGuards(), [&](const auto& range) { return range.device == device; });
-    publishDepthGuards();
+    const auto removed = std::erase_if(depthGuards(), [&](const auto& range) { return range.device == device; });
+    publishDepthGuards(removed != 0);
     UpdateResidentImageUnmapObserver_nid_no_patch();
 }
 
