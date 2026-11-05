@@ -3357,7 +3357,7 @@ bool VerifyPassAttachments() {
     return verify;
 }
 
-enum class AttachmentEvent : std::size_t { Hit, NoMemo, Pass, Serials, Targets, Images, Depth, Stored, Ineligible, Verified, Mismatch, Count };
+enum class AttachmentEvent : std::size_t { Hit, NoMemo, Pass, Serials, Targets, Images, Depth, Stored, Ineligible, Verified, Mismatch, MultisampleDepth, MultisampleColor, Count };
 
 void noteAttachments(AttachmentEvent event) {
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3369,7 +3369,7 @@ void noteAttachments(AttachmentEvent event) {
     if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
     std::array<unsigned long long, static_cast<std::size_t>(AttachmentEvent::Count)> taken{};
     for (std::size_t index = 0; index < taken.size(); ++index) taken[index] = counts[index].exchange(0, std::memory_order_relaxed);
-    AgcDriver::ProfilePrint_nid_no_patch("[pass-attachments] 10 s: %llu hits; misses: %llu no memo, %llu pass, %llu serials, %llu targets, %llu images, %llu depth; %llu stored, %llu ineligible; verify %llu checked, %llu differed\n", taken[0], taken[1], taken[2], taken[3], taken[4], taken[5], taken[6], taken[7], taken[8], taken[9], taken[10]);
+    AgcDriver::ProfilePrint_nid_no_patch("[pass-attachments] 10 s: %llu hits; misses: %llu no memo, %llu pass, %llu serials, %llu targets, %llu images, %llu depth; %llu stored, %llu ineligible (%llu multisample depth, %llu multisampled colour); verify %llu checked, %llu differed\n", taken[0], taken[1], taken[2], taken[3], taken[4], taken[5], taken[6], taken[7], taken[8], taken[11], taken[12], taken[9], taken[10]);
 }
 
 bool memoAttachments(const Context& context, const State& state, PreparedDraw& prepared, bool fill) {
@@ -3430,6 +3430,8 @@ void rememberAttachments(const Context& context, const State& state, const Prepa
     if (!eligible) {
         memo.valid = false;
         noteAttachments(AttachmentEvent::Ineligible);
+        if (state.depth && state.depth->samples != 1u) noteAttachments(AttachmentEvent::MultisampleDepth);
+        if (std::ranges::any_of(prepared.targets, [](const TargetBinding& binding) { return binding.multisampled; })) noteAttachments(AttachmentEvent::MultisampleColor);
         return;
     }
     memo.valid = true;
