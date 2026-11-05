@@ -1515,31 +1515,53 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     auto* recorder = context.recorder;
     if (recorder == nullptr || bytes == 0 || !context.drawInputsInPlace) return nullptr;
     const bool memo = !RuntimeSwitches::Set(RuntimeSwitch::NoInputMemo);
+    // APS5_VERIFY_INPUT_MEMO: a memo hit runs the checks too, takes their answer and counts the hits
+    // that answered otherwise ([input-memo-verify] on stderr).
+    static const bool verify = std::getenv("APS5_VERIFY_INPUT_MEMO") != nullptr;
     auto& memoized = HostThreadLocal<InPlaceInputMemo, InPlaceInputMemoStorage>();
+    const InPlaceInputMemo::Entry* remembered = nullptr;
     if (memo) {
         const auto now = inPlaceInputState(*recorder, address, bytes, alignment, behindGpuWrite != nullptr);
         for (const auto& entry : memoized.entries) {
             if (entry.import == nullptr || !entry.Same(now)) continue;
-            if (behindGpuWrite != nullptr && entry.behind) *behindGpuWrite = true;
-            return entry.import;
+            remembered = &entry;
+            break;
+        }
+        if (remembered != nullptr && !verify) {
+            if (behindGpuWrite != nullptr && remembered->behind) *behindGpuWrite = true;
+            return remembered->import;
         }
     }
+    const auto rememberedImport = remembered != nullptr ? remembered->import : nullptr;
+    const bool rememberedBehind = remembered != nullptr && remembered->behind;
     bool behind = false;
-    if (behindGpuWrite == nullptr) {
-        GuestMemory::FlushGpuWrites(address, bytes);
-        if (recorder->PendingWriteOverlaps(address, bytes)) return nullptr;
-    } else {
-        StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input");
-        behind = recorder->PendingWriteOverlaps(address, bytes);
+    const auto check = [&]() -> const HostImport* {
+        if (behindGpuWrite == nullptr) {
+            GuestMemory::FlushGpuWrites(address, bytes);
+            if (recorder->PendingWriteOverlaps(address, bytes)) return nullptr;
+        } else {
+            StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input");
+            behind = recorder->PendingWriteOverlaps(address, bytes);
+        }
+        if (recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) return nullptr;
+        const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
+        if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
+        const auto drawWriters = DrawCopiedWriters();
+        if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return nullptr;
+        const auto* found = HostImportFor(context, address, bytes);
+        if (found == nullptr || HostImportOffset(*found, address) % alignment != 0) return nullptr;
+        recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
+        return found;
+    };
+    const auto* import = check();
+    if (verify && rememberedImport != nullptr) {
+        static std::atomic<std::uint64_t> checks{0}, differences{0};
+        const bool differed = import != rememberedImport || (behindGpuWrite != nullptr && behind != rememberedBehind);
+        if (differed) differences.fetch_add(1, std::memory_order_relaxed);
+        const auto count = checks.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (differed || count % 262144u == 0u || (count & (count - 1u)) == 0u) std::fprintf(stderr, "[input-memo-verify] %llu checked, %llu differed\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differences.load()));
     }
-    if (recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) return nullptr;
-    const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
-    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
-    const auto drawWriters = DrawCopiedWriters();
-    if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return nullptr;
-    const auto* import = HostImportFor(context, address, bytes);
-    if (import == nullptr || HostImportOffset(*import, address) % alignment != 0) return nullptr;
-    recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
+    if (import == nullptr) return nullptr;
     if (behindGpuWrite != nullptr && behind) *behindGpuWrite = true;
     if (memo) {
         // The state after the checks (their flushes may have moved it), so the next identical
