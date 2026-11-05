@@ -822,11 +822,20 @@ void GuestArenaSweepWriteWatch_nid_no_patch(std::uint64_t* out) {
     WindowsMappings::Get().SweepWriteWatch(out);
 }
 
+// APS5_XP_ARM_COMPARED (experiment, unsafe with unframed red-zone leaves, #361): no page is marked to
+// be compared, so clearing collects arm shared pages again and their writes fault.
+bool armCompared() {
+    static const bool arm = std::getenv("APS5_XP_ARM_COMPARED") != nullptr;
+    return arm;
+}
+
 void GuestArenaCompareWhenShared_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    if (armCompared()) return;
     WindowsMappings::Get().CompareWhenShared(address, bytes);
 }
 
 void GuestArenaCompareResidentWhenShared_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    if (armCompared()) return;
     WindowsMappings::Get().CompareWhenShared(address, bytes, true);
 }
 

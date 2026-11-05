@@ -2102,19 +2102,20 @@ std::string SweepCostReport() {
     std::snprintf(text, sizeof(text), "write-watch sweep %.1f us in %llu calls over %.1f MiB private (%llu pages written) and %.1f MiB watched resident (%llu pages written); %llu epoch bumps since the last report; walks %llu over %.1f MiB found %llu pages written (%llu walks with any); compares %llu over %.1f MiB, %llu differed over %.1f MiB", static_cast<double>(out[5]) / 1e3, static_cast<unsigned long long>(out[4]), static_cast<double>(out[0]) / 1048576.0, static_cast<unsigned long long>(out[1]), static_cast<double>(out[2]) / 1048576.0, static_cast<unsigned long long>(out[3]), static_cast<unsigned long long>(bumps - reportedBumps), rates[0], static_cast<double>(rates[1]) / 1048576.0, rates[2], rates[3], rates[4], static_cast<double>(rates[5]) / 1048576.0, rates[6], static_cast<double>(rates[7]) / 1048576.0);
     reportedBumps = bumps;
 #ifdef _WIN32
-    // APS5_FAULT_SITES=<file>: every write-fault site on armed pages so far, with the main module's base.
-    if (const char* path = std::getenv("APS5_FAULT_SITES"); path != nullptr && *path != 0) {
+    // APS5_FAULT_SITES: every write-fault site on armed pages so far, with the main module's base, as
+    // [fault-site] lines after the report (cumulative; the 256 most frequent).
+    if (std::getenv("APS5_FAULT_SITES") != nullptr) {
         std::vector<std::uintptr_t> rips(4096);
         std::vector<std::uint64_t> counts(4096);
         std::uint64_t dropped = 0;
         const auto taken = GuestArena::GuestArenaFaultSites_nid_no_patch(rips.data(), counts.data(), rips.size(), &dropped);
         std::uint64_t total = 0;
         for (std::size_t index = 0; index < taken; ++index) total += counts[index];
-        if (FILE* file = std::fopen(path, "w"); file != nullptr) {
-            std::fprintf(file, "# base 0x%llx sites %zu faults %llu dropped %llu\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))), taken, static_cast<unsigned long long>(total), static_cast<unsigned long long>(dropped));
-            for (std::size_t index = 0; index < taken; ++index) std::fprintf(file, "0x%llx %llu\n", static_cast<unsigned long long>(rips[index]), static_cast<unsigned long long>(counts[index]));
-            std::fclose(file);
-        }
+        std::vector<std::size_t> order(taken);
+        for (std::size_t index = 0; index < taken; ++index) order[index] = index;
+        std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return counts[a] > counts[b]; });
+        AgcDriver::ProfilePrint_nid_no_patch("[fault-sites] base 0x%llx sites %zu faults %llu dropped %llu\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))), taken, static_cast<unsigned long long>(total), static_cast<unsigned long long>(dropped));
+        for (std::size_t index = 0; index < taken && index < 256; ++index) AgcDriver::ProfilePrint_nid_no_patch("[fault-site] 0x%llx %llu\n", static_cast<unsigned long long>(rips[order[index]]), static_cast<unsigned long long>(counts[order[index]]));
         const auto length = std::strlen(text);
         std::snprintf(text + length, sizeof(text) - length, "; armed write faults so far %llu at %zu sites", static_cast<unsigned long long>(total), taken);
     }
