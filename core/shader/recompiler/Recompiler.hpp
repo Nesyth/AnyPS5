@@ -502,6 +502,9 @@ struct HeapStageWords {
     std::vector<std::uint32_t> flattenedSrt;
     std::vector<VertexAttribute> vertexAttributes;
     std::vector<std::vector<std::uint32_t>> bindings;
+    // Push constant dwords (index within the stage's push constants, value) that replace the
+    // compiled stage's: a relocated draw's forwarded user words.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> pushWords;
 };
 
 struct RecompileRequest {

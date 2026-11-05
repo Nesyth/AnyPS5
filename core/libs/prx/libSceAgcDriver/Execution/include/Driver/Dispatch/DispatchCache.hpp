@@ -78,6 +78,10 @@ struct DispatchVariant {
     std::uint64_t userDataMask = ~std::uint64_t{0};
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
     std::shared_ptr<const ShaderRecompiler::HeapStageWords> ringTemplate;
+    // The words a relocation patched (descriptor and shader data words, forwarded push constant
+    // dwords) beside `compiled`, which stays the donor's: read through DrawGuestWords and
+    // AssemblePushConstants (Driver::applyShaderDataPatches).
+    std::shared_ptr<const ShaderRecompiler::HeapStageWords> side;
 
     std::shared_ptr<ShaderMemory> memory;
     std::vector<ShaderRecompiler::MemoryRegion> captured;

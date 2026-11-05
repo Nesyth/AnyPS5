@@ -5,6 +5,7 @@
 #include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
 #include "Recompiler.hpp"
 #include <algorithm>
+#include <cstring>
 #include <array>
 #include <cstddef>
 #include <span>
@@ -125,6 +126,10 @@ inline std::array<std::byte, PipelinePushConstantBytes> AssemblePushConstants(st
             Require(!occupied[position], "shader push constant ranges of different stages overlap");
             occupied[position] = true;
             result[position] = bytes[i];
+        }
+        if (shader.heap == nullptr) continue;
+        for (const auto& [dword, value] : shader.heap->pushWords) {
+            if ((static_cast<std::size_t>(dword) + 1) * sizeof(std::uint32_t) <= bytes.size()) std::memcpy(result.data() + shader.pushConstantOffset + static_cast<std::size_t>(dword) * sizeof(std::uint32_t), &value, sizeof(value));
         }
     }
     return result;

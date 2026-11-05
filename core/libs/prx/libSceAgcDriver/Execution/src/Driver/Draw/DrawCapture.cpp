@@ -413,7 +413,14 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             };
             if (verifyHit && matched[i] != nullptr) {
                 const auto& words = stageData[i].compiled != nullptr ? stageData[i].words : matched[i]->words;
-                const auto& compiled = stageData[i].compiled != nullptr ? *stageData[i].compiled : *matched[i]->compiled;
+                const auto& held = stageData[i].compiled != nullptr ? *stageData[i].compiled : *matched[i]->compiled;
+                const auto* side = stageData[i].compiled != nullptr ? stageData[i].side.get() : matched[i]->side.get();
+                std::optional<ShaderRecompiler::RecompileResult> withSide;
+                if (side != nullptr) {
+                    withSide.emplace(held);
+                    applySideWords(*withSide, *side);
+                }
+                const auto& compiled = withSide.has_value() ? *withSide : held;
                 if (!sameContent(*matched[i], words, *variant) || !sameForwardedWords(compiled, *variant->compiled, programs[i].hiddenUserWords)) {
                     ++mismatches;
                     static std::atomic<std::uint64_t> reports{0};

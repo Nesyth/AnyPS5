@@ -341,6 +341,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             copy->pushOffset = variant->pushOffset;
             copy->vertexInfo = variant->vertexInfo;
             copy->ringTemplate = variant->ringTemplate;
+            copy->side = variant->side;
             for (const auto& move : moves) {
                 if (move.program != i) continue;
                 const auto delta = AlignedWord(move.to) - AlignedWord(move.from);
@@ -368,7 +369,40 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
 
 void Driver::applyShaderDataPatches(DispatchVariant& variant) {
     if (variant.shaderDataPatches.empty() && variant.descriptorPatches.empty()) return;
+    // Side cars (APS5_NO_STAGE_DATA_SIDE_CARS turns them off): the patched words go beside the
+    // donor's compiled stage instead of into a copy of it, on top of the words an earlier
+    // relocation of the same variant patched.
+    if (stageSideCars(variant)) {
+        const auto& compiled = *variant.compiled;
+        auto words = variant.side != nullptr ? std::make_shared<ShaderRecompiler::HeapStageWords>(*variant.side) : std::make_shared<ShaderRecompiler::HeapStageWords>();
+        words->bindings.resize(compiled.bindings.size());
+        const auto patch = [&](std::size_t binding, std::size_t word, std::uint32_t value) {
+            auto& descriptor = words->bindings[binding];
+            if (descriptor.empty()) descriptor = compiled.bindings[binding].guestDescriptor;
+            if (word < descriptor.size()) descriptor[word] = value;
+        };
+        for (const auto& [slot, value] : variant.shaderDataPatches) {
+            const auto at = static_cast<std::size_t>(slot) * sizeof(std::uint32_t);
+            if (!compiled.dataAddressPush && at + sizeof(std::uint32_t) <= compiled.pushConstants.size()) {
+                const auto held = std::find_if(words->pushWords.begin(), words->pushWords.end(), [&](const auto& entry) { return entry.first == slot; });
+                if (held != words->pushWords.end()) held->second = value;
+                else words->pushWords.emplace_back(slot, value);
+            }
+            for (std::size_t binding = 0; binding < compiled.bindings.size(); ++binding) {
+                if (compiled.bindings[binding].role == ShaderRecompiler::DescriptorRole::ShaderData && slot < compiled.bindings[binding].guestDescriptor.size()) patch(binding, slot, value);
+            }
+        }
+        for (const auto& [binding, word, value] : variant.descriptorPatches) {
+            if (binding < compiled.bindings.size()) patch(binding, word, value);
+        }
+        variant.side = std::move(words);
+        variant.shaderDataPatches.clear();
+        variant.descriptorPatches.clear();
+        return;
+    }
     auto rebased = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+    if (variant.side != nullptr) applySideWords(*rebased, *variant.side);
+    variant.side = nullptr;
     for (const auto& [slot, value] : variant.shaderDataPatches) {
         const auto at = static_cast<std::size_t>(slot) * sizeof(std::uint32_t);
         if (!rebased->dataAddressPush && at + sizeof(std::uint32_t) <= rebased->pushConstants.size()) std::memcpy(rebased->pushConstants.data() + at, &value, sizeof(value));

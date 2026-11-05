@@ -1079,7 +1079,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             try {
                 const auto slotEnd = (pushCursorBytes / Graphics::PipelinePushSlotBytes + 1u) * Graphics::PipelinePushSlotBytes;
                 require(result.pushConstants.size() <= slotEnd - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
-                const auto* side = stageCaptures[i].heapWords != nullptr ? stageCaptures[i].heapWords.get() : &result == stageData[i].compiled.get() ? stageData[i].side.get() : nullptr;
+                const auto* side = stageCaptures[i].heapWords != nullptr ? stageCaptures[i].heapWords.get() : &result == stageData[i].compiled.get() ? stageData[i].side.get() : matched[i] != nullptr && &result == matched[i]->compiled.get() ? matched[i]->side.get() : nullptr;
                 stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes, stageCaptures[i].registeredViews.get(), side});
                 pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
             } catch (...) {

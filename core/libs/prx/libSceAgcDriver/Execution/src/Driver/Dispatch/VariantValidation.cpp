@@ -48,20 +48,50 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::patchDataWords(
     return patched;
 }
 
+bool Driver::stageSideCars(const DispatchVariant& variant) {
+    const auto& compiled = *variant.compiled;
+    return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoStageDataSideCars) && variant.ringTemplate == nullptr && !compiled.gpuResolvedImages && compiled.heapTemplateId == 0;
+}
+
+void Driver::applySideWords(ShaderRecompiler::RecompileResult& result, const ShaderRecompiler::HeapStageWords& side) {
+    for (std::size_t index = 0; index < side.bindings.size() && index < result.bindings.size(); ++index) {
+        if (!side.bindings[index].empty()) result.bindings[index].guestDescriptor = side.bindings[index];
+    }
+    for (const auto& [dword, value] : side.pushWords) {
+        const auto at = static_cast<std::size_t>(dword) * sizeof(std::uint32_t);
+        if (at + sizeof(std::uint32_t) <= result.pushConstants.size()) std::memcpy(result.pushConstants.data() + at, &value, sizeof(value));
+    }
+}
+
 void Driver::takeStageData(StageDataHit& hit, const DispatchVariant& variant) {
     const auto& compiled = *variant.compiled;
-    const bool side = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoStageDataSideCars) && variant.ringTemplate == nullptr && !compiled.gpuResolvedImages && compiled.heapTemplateId == 0 && variant.flatBinding < compiled.bindings.size();
-    if (!side) {
-        hit.compiled = patchDataWords(variant, hit.words);
+    const bool flat = variant.flatBinding < compiled.bindings.size();
+    if (!stageSideCars(variant)) {
+        // A relocation's side words (made while side cars were on) go into the copy first.
+        if (variant.side == nullptr) {
+            hit.compiled = patchDataWords(variant, hit.words);
+        } else {
+            auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(compiled);
+            applySideWords(*patched, *variant.side);
+            if (flat) {
+                auto& descriptor = patched->bindings[variant.flatBinding].guestDescriptor;
+                for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
+                    if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = hit.words[variant.dataPositions[k]];
+                }
+            }
+            hit.compiled = std::move(patched);
+        }
         hit.side = nullptr;
         return;
     }
-    auto words = std::make_shared<ShaderRecompiler::HeapStageWords>();
+    auto words = variant.side != nullptr ? std::make_shared<ShaderRecompiler::HeapStageWords>(*variant.side) : std::make_shared<ShaderRecompiler::HeapStageWords>();
     words->bindings.resize(compiled.bindings.size());
-    auto& descriptor = words->bindings[variant.flatBinding];
-    descriptor = compiled.bindings[variant.flatBinding].guestDescriptor;
-    for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
-        if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = hit.words[variant.dataPositions[k]];
+    if (flat) {
+        auto& descriptor = words->bindings[variant.flatBinding];
+        if (descriptor.empty()) descriptor = compiled.bindings[variant.flatBinding].guestDescriptor;
+        for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
+            if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = hit.words[variant.dataPositions[k]];
+        }
     }
     hit.compiled = variant.compiled;
     hit.side = std::move(words);
