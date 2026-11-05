@@ -2120,7 +2120,21 @@ std::string SweepCostReport() {
         for (std::size_t index = 0; index < taken; ++index) order[index] = index;
         std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return counts[a] > counts[b]; });
         AgcDriver::ProfilePrint_nid_no_patch("[fault-sites] base 0x%llx sites %zu faults %llu dropped %llu\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))), taken, static_cast<unsigned long long>(total), static_cast<unsigned long long>(dropped));
-        for (std::size_t index = 0; index < taken && index < 256; ++index) AgcDriver::ProfilePrint_nid_no_patch("[fault-site] 0x%llx %llu\n", static_cast<unsigned long long>(rips[order[index]]), static_cast<unsigned long long>(counts[order[index]]));
+        for (std::size_t index = 0; index < taken && index < 256; ++index) {
+            const auto rip = rips[order[index]];
+            HMODULE module = nullptr;
+            char name[MAX_PATH] = "?";
+            std::uintptr_t offset = rip;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(rip), &module) && module != nullptr) {
+                char path[MAX_PATH];
+                if (GetModuleFileNameA(module, path, MAX_PATH) != 0) {
+                    const char* slash = std::strrchr(path, '\\');
+                    std::snprintf(name, sizeof(name), "%s", slash != nullptr ? slash + 1 : path);
+                }
+                offset = rip - reinterpret_cast<std::uintptr_t>(module);
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("[fault-site] 0x%llx %llu %s+0x%llx\n", static_cast<unsigned long long>(rip), static_cast<unsigned long long>(counts[order[index]]), name, static_cast<unsigned long long>(offset));
+        }
         const auto length = std::strlen(text);
         std::snprintf(text + length, sizeof(text) - length, "; armed write faults so far %llu at %zu sites", static_cast<unsigned long long>(total), taken);
     }
