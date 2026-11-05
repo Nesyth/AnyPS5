@@ -12,6 +12,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include <chrono>
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTextureLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -2737,6 +2739,35 @@ bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t a
     return true;
 }
 
+enum class HtileReadEvent : std::size_t { Unchanged, Stamp, Fills, Mask, Read, ReadPending, Count };
+
+void noteHtileRead(HtileReadEvent event) {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!stats) return;
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(HtileReadEvent::Count)> counts{};
+    static std::atomic<std::int64_t> reportedAt{0};
+    counts[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    std::array<unsigned long long, static_cast<std::size_t>(HtileReadEvent::Count)> taken{};
+    for (std::size_t index = 0; index < taken.size(); ++index) taken[index] = counts[index].exchange(0, std::memory_order_relaxed);
+    AgcDriver::ProfilePrint_nid_no_patch("[htile-reads] 10 s: %llu unchanged, %llu untracked stamp kept, %llu pending fills resolved, %llu mask clears resolved; %llu read, %llu read over pending GPU writes\n", taken[0], taken[1], taken[2], taken[3], taken[4], taken[5]);
+}
+
+void describeHtileRead(const Recorder* recorder, const DepthTarget& target, std::size_t bytes, std::uint64_t collected) {
+    static std::atomic<unsigned> reports{0};
+    if (recorder == nullptr || reports.fetch_add(1, std::memory_order_relaxed) >= 20) return;
+    const auto writes = recorder->PendingWritesOver(target.htileAddress, bytes);
+    const auto info = recorder->DescribePendingWrite(target.htileAddress, bytes);
+    std::string text;
+    for (std::size_t index = 0; index < writes.size() && index < 6; ++index) {
+        char item[128];
+        std::snprintf(item, sizeof(item), " [+0x%llx,+0x%llx) note %llu value %d word %lld;", static_cast<unsigned long long>(writes[index].begin - target.htileAddress), static_cast<unsigned long long>(writes[index].end - target.htileAddress), static_cast<unsigned long long>(writes[index].note), writes[index].value, static_cast<long long>(writes[index].word));
+        text += item;
+    }
+    std::fprintf(stderr, "[htile-reads] read over pending GPU writes: depth 0x%llx %ux%u, %u samples, HTILE 0x%llx+0x%zx (stencil %d), collected %llu; %zu writes:%s newest batch serial %llu open %d signaled %d, %zu batches to finish\n", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, target.samples, static_cast<unsigned long long>(target.htileAddress), bytes, target.htileStencil ? 1 : 0, static_cast<unsigned long long>(collected), writes.size(), text.c_str(), static_cast<unsigned long long>(info ? info->serial : 0), info && info->open ? 1 : 0, info && info->signaled ? 1 : 0, info ? info->batchesToFinish : std::size_t{0});
+}
+
 VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
     if (target.htileAddress == 0) return 0;
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
@@ -2748,10 +2779,16 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     if (!pending) {
         std::lock_guard lock(htileReadsMutex());
         const auto found = htileReads().find(target.htileAddress);
-        if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) return 0;
+        if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) {
+            noteHtileRead(HtileReadEvent::Unchanged);
+            return 0;
+        }
         if (untracked) {
             const auto scanned = untrackedHtileScans().find(target.htileAddress);
-            if (scanned != untrackedHtileScans().end() && scanned->second.bytes == bytes && scanned->second.stencil == target.htileStencil && scanned->second.stamp == *untracked) return 0;
+            if (scanned != untrackedHtileScans().end() && scanned->second.bytes == bytes && scanned->second.stencil == target.htileStencil && scanned->second.stamp == *untracked) {
+                noteHtileRead(HtileReadEvent::Stamp);
+                return 0;
+            }
         }
     }
     static const bool pendingFills = std::getenv("APS5_NO_PENDING_HTILE_FILLS") == nullptr;
@@ -2759,6 +2796,7 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
         std::lock_guard gpu(GuestMemory::GpuMutex());
         if (const auto landed = htileAfterPendingFills(*recorder, target.htileAddress, bytes)) {
             const VkImageAspectFlags cleared = (VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u)) & HtileFillClears(*landed, target.htileStencil);
+            noteHtileRead(HtileReadEvent::Fills);
             if (cleared == 0) {
                 std::lock_guard lock(htileReadsMutex());
                 htileReads()[target.htileAddress] = collected;
@@ -2771,12 +2809,15 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
                 return cleared;
             }
         } else if (const auto known = htileAfterMaskClear(*recorder, target, bytes); known.has_value() && storeHtileOnGpu(context, *recorder, target.htileAddress, bytes, known->second)) {
+            noteHtileRead(HtileReadEvent::Mask);
             const auto generation = GuestMemory::CollectWrites(target.htileAddress, bytes);
             std::lock_guard lock(htileReadsMutex());
             htileReads()[target.htileAddress] = generation;
             return known->first;
         }
     }
+    noteHtileRead(pending ? HtileReadEvent::ReadPending : HtileReadEvent::Read);
+    if (pending) describeHtileRead(recorder, target, bytes, collected);
     std::vector<std::uint32_t> words(bytes / 4u);
     GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(words)), 4);
     VkImageAspectFlags cleared = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
@@ -3100,6 +3141,26 @@ void NoteDepthSurfaceWrite(const Context& context, const DepthTarget& target) {
         }
     }
     Require(attached, "a native multisample depth attachment was retired while its draw resolved resources");
+}
+
+std::uint64_t DepthHtileOverlapping_nid_no_patch(std::uint64_t address, std::uint64_t bytes) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (!surface->active->load(std::memory_order_acquire) || surface->target.htileAddress == 0u) continue;
+        const auto htile = surface->target.htileAddress;
+        if (address < htile + HtileMetadataBytes(surface->target.extent) && htile < address + bytes) return htile;
+    }
+    return 0;
+}
+
+void NoteHtileWriter_nid_no_patch(const char* kind, std::uint64_t program, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes) {
+    static std::atomic<unsigned> reports{0};
+    if (reports.load(std::memory_order_relaxed) >= 12) return;
+    for (const auto& [begin, end] : writes) {
+        const auto htile = DepthHtileOverlapping_nid_no_patch(begin, end - begin);
+        if (htile == 0 || reports.fetch_add(1, std::memory_order_relaxed) >= 12) continue;
+        std::fprintf(stderr, "[htile-writer] %s 0x%llx writes 0x%llx+0x%llx over the HTILE at 0x%llx (%zu written ranges)\n", kind, static_cast<unsigned long long>(program), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<unsigned long long>(htile), writes.size());
+    }
 }
 
 bool HasResidentDepthGuards_nid_no_patch() {

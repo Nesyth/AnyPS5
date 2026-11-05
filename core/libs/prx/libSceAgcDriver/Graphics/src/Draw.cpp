@@ -2483,6 +2483,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     if (resources->HoldsLease()) CountLeaseOutcome(outcome.waited, outcome.waited ? 0 : recorder.Submissions() + 1);
     // Every use of a (possibly shared) resources object registers its GPU writes anew.
     resources->MarkGpuWrites(recorder);
+    NoteHtileWriter_nid_no_patch("draw", 0, resources->GpuWrites());
     if (spaceKeep != nullptr) *spaceKeep = resources->ReleaseSpace();
     // The write-back (fault check, copied buffers) runs when the batch completed; a fault is
     // reported by the recorder ("deferred write-back failed") instead of thrown out of the draw.

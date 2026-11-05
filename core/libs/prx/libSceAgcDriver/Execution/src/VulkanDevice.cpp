@@ -5930,6 +5930,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recordStep(PhaseRecordBind);
     if (record.htileClear.has_value()) Graphics::ArmHtileDepthClear(record.htileClear->first, record.htileClear->second);
     resources.MarkGpuWrites(recorder);
+    Graphics::NoteHtileWriter_nid_no_patch(record.htileClear.has_value() ? "recognised HTILE clear dispatch" : "dispatch", record.programAddress, resources.GpuWrites());
     if (record.htileClear.has_value()) {
         Graphics::QueueHtileDepthClear(record.htileClear->first, record.htileClear->second);
         recorder.NotePendingWrite(record.htileClear->first, record.htileClear->second);

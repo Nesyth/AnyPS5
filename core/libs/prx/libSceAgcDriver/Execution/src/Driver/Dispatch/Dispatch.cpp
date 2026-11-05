@@ -161,12 +161,33 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             return;
         }
         if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (const char* watched = std::getenv("APS5_DUMP_DISPATCH_PROGRAM"); watched != nullptr && std::strtoull(watched, nullptr, 0) == address) {
+            static std::atomic<unsigned> programDumps{0};
+            if (programDumps.fetch_add(1, std::memory_order_relaxed) < 3) {
+                const auto code = std::span(snapshot.code).subspan(codeOffset);
+                std::string text;
+                for (std::size_t index = 0; index < code.size() && index < 160; ++index) {
+                    char word[12];
+                    std::snprintf(word, sizeof(word), " %08x", code[index]);
+                    text += word;
+                }
+                std::string user;
+                for (const auto word : userData) {
+                    char item[12];
+                    std::snprintf(item, sizeof(item), " %08x", word);
+                    user += item;
+                }
+                std::fprintf(stderr, "[dispatch-program] 0x%llx: packet %08x %08x %08x %08x, threads %u %u %u, user data%s; code (%zu dwords):%s\n", static_cast<unsigned long long>(address), packet[1], packet[2], packet[3], packet[4], compute.numThreads[0], compute.numThreads[1], compute.numThreads[2], user.c_str(), code.size(), text.c_str());
+            }
+        }
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
             const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
             const auto nativeBytes = Graphics::HtileDepthClearBytes_nid_no_patch(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
             const auto bytes = static_cast<std::size_t>(threads * 16u);
             if (Graphics::NoteHtileDepthClear(htile, bytes, nativeBytes)) htileClearCompletion = std::pair{htile, bytes};
             if (nativeBytes != 0u) htileMask = {htile, nativeBytes, userData[5], userData[4]};
+            static std::atomic<unsigned> htileReports{0};
+            if (htileReports.fetch_add(1, std::memory_order_relaxed) < 12) std::fprintf(stderr, "[htile-clear] dispatch: HTILE 0x%llx, packet %08x %08x %08x %08x, user data %zu words [4] %08x [5] %08x, threads %llu, bytes 0x%zx, native bytes 0x%zx, partial groups %d, group id x %d, thread id components %u, indirect %llu, completion %d\n", static_cast<unsigned long long>(htile), packet[1], packet[2], packet[3], packet[4], userData.size(), userData.size() > 4 ? userData[4] : 0u, userData.size() > 5 ? userData[5] : 0u, static_cast<unsigned long long>(threads), bytes, nativeBytes, compute.PartialGroups() ? 1 : 0, compute.groupIdEnable[0] ? 1 : 0, compute.threadIdComponentCount, static_cast<unsigned long long>(indirectArguments), htileClearCompletion.has_value() ? 1 : 0);
         } else if (const auto buffered = Graphics::MatchHtileBufferMaskClear(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments)) {
             if (Graphics::NoteHtileDepthClear(buffered->address, buffered->bytes, buffered->bytes)) htileClearCompletion = std::pair{buffered->address, buffered->bytes};
             htileMask = *buffered;
