@@ -1471,9 +1471,59 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
     recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived);
 }
 
+// The last in-place answers of the thread (APS5_NO_INPUT_MEMO turns it off): the same range, alignment
+// and kind in the same open batch answers as before while nothing that its checks read moved since
+// they ran: no pending write, label or completion noted (Recorder::WriteGeneration), no store
+// recorded or queued, the same pending-write snapshot, no storage result pending anew, the same
+// host imports (a retired import moves them) and guest mappings. Its read is noted in the batch
+// already. A range that went to a copy is not kept.
+struct InPlaceInputMemo {
+    struct Entry {
+        const Recorder* recorder = nullptr;
+        std::uint64_t open = 0, writes = 0, stores = 0, published = 0, pending = 0, imports = 0, mapping = 0;
+        std::uint64_t address = 0;
+        std::size_t bytes = 0, alignment = 0;
+        bool vertex = false, behind = false;
+        const HostImport* import = nullptr;
+        bool Same(const Entry& other) const {
+            return recorder == other.recorder && open == other.open && writes == other.writes && stores == other.stores && published == other.published && pending == other.pending && imports == other.imports && mapping == other.mapping && address == other.address && bytes == other.bytes && alignment == other.alignment && vertex == other.vertex;
+        }
+    };
+    std::array<Entry, 32> entries{};
+    std::size_t next = 0;
+};
+struct InPlaceInputMemoStorage {};
+
+InPlaceInputMemo::Entry inPlaceInputState(const Recorder& recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool vertex) {
+    InPlaceInputMemo::Entry state;
+    state.recorder = &recorder;
+    state.open = recorder.OpenSerial();
+    state.writes = Recorder::WriteGeneration();
+    state.stores = Recorder::QueuedStoreGeneration();
+    state.published = Recorder::PublishGeneration();
+    state.pending = StorageTexture::PendingSerial();
+    state.imports = HostImportSetGeneration();
+    state.mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    state.address = address;
+    state.bytes = bytes;
+    state.alignment = alignment;
+    state.vertex = vertex;
+    return state;
+}
+
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
     auto* recorder = context.recorder;
     if (recorder == nullptr || bytes == 0 || !context.drawInputsInPlace) return nullptr;
+    const bool memo = !RuntimeSwitches::Set(RuntimeSwitch::NoInputMemo);
+    auto& memoized = HostThreadLocal<InPlaceInputMemo, InPlaceInputMemoStorage>();
+    if (memo) {
+        const auto now = inPlaceInputState(*recorder, address, bytes, alignment, behindGpuWrite != nullptr);
+        for (const auto& entry : memoized.entries) {
+            if (entry.import == nullptr || !entry.Same(now)) continue;
+            if (behindGpuWrite != nullptr && entry.behind) *behindGpuWrite = true;
+            return entry.import;
+        }
+    }
     bool behind = false;
     if (behindGpuWrite == nullptr) {
         GuestMemory::FlushGpuWrites(address, bytes);
@@ -1491,6 +1541,14 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     if (import == nullptr || HostImportOffset(*import, address) % alignment != 0) return nullptr;
     recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
     if (behindGpuWrite != nullptr && behind) *behindGpuWrite = true;
+    if (memo) {
+        // The state after the checks (their flushes may have moved it), so the next identical
+        // draw finds it unchanged.
+        auto entry = inPlaceInputState(*recorder, address, bytes, alignment, behindGpuWrite != nullptr);
+        entry.behind = behind;
+        entry.import = import;
+        memoized.entries[memoized.next++ % memoized.entries.size()] = entry;
+    }
     return import;
 }
 

@@ -441,6 +441,8 @@ public:
     // before the store), so a reader that loads it before and after a set of in-place reads knows
     // the snapshot it consulted in between was the one in force for all of them;
     static std::uint64_t PublishGeneration();
+    // bumped by every RecordStore (queued or recorded), which notes no pending write;
+    static std::uint64_t QueuedStoreGeneration();
     // labels waiting in completion actions (the CPU must reap their batch for them to land);
     static std::uint64_t PendingCompletionLabels();
     static std::uint64_t PendingCompletionStores();

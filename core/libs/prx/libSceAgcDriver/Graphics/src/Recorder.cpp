@@ -529,6 +529,7 @@ constexpr BarrierMask LabelLeadingBarrier{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK
 std::atomic<std::int64_t> pendingLabelSince{NoPendingLabel};
 std::atomic<std::uint64_t> writeGeneration{0};
 std::atomic<std::uint64_t> publishGeneration{0};
+std::atomic<std::uint64_t> queuedStoreGeneration{0};
 std::atomic<std::uint64_t> completionLabels{0};
 std::atomic<std::uint64_t> completionStores{0};
 std::atomic<std::uint64_t> writeBackCompletions{0};
@@ -1295,6 +1296,10 @@ std::uint64_t Recorder::WriteGeneration() {
     return writeGeneration.load(std::memory_order_acquire);
 }
 
+std::uint64_t Recorder::QueuedStoreGeneration() {
+    return queuedStoreGeneration.load(std::memory_order_acquire);
+}
+
 std::uint64_t Recorder::PublishGeneration() {
     return publishGeneration.load(std::memory_order_acquire);
 }
@@ -1833,6 +1838,7 @@ void Recorder::ensureOpen() {
 
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
+    queuedStoreGeneration.fetch_add(1, std::memory_order_release);
     ensureOpen();
     flushDeferredDispatch();
     auto& run = open->run;
