@@ -277,6 +277,27 @@ public:
         }
     }
 
+    void DescribeViews(std::uintptr_t address, std::size_t bytes, std::uint64_t* out) {
+        std::lock_guard lock(mutex);
+        const auto end = address + bytes;
+        std::uint64_t covered = 0;
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
+            const auto begin = std::max<std::uintptr_t>(it->first, address);
+            const auto stop = std::min<std::uintptr_t>(it->first + it->second.viewBytes, end);
+            if (stop <= begin) continue;
+            const auto part = static_cast<std::uint64_t>(stop - begin);
+            covered += part;
+            const auto aliases = it->second.resident || !it->second.page ? std::size_t{0} : it->second.page->aliases.size();
+            if (it->second.resident) out[1] += part;
+            else if (aliases <= 1) out[2] += part;
+            else out[3] += part;
+            if (it->second.hostImports != 0) out[4] += part;
+            if (it->second.comparedWhenShared || (!it->second.resident && it->second.page && it->second.page->comparedWhenShared)) out[5] += part;
+            if (it->second.armed != 0) out[6] += part;
+        }
+        out[0] += bytes > covered ? bytes - covered : 0;
+    }
+
     void CompareWhenShared(std::uintptr_t address, std::size_t bytes, bool residentOnly = false) {
         std::lock_guard lock(mutex);
         collectableRanges.clear();

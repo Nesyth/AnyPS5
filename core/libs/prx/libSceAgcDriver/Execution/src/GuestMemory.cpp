@@ -3160,8 +3160,32 @@ void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destinati
     copyCommitted(address, destination);
 }
 
+void noteCompareKinds(std::uint64_t address, std::size_t bytes) {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!stats) return;
+    static std::mutex mutex;
+    static std::array<std::uint64_t, 10> totals{};
+    static std::int64_t reportedAt = 0;
+    std::array<std::uint64_t, 7> kinds{};
+#ifdef _WIN32
+    GuestArena::GuestArenaDescribeViews_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, kinds.data());
+#endif
+    const bool watched = Watched(address, bytes);
+    std::lock_guard lock(mutex);
+    ++totals[0];
+    totals[1] += bytes;
+    for (std::size_t index = 0; index < kinds.size(); ++index) totals[2 + index] += kinds[index];
+    if (watched) totals[9] += bytes;
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt == tenSeconds) return;
+    reportedAt = tenSeconds;
+    AgcDriver::ProfilePrint_nid_no_patch("[compare-kinds] 10 s: %llu compares, %.1f MiB; by view: %.1f MiB outside views, %.1f resident, %.1f shared with one view, %.1f shared with aliases, %.1f with host imports, %.1f compared when shared, %.1f armed; %.1f MiB write-watched\n", static_cast<unsigned long long>(totals[0]), totals[1] / 1048576.0, totals[2] / 1048576.0, totals[3] / 1048576.0, totals[4] / 1048576.0, totals[5] / 1048576.0, totals[6] / 1048576.0, totals[7] / 1048576.0, totals[8] / 1048576.0, totals[9] / 1048576.0);
+    totals = {};
+}
+
 bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
+    noteCompareKinds(address, bytes.size());
     FlushGpuWrites(address, bytes.size());
     return EqualsCommittedUnsynced(address, bytes);
 }

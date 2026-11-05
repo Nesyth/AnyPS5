@@ -781,6 +781,10 @@ bool GuestArenaResidentSpan_nid_postfix(std::uintptr_t address, std::size_t byte
     return WindowsMappings::Get().ResidentSpan(address, bytes, start, end);
 }
 
+void GuestArenaDescribeViews_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* out) {
+    WindowsMappings::Get().DescribeViews(address, bytes, out);
+}
+
 void GuestArenaCompareWhenShared_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
     WindowsMappings::Get().CompareWhenShared(address, bytes);
 }
