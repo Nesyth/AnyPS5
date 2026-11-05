@@ -1388,7 +1388,7 @@ bool DrawRecipes() {
 }
 
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
-    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof", "moved"};
     return names[static_cast<std::size_t>(miss)];
 }
 
@@ -3910,7 +3910,8 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->SpaceReuse() && resolved.moved.empty() && !multisampled && !pipeline->ReordersSamples()) {
+        const bool dataRecipes = !RuntimeSwitches::Set(RuntimeSwitch::NoDataRecipes);
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->SpaceReuse() && (resolved.moved.empty() || dataRecipes) && !multisampled && !pipeline->ReordersSamples()) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -3930,6 +3931,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->fragmentOutputs = inputs.fragmentOutputs;
             recipe->shaderStages = inputs.shaderStages;
             recipe->hasDepth = state.depth.has_value();
+            recipe->perDrawMoves = dataRecipes;
             *recipeOut = std::move(recipe);
         }
         timing.Mark("draw_and_resource_release");
@@ -4425,6 +4427,22 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         timer.phase(PhaseLookup);
         return miss(DrawRecipeMiss::Proof);
     }
+    // A data recipe's hit takes the draw's own data words and read-only buffer bases, as a
+    // template hit does in resolveDrawResources; a template that cannot move them is a miss.
+    std::vector<ShaderResources::MovedBuffer> moved;
+    if (!recipe.perDrawMoves && std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.heap != nullptr; })) {
+        timer.phase(PhaseLookup);
+        return miss(DrawRecipeMiss::Moved);
+    }
+    if (recipe.perDrawMoves) {
+        bool patched = false;
+        auto found = resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched);
+        if (!found.has_value()) {
+            timer.phase(PhaseLookup);
+            return miss(DrawRecipeMiss::Moved);
+        }
+        moved = std::move(*found);
+    }
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
     if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     SharedResourceCache().Touch(recipe.key);
@@ -4454,7 +4472,10 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.targetViews = recipe.targetViews;
     record.targets = std::move(targets);
     for (const auto& color : state.colors) record.targetSlices.emplace_back(color.arraySlice, color.arrayLastSlice != 0 ? color.layers : 1u);
-    record.pushBytes = &recipe.pushBytes;
+    record.moved = moved;
+    // Push constant dwords a stage's side words replace are assembled per draw.
+    const bool sidePush = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.heap != nullptr && !shader.heap->pushWords.empty(); });
+    record.pushBytes = sidePush ? nullptr : &recipe.pushBytes;
     record.pushStages = recipe.pushStages;
     record.depthLocations = passDepthLocations(context, state, *record.pipeline);
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, trace);

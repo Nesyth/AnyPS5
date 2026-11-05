@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -731,7 +732,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (const auto& patch : userPatches) current->programs[patch.program].userData[patch.index] = patch.value;
         decode = std::move(current);
     }
-    tail.patchedStages = std::any_of(stageData.begin(), stageData.end(), [](const StageDataHit& hit) { return hit.compiled != nullptr; });
+    // A stage data hit on the variant's own stage (side words) can use the entry's recipe, which
+    // then moves the data words per draw (DrawRecipe::perDrawMoves); a patched copy cannot.
+    const bool dataRecipes = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoDataRecipes);
+    tail.patchedStages = std::any_of(stageData.begin(), stageData.end(), [&](const StageDataHit& hit) { return hit.compiled != nullptr && (hit.side == nullptr || !dataRecipes); });
     tail.relocatedDecode = relocatedDecode;
     std::uint64_t stageDataVerified = 0;
     const auto target = graphics.hasColorTarget ? graphics.color.address : 0;

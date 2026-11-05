@@ -85,6 +85,10 @@ struct DrawRecipe {
     std::uint32_t fragmentOutputs = 0;
     VkPipelineStageFlags shaderStages = 0;
     bool hasDepth = false;
+    // Made while data recipes were on (APS5_NO_DATA_RECIPES unset): a hit may be a stage data hit
+    // with its own data words and read-only buffer bases, which DrawWithRecipe moves per draw as a
+    // template hit does.
+    bool perDrawMoves = false;
 };
 
 }
