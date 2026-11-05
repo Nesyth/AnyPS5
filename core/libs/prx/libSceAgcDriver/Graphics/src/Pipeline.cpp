@@ -16,6 +16,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <optional>
+#include <cstring>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -967,9 +969,63 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
     Continue(commands, state);
 }
 
+namespace {
+
+void notePipelineRun(VkCommandBuffer commands, VkPipeline pipeline, const State& state) {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!stats) return;
+    struct Tally {
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkViewport viewport{};
+        VkRect2D scissor{};
+        std::optional<std::uint32_t> stencil;
+        std::uint64_t length = 0;
+        std::array<std::uint64_t, 6> runs{};
+        std::array<std::uint64_t, 6> draws{};
+        std::int64_t reportedAt = 0;
+    };
+    static std::mutex mutex;
+    static Tally tally;
+    std::lock_guard lock(mutex);
+    const auto close = [&] {
+        if (tally.length == 0) return;
+        const auto bucket = tally.length == 1 ? 0 : tally.length < 4 ? 1 : tally.length < 8 ? 2 : tally.length < 16 ? 3 : tally.length < 64 ? 4 : 5;
+        ++tally.runs[bucket];
+        tally.draws[bucket] += tally.length;
+        tally.length = 0;
+    };
+    const bool same = tally.length != 0 && tally.commands == commands && tally.pipeline == pipeline && std::memcmp(&tally.viewport, &state.viewport, sizeof(VkViewport)) == 0 && std::memcmp(&tally.scissor, &state.scissor, sizeof(VkRect2D)) == 0 && tally.stencil == state.stencilReplayReference;
+    if (!same) {
+        close();
+        tally.commands = commands;
+        tally.pipeline = pipeline;
+        tally.viewport = state.viewport;
+        tally.scissor = state.scissor;
+        tally.stencil = state.stencilReplayReference;
+    }
+    ++tally.length;
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (tally.reportedAt == tenSeconds) return;
+    tally.reportedAt = tenSeconds;
+    std::uint64_t draws = 0;
+    for (const auto count : tally.draws) draws += count;
+    const auto share = [&](const std::size_t from) {
+        std::uint64_t part = 0;
+        for (std::size_t index = from; index < tally.draws.size(); ++index) part += tally.draws[index];
+        return draws == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(draws);
+    };
+    AgcDriver::ProfilePrint_nid_no_patch("[pipeline-runs] 10 s: %llu draws in runs of one pipeline, viewport, scissor and stencil reference per pass: runs of 1 %llu, 2-3 %llu, 4-7 %llu, 8-15 %llu, 16-63 %llu, 64+ %llu; draws in runs of 2+ %.1f%%, 4+ %.1f%%, 8+ %.1f%%, 16+ %.1f%%; %.2f draws per run\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(tally.runs[0]), static_cast<unsigned long long>(tally.runs[1]), static_cast<unsigned long long>(tally.runs[2]), static_cast<unsigned long long>(tally.runs[3]), static_cast<unsigned long long>(tally.runs[4]), static_cast<unsigned long long>(tally.runs[5]), share(1), share(2), share(3), share(4), [&] { std::uint64_t runs = 0; for (const auto count : tally.runs) runs += count; return runs == 0 ? 0.0 : static_cast<double>(draws) / static_cast<double>(runs); }());
+    tally.runs = {};
+    tally.draws = {};
+}
+
+}
+
 void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
     if (optimized != nullptr) optimized->Schedule();
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
+    notePipelineRun(commands, best != VK_NULL_HANDLE ? best : pipeline, state);
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, best != VK_NULL_HANDLE ? best : pipeline);
     context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
     context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
