@@ -898,7 +898,8 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(58u);
+    // Version 58 only adds the device image table flag: a request without it keeps version 55.
+    writer.WriteU32(request.target.deviceImageTables ? 58u : 55u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -953,7 +954,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.exactRobustLoads);
     writer.WriteBool(request.target.robustBufferAccess2);
     writer.WriteBool(request.target.heapBufferDescriptors);
-    writer.WriteBool(request.target.deviceImageTables);
+    if (request.target.deviceImageTables) writer.WriteBool(true);
     return base64Encode(buffer);
 }
 
