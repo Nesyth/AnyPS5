@@ -13,6 +13,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <tlhelp32.h>
 #elif defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -383,7 +384,25 @@ void PlaceReservedThread(const char* role) {
     }
     const bool process = setDefault(GetCurrentProcess(), others.data(), static_cast<ULONG>(others.size())) != 0;
     const bool thread = setSelected(GetCurrentThread(), &own, 1) != 0;
-    std::fprintf(stderr, "[placement] %s on logical %u (core %u reserved: process default %s, thread %s; %zu other CPU sets)\n", role, wanted, core, process ? "set" : "failed", thread ? "set" : "failed", others.size());
+    // Threads already running (the title's spinning job workers among them) may stay on the reserved core
+    // until the scheduler moves them, so they select the other CPU sets explicitly; later threads take the
+    // process default. A thread pinned with an affinity mask keeps its mask.
+    std::size_t moved = 0;
+    if (const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0); snapshot != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+        const DWORD processId = GetCurrentProcessId();
+        const DWORD self = GetCurrentThreadId();
+        for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+            if (entry.th32OwnerProcessID != processId || entry.th32ThreadID == self) continue;
+            if (const HANDLE other = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, entry.th32ThreadID); other != nullptr) {
+                if (setSelected(other, others.data(), static_cast<ULONG>(others.size()))) ++moved;
+                CloseHandle(other);
+            }
+        }
+        CloseHandle(snapshot);
+    }
+    std::fprintf(stderr, "[placement] %s on logical %u (core %u reserved: process default %s, thread %s, %zu running threads moved; %zu other CPU sets)\n", role, wanted, core, process ? "set" : "failed", thread ? "set" : "failed", moved, others.size());
 #else
     (void)role;
 #endif
