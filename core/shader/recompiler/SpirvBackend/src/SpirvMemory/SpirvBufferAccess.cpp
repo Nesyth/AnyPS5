@@ -87,6 +87,10 @@ std::uint32_t readOnlyWordPointer(SpirvEmitterState& state, std::uint32_t base, 
 
 }
 
+std::uint32_t EmitAddressWordPointer(SpirvEmitterState& state, std::uint32_t base, std::uint32_t index) {
+    return wordPointer(state, base, index);
+}
+
 std::uint32_t EmitRootAddressWordPointer(SpirvEmitterState& state, std::uint32_t field, std::uint32_t index) {
     return wordPointer(state, rootAddress(state, field), index);
 }

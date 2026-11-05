@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FloatFlushProbe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DeviceImageTable.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -25,6 +26,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DeviceFault.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FragmentBarycentric.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Float32FlushControl.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DescriptorHeapVersions.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DrawInputsInPlace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubgroupBarrier.hpp"
@@ -162,20 +164,19 @@ std::optional<std::uint32_t> ActiveValidationLayerVersion(PFN_vkGetInstanceProcA
     return std::nullopt;
 }
 
-constexpr std::uint32_t MinHeapValidationLayerVersion = VK_MAKE_API_VERSION(0, 1, 4, 363);
 constexpr std::uint32_t HeapDataUniformDwordCap = 16384u;
 
 bool DescriptorHeapAvailable(const std::vector<VkExtensionProperties>& availableExtensions, PFN_vkGetInstanceProcAddr instanceProc) {
     if (!Graphics::GpuHeapEnabled()) return false;
     const auto heapExtension = std::find_if(availableExtensions.begin(), availableExtensions.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME) == 0; });
     if (heapExtension == availableExtensions.end()) return false;
-    if (heapExtension->specVersion < VK_EXT_DESCRIPTOR_HEAP_SPEC_VERSION) {
+    if (!DescriptorHeapVersionsSupported(heapExtension->specVersion)) {
         std::fprintf(stderr, "[gpu-heap] the driver's VK_EXT_descriptor_heap is revision %u, older than the released revision %u, so the GPU heap stays off\n",
                      heapExtension->specVersion, static_cast<unsigned>(VK_EXT_DESCRIPTOR_HEAP_SPEC_VERSION));
         return false;
     }
     const auto validationVersion = ActiveValidationLayerVersion(instanceProc);
-    if (validationVersion.has_value() && *validationVersion < MinHeapValidationLayerVersion) {
+    if (validationVersion.has_value() && !DescriptorHeapVersionsSupported(heapExtension->specVersion, validationVersion)) {
         std::fprintf(stderr, "[gpu-heap] VK_LAYER_KHRONOS_validation %u.%u.%u predates its descriptor heap rules (1.4.363 is the oldest layer that validates heap push data), so the GPU heap stays off\n",
                      VK_API_VERSION_MAJOR(*validationVersion), VK_API_VERSION_MINOR(*validationVersion), VK_API_VERSION_PATCH(*validationVersion));
         return false;
@@ -194,6 +195,11 @@ void check(VkResult result, const char* operation) {
 
 void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("Vulkan presentation: ") + reason);
+}
+
+void reportDeviceImagePathRefusal(const std::string& reason) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) std::fprintf(stderr, "[device-images] APS5_GPU_PATH stays off on this device: %s\n", reason.c_str());
 }
 
 void checkHostRequirements(const HostGpuQuery& query, bool printReport) {
@@ -652,6 +658,7 @@ struct VulkanDevice::State {
     bool contextReady = false;
     std::unique_ptr<Graphics::TextureDetiler> detiler;
     bool descriptorHeap = false;
+    bool deviceImagePath = false;
     VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptorHeapProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT};
     std::uint32_t heapDataUniformDwords = 0;
     bool heapBufferDescriptors = false;
@@ -1160,6 +1167,7 @@ struct VulkanDevice::State {
             Graphics::ClearRetainedSpaces(device);
             Graphics::ClearCachedTextures(device);
             Graphics::ClearSnapshotCopies(device);
+            Graphics::DeviceImageTable::Release(device);
             Graphics::BindlessHeap::Release(device);
             Graphics::ClearImageMirrors(device);
             Graphics::ClearHostImports(device);
@@ -2521,6 +2529,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     Graphics::PrepareImportWatch(graphicsContext());
     Graphics::SetDescriptorHeapDevice(state->descriptorHeap && state->descriptorHeapProperties.maxPushDataSize >= Graphics::PipelinePushConstantBytes);
     Graphics::BufferPool::SetForceAddresses(Graphics::DescriptorHeapEnabled());
+    if (Graphics::GpuPathEnabled()) {
+        const auto refusal = Graphics::DeviceImagePathRefusal({Graphics::GpuHeapEnabled(), Graphics::DescriptorHeapEnabled()});
+        state->deviceImagePath = !refusal.has_value();
+        if (refusal.has_value()) reportDeviceImagePathRefusal(*refusal);
+    }
     state->bufferPool = std::make_shared<Graphics::BufferPool>(graphicsContext());
     state->emptyBuffer = std::make_unique<Graphics::Buffer>(graphicsContext(), Graphics::EmptyBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::ranges::fill(state->emptyBuffer->Bytes(), std::byte{0});
@@ -2545,6 +2558,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->recorder->Activate();
     state->context = buildContext();
     state->contextReady = true;
+    if (state->deviceImagePath) {
+        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+        if (!GuestMemory::GpuMutex().HeldByThisThread()) gpuLock.lock();
+        Graphics::DeviceImageTable::Create(state->context, ShaderRecompiler::ResourceMaterializer::FindDeviceImageInterface);
+    }
     if (window != nullptr) {
         require(window->getDrawableSize != nullptr, "missing window drawable size query");
         std::uint32_t drawableWidth = 0;
@@ -4395,6 +4413,52 @@ bool VulkanDevice::PresentsOnOwnQueue() const {
     return state->presentQueue != VK_NULL_HANDLE;
 }
 
+bool VulkanDevice::DeviceImagePath() const {
+    return state->deviceImagePath;
+}
+
+bool VulkanDevice::DeviceImagesServe(std::uint64_t codeAddress) const {
+    if (!state->deviceImagePath) return false;
+    const auto* table = Graphics::DeviceImageTable::Existing(state->context);
+    return table != nullptr && table->ServesProgram(codeAddress);
+}
+
+void VulkanDevice::NoteDeviceImageProgram(const ShaderRecompiler::RecompileResult& result, std::uint64_t codeAddress) const {
+    if (!result.deviceImageTables) return;
+    if (auto* table = Graphics::DeviceImageTable::Existing(state->context)) table->NoteProgram(result.Identity(), codeAddress);
+}
+
+std::optional<std::string> VulkanDevice::ExpectDeviceImages(std::span<const ShaderRecompiler::DeviceImageTableAbi::Expectation> images, bool unexpected) const {
+    auto* table = Graphics::DeviceImageTable::Existing(state->context);
+    require(table != nullptr && state->recorder != nullptr, "expected device images need the device's table and its recorder");
+    auto unserved = table->Expect(graphicsContext(), *state->recorder, images);
+    if (unexpected) table->NoteUnexpectedBatch(*state->recorder);
+    return unserved;
+}
+
+void VulkanDevice::SettleDeviceImageMisses() const {
+    if (!state->deviceImagePath || !Graphics::DeviceImageTable::KeepsUnexpectedPrograms() || state->recorder == nullptr) return;
+    auto* table = Graphics::DeviceImageTable::Existing(state->context);
+    if (table == nullptr) return;
+    std::uint64_t serial = 0;
+    {
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        serial = table->UnexpectedSerial(*state->recorder);
+        if (serial != 0u && !state->recorder->HasTimeline()) state->recorder->Sync();
+    }
+    if (serial == 0u) return;
+    if (state->recorder->HasTimeline()) state->recorder->WaitSerial(serial);
+    std::lock_guard lock(GuestMemory::GpuMutex());
+    if (state->recorder->HasTimeline()) state->recorder->FinishUpTo(serial);
+    table->Settle(graphicsContext(), *state->recorder);
+}
+
+void VulkanDevice::FallBackDeviceImages(const ShaderRecompiler::RecompileResult& result, std::uint64_t codeAddress, const std::string& reason) const {
+    auto* table = Graphics::DeviceImageTable::Existing(state->context);
+    require(table != nullptr, "a device image fallback needs the device's table");
+    table->FallBackProgram(result.Identity(), codeAddress, reason);
+}
+
 ShaderRecompiler::SpirvTarget VulkanDevice::ComputeTarget(std::uint32_t waveSize) const {
     auto target = Target();
     if (waveSize == 32u && state->computeWave32) target.subgroupSize = 32u;
@@ -4464,6 +4528,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     target.hostInterpolationFirst = state->hostInterpolationFirst;
     target.float32DenormPreserve = state->float32DenormPreserve;
     target.descriptorMemory = Graphics::DescriptorHeapEnabled();
+    target.deviceImageTables = state->deviceImagePath;
     target.heapDataUniformDwords = target.descriptorMemory ? state->heapDataUniformDwords : 0u;
     target.heapBufferDescriptors = target.descriptorMemory && state->heapBufferDescriptors;
     return target;

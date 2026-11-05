@@ -21,6 +21,8 @@
 
 namespace ShaderRecompiler {
 
+struct IrResourcePlan;
+
 enum class ShaderStage {
     Compute,
     Vertex,
@@ -366,6 +368,7 @@ struct SpirvTarget {
     bool meshWindowBuffer = false;
     bool hostInterpolationFirst = false;
     bool shaderImageMinLod = false;
+    bool deviceImageTables = false;
 };
 
 struct BindingLayout {
@@ -787,6 +790,7 @@ struct CompiledShaderArtifact {
     std::uint32_t bufferAddressCount = 0;
     bool dataAddressPush = false;
     bool bdaStores = false;
+    bool deviceImageTables = false;
     std::uint32_t bdaAbiVersion = 0;
     std::uint32_t windowLaneGuards = 0;
     std::uint32_t descriptorFaults = 0;
@@ -830,6 +834,8 @@ struct ShaderInvocation {
     std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
     std::uint64_t imageTableShader = 0;
     std::uint32_t imageTableFaults = 0;
+    std::vector<std::uint64_t> deviceImageInterfaces;
+    std::vector<std::uint32_t> deviceSamplerClasses;
 };
 
 // What a Vulkan pipeline built from a result depends on besides the fixed-function state and the
@@ -863,6 +869,7 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
     std::vector<std::uint32_t> shaderDataUserWords;
+    std::shared_ptr<const IrResourcePlan> deviceImagePlan;
     [[nodiscard]] std::uint64_t PipelineVariantId() const { return specializationId != 0 ? specializationId : variantId; }
     [[nodiscard]] PipelineIdentity Identity() const {
         const auto hash = spirv.ContentHash();

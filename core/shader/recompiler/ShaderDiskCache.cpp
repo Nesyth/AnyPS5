@@ -86,16 +86,16 @@ namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
 static_assert(sizeof(CompiledShaderArtifact) == 304, "CompiledShaderArtifact changed: update the artifact encoder");
-static_assert(sizeof(ShaderInvocation) == 240, "ShaderInvocation changed: update the invocation encoder");
+static_assert(sizeof(ShaderInvocation) == 288, "ShaderInvocation changed: update the invocation encoder");
 #if defined(__cpp_lib_atomic_shared_ptr)
-static_assert(sizeof(RecompileResult) == 624, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(RecompileResult) == 688, "RecompileResult changed: update EncodeResult and DecodeResult");
 #endif
 static_assert(sizeof(DescriptorBinding) == 656, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 16, "FragmentParameter changed: update the parameter encoder");
-static_assert(sizeof(CompiledShaderInfo) == 368, "CompiledShaderInfo changed: update the info encoder");
-static_assert(sizeof(ShaderInfo) == 232, "ShaderInfo changed: update the info encoder");
+static_assert(sizeof(CompiledShaderInfo) == 392, "CompiledShaderInfo changed: update the info encoder");
+static_assert(sizeof(ShaderInfo) == 256, "ShaderInfo changed: update the info encoder");
 static_assert(sizeof(BufferResource) == 32, "BufferResource changed: update the info encoder");
 static_assert(sizeof(ImageResource) == 108, "ImageResource changed: update the info encoder");
 static_assert(sizeof(SamplerResource) == 24, "SamplerResource changed: update the info encoder");
@@ -107,7 +107,7 @@ static_assert(sizeof(IrDescriptorBinding) == 32, "IrDescriptorBinding changed: u
 static_assert(sizeof(BindingAllocationResult) == 200, "BindingAllocationResult changed: update the allocation encoder");
 static_assert(sizeof(CompiledBindingLayout) == 104, "CompiledBindingLayout changed: update the allocation encoder");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
-static_assert(sizeof(IrResourcePlan) == 728, "IrResourcePlan changed: update EncodePlan and DecodePlan");
+static_assert(sizeof(IrResourcePlan) == 752, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(sizeof(IrValue) == 144, "IrValue changed: update the plan value encoder");
 static_assert(sizeof(GuestRegister) == 8, "GuestRegister changed: update the plan value encoder");
 static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan encoder");
@@ -141,11 +141,12 @@ constexpr std::size_t fieldCount() {
     }
 }
 
-static_assert(fieldCount<ShaderInfo>() == 24, "ShaderInfo changed: update the info encoder");
+static_assert(fieldCount<ShaderInfo>() == 25, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 12, "BufferResource changed: update the info encoder");
-static_assert(fieldCount<ImageResource>() == 50, "ImageResource changed: update the info encoder");
+static_assert(fieldCount<ImageResource>() == 51, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
 static_assert(fieldCount<SampledResourcePair>() == 4, "SampledResourcePair changed: update the info encoder");
+static_assert(fieldCount<DeviceImageUse>() == 5, "DeviceImageUse changed: update the info encoder");
 static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the info encoder");
 static_assert(fieldCount<StageOutput>() == 4, "StageOutput changed: update the info encoder");
 static_assert(fieldCount<IrResourcePlan>() == 25, "IrResourcePlan changed: update EncodePlan and DecodePlan");
@@ -527,6 +528,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.samplerSlotDword);
     writer.Value(result.bufferAddressDword);
     writer.Value(result.bufferAddressCount);
+    writer.Value(result.deviceImageTables);
     writer.Value(result.dataAddressPush);
     writer.Value(result.bdaStores);
     writer.List(result.vertexInputPatches, [](Writer& out, const VertexInputPatch& patch) {
@@ -600,6 +602,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.samplerSlotDword);
     reader.Value(result.bufferAddressDword);
     reader.Value(result.bufferAddressCount);
+    reader.Value(result.deviceImageTables);
     reader.Value(result.dataAddressPush);
     reader.Value(result.bdaStores);
     reader.List(result.vertexInputPatches, 20, [](Reader& in, VertexInputPatch& patch) {
@@ -703,6 +706,8 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
     });
     writer.Value(invocation.imageTableShader);
     writer.Value(invocation.imageTableFaults);
+    writer.List(invocation.deviceImageInterfaces, [](Writer& out, std::uint64_t id) { out.Value(id); });
+    writer.List(invocation.deviceSamplerClasses, [](Writer& out, std::uint32_t bits) { out.Value(bits); });
 }
 
 void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
@@ -749,6 +754,8 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
     });
     reader.Value(invocation.imageTableShader);
     reader.Value(invocation.imageTableFaults);
+    reader.List(invocation.deviceImageInterfaces, 8, [](Reader& in, std::uint64_t& id) { in.Value(id); });
+    reader.List(invocation.deviceSamplerClasses, 4, [](Reader& in, std::uint32_t& bits) { in.Value(bits); });
 }
 
 void encodeLayout(Writer& writer, const IrBindingLayout& layout) {
@@ -861,6 +868,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
         out.Value(image.table);
         out.Value(image.tableOperation);
         out.Value(image.targetMerge);
+        out.Value(image.deviceTable);
     });
     writer.Value(!info.runtimeImageModes.empty());
     writer.List(info.samplers, [](Writer& out, const SamplerResource& sampler) {
@@ -878,6 +886,13 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
         out.Value(pair.sampler);
         out.Value(pair.firstUsePc);
         out.Value(pair.volumeGather);
+    });
+    writer.List(info.deviceImageUses, [](Writer& out, const DeviceImageUse& use) {
+        out.Value(use.image);
+        out.Value(use.sampler);
+        out.Value(use.descriptor);
+        out.Value(use.firstUsePc);
+        out.Value(use.samplerDescriptor);
     });
     writer.List(info.inputs, [](Writer& out, const StageInput& input) {
         out.Value(input.kind);
@@ -977,6 +992,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(image.table);
         in.Value(image.tableOperation);
         in.Value(image.targetMerge);
+        in.Value(image.deviceTable);
     });
     bool preparedImageModes = false;
     reader.Value(preparedImageModes);
@@ -996,6 +1012,13 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(pair.sampler);
         in.Value(pair.firstUsePc);
         in.Value(pair.volumeGather);
+    });
+    reader.List(info.deviceImageUses, 20, [](Reader& in, DeviceImageUse& use) {
+        in.Value(use.image);
+        in.Value(use.sampler);
+        in.Value(use.descriptor);
+        in.Value(use.firstUsePc);
+        in.Value(use.samplerDescriptor);
     });
     reader.List(info.inputs, 21, [](Reader& in, StageInput& input) {
         in.Value(input.kind);
@@ -1431,6 +1454,12 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
     if (!std::ranges::all_of(plan.info.buffers, [&](const BufferResource& buffer) { return knownSource(buffer.source); })) return false;
     if (!std::ranges::all_of(plan.info.images, [&](const ImageResource& image) { return knownSource(image.source); })) return false;
     if (!std::ranges::all_of(plan.info.samplers, [&](const SamplerResource& sampler) { return knownSource(sampler.source); })) return false;
+    if (!std::ranges::all_of(plan.info.deviceImageUses, [&](const DeviceImageUse& use) {
+        if (use.samplerDescriptor == NoSampler) return true;
+        if (!knownSource(use.samplerDescriptor)) return false;
+        const auto& source = plan.descriptorSources[use.samplerDescriptor];
+        return source.dwordCount == DeviceImageTableAbi::SamplerWords && std::all_of(source.dwords.begin(), source.dwords.begin() + DeviceImageTableAbi::SamplerWords, [](const IrValue* word) { return word != nullptr && word->Type() == IrType::U32; });
+    })) return false;
     const bool blocksValid = std::ranges::all_of(plan.controlFlow, [&](const ResourceBlock& block) {
         return (block.condition == nullptr || block.successors.size() == 2u) &&
                std::ranges::all_of(block.successors, [&](std::uint32_t successor) { return successor < plan.controlFlow.size(); }) &&
