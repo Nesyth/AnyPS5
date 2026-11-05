@@ -1608,9 +1608,14 @@ ThreadCollectMemo& threadCollectMemo() {
     return *memo;
 }
 
+// The thread's walks in its current collect epoch. `intervals` (APS5_NO_INTERVAL_COLLECT_MEMO
+// turns it off for `ranges`, keyed by a walk's first page) holds the walked ranges merged, so a range
+// inside any earlier walk of the epoch answers from it: neighbouring inputs in one rounded block,
+// sub-ranges of a surface, a view inside its image's range.
 struct EpochCollectMap {
     std::uint64_t epoch = 0;
     std::unordered_map<std::uintptr_t, WriteTracker::Memo> ranges;
+    std::map<std::uintptr_t, WriteTracker::Memo> intervals;
 };
 
 EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
@@ -1618,9 +1623,41 @@ EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
     auto& map = ShaderRecompiler::ThreadOwned(slot);
     if (map.epoch != epoch) {
         map.ranges.clear();
+        map.intervals.clear();
         map.epoch = epoch;
     }
     return map;
+}
+
+bool intervalCollectMemo() {
+    return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoIntervalCollectMemo);
+}
+
+const WriteTracker::Memo* walkedInterval(const EpochCollectMap& map, std::uintptr_t first, std::uintptr_t stop) {
+    auto found = map.intervals.upper_bound(first);
+    if (found == map.intervals.begin()) return nullptr;
+    --found;
+    return found->second.begin <= first && stop <= found->second.end ? &found->second : nullptr;
+}
+
+// Merges a completed walk with the walks it overlaps or touches under the same serials; an
+// overlapping walk under other serials is stale and goes.
+void noteWalkedInterval(EpochCollectMap& map, WriteTracker::Memo walked) {
+    auto at = map.intervals.upper_bound(walked.begin);
+    if (at != map.intervals.begin()) --at;
+    while (at != map.intervals.end() && at->second.begin <= walked.end) {
+        const auto& entry = at->second;
+        if (entry.end < walked.begin) {
+            ++at;
+            continue;
+        }
+        if (entry.unwatched == walked.unwatched && entry.mapping == walked.mapping) {
+            walked.begin = std::min(walked.begin, entry.begin);
+            walked.end = std::max(walked.end, entry.end);
+        }
+        at = map.intervals.erase(at);
+    }
+    map.intervals[walked.begin] = walked;
 }
 
 bool epochCollectMapEnabled() {
@@ -1761,7 +1798,12 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         // initialized and watched; nothing below the lock needs asking.
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
-            if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && found->second.mapping == mapping && stop <= found->second.end) {
+            if (intervalCollectMemo()) {
+                if (const auto* walked = walkedInterval(map, first, stop); walked != nullptr && walked->unwatched == unwatched && walked->mapping == mapping) {
+                    collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                    return tracker.stable.load(std::memory_order_acquire);
+                }
+            } else if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && found->second.mapping == mapping && stop <= found->second.end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.stable.load(std::memory_order_acquire);
             }
@@ -1817,8 +1859,13 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             auto& memo = threadCollectMemo();
             memo.entries[memo.next++ % memo.entries.size()] = {first, stop, epoch, serial, mapping};
             if (epochCollectMapEnabled()) {
-                auto& entry = epochCollectMap(epoch).ranges[first];
-                if (entry.unwatched != serial || entry.mapping != mapping || entry.end < stop) entry = {first, stop, epoch, serial, mapping};
+                auto& map = epochCollectMap(epoch);
+                if (intervalCollectMemo()) {
+                    noteWalkedInterval(map, {first, stop, epoch, serial, mapping});
+                } else {
+                    auto& entry = map.ranges[first];
+                    if (entry.unwatched != serial || entry.mapping != mapping || entry.end < stop) entry = {first, stop, epoch, serial, mapping};
+                }
             }
         }
     }

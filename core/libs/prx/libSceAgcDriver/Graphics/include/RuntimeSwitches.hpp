@@ -20,6 +20,7 @@ enum class RuntimeSwitch : std::size_t {
     NoStageDataSideCars,
     NoDataRecipes,
     NoHeapRecipes,
+    NoIntervalCollectMemo,
     Count,
 };
 
