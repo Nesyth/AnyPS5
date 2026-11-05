@@ -28,9 +28,11 @@ struct RealtimePlan {
 ThreadPriorityMode ParseThreadPriorityMode(const char* text);
 RealtimePlan PlanRealtime(std::uint32_t priority, const std::optional<RtkitLimits>& rtkit, RttimeLimit current, std::uint64_t requestedUs);
 void RaiseWorkerThreadPriority(const char* role);
-// APS5_XP_COMMITTER_CPU=<logical processor> (experiment, Windows): reserve that processor's physical core
-// for the calling thread. The process default CPU set drops both of the core's logical processors and the
-// thread selects the given one, so its SMT sibling stays idle. Pinned threads (job workers) need their own mask.
+// Windows: reserve a physical core for the calling thread (the draw committer). The process default CPU
+// set drops both of the core's logical processors and the thread selects one, so its SMT sibling stays
+// idle and the title's spinning job workers cannot share it. By default the highest-numbered core on a
+// host with at least six; APS5_COMMITTER_CPU=<logical processor> picks one, APS5_NO_COMMITTER_CORE=1
+// turns it off. Threads pinned with their own mask (APS5_JOB_AFFINITY_MASK) keep it.
 void PlaceReservedThread(const char* role);
 
 }

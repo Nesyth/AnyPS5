@@ -338,9 +338,8 @@ void RaiseWorkerThreadPriority(const char* role) {
 
 void PlaceReservedThread(const char* role) {
 #ifdef _WIN32
-    const char* text = std::getenv("APS5_XP_COMMITTER_CPU");
-    if (text == nullptr || *text == 0) return;
-    const auto wanted = static_cast<unsigned>(std::strtoul(text, nullptr, 10));
+    if (std::getenv("APS5_NO_COMMITTER_CORE") != nullptr) return;
+    const char* text = std::getenv("APS5_COMMITTER_CPU");
     using GetInformation = BOOL(WINAPI*)(void*, ULONG, PULONG, HANDLE, ULONG);
     using SetCpuSets = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
     const auto kernel = GetModuleHandleW(L"kernel32.dll");
@@ -356,6 +355,19 @@ void PlaceReservedThread(const char* role) {
     // LogicalProcessorIndex at 14, CoreIndex at 15.
     const auto byteAt = [&](ULONG at) { return static_cast<unsigned>(buffer[at]); };
     const auto wordAt = [&](ULONG at) { ULONG value = 0; std::memcpy(&value, buffer.data() + at, sizeof(value)); return value; };
+    // Without APS5_COMMITTER_CPU: the first logical processor of the highest-numbered physical core, on a
+    // host with at least six cores (fewer would leave the title's spinning job workers too little room).
+    std::set<unsigned> cores;
+    for (ULONG offset = 0; offset + 16 <= bytes && wordAt(offset) != 0; offset += wordAt(offset)) {
+        if (wordAt(offset + 4) == 0) cores.insert(byteAt(offset + 15));
+    }
+    if (cores.empty() || ((text == nullptr || *text == 0) && cores.size() < 6)) return;
+    const unsigned lastCore = *cores.rbegin();
+    unsigned lastCoreFirst = 0x100;
+    for (ULONG offset = 0; offset + 16 <= bytes && wordAt(offset) != 0; offset += wordAt(offset)) {
+        if (wordAt(offset + 4) == 0 && byteAt(offset + 15) == lastCore) lastCoreFirst = std::min(lastCoreFirst, byteAt(offset + 14));
+    }
+    const auto wanted = text != nullptr && *text != 0 ? static_cast<unsigned>(std::strtoul(text, nullptr, 10)) : lastCoreFirst;
     unsigned core = 0x100;
     ULONG own = 0;
     for (ULONG offset = 0; offset + 16 <= bytes && wordAt(offset) != 0; offset += wordAt(offset)) {
