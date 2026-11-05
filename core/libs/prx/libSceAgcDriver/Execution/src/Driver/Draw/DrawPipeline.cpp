@@ -374,6 +374,7 @@ void DrawPipeline::enqueue(Item item) {
         thread = std::thread([this] {
             GuestMemory::MarkProofThread();
             RaiseWorkerThreadPriority("draw committer");
+            PlaceReservedThread("draw committer");
             run();
         });
         runningCommitters.fetch_add(1, std::memory_order_acq_rel);

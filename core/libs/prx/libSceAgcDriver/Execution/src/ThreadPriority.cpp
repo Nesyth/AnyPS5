@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -333,6 +334,47 @@ RealtimePlan PlanRealtime(std::uint32_t priority, const std::optional<RtkitLimit
 void RaiseWorkerThreadPriority(const char* role) {
     if (RequestedMode() == ThreadPriorityMode::Off) return;
     Raise(role);
+}
+
+void PlaceReservedThread(const char* role) {
+#ifdef _WIN32
+    const char* text = std::getenv("APS5_XP_COMMITTER_CPU");
+    if (text == nullptr || *text == 0) return;
+    const auto wanted = static_cast<unsigned>(std::strtoul(text, nullptr, 10));
+    using GetInformation = BOOL(WINAPI*)(void*, ULONG, PULONG, HANDLE, ULONG);
+    using SetCpuSets = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
+    const auto kernel = GetModuleHandleW(L"kernel32.dll");
+    const auto getInformation = reinterpret_cast<GetInformation>(reinterpret_cast<void*>(GetProcAddress(kernel, "GetSystemCpuSetInformation")));
+    const auto setDefault = reinterpret_cast<SetCpuSets>(reinterpret_cast<void*>(GetProcAddress(kernel, "SetProcessDefaultCpuSets")));
+    const auto setSelected = reinterpret_cast<SetCpuSets>(reinterpret_cast<void*>(GetProcAddress(kernel, "SetThreadSelectedCpuSets")));
+    if (getInformation == nullptr || setDefault == nullptr || setSelected == nullptr) return;
+    ULONG bytes = 0;
+    getInformation(nullptr, 0, &bytes, GetCurrentProcess(), 0);
+    std::vector<unsigned char> buffer(bytes);
+    if (bytes == 0 || !getInformation(buffer.data(), bytes, &bytes, GetCurrentProcess(), 0)) return;
+    // SYSTEM_CPU_SET_INFORMATION: Size at 0, Type at 4 (0 = CpuSetInformation), Id at 8,
+    // LogicalProcessorIndex at 14, CoreIndex at 15.
+    const auto byteAt = [&](ULONG at) { return static_cast<unsigned>(buffer[at]); };
+    const auto wordAt = [&](ULONG at) { ULONG value = 0; std::memcpy(&value, buffer.data() + at, sizeof(value)); return value; };
+    unsigned core = 0x100;
+    ULONG own = 0;
+    for (ULONG offset = 0; offset + 16 <= bytes && wordAt(offset) != 0; offset += wordAt(offset)) {
+        if (wordAt(offset + 4) == 0 && byteAt(offset + 14) == wanted) {
+            core = byteAt(offset + 15);
+            own = wordAt(offset + 8);
+        }
+    }
+    if (core == 0x100) return;
+    std::vector<ULONG> others;
+    for (ULONG offset = 0; offset + 16 <= bytes && wordAt(offset) != 0; offset += wordAt(offset)) {
+        if (wordAt(offset + 4) == 0 && byteAt(offset + 15) != core) others.push_back(wordAt(offset + 8));
+    }
+    const bool process = setDefault(GetCurrentProcess(), others.data(), static_cast<ULONG>(others.size())) != 0;
+    const bool thread = setSelected(GetCurrentThread(), &own, 1) != 0;
+    std::fprintf(stderr, "[placement] %s on logical %u (core %u reserved: process default %s, thread %s; %zu other CPU sets)\n", role, wanted, core, process ? "set" : "failed", thread ? "set" : "failed", others.size());
+#else
+    (void)role;
+#endif
 }
 
 }
