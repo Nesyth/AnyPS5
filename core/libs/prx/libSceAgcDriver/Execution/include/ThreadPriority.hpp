@@ -34,7 +34,8 @@ void RaiseWorkerThreadPriority(const char* role);
 // host with at least six; APS5_COMMITTER_CPU=<logical processor> picks one, APS5_NO_COMMITTER_CORE=1
 // turns it off. Threads pinned with their own mask (APS5_JOB_AFFINITY_MASK) keep it.
 void PlaceReservedThread(const char* role);
-// APS5_XP_FINISHER_CORE=1 (experiment): reserve the next free physical core the same way for the draw finisher.
+// The next free physical core the same way for the draw finisher; APS5_NO_FINISHER_CORE=1 turns that off
+// (APS5_NO_COMMITTER_CORE=1 turns both off).
 void PlaceFinisherThread(const char* role);
 
 }

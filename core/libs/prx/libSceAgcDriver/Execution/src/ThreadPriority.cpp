@@ -435,7 +435,7 @@ void PlaceReservedThread(const char* role) {
 
 void PlaceFinisherThread(const char* role) {
 #ifdef _WIN32
-    if (std::getenv("APS5_XP_FINISHER_CORE") == nullptr) return;
+    if (std::getenv("APS5_NO_FINISHER_CORE") != nullptr || std::getenv("APS5_NO_COMMITTER_CORE") != nullptr) return;
     reserveCore(role, nullptr);
 #else
     (void)role;
