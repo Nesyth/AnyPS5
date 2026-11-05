@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -203,6 +204,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         running = true;
         thread = std::thread([this] {
             finisherThread = true;
+            RaiseWorkerThreadPriority("draw finisher");
             run();
         });
         runningFinishers.fetch_add(1, std::memory_order_acq_rel);
@@ -371,6 +373,7 @@ void DrawPipeline::enqueue(Item item) {
     if (!thread.joinable()) {
         thread = std::thread([this] {
             GuestMemory::MarkProofThread();
+            RaiseWorkerThreadPriority("draw committer");
             run();
         });
         runningCommitters.fetch_add(1, std::memory_order_acq_rel);
