@@ -1772,6 +1772,9 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #ifdef _WIN32
     // APS5_XP_WALKS_FREE (ceiling experiment, wrong once guest memory changes): every walk finds nothing written.
     if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpWalksFree)) return true;
+    static std::atomic<int> armResident{-1};
+    const int armWanted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpArmResident) ? 1 : 0;
+    if (armResident.load(std::memory_order_relaxed) != armWanted && armResident.exchange(armWanted, std::memory_order_relaxed) != armWanted) GuestArena::GuestArenaSetArmResident_nid_no_patch(armWanted != 0);
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
     writeRates[0].fetch_add(1, std::memory_order_relaxed);
     writeRates[1].fetch_add(stop - first, std::memory_order_relaxed);
