@@ -23,6 +23,7 @@ enum class RuntimeSwitch : std::size_t {
     NoIntervalCollectMemo,
     NoInputMemo,
     NoPassAttachmentMemo,
+    NoGuardSpans,
     Count,
 };
 
