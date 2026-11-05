@@ -2998,6 +2998,14 @@ void VulkanDevice::NoteHtileMask(const Graphics::HtileMaskClear& clear) const {
     Graphics::NoteHtileMaskOnGpu(graphicsContext(), clear);
 }
 
+bool VulkanDevice::HtileClearStateCurrent(const Graphics::HtileZmaskFixup& fixup) const {
+    return Graphics::HtileClearStateCurrent(graphicsContext(), fixup);
+}
+
+void VulkanDevice::NoteHtileZmaskFixup(const Graphics::HtileZmaskFixup& fixup, bool carried) const {
+    Graphics::NoteHtileZmaskFixupOnGpu(graphicsContext(), fixup, carried);
+}
+
 bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     static const bool syncDumps = std::getenv("APS5_SYNC_SAMPLE_DUMPS") != nullptr || std::getenv("APS5_NO_GPU_SAMPLE_DUMPS") != nullptr;
     if (syncDumps) return false;

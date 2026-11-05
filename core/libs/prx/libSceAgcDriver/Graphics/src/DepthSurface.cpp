@@ -2739,7 +2739,31 @@ bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t a
     return true;
 }
 
-enum class HtileReadEvent : std::size_t { Unchanged, Stamp, Fills, Mask, Read, ReadPending, Count };
+struct HtileFixupWrite {
+    HtileZmaskFixup fixup;
+    std::uint64_t note;
+    std::uint64_t recorderId;
+    VkDevice device;
+    bool carried;
+};
+
+std::vector<HtileFixupWrite>& htileFixups() {
+    static std::vector<HtileFixupWrite> writes;
+    return writes;
+}
+
+bool carriedFixupNote(std::uint64_t recorderId, std::uint64_t note) {
+    return std::ranges::any_of(htileFixups(), [&](const HtileFixupWrite& write) { return write.carried && write.recorderId == recorderId && write.note == note; });
+}
+
+bool carriedOverPending(const Recorder& recorder, std::uint64_t address, std::size_t bytes) {
+    const auto writes = recorder.PendingWritesOver(address, bytes);
+    if (writes.empty()) return false;
+    std::lock_guard masks(htileMasksMutex());
+    return std::ranges::all_of(writes, [&](const Recorder::PendingWrite& write) { return carriedFixupNote(recorder.Id(), write.note); });
+}
+
+enum class HtileReadEvent : std::size_t { Unchanged, Stamp, Fills, Mask, Read, ReadPending, Carried, CarryVerified, CarryMismatch, Count };
 
 void noteHtileRead(HtileReadEvent event) {
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -2751,7 +2775,7 @@ void noteHtileRead(HtileReadEvent event) {
     if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
     std::array<unsigned long long, static_cast<std::size_t>(HtileReadEvent::Count)> taken{};
     for (std::size_t index = 0; index < taken.size(); ++index) taken[index] = counts[index].exchange(0, std::memory_order_relaxed);
-    AgcDriver::ProfilePrint_nid_no_patch("[htile-reads] 10 s: %llu unchanged, %llu untracked stamp kept, %llu pending fills resolved, %llu mask clears resolved; %llu read, %llu read over pending GPU writes\n", taken[0], taken[1], taken[2], taken[3], taken[4], taken[5]);
+    AgcDriver::ProfilePrint_nid_no_patch("[htile-reads] 10 s: %llu unchanged, %llu untracked stamp kept, %llu pending fills resolved, %llu mask clears resolved, %llu kept across ZMASK fixups (verify %llu, %llu differed); %llu read, %llu read over pending GPU writes\n", taken[0], taken[1], taken[2], taken[3], taken[6], taken[7], taken[8], taken[4], taken[5]);
 }
 
 void describeHtileRead(const Recorder* recorder, const DepthTarget& target, std::size_t bytes, std::uint64_t collected) {
@@ -2791,8 +2815,19 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
             }
         }
     }
+    static const bool verifyCarry = std::getenv("APS5_VERIFY_HTILE_CARRY") != nullptr;
+    bool carried = false;
+    if (pending && !target.htileStencil && !RuntimeSwitches::Set(RuntimeSwitch::NoHtileFixupCarry) && carriedOverPending(*recorder, target.htileAddress, bytes)) {
+        std::lock_guard lock(htileReadsMutex());
+        const auto found = htileReads().find(target.htileAddress);
+        carried = found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second);
+    }
+    if (carried) {
+        noteHtileRead(HtileReadEvent::Carried);
+        if (!verifyCarry) return 0;
+    }
     static const bool pendingFills = std::getenv("APS5_NO_PENDING_HTILE_FILLS") == nullptr;
-    if (pending && pendingFills) {
+    if (pending && pendingFills && !carried) {
         std::lock_guard gpu(GuestMemory::GpuMutex());
         if (const auto landed = htileAfterPendingFills(*recorder, target.htileAddress, bytes)) {
             const VkImageAspectFlags cleared = (VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u)) & HtileFillClears(*landed, target.htileStencil);
@@ -2817,11 +2852,16 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
         }
     }
     noteHtileRead(pending ? HtileReadEvent::ReadPending : HtileReadEvent::Read);
-    if (pending) describeHtileRead(recorder, target, bytes, collected);
+    if (pending && !carried) describeHtileRead(recorder, target, bytes, collected);
     std::vector<std::uint32_t> words(bytes / 4u);
     GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(words)), 4);
     VkImageAspectFlags cleared = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
     for (const auto word : words) cleared &= HtileFillClears(word, target.htileStencil);
+    if (carried) {
+        noteHtileRead(cleared == 0 ? HtileReadEvent::CarryVerified : HtileReadEvent::CarryMismatch);
+        static std::atomic<unsigned> reports{0};
+        if (cleared != 0 && reports.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[htile-reads] verify: the HTILE at 0x%llx reads cleared after a kept answer\n", static_cast<unsigned long long>(target.htileAddress));
+    }
     auto generation = collected;
     if (cleared != 0) {
         for (auto& word : words) word = expandedHtileWord(word, target.htileStencil, cleared);
@@ -3637,6 +3677,71 @@ void NoteHtileMaskOnGpu(const Context& context, const HtileMaskClear& clear) {
 void ForgetHtileMasks_nid_no_patch(std::uint64_t recorderId) {
     std::lock_guard lock(htileMasksMutex());
     std::erase_if(htileMasks(), [&](const HtileMaskWrite& write) { return write.recorderId == recorderId; });
+    std::erase_if(htileFixups(), [&](const HtileFixupWrite& write) { return write.recorderId == recorderId; });
+}
+
+std::optional<HtileZmaskFixup> MatchHtileZmaskFixup(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments) {
+    static constexpr std::array<std::uint32_t, 40> kernel{0xbfa00002u, 0xd7460008u, 0x04010a05u, 0xe0382000u, 0x80000008u, 0xbf8c3f70u, 0x3608048fu, 0x360a068fu, 0x360c028fu, 0x360e008fu, 0x7d8408f9u, 0x06868680u, 0x7d840af9u, 0x06868880u, 0x7d840cf9u, 0x06868a80u, 0x7d840e80u, 0xd5010006u, 0x00180902u, 0xd5010007u, 0x00200903u, 0xd5010005u, 0x00280901u, 0x020808f9u, 0x86060600u, 0x7d8a04f9u, 0x06068406u, 0x7d8a0707u, 0x7d8a02f9u, 0x06068605u, 0x7d8a00f9u, 0x06068804u, 0x88ea6a04u, 0x88ea6a06u, 0x88ea6a08u, 0xbefe046au, 0xbf880002u, 0xe0782000u, 0x80000408u, 0xbf810000u};
+    if (userData.size() != 5u || packet.size() < 5u || indirectArguments != 0u) return std::nullopt;
+    if (code.size() < kernel.size() || !std::equal(kernel.begin(), kernel.end(), code.begin())) return std::nullopt;
+    if (compute.numThreads != std::array<std::uint32_t, 3>{32u, 1u, 1u} || !compute.groupIdEnable[0] || compute.PartialGroups()) return std::nullopt;
+    if (packet[1] == 0u || packet[2] != 1u || packet[3] != 1u || (packet[4] & 0x3u) != 0x1u) return std::nullopt;
+    const auto stride = (userData[1] >> 16u) & 0x3fffu;
+    const bool swizzled = ((userData[1] >> 31u) & 1u) != 0u;
+    const bool addTid = ((userData[3] >> 23u) & 1u) != 0u;
+    if (stride != 16u || swizzled || addTid || userData[2] == 0u || (userData[4] & 0xfu) != 0u) return std::nullopt;
+    const auto address = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
+    if (address == 0u || (address & 15u) != 0u) return std::nullopt;
+    return HtileZmaskFixup{address, static_cast<std::size_t>(userData[2]) * 16u, userData[4]};
+}
+
+bool HtileClearStateCurrent(const Context& context, const HtileZmaskFixup& fixup) {
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoHtileFixupCarry)) return false;
+    const auto* recorder = RecorderFor(context);
+    if (recorder == nullptr) return false;
+    {
+        std::lock_guard lock(surfacesMutex());
+        bool known = false;
+        for (const auto& surface : surfaces()) {
+            if (!surface->active->load(std::memory_order_acquire) || surface->target.htileAddress != fixup.address) continue;
+            if (surface->target.htileStencil || surface->target.samples != 1u || HtileMetadataBytes(surface->target.extent) != fixup.bytes) return false;
+            known = true;
+        }
+        if (!known) return false;
+    }
+    const auto writes = recorder->PendingWritesOver(fixup.address, fixup.bytes);
+    if (!writes.empty()) {
+        std::lock_guard masks(htileMasksMutex());
+        if (!std::ranges::all_of(writes, [&](const Recorder::PendingWrite& write) { return carriedFixupNote(recorder->Id(), write.note); })) return false;
+    }
+    std::lock_guard lock(htileReadsMutex());
+    const auto found = htileReads().find(fixup.address);
+    return found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(fixup.address, fixup.bytes, found->second);
+}
+
+void NoteHtileZmaskFixupOnGpu(const Context& context, const HtileZmaskFixup& fixup, bool carried) {
+    const auto* recorder = RecorderFor(context);
+    if (recorder == nullptr || fixup.bytes == 0) return;
+    const auto end = fixup.address + fixup.bytes;
+    std::uint64_t note = 0;
+    bool covers = false;
+    for (const auto& write : recorder->PendingWritesOver(fixup.address, fixup.bytes)) {
+        if (write.note <= note) continue;
+        note = write.note;
+        covers = write.begin <= fixup.address && write.end >= end;
+    }
+    {
+        std::lock_guard lock(htileMasksMutex());
+        auto& fixups = htileFixups();
+        if (!covers) return;
+        constexpr std::size_t KeptFixups = 64;
+        if (fixups.size() >= KeptFixups) fixups.erase(fixups.begin());
+        fixups.push_back({fixup, note, recorder->Id(), context.device, carried});
+    }
+    if (!carried) return;
+    const auto generation = GuestMemory::CollectWrites(fixup.address, fixup.bytes);
+    std::lock_guard lock(htileReadsMutex());
+    htileReads()[fixup.address] = generation;
 }
 
 bool NoteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes, std::size_t nativeBytes) {
@@ -3710,6 +3815,7 @@ void ClearDepthSurfaces(VkDevice device) {
     {
         std::lock_guard lock(htileMasksMutex());
         std::erase_if(htileMasks(), [&](const HtileMaskWrite& write) { return write.device == device; });
+        std::erase_if(htileFixups(), [&](const HtileFixupWrite& write) { return write.device == device; });
     }
     std::lock_guard lock(surfacesMutex());
     drawnDepth = nullptr;

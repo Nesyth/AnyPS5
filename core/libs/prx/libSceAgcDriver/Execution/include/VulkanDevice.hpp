@@ -27,6 +27,7 @@ namespace AgcDriver {
 namespace Graphics {
 class StorageTexture;
 struct HtileMaskClear;
+struct HtileZmaskFixup;
 }
 
 // Stage A of a dispatch's resource build (see VulkanDevice::PrepareDispatch); opaque to callers.
@@ -157,6 +158,8 @@ public:
     bool FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern);
     bool DumpSamplesOnGpu(std::uint64_t address);
     void NoteHtileMask(const Graphics::HtileMaskClear& clear) const;
+    bool HtileClearStateCurrent(const Graphics::HtileZmaskFixup& fixup) const;
+    void NoteHtileZmaskFixup(const Graphics::HtileZmaskFixup& fixup, bool carried) const;
     // Copies `bytes` of guest memory from `source` to `destination` (disjoint ranges) in place of the
     // engine's memcpy kernel (Driver.cpp copyBuffer). `path` 0: copied on the CPU at once, when
     // every test of the rule holds (each a pure query, nothing flushed or recorded before the

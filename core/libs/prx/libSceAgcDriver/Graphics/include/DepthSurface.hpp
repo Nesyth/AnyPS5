@@ -80,6 +80,14 @@ struct HtileMaskClear {
 };
 std::optional<HtileMaskClear> MatchHtileBufferMaskClear(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments);
 void NoteHtileMaskOnGpu(const Context& context, const HtileMaskClear& clear);
+struct HtileZmaskFixup {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    std::uint32_t value = 0;
+};
+std::optional<HtileZmaskFixup> MatchHtileZmaskFixup(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments);
+bool HtileClearStateCurrent(const Context& context, const HtileZmaskFixup& fixup);
+void NoteHtileZmaskFixupOnGpu(const Context& context, const HtileZmaskFixup& fixup, bool carried);
 void ForgetHtileMasks_nid_no_patch(std::uint64_t recorderId);
 struct MemoryValueFill {
     std::uint64_t address;

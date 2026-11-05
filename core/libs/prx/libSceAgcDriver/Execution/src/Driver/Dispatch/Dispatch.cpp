@@ -141,6 +141,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     const bool partialLastGroup = partialGroups != std::array<std::uint32_t, 3>{};
     std::optional<std::pair<std::uint64_t, std::size_t>> htileClearCompletion;
     Graphics::HtileMaskClear htileMask;
+    std::optional<Graphics::HtileZmaskFixup> htileFixup;
     if (resolving) {
         if (indirectArguments == 0 && Graphics::MatchMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) return;
         if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
@@ -191,6 +192,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         } else if (const auto buffered = Graphics::MatchHtileBufferMaskClear(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments)) {
             if (Graphics::NoteHtileDepthClear(buffered->address, buffered->bytes, buffered->bytes)) htileClearCompletion = std::pair{buffered->address, buffered->bytes};
             htileMask = *buffered;
+        } else {
+            htileFixup = Graphics::MatchHtileZmaskFixup(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
         }
         if (!partialLastGroup && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
             pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
@@ -703,6 +706,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         phaseTiming.Phase(PhaseNoteWriters);
         auto* const keysRecorder = filledKeys ? Graphics::Recorder::Active() : nullptr;
         const auto keysNoteBefore = keysRecorder != nullptr ? keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes) : 0;
+        const bool htileFixupCarried = htileFixup.has_value() && localDevice->HtileClearStateCurrent(*htileFixup);
         try {
             if (recipeHit != nullptr) {
                 VulkanDevice::IndirectOutcome outcome{0, 0};
@@ -733,6 +737,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (note != 0 && note != keysNoteBefore) Graphics::NoteKeysFillOnGpu(keysFill->base, keysFill->bytes, *filledKeys);
         }
         if (htileMask.bytes != 0u) localDevice->NoteHtileMask(htileMask);
+        if (htileFixup.has_value()) localDevice->NoteHtileZmaskFixup(*htileFixup, htileFixupCarried);
         if (builtRecipe != nullptr) {
             if (dataHit) {
 
