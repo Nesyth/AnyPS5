@@ -28,6 +28,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_HEAP_RECIPES",
     "APS5_NO_INTERVAL_COLLECT_MEMO",
     "APS5_NO_INPUT_MEMO",
+    "APS5_NO_PASS_ATTACHMENT_MEMO",
 };
 
 struct SwitchValues {
@@ -45,6 +46,7 @@ struct SwitchValues {
             std::getenv("APS5_NO_HEAP_RECIPES") != nullptr,
             std::getenv("APS5_NO_INTERVAL_COLLECT_MEMO") != nullptr,
             std::getenv("APS5_NO_INPUT_MEMO") != nullptr,
+            std::getenv("APS5_NO_PASS_ATTACHMENT_MEMO") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

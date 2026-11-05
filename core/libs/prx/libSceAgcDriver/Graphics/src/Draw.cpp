@@ -3327,8 +3327,7 @@ AttachmentMemo& attachmentMemo() {
 }
 
 bool PassAttachmentMemoEnabled() {
-    static const bool enabled = std::getenv("APS5_NO_PASS_ATTACHMENT_MEMO") == nullptr;
-    return enabled && ShaderResources::EpochProofs();
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoPassAttachmentMemo) && ShaderResources::EpochProofs();
 }
 
 bool VerifyPassAttachments() {
