@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -361,14 +362,18 @@ void reserveCore(const char* role, const char* cpuVariable) {
     std::vector<unsigned char> buffer(bytes);
     if (bytes == 0 || !getInformation(buffer.data(), bytes, &bytes, GetCurrentProcess(), 0)) return;
     // SYSTEM_CPU_SET_INFORMATION: Size at 0, Type at 4 (0 = CpuSetInformation), Id at 8,
-    // LogicalProcessorIndex at 14, CoreIndex at 15.
+    // LogicalProcessorIndex at 14, CoreIndex at 15, EfficiencyClass at 18.
     const auto byteAt = [&](ULONG at) { return static_cast<unsigned>(buffer[at]); };
     const auto wordAt = [&](ULONG at) { ULONG value = 0; std::memcpy(&value, buffer.data() + at, sizeof(value)); return value; };
     // Without the variable: the first logical processor of the highest-numbered physical core not reserved
-    // yet, on a host with at least six cores (fewer would leave the title's spinning job workers too little room).
+    // yet among those of the highest efficiency class (so a hybrid host keeps it off its efficiency cores),
+    // on a host with at least six cores (fewer would leave the title's spinning job workers too little room).
     std::set<unsigned> cores;
-    for (ULONG offset = 0; offset + 16 <= bytes && wordAt(offset) != 0; offset += wordAt(offset)) {
-        if (wordAt(offset + 4) == 0) cores.insert(byteAt(offset + 15));
+    std::map<unsigned, unsigned> efficiency;
+    for (ULONG offset = 0; offset + 19 <= bytes && wordAt(offset) != 0; offset += wordAt(offset)) {
+        if (wordAt(offset + 4) != 0) continue;
+        cores.insert(byteAt(offset + 15));
+        efficiency[byteAt(offset + 15)] = std::max(efficiency[byteAt(offset + 15)], byteAt(offset + 18));
     }
     if (cores.empty() || ((text == nullptr || *text == 0) && cores.size() < 6)) return;
     unsigned wanted = 0x100;
@@ -376,8 +381,8 @@ void reserveCore(const char* role, const char* cpuVariable) {
         wanted = static_cast<unsigned>(std::strtoul(text, nullptr, 10));
     } else {
         unsigned pick = 0x100;
-        for (auto it = cores.rbegin(); it != cores.rend() && pick == 0x100; ++it) {
-            if (!reservedCores.contains(*it)) pick = *it;
+        for (auto it = cores.rbegin(); it != cores.rend(); ++it) {
+            if (!reservedCores.contains(*it) && (pick == 0x100 || efficiency[*it] > efficiency[pick])) pick = *it;
         }
         if (pick == 0x100) return;
         for (ULONG offset = 0; offset + 16 <= bytes && wordAt(offset) != 0; offset += wordAt(offset)) {
