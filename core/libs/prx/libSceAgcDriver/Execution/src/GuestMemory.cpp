@@ -1770,6 +1770,8 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     ++tracker.generation;
     StampRuns runs{tracker, kind, 0, window, {}};
 #ifdef _WIN32
+    // APS5_XP_WALKS_FREE (ceiling experiment, wrong once guest memory changes): every walk finds nothing written.
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpWalksFree)) return true;
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
     writeRates[0].fetch_add(1, std::memory_order_relaxed);
     writeRates[1].fetch_add(stop - first, std::memory_order_relaxed);
