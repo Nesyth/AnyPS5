@@ -281,6 +281,13 @@ public:
 
     // APS5_NO_ARM_RESIDENT as a runtime switch: turning arming off resumes every armed run (without marking it
     // written), so an A/B phase without it collects with GetWriteWatch only.
+    void SetViewDisarm(bool on) {
+        std::lock_guard lock(mutex);
+        viewDisarmFlag().store(on, std::memory_order_relaxed);
+        if (on) return;
+        for (auto& [base, view] : views) view.writeObserved = false;
+    }
+
     void SetArmResident(bool on) {
         std::lock_guard lock(mutex);
         armResidentFlag().store(on, std::memory_order_relaxed);
@@ -386,7 +393,14 @@ public:
         auto& view = found->second;
         if (view.resident) {
             if ((view.armed & subpagesOf(base, address, address + 1)) != 0) {
-                resumeResidentWrites(base);
+                if (viewDisarm()) {
+                    protectSubpages(base, view.armed, view.protection, "resume resident view writes", view.viewBytes);
+                    view.armed = 0;
+                    view.writeObserved = true;
+                    invalidate(base, view);
+                } else {
+                    resumeResidentWrites(base);
+                }
                 return true;
             }
             const auto memory = query(address);
@@ -914,6 +928,15 @@ private:
         return armResidentFlag().load(std::memory_order_relaxed);
     }
 
+    static std::atomic<bool>& viewDisarmFlag() {
+        static std::atomic<bool> perView{false};
+        return perView;
+    }
+
+    static bool viewDisarm() {
+        return viewDisarmFlag().load(std::memory_order_relaxed);
+    }
+
     bool armResident(std::uintptr_t from, std::uintptr_t stop) {
         const auto first = views.lower_bound(from & ~(pageBytes - 1));
         if (first == views.end() || first->first > from || !writable(first->second.protection)) return false;
@@ -921,7 +944,7 @@ private:
         auto expected = first->first;
         for (auto it = first; it != views.end() && it->first < stop; ++it) {
             const auto& view = it->second;
-            if (it->first != expected || !view.resident || view.protection != protection || view.hostWrites != 0 || view.hostImports != 0 || view.pins != 0) return false;
+            if (it->first != expected || !view.resident || view.protection != protection || view.hostWrites != 0 || view.hostImports != 0 || view.pins != 0 || view.writeObserved) return false;
             expected = it->first + pageBytes;
         }
         if (expected < stop) return false;
@@ -1045,6 +1068,7 @@ private:
         std::uint32_t hostImports = 0;
         bool aliasDemoted = false;
         std::uint8_t unreported = 0;
+        bool writeObserved = false;
     };
     struct Run {
         std::uintptr_t end;
