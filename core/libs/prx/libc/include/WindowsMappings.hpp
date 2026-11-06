@@ -281,6 +281,10 @@ public:
 
     // APS5_NO_ARM_RESIDENT as a runtime switch: turning arming off resumes every armed run (without marking it
     // written), so an A/B phase without it collects with GetWriteWatch only.
+    static void SetRearmQuiet(std::uint32_t collects) {
+        rearmQuietFlag().store(collects, std::memory_order_relaxed);
+    }
+
     void SetArmResident(bool on) {
         std::lock_guard lock(mutex);
         armResidentFlag().store(on, std::memory_order_relaxed);
@@ -914,6 +918,15 @@ private:
         return armResidentFlag().load(std::memory_order_relaxed);
     }
 
+    static std::atomic<std::uint32_t>& rearmQuietFlag() {
+        static std::atomic<std::uint32_t> quiet{0};
+        return quiet;
+    }
+
+    static std::uint32_t rearmQuietCollects() {
+        return rearmQuietFlag().load(std::memory_order_relaxed);
+    }
+
     bool armResident(std::uintptr_t from, std::uintptr_t stop) {
         const auto first = views.lower_bound(from & ~(pageBytes - 1));
         if (first == views.end() || first->first > from || !writable(first->second.protection)) return false;
@@ -934,7 +947,10 @@ private:
 
     void resumeResidentWrites(std::uintptr_t address, bool observed = true) {
         const auto run = std::prev(residentRuns.upper_bound(address));
-        if (observed) run->second.writeObserved = true;
+        if (observed) {
+            run->second.writeObserved = true;
+            run->second.quiet = 0;
+        }
         forgetClean(run->first, run->second.end);
         auto first = views.lower_bound(run->first);
         while (first != views.end() && first->first < run->second.end) {
@@ -1056,6 +1072,7 @@ private:
         bool reset = false;
         bool imported = false;
         bool writeObserved = false;
+        std::uint32_t quiet = 0;
     };
     struct Window {
         void* view = nullptr;
@@ -1070,7 +1087,13 @@ private:
     void collectResident(std::uintptr_t start, Run& run, std::uintptr_t from, std::uintptr_t stop, void** pages, std::size_t* count, bool clear, Collection collection) {
         if (clear) run.reset = true;
         const auto first = from & ~std::uintptr_t{4095};
-        const bool armed = armResidentRuns() && clear && run.watched && run.fresh == 0 && !run.writeObserved && collection != Collection::Fresh && run.end - start >= 0x40000 && armResident(first, stop);
+        const auto quietToRearm = rearmQuietCollects();
+        const bool mayArm = !run.writeObserved || (quietToRearm != 0 && run.quiet >= quietToRearm);
+        const bool armed = armResidentRuns() && clear && run.watched && run.fresh == 0 && mayArm && collection != Collection::Fresh && run.end - start >= 0x40000 && armResident(first, stop);
+        if (armed && run.writeObserved) {
+            run.writeObserved = false;
+            run.quiet = 0;
+        }
         if (run.fresh == 0 && collection != Collection::Fresh) {
             ULONG_PTR reported = (stop - first + 4095) / 4096;
             DWORD granularity = 0;
@@ -1078,6 +1101,7 @@ private:
             for (ULONG_PTR index = 0; index < reported; ++index) pages[*count + index] = reinterpret_cast<void*>(std::max(from, reinterpret_cast<std::uintptr_t>(pages[*count + index])));
             *count += reported;
             if (armed) rememberClean(from, stop);
+            if (clear && run.writeObserved) run.quiet = reported == 0 ? run.quiet + 1 : 0;
             return;
         }
         std::vector<std::uintptr_t> written;
