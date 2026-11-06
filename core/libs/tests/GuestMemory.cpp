@@ -2183,7 +2183,7 @@ static void CheckLargeResidentWritesDoNotFault() {
     };
     Require(collect() == bytes / 4096);
     Require(collect() == 0 && collect() == 0);
-    const bool armed = std::getenv("APS5_NO_ARM_RESIDENT") == nullptr;
+    const bool armed = std::getenv("APS5_ARM_RESIDENT") != nullptr;
     const DWORD settled = armed ? PAGE_READONLY : PAGE_READWRITE;
     MEMORY_BASIC_INFORMATION memory{};
     Require(VirtualQuery(mapped, &memory, sizeof(memory)) == sizeof(memory) && memory.Protect == settled);

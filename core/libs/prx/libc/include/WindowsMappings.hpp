@@ -6,9 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#ifdef APS5_COUNT_MAPPING_QUERIES
 #include <chrono>
-#endif
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -279,8 +277,17 @@ public:
         }
     }
 
-    // APS5_NO_ARM_RESIDENT as a runtime switch: turning arming off resumes every armed run (without marking it
+    // APS5_ARM_RESIDENT as a runtime switch: turning arming off resumes every armed run (without marking it
     // written), so an A/B phase without it collects with GetWriteWatch only.
+    // Diagnostic: arms and their VirtualProtect ns, resumes and their ns since the last call, then the clean
+    // ranges and resident runs held now.
+    void ArmingReport(std::uint64_t* out) {
+        std::lock_guard lock(mutex);
+        for (std::size_t index = 0; index < 4; ++index) out[index] = armingCounters()[index].exchange(0, std::memory_order_relaxed);
+        out[4] = cleanRanges.size();
+        out[5] = residentRuns.size();
+    }
+
     void SetArmResident(bool on) {
         std::lock_guard lock(mutex);
         armResidentFlag().store(on, std::memory_order_relaxed);
@@ -899,19 +906,24 @@ private:
         return verify;
     }
 
-    // Resident arming (on unless APS5_NO_ARM_RESIDENT): a clearing collect write-protects a settled, write-watched resident
+    // Resident arming (off unless APS5_ARM_RESIDENT; long runs stall with it, see LATE-GAME 2026-11-06): a clearing collect write-protects a settled, write-watched resident
     // span of a run of at least 256 KiB that no guest store has reached since it was last armed, and
     // remembers it clean, so later collects skip GetWriteWatch there. The first guest store into it faults
     // and resumes the whole run for good (writeObserved), so a run the guest keeps writing pays one fault.
     // Safe only where the relinker framed or relocated every red-zone leaf (#361); d6e270ea9f removed the
     // unconditional version for that reason.
     static std::atomic<bool>& armResidentFlag() {
-        static std::atomic<bool> arm{std::getenv("APS5_NO_ARM_RESIDENT") == nullptr};
+        static std::atomic<bool> arm{std::getenv("APS5_ARM_RESIDENT") != nullptr};
         return arm;
     }
 
     static bool armResidentRuns() {
         return armResidentFlag().load(std::memory_order_relaxed);
+    }
+
+    static std::array<std::atomic<std::uint64_t>, 4>& armingCounters() {
+        static std::array<std::atomic<std::uint64_t>, 4> counters{};
+        return counters;
     }
 
     bool armResident(std::uintptr_t from, std::uintptr_t stop) {
@@ -927,12 +939,23 @@ private:
         if (expected < stop) return false;
         DWORD previous;
         const auto readOnly = protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
+        const auto armStart = std::chrono::steady_clock::now();
         if (!VirtualProtect(reinterpret_cast<void*>(from), stop - from, readOnly, &previous)) fail("arm resident memory write tracking");
+        armingCounters()[0].fetch_add(1, std::memory_order_relaxed);
+        armingCounters()[1].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - armStart).count()), std::memory_order_relaxed);
         for (auto it = first; it != views.end() && it->first < stop; ++it) it->second.armed |= subpagesOf(it->first, from, stop);
         return true;
     }
 
     void resumeResidentWrites(std::uintptr_t address, bool observed = true) {
+        const auto resumeStart = std::chrono::steady_clock::now();
+        struct Timed {
+            std::chrono::steady_clock::time_point start;
+            ~Timed() {
+                armingCounters()[2].fetch_add(1, std::memory_order_relaxed);
+                armingCounters()[3].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+            }
+        } timed{resumeStart};
         const auto run = std::prev(residentRuns.upper_bound(address));
         if (observed) run->second.writeObserved = true;
         forgetClean(run->first, run->second.end);

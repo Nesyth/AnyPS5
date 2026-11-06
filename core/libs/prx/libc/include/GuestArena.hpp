@@ -73,6 +73,7 @@ void GuestArenaCompareWhenShared_nid_no_patch(std::uintptr_t address, std::size_
 void GuestArenaDescribeViews_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* out);
 void GuestArenaSweepWriteWatch_nid_no_patch(std::uint64_t* out);
 void GuestArenaSetArmResident_nid_no_patch(bool on);
+void GuestArenaArmingReport_nid_no_patch(std::uint64_t* out);
 // Diagnostic (APS5_FAULT_SITES): the code addresses of write faults on armed guest pages, with counts
 // since start-up; at most `capacity` sites are taken.
 void GuestArenaNoteWriteFault_nid_no_patch(std::uintptr_t rip);

@@ -1773,7 +1773,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     // APS5_XP_WALKS_FREE (ceiling experiment, wrong once guest memory changes): every walk finds nothing written.
     if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpWalksFree)) return true;
     static std::atomic<int> armResident{-1};
-    const int armWanted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoArmResident) ? 0 : 1;
+    const int armWanted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ArmResident) ? 1 : 0;
     if (armResident.load(std::memory_order_relaxed) != armWanted && armResident.exchange(armWanted, std::memory_order_relaxed) != armWanted) GuestArena::GuestArenaSetArmResident_nid_no_patch(armWanted != 0);
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
     writeRates[0].fetch_add(1, std::memory_order_relaxed);
@@ -2119,6 +2119,9 @@ std::string SweepCostReport() {
         std::vector<std::size_t> order(taken);
         for (std::size_t index = 0; index < taken; ++index) order[index] = index;
         std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return counts[a] > counts[b]; });
+        std::array<std::uint64_t, 6> arming{};
+        GuestArena::GuestArenaArmingReport_nid_no_patch(arming.data());
+        AgcDriver::ProfilePrint_nid_no_patch("[arming] 10 s: %llu arms in %.1f ms, %llu resumes in %.1f ms; %llu clean ranges, %llu resident runs\n", static_cast<unsigned long long>(arming[0]), static_cast<double>(arming[1]) / 1e6, static_cast<unsigned long long>(arming[2]), static_cast<double>(arming[3]) / 1e6, static_cast<unsigned long long>(arming[4]), static_cast<unsigned long long>(arming[5]));
         AgcDriver::ProfilePrint_nid_no_patch("[fault-sites] base 0x%llx sites %zu faults %llu dropped %llu\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))), taken, static_cast<unsigned long long>(total), static_cast<unsigned long long>(dropped));
         for (std::size_t index = 0; index < taken && index < 256; ++index) {
             const auto rip = rips[order[index]];
