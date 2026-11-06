@@ -277,7 +277,7 @@ public:
         }
     }
 
-    // APS5_ARM_RESIDENT as a runtime switch: turning arming off resumes every armed run (without marking it
+    // APS5_NO_ARM_RESIDENT as a runtime switch: turning arming off resumes every armed run (without marking it
     // written), so an A/B phase without it collects with GetWriteWatch only.
     // Diagnostic: arms and their VirtualProtect ns, resumes and their ns since the last call, then the clean
     // ranges and resident runs held now.
@@ -906,14 +906,14 @@ private:
         return verify;
     }
 
-    // Resident arming (off unless APS5_ARM_RESIDENT; long runs stall with it, see LATE-GAME 2026-11-06): a clearing collect write-protects a settled, write-watched resident
+    // Resident arming (on unless APS5_NO_ARM_RESIDENT): a clearing collect write-protects a settled, write-watched resident
     // span of a run of at least 256 KiB that no guest store has reached since it was last armed, and
     // remembers it clean, so later collects skip GetWriteWatch there. The first guest store into it faults
     // and resumes the whole run for good (writeObserved), so a run the guest keeps writing pays one fault.
     // Safe only where the relinker framed or relocated every red-zone leaf (#361); d6e270ea9f removed the
     // unconditional version for that reason.
     static std::atomic<bool>& armResidentFlag() {
-        static std::atomic<bool> arm{std::getenv("APS5_ARM_RESIDENT") != nullptr};
+        static std::atomic<bool> arm{std::getenv("APS5_NO_ARM_RESIDENT") == nullptr};
         return arm;
     }
 
