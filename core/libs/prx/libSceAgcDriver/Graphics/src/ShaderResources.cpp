@@ -4252,7 +4252,7 @@ const std::vector<std::pair<std::uint64_t, std::uint64_t>>* ShaderResources::ran
 
 namespace {
 
-enum class CleanEvent { Hit, Requeried, Verified, Differs, NoRecord, Views, Serials, Forgotten, PendingWrites, Ineligible, NotClean, Count };
+enum class CleanEvent { Hit, Requeried, Verified, Differs, NoRecord, Views, Serials, Forgotten, PendingWrites, NotReusable, StorageImages, DepthCopies, OwnWrites, NotClean, Count };
 
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CleanEvent::Count)>& cleanEvents() {
     static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CleanEvent::Count)> events{};
@@ -4264,7 +4264,7 @@ void noteClean(CleanEvent event) {
     events[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
     static std::atomic<std::uint64_t> calls{0};
     if ((calls.fetch_add(1, std::memory_order_relaxed) & 0x7ffffu) != 0x7ffffu) return;
-    constexpr std::array<const char*, static_cast<std::size_t>(CleanEvent::Count)> names{"hits", "of them re-queried", "verified", "verify differs", "no record", "views moved", "serials moved", "a range forgotten", "pending writes", "not eligible", "not all clean"};
+    constexpr std::array<const char*, static_cast<std::size_t>(CleanEvent::Count)> names{"hits", "of them re-queried", "verified", "verify differs", "no record", "views moved", "serials moved", "a range forgotten", "pending writes", "not reusable", "storage images", "depth copies", "own writes", "not all clean"};
     std::string line = "[clean-currency] template proofs (last 524288 events):";
     for (std::size_t index = 0; index < names.size(); ++index) {
         char item[64];
@@ -4293,7 +4293,7 @@ ShaderResources::CleanStamp ShaderResources::cleanStampNow() const {
 bool ShaderResources::cleanEligible() {
     if (cleanEligibility == 0) {
         const bool depthCopies = std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->IsDepthCopy(); });
-        cleanEligibility = reusable && storageTextures.empty() && directRegions.empty() && !depthCopies ? 1 : 2;
+        cleanEligibility = !reusable ? 2 : !storageTextures.empty() ? 3 : depthCopies ? 4 : 1;
         if (cleanEligibility == 1) {
             for (const auto& range : describedRanges) {
                 cleanRangeList.emplace_back(range.address, range.address + range.bytes);
@@ -4301,7 +4301,15 @@ bool ShaderResources::cleanEligible() {
             }
         }
     }
-    return cleanEligibility == 1 && guestMemory.Writes().empty() && !guestMemory.HasGpuCopies() && std::find(storageWritten.begin(), storageWritten.end(), true) == storageWritten.end();
+    if (cleanEligibility != 1) {
+        noteClean(cleanEligibility == 2 ? CleanEvent::NotReusable : cleanEligibility == 3 ? CleanEvent::StorageImages : CleanEvent::DepthCopies);
+        return false;
+    }
+    if (!guestMemory.Writes().empty() || std::find(storageWritten.begin(), storageWritten.end(), true) != storageWritten.end()) {
+        noteClean(CleanEvent::OwnWrites);
+        return false;
+    }
+    return true;
 }
 
 bool ShaderResources::cleanCurrent(const CleanStamp& stamp) {
@@ -4341,6 +4349,14 @@ bool ShaderResources::cleanCurrent(const CleanStamp& stamp) {
             return false;
         }
     }
+    for (const auto& region : directRegions) {
+        static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
+        if (pendingCpu && CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin))) {
+            cleanProved = false;
+            noteClean(CleanEvent::PendingWrites);
+            return false;
+        }
+    }
     if (!guestMemory.StagingDecisionsCurrent()) {
         cleanProved = false;
         noteClean(CleanEvent::PendingWrites);
@@ -4361,10 +4377,7 @@ bool ShaderResources::cleanCurrent(const CleanStamp& stamp) {
 void ShaderResources::recordClean(bool proved, const CleanStamp& stamp) {
     cleanProved = false;
     if (!proved) return;
-    if (!cleanEligible()) {
-        noteClean(CleanEvent::Ineligible);
-        return;
-    }
+    if (!cleanEligible()) return;
     if (cleanMisses != 0 && (++cleanMisses & 15u) != 0) return;
     if (!GuestMemory::AllClean(cleanRangeList)) {
         if (cleanMisses == 0) cleanMisses = 1;
