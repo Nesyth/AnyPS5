@@ -30,11 +30,7 @@ namespace AgcDriver::DriverDetail {
 namespace {
 
 bool DispatchItemsEnabled() {
-    static const bool enabled = [] {
-        const char* text = std::getenv("APS5_PIPELINE_DISPATCH");
-        return text != nullptr && text[0] != '\0' && text[0] != '0';
-    }();
-    return enabled;
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelineDispatch);
 }
 
 enum class ItemFallback : std::size_t { Miss, Reads, NoRecipe, Writes, Verify, Count };
