@@ -35,6 +35,7 @@ enum class RuntimeSwitch : std::size_t {
     XpProofAsIs,
     XpStagesAsIs,
     RearmQuiet,
+    CleanCurrency,
     Count,
 };
 

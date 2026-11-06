@@ -2560,6 +2560,24 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
     return true;
 }
 
+std::uint64_t CleanForgetSerial() {
+#ifdef _WIN32
+    return GuestArena::GuestArenaCleanForgetSerial_nid_no_patch();
+#else
+    return 0;
+#endif
+}
+
+bool AllClean(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+#ifdef _WIN32
+    static_assert(sizeof(std::pair<std::uint64_t, std::uint64_t>) == 2 * sizeof(std::uint64_t));
+    return GuestArena::GuestArenaAllClean_nid_no_patch(reinterpret_cast<const std::uint64_t*>(ranges.data()), ranges.size());
+#else
+    static_cast<void>(ranges);
+    return false;
+#endif
+}
+
 std::uint64_t TrackerGeneration() {
     auto& tracker = Tracker();
     // Under the mutex: a collect bumps the generation before its walk, and a walk still running

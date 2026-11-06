@@ -830,6 +830,14 @@ void GuestArenaSetRearmQuiet_nid_no_patch(bool on) {
     WindowsMappings::Get().SetRearmQuiet(on);
 }
 
+std::uint64_t GuestArenaCleanForgetSerial_nid_no_patch() {
+    return WindowsMappings::CleanForgetSerial();
+}
+
+bool GuestArenaAllClean_nid_no_patch(const std::uint64_t* pairs, std::size_t count) {
+    return WindowsMappings::Get().AllClean(pairs, count);
+}
+
 void GuestArenaArmingReport_nid_no_patch(std::uint64_t* out) {
     WindowsMappings::Get().ArmingReport(out);
 }

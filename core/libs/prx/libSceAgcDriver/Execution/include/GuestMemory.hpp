@@ -134,6 +134,10 @@ std::string SweepCostReport();
 void MarkProofThread();
 bool OnProofThread();
 std::uint64_t CollectEpoch();
+// Windows: a serial that moves whenever a remembered clean (armed, unwritten) range is dropped, and whether every
+// range lies inside remembered clean ranges. Elsewhere 0 and false.
+std::uint64_t CleanForgetSerial();
+bool AllClean(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();
 std::uint64_t UnwatchSerial();

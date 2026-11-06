@@ -4250,7 +4250,142 @@ const std::vector<std::pair<std::uint64_t, std::uint64_t>>* ShaderResources::ran
     return proofRangesKnown ? &proofRanges : nullptr;
 }
 
+namespace {
+
+enum class CleanEvent { Hit, Requeried, Verified, Differs, NoRecord, Views, Serials, Forgotten, PendingWrites, Ineligible, NotClean, Count };
+
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CleanEvent::Count)>& cleanEvents() {
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CleanEvent::Count)> events{};
+    return events;
+}
+
+void noteClean(CleanEvent event) {
+    auto& events = cleanEvents();
+    events[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<std::uint64_t> calls{0};
+    if ((calls.fetch_add(1, std::memory_order_relaxed) & 0x7ffffu) != 0x7ffffu) return;
+    constexpr std::array<const char*, static_cast<std::size_t>(CleanEvent::Count)> names{"hits", "of them re-queried", "verified", "verify differs", "no record", "views moved", "serials moved", "a range forgotten", "pending writes", "not eligible", "not all clean"};
+    std::string line = "[clean-currency] template proofs (last 524288 events):";
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        char item[64];
+        std::snprintf(item, sizeof(item), " %s %llu", names[index], static_cast<unsigned long long>(events[index].exchange(0, std::memory_order_relaxed)));
+        line += item;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
+bool verifyCleanCurrency() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_CLEAN_CURRENCY");
+        return text != nullptr ? std::max<std::uint64_t>(1u, std::strtoull(text, nullptr, 10)) : 0u;
+    }();
+    if (every == 0) return false;
+    thread_local std::uint64_t hits = 0;
+    return ++hits % every == 0;
+}
+
+}
+
+ShaderResources::CleanStamp ShaderResources::cleanStampNow() const {
+    return {GuestMemory::CleanForgetSerial(), TextureReleaseSerial().load(std::memory_order_acquire), StorageTexture::PendingSerial(), HostImportSetGeneration()};
+}
+
+bool ShaderResources::cleanEligible() {
+    if (cleanEligibility == 0) {
+        const bool depthCopies = std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->IsDepthCopy(); });
+        cleanEligibility = reusable && rangedProofRanges() != nullptr && storageTextures.empty() && directRegions.empty() && !depthCopies ? 1 : 2;
+    }
+    return cleanEligibility == 1 && guestMemory.Writes().empty() && !guestMemory.HasGpuCopies() && std::find(storageWritten.begin(), storageWritten.end(), true) == storageWritten.end();
+}
+
+bool ShaderResources::cleanCurrent(const CleanStamp& stamp) {
+    if (!cleanProved) {
+        noteClean(CleanEvent::NoRecord);
+        return false;
+    }
+    if (!registeredImageViewsCurrent(registeredImageViews)) {
+        cleanProved = false;
+        noteClean(CleanEvent::Views);
+        return false;
+    }
+    if (stamp.release != cleanAt.release || stamp.pending != cleanAt.pending || stamp.imports != cleanAt.imports) {
+        cleanProved = false;
+        noteClean(CleanEvent::Serials);
+        return false;
+    }
+    const auto* ranges = rangedProofRanges();
+    if (stamp.forget != cleanAt.forget) {
+        if (ranges == nullptr || !GuestMemory::AllClean(*ranges)) {
+            cleanProved = false;
+            noteClean(CleanEvent::Forgotten);
+            return false;
+        }
+        cleanAt.forget = stamp.forget;
+        noteClean(CleanEvent::Requeried);
+    }
+    const bool pendingCpu = [&] {
+        if (Recorder::InCompletion() || Recorder::Active() == nullptr) return false;
+        return (context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0;
+    }();
+    for (const auto& [begin, end] : *ranges) {
+        if (!pendingCpu) break;
+        if (CompletePendingCpuWrites(context, begin, static_cast<std::size_t>(end - begin))) {
+            cleanProved = false;
+            noteClean(CleanEvent::PendingWrites);
+            return false;
+        }
+    }
+    return true;
+}
+
+void ShaderResources::recordClean(bool proved, const CleanStamp& stamp) {
+    cleanProved = false;
+    if (!proved) return;
+    if (!cleanEligible()) {
+        noteClean(CleanEvent::Ineligible);
+        return;
+    }
+    if (cleanMisses != 0 && (++cleanMisses & 15u) != 0) return;
+    const auto* ranges = rangedProofRanges();
+    if (ranges == nullptr || !GuestMemory::AllClean(*ranges)) {
+        if (cleanMisses == 0) cleanMisses = 1;
+        noteClean(CleanEvent::NotClean);
+        return;
+    }
+    cleanMisses = 0;
+    cleanProved = true;
+    cleanAt = stamp;
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    if (!RuntimeSwitches::Set(RuntimeSwitch::CleanCurrency)) return revalidateProof(shaders, report);
+    const auto stamp = cleanStampNow();
+    if (cleanCurrent(stamp)) {
+        if (!verifyCleanCurrency()) {
+            noteClean(CleanEvent::Hit);
+            if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::None};
+            return true;
+        }
+        std::vector<std::pair<const StorageTexture*, std::uint64_t>> versions;
+        for (const auto& surface : validatedTextures) {
+            if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
+        }
+        const auto before = textures;
+        const bool ok = revalidateProof(shaders, report);
+        const bool moved = std::any_of(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
+        const bool same = ok && !moved && textures == before;
+        noteClean(same ? CleanEvent::Verified : CleanEvent::Differs);
+        static std::atomic<int> reports{0};
+        if (!same && reports.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[clean-currency] verify: a clean-currency hit disagrees with the full proof (proved %d, an upload %d, other objects %d, %zu ranges)\n", ok ? 1 : 0, moved ? 1 : 0, textures == before ? 0 : 1, rangedProofRanges() != nullptr ? rangedProofRanges()->size() : 0u);
+        recordClean(ok, stamp);
+        return ok;
+    }
+    const bool ok = revalidateProof(shaders, report);
+    recordClean(ok, stamp);
+    return ok;
+}
+
+bool ShaderResources::revalidateProof(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (!registeredImageViewsCurrent(registeredImageViews)) {
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
         provedEpoch = 0;

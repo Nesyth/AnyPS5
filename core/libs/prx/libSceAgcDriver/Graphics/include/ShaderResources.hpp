@@ -367,6 +367,12 @@ public:
         bool audited = false;
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
+    struct CleanStamp {
+        std::uint64_t forget = 0;
+        std::uint64_t release = 0;
+        std::uint64_t pending = 0;
+        std::uint64_t imports = 0;
+    };
     bool AsIsCurrent();
     // Objects whose fast proof came from another template's stamp (FastProofStamp), so far.
     static std::uint64_t FastProofStampsTaken();
@@ -862,6 +868,15 @@ private:
     // no image other than the object's own sources has results pending over its surfaces and
     // regions, so those checks are skipped (see fastRevalidate).
     std::uint64_t pendingSerialSeen = 0;
+    bool revalidateProof(std::span<const CompiledShader> shaders, ProofReport* report);
+    CleanStamp cleanStampNow() const;
+    bool cleanCurrent(const CleanStamp& stamp);
+    void recordClean(bool proved, const CleanStamp& stamp);
+    bool cleanEligible();
+    bool cleanProved = false;
+    std::uint8_t cleanEligibility = 0;
+    std::uint32_t cleanMisses = 0;
+    CleanStamp cleanAt;
     std::uint64_t provedEpoch = 0;
     std::uint64_t provedProof = 0;
     std::uint64_t provedPending = 0;

@@ -295,6 +295,28 @@ public:
         rearmQuietFlag().store(on, std::memory_order_relaxed);
     }
 
+    // A serial bumped whenever a remembered clean range is dropped (a write fault, an unmap, a host write or an
+    // alias invalidation), and whether every range in pairs (begin, end, ...) lies inside remembered clean ranges.
+    static std::uint64_t CleanForgetSerial() {
+        return cleanForgetSerial().load(std::memory_order_acquire);
+    }
+
+    bool AllClean(const std::uint64_t* pairs, std::size_t count) {
+        std::lock_guard lock(mutex);
+        for (std::size_t index = 0; index < count; ++index) {
+            auto cursor = static_cast<std::uintptr_t>(pairs[2 * index]);
+            const auto end = static_cast<std::uintptr_t>(pairs[2 * index + 1]);
+            while (cursor < end) {
+                auto it = cleanRanges.upper_bound(cursor);
+                if (it == cleanRanges.begin()) return false;
+                --it;
+                if (it->second <= cursor) return false;
+                cursor = it->second;
+            }
+        }
+        return true;
+    }
+
     void SetArmResident(bool on) {
         std::lock_guard lock(mutex);
         armResidentFlag().store(on, std::memory_order_relaxed);
@@ -933,6 +955,11 @@ private:
         return counters;
     }
 
+    static std::atomic<std::uint64_t>& cleanForgetSerial() {
+        static std::atomic<std::uint64_t> serial{1};
+        return serial;
+    }
+
     static std::atomic<bool>& rearmQuietFlag() {
         static std::atomic<bool> rearm{false};
         return rearm;
@@ -1408,16 +1435,19 @@ private:
         return saved;
     }
 
-    static void forget(Ranges& ranges, std::uintptr_t start, std::uintptr_t end) {
+    static bool forget(Ranges& ranges, std::uintptr_t start, std::uintptr_t end) {
+        bool erased = false;
         auto it = ranges.lower_bound(start);
         if (it != ranges.begin() && std::prev(it)->second > start) --it;
         while (it != ranges.end() && it->first < end) {
             const auto first = it->first;
             const auto last = it->second;
             it = ranges.erase(it);
+            erased = true;
             if (first < start) ranges.emplace(first, start);
             if (last > end) it = ranges.emplace(end, last).first;
         }
+        return erased;
     }
 
     static void remember(Ranges& ranges, std::uintptr_t start, std::uintptr_t end) {
@@ -1432,7 +1462,7 @@ private:
     }
 
     void forgetClean(std::uintptr_t start, std::uintptr_t end) {
-        forget(cleanRanges, start, end);
+        if (forget(cleanRanges, start, end)) cleanForgetSerial().fetch_add(1, std::memory_order_acq_rel);
     }
 
     void rememberClean(std::uintptr_t start, std::uintptr_t end) {
