@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -156,6 +157,16 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 }
 
 void Driver::execute(const Submission& submission) {
+    struct SubmissionReport {
+        ThreadReport::Clock::time_point start;
+        ~SubmissionReport() {
+            if (start == ThreadReport::Clock::time_point{}) return;
+            const auto end = ThreadReport::Clock::now();
+            ThreadReport::Add(ThreadReport::Count::WorkerSubmissions, 1);
+            ThreadReport::Add(ThreadReport::Count::WorkerSubmissionNs, ThreadReport::Nanoseconds(start, end));
+            ThreadReport::Tick(end);
+        }
+    } submissionReport{submission.queue == 0 && ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{}};
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
         Driver& driver;
@@ -445,6 +456,7 @@ void Driver::execute(const Submission& submission) {
                     abLines = Graphics::AbAtPresent(flipsCounted.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - abClock).count());
                 }
                 for (const auto& line : abLines) AgcDriver::ProfilePrint_nid_no_patch("%s", line.c_str());
+                if (!abLines.empty()) ThreadReport::Phase();
             }
 
             timing.Mark("flip_flush");
@@ -508,6 +520,15 @@ void Driver::execute(const Submission& submission) {
             packetCounters.CountDraw();
             drawnSinceSeal() = true;
             bool drawn = false;
+            const auto drawStart = submission.queue == 0 && ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
+            struct DrawPacketReport {
+                ThreadReport::Clock::time_point start;
+                ~DrawPacketReport() {
+                    if (start == ThreadReport::Clock::time_point{}) return;
+                    ThreadReport::Add(ThreadReport::Count::WorkerDrawPackets, 1);
+                    ThreadReport::Add(ThreadReport::Count::WorkerDrawPacketNs, ThreadReport::Nanoseconds(start, ThreadReport::Clock::now()));
+                }
+            } drawPacketReport{drawStart};
             timed(&WorkerProfile::drawMs, [&] {
                 static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
                 static const bool profileDraws = std::getenv("APS5_PROFILE_DRAW") != nullptr;

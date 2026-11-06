@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -196,7 +197,12 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         return;
     }
     if (jobs.size() >= depth && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
+    const auto roomStart = jobs.size() >= depth && ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
     idle.wait(lock, [&] { return jobs.size() < depth; });
+    if (roomStart != ThreadReport::Clock::time_point{}) {
+        ThreadReport::Add(ThreadReport::Count::WorkerFinisherRoomWaits, 1);
+        ThreadReport::Add(ThreadReport::Count::WorkerFinisherRoomNs, ThreadReport::Nanoseconds(roomStart, ThreadReport::Clock::now()));
+    }
     jobs.push_back(std::move(job));
     pending.push_back(std::move(held));
     outstanding.fetch_add(1, std::memory_order_release);
@@ -215,6 +221,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
 
 void DrawFinisher::run() {
     PerformanceTrace::BindThread("draw finisher");
+    ThreadReport::Clock::time_point lastEnd{};
     for (;;) {
         Job* job = nullptr;
         bool failed = false;
@@ -228,11 +235,20 @@ void DrawFinisher::run() {
             job = &jobs.front();
             failed = failure != nullptr;
         }
+        const auto jobStart = ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
         std::exception_ptr error;
         try {
             if (!failed) (*job)();
         } catch (...) {
             error = std::current_exception();
+        }
+        if (jobStart != ThreadReport::Clock::time_point{}) {
+            const auto end = ThreadReport::Clock::now();
+            ThreadReport::Add(ThreadReport::Count::FinisherJobs, 1);
+            ThreadReport::Add(ThreadReport::Count::FinisherJobNs, ThreadReport::Nanoseconds(jobStart, end));
+            if (lastEnd != ThreadReport::Clock::time_point{}) ThreadReport::Add(ThreadReport::Count::FinisherIdleNs, ThreadReport::Nanoseconds(lastEnd, jobStart));
+            lastEnd = end;
+            ThreadReport::Tick(end);
         }
         std::lock_guard lock(mutex);
         if (error != nullptr && failure == nullptr) failure = error;
@@ -255,9 +271,14 @@ void DrawFinisher::Settle() {
 void DrawFinisher::Drain() {
     if (OnFinisherThread()) return;
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
+    const auto drainStart = ThreadReport::Enabled() && Busy() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
     if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
+    if (drainStart != ThreadReport::Clock::time_point{}) {
+        ThreadReport::Add(ThreadReport::Count::FinisherDrains, 1);
+        ThreadReport::Add(ThreadReport::Count::FinisherDrainNs, ThreadReport::Nanoseconds(drainStart, ThreadReport::Clock::now()));
+    }
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
 
@@ -362,7 +383,13 @@ void DrawPipeline::enqueue(Item item) {
         idle.wait(lock, [&] { return items.size() <= resumeAt; });
         --idleWaiters;
         resumeAt = 0;
-        fullWaitNs += elapsedNs(start);
+        const auto waited = elapsedNs(start);
+        fullWaitNs += waited;
+        if (ThreadReport::Enabled()) {
+            const bool finisher = DrawFinisher::OnFinisherThread();
+            ThreadReport::Add(finisher ? ThreadReport::Count::FinisherRoomWaits : ThreadReport::Count::WorkerCommitterRoomWaits, 1);
+            ThreadReport::Add(finisher ? ThreadReport::Count::FinisherRoomNs : ThreadReport::Count::WorkerCommitterRoomNs, waited);
+        }
         rethrowFailure();
     }
     depthSum += items.size();
@@ -437,6 +464,7 @@ void DrawPipeline::run() {
     constexpr std::size_t LeanRunCap = 32;
     std::optional<std::unique_lock<GuestMemory::GpuMutexType>> runHold;
     std::size_t runLength = 0;
+    ThreadReport::Clock::time_point lastEnd{};
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
@@ -485,6 +513,14 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         }
         const auto spent = elapsedNs(start);
+        if (ThreadReport::Enabled()) {
+            const auto end = start + std::chrono::nanoseconds(spent);
+            ThreadReport::Add(isDraw ? ThreadReport::Count::CommitterDraws : ThreadReport::Count::CommitterOther, 1);
+            ThreadReport::Add(isDraw ? ThreadReport::Count::CommitterDrawNs : ThreadReport::Count::CommitterOtherNs, spent);
+            if (lastEnd != ThreadReport::Clock::time_point{}) ThreadReport::Add(ThreadReport::Count::CommitterIdleNs, ThreadReport::Nanoseconds(lastEnd, start));
+            lastEnd = end;
+            ThreadReport::Tick(end);
+        }
         if (fatal != nullptr) runHold.reset();
         if (fatal != nullptr && !stopped) {
             stopped = true;
@@ -546,7 +582,12 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
-    drainWaitNs[index] += elapsedNs(start);
+    const auto waited = elapsedNs(start);
+    drainWaitNs[index] += waited;
+    if (ThreadReport::Enabled()) {
+        ThreadReport::Add(ThreadReport::Count::CommitterDrains, 1);
+        ThreadReport::Add(ThreadReport::Count::CommitterDrainNs, waited);
+    }
     rethrowFailure();
 }
 
