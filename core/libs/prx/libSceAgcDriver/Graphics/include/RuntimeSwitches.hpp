@@ -33,6 +33,7 @@ enum class RuntimeSwitch : std::size_t {
     ReplayHeapStage,
     XpReplay,
     XpProofAsIs,
+    XpStagesAsIs,
     Count,
 };
 

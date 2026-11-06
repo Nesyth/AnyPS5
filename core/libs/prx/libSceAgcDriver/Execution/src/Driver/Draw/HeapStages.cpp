@@ -610,9 +610,10 @@ struct StageRecord {
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
     std::shared_ptr<const ShaderRecompiler::HeapStageWords> words;
+    std::uint32_t asIsHits = 0;
 };
 
-enum class StageRecordEvent { Same, Patched, Absent, Identity, NotTemplate, BaseWord, ValueWord, HighWord, FixedWord, Memory, Shape, Verified, Differs, Count };
+enum class StageRecordEvent { Same, Patched, Absent, Identity, NotTemplate, BaseWord, ValueWord, HighWord, FixedWord, Memory, Shape, AsIsTemplate, AsIsBaked, AsIsRefresh, Verified, Differs, Count };
 
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(StageRecordEvent::Count)>& stageRecordEvents() {
     static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(StageRecordEvent::Count)> events{};
@@ -625,7 +626,7 @@ void noteStageRecord(StageRecordEvent event) {
     static std::atomic<std::uint64_t> calls{0};
     if (event == StageRecordEvent::Verified || event == StageRecordEvent::Differs) return;
     if ((calls.fetch_add(1, std::memory_order_relaxed) & 0x7ffffu) != 0x7ffffu) return;
-    constexpr std::array<const char*, static_cast<std::size_t>(StageRecordEvent::Count)> names{"same words", "patched", "absent", "other identity", "not a template", "changed base word", "changed value word", "changed word above 64", "changed fixed word", "memory changed", "words shape", "verified", "verify differs"};
+    constexpr std::array<const char*, static_cast<std::size_t>(StageRecordEvent::Count)> names{"same words", "patched", "absent", "other identity", "not a template", "changed base word", "changed value word", "changed word above 64", "changed fixed word", "memory changed", "words shape", "as-is template", "as-is baked result", "as-is refresh", "verified", "verify differs"};
     std::string line = "[xp-replay] stage records (last 524288 stages):";
     for (std::size_t index = 0; index < names.size(); ++index) {
         char item[64];
@@ -767,13 +768,46 @@ bool replayStageRecord(const ShaderRecompiler::PreparedShaderInvocation& invocat
     return true;
 }
 
+bool asIsStageRecord(const ShaderRecompiler::PreparedShaderInvocation& invocation, std::span<const std::uint32_t> userData, std::uint64_t shaderBase,
+                     HeapStageMaterialized& adopted) {
+    auto& records = stageRecords();
+    const auto key = (invocation.VariantId() * 0x9e3779b97f4a7c15ull ^ shaderBase) + invocation.Request().layout.pushConstantOffsetBytes;
+    const auto found = records.find(key);
+    if (found == records.end() || found->second.result == nullptr) {
+        noteStageRecord(StageRecordEvent::Absent);
+        return false;
+    }
+    auto& record = found->second;
+    if (record.variant != invocation.VariantId() || record.shaderBase != shaderBase || record.pushOffset != invocation.Request().layout.pushConstantOffsetBytes ||
+        record.userData.size() != userData.size() || record.exportMapping != exportMappingOf(invocation) || tessellationInstances(invocation)) {
+        noteStageRecord(StageRecordEvent::Identity);
+        return false;
+    }
+    if (++record.asIsHits % 16u == 0u) {
+        noteStageRecord(StageRecordEvent::AsIsRefresh);
+        return false;
+    }
+    std::shared_ptr<const ShaderRecompiler::HeapStageWords> words = record.words;
+    const bool templated = record.result->heapTemplateId != 0;
+    if (templated && !patchRecordWords(record, invocation, userData, words)) {
+        noteStageRecord(StageRecordEvent::Shape);
+        return false;
+    }
+    guardRanges(record.ranges);
+    adopted.result = record.result;
+    adopted.words = std::move(words);
+    adopted.reads = {record.ranges, record.values, record.userDataUse, record.capture, true};
+    noteStageRecord(templated ? StageRecordEvent::AsIsTemplate : StageRecordEvent::AsIsBaked);
+    return true;
+}
+
 void keepStageRecord(const ShaderRecompiler::PreparedShaderInvocation& invocation, std::span<const std::uint32_t> userData, std::uint64_t shaderBase,
                      const AddressRanges& ranges, const std::vector<std::uint32_t>& values, const AddressRanges& accessible,
                      const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result,
                      const std::shared_ptr<const ShaderRecompiler::HeapStageWords>& words) {
     auto& records = stageRecords();
-    if (result->heapTemplateId == 0) return;
-    if (records.size() >= 16384u) records.clear();
+    if (result->heapTemplateId == 0 && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpStagesAsIs)) return;
+    if (records.size() >= 65536u) records.clear();
     const auto key = (invocation.VariantId() * 0x9e3779b97f4a7c15ull ^ shaderBase) + invocation.Request().layout.pushConstantOffsetBytes;
     auto& record = records[key];
     record.variant = invocation.VariantId();
@@ -820,9 +854,11 @@ HeapStageMaterialized MaterializeHeapStage(const ShaderRecompiler::PreparedShade
     const auto before = Graphics::Recorder::PendingWriteSnapshot();
     snapshotCost.Stop();
     const auto generation = GuestMemory::TrackerGeneration();
-    const bool records = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpReplay);
+    const bool stagesAsIs = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpStagesAsIs);
+    const bool records = stagesAsIs || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpReplay);
     HeapStageMaterialized recorded;
-    const bool replayed = records && replayStageRecord(invocation, userData, shaderBase, fixedWords, before.get(), generation, recorded);
+    if (stagesAsIs && asIsStageRecord(invocation, userData, shaderBase, recorded)) return recorded;
+    const bool replayed = records && !stagesAsIs && replayStageRecord(invocation, userData, shaderBase, fixedWords, before.get(), generation, recorded);
     if (replayed && !verifyStageRecord()) return recorded;
     const bool memoOn = !records && !invocation.Request().context.vertex.has_value();
     std::uint64_t memoKey = 0;
