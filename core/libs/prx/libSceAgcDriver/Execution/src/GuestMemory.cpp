@@ -1781,6 +1781,9 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     static std::atomic<int> armWide{-1};
     const int wideWanted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ArmWide) ? 1 : 0;
     if (armWide.load(std::memory_order_relaxed) != wideWanted && armWide.exchange(wideWanted, std::memory_order_relaxed) != wideWanted) GuestArena::GuestArenaSetArmWide_nid_no_patch(wideWanted != 0);
+    static std::atomic<int> armSpans{-1};
+    const int spansWanted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ArmSpans) ? 1 : 0;
+    if (armSpans.load(std::memory_order_relaxed) != spansWanted && armSpans.exchange(spansWanted, std::memory_order_relaxed) != spansWanted) GuestArena::GuestArenaSetArmSpans_nid_no_patch(spansWanted != 0);
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
     writeRates[0].fetch_add(1, std::memory_order_relaxed);
     writeRates[1].fetch_add(stop - first, std::memory_order_relaxed);
@@ -2117,9 +2120,9 @@ std::string SweepCostReport() {
     std::snprintf(text, sizeof(text), "write-watch sweep %.1f us in %llu calls over %.1f MiB private (%llu pages written) and %.1f MiB watched resident (%llu pages written); %llu epoch bumps since the last report; walks %llu over %.1f MiB found %llu pages written (%llu walks with any); compares %llu over %.1f MiB, %llu differed over %.1f MiB", static_cast<double>(out[5]) / 1e3, static_cast<unsigned long long>(out[4]), static_cast<double>(out[0]) / 1048576.0, static_cast<unsigned long long>(out[1]), static_cast<double>(out[2]) / 1048576.0, static_cast<unsigned long long>(out[3]), static_cast<unsigned long long>(bumps - reportedBumps), rates[0], static_cast<double>(rates[1]) / 1048576.0, rates[2], rates[3], rates[4], static_cast<double>(rates[5]) / 1048576.0, rates[6], static_cast<double>(rates[7]) / 1048576.0);
     reportedBumps = bumps;
 #ifdef _WIN32
-    std::array<std::uint64_t, 17> arming{};
+    std::array<std::uint64_t, 18> arming{};
     GuestArena::GuestArenaArmingReport_nid_no_patch(arming.data());
-    AgcDriver::ProfilePrint_nid_no_patch("[arm-decisions] 10 s: %llu clearing collects of resident runs; not armed: not watched %llu, fresh pages %llu, written after arming %llu, under the size floor %llu, refused (views, imports, pins, protection) %llu; armed %llu, of them partly fresh runs %llu\n", static_cast<unsigned long long>(arming[9]), static_cast<unsigned long long>(arming[10]), static_cast<unsigned long long>(arming[11]), static_cast<unsigned long long>(arming[12]), static_cast<unsigned long long>(arming[13]), static_cast<unsigned long long>(arming[14]), static_cast<unsigned long long>(arming[15]), static_cast<unsigned long long>(arming[16]));
+    AgcDriver::ProfilePrint_nid_no_patch("[arm-decisions] 10 s: %llu clearing collects of resident runs; not armed: not watched %llu, fresh pages %llu, written after arming %llu, under the size floor %llu, refused (views, imports, pins, protection) %llu; armed %llu, of them partly fresh runs %llu; single views resumed %llu\n", static_cast<unsigned long long>(arming[9]), static_cast<unsigned long long>(arming[10]), static_cast<unsigned long long>(arming[11]), static_cast<unsigned long long>(arming[12]), static_cast<unsigned long long>(arming[13]), static_cast<unsigned long long>(arming[14]), static_cast<unsigned long long>(arming[15]), static_cast<unsigned long long>(arming[16]), static_cast<unsigned long long>(arming[17]));
     AgcDriver::ProfilePrint_nid_no_patch("[arming] 10 s: %llu arms in %.1f ms, %llu resumes in %.1f ms; %llu clean ranges, %llu resident runs; %llu collects of runs written after arming, %llu of them unwritten, %llu runs armed again\n", static_cast<unsigned long long>(arming[0]), static_cast<double>(arming[1]) / 1e6, static_cast<unsigned long long>(arming[2]), static_cast<double>(arming[3]) / 1e6, static_cast<unsigned long long>(arming[4]), static_cast<unsigned long long>(arming[5]), static_cast<unsigned long long>(arming[6]), static_cast<unsigned long long>(arming[7]), static_cast<unsigned long long>(arming[8]));
     // APS5_FAULT_SITES: every write-fault site on armed pages so far, with the main module's base, as
     // [fault-site] lines after the report (cumulative; the 256 most frequent).

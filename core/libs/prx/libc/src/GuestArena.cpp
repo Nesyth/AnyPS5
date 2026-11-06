@@ -834,6 +834,10 @@ void GuestArenaSetArmWide_nid_no_patch(bool on) {
     WindowsMappings::Get().SetArmWide(on);
 }
 
+void GuestArenaSetArmSpans_nid_no_patch(bool on) {
+    WindowsMappings::Get().SetArmSpans(on);
+}
+
 std::uint64_t GuestArenaCleanForgetSerial_nid_no_patch() {
     return WindowsMappings::CleanForgetSerial();
 }

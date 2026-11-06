@@ -288,6 +288,7 @@ public:
         out[5] = residentRuns.size();
         for (std::size_t index = 4; index < 7; ++index) out[index + 2] = armingCounters()[index].exchange(0, std::memory_order_relaxed);
         for (std::size_t index = 0; index < 8; ++index) out[9 + index] = armDecisions()[index].exchange(0, std::memory_order_relaxed);
+        out[17] = armingCounters()[7].exchange(0, std::memory_order_relaxed);
     }
 
     // APS5_REARM_QUIET as a runtime switch: a resident run the guest wrote after it was armed is armed again once 8
@@ -300,6 +301,12 @@ public:
     // partly settled, or of at least 16 KiB instead of 256 KiB; fresh pages in it are still reported written once.
     void SetArmWide(bool on) {
         armWideFlag().store(on, std::memory_order_relaxed);
+    }
+
+    // APS5_ARM_SPANS as a runtime switch: a write fault resumes only the faulting view and marks it written, and arming
+    // a collected span arms every piece of it between written views, so the rest of the run stays armed and clean.
+    void SetArmSpans(bool on) {
+        armSpansFlag().store(on, std::memory_order_relaxed);
     }
 
     // A serial bumped whenever a remembered clean range is dropped (a write fault, an unmap, a host write or an
@@ -429,7 +436,8 @@ public:
         auto& view = found->second;
         if (view.resident) {
             if ((view.armed & subpagesOf(base, address, address + 1)) != 0) {
-                resumeResidentWrites(base);
+                if (armSpansFlag().load(std::memory_order_relaxed)) resumeResidentView(base);
+                else resumeResidentWrites(base);
                 return true;
             }
             const auto memory = query(address);
@@ -962,6 +970,11 @@ private:
         return counters;
     }
 
+    static std::atomic<bool>& armSpansFlag() {
+        static std::atomic<bool> spans{false};
+        return spans;
+    }
+
     static std::atomic<bool>& armWideFlag() {
         static std::atomic<bool> wide{false};
         return wide;
@@ -1003,6 +1016,53 @@ private:
         armingCounters()[1].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - armStart).count()), std::memory_order_relaxed);
         for (auto it = first; it != views.end() && it->first < stop; ++it) it->second.armed |= subpagesOf(it->first, from, stop);
         return true;
+    }
+
+    bool armResidentSpans(std::uintptr_t from, std::uintptr_t stop, std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& armedSpans) {
+        armedSpans.clear();
+        const auto first = views.lower_bound(from & ~(pageBytes - 1));
+        if (first == views.end() || first->first > from || !writable(first->second.protection)) return false;
+        const auto protection = first->second.protection;
+        auto expected = first->first;
+        for (auto it = first; it != views.end() && it->first < stop; ++it) {
+            const auto& view = it->second;
+            if (it->first != expected || !view.resident || view.protection != protection || view.hostWrites != 0 || view.hostImports != 0 || view.pins != 0) return false;
+            expected = it->first + pageBytes;
+        }
+        if (expected < stop) return false;
+        std::uintptr_t spanStart = 0;
+        for (auto it = first; it != views.end() && it->first < stop; ++it) {
+            const auto viewStart = std::max<std::uintptr_t>(it->first, from);
+            const auto viewEnd = std::min<std::uintptr_t>(it->first + pageBytes, stop);
+            if (it->second.writtenAfterArming) {
+                if (spanStart != 0) armedSpans.emplace_back(spanStart, viewStart);
+                spanStart = 0;
+                continue;
+            }
+            if (spanStart == 0) spanStart = viewStart;
+            if (viewEnd == stop) armedSpans.emplace_back(spanStart, viewEnd);
+        }
+        if (armedSpans.empty()) return false;
+        const auto readOnly = protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
+        for (const auto& [begin, end] : armedSpans) {
+            DWORD previous;
+            const auto armStart = std::chrono::steady_clock::now();
+            if (!VirtualProtect(reinterpret_cast<void*>(begin), end - begin, readOnly, &previous)) fail("arm resident memory write tracking");
+            armingCounters()[0].fetch_add(1, std::memory_order_relaxed);
+            armingCounters()[1].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - armStart).count()), std::memory_order_relaxed);
+            for (auto it = views.lower_bound(begin & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) it->second.armed |= subpagesOf(it->first, begin, end);
+        }
+        return true;
+    }
+
+    void resumeResidentView(std::uintptr_t base) {
+        auto& view = views.at(base);
+        DWORD previous;
+        if (!VirtualProtect(reinterpret_cast<void*>(base), pageBytes, view.protection, &previous)) fail("resume a resident guest view");
+        view.armed = 0;
+        view.writtenAfterArming = true;
+        forgetClean(base, base + pageBytes);
+        armingCounters()[7].fetch_add(1, std::memory_order_relaxed);
     }
 
     void resumeResidentWrites(std::uintptr_t address, bool observed = true) {
@@ -1127,6 +1187,7 @@ private:
         std::uint32_t hostImports = 0;
         bool aliasDemoted = false;
         std::uint8_t unreported = 0;
+        bool writtenAfterArming = false;
     };
     struct Run {
         std::uintptr_t end;
@@ -1161,11 +1222,20 @@ private:
         const bool considered = armResidentRuns() && clear && collection != Collection::Fresh;
         const bool sized = run.end - start >= (wide ? 0x4000u : 0x40000u);
         const bool settled = run.fresh == 0 || wide;
-        const bool armed = considered && run.watched && settled && (!run.writeObserved || rearm) && sized && armResident(first, stop);
+        const bool spans = armSpansFlag().load(std::memory_order_relaxed);
+        thread_local std::vector<std::pair<std::uintptr_t, std::uintptr_t>> armedSpans;
+        const bool armed = considered && run.watched && settled && (spans || !run.writeObserved || rearm) && sized && (spans ? armResidentSpans(first, stop, armedSpans) : armResident(first, stop));
+        const auto rememberArmed = [&] {
+            if (!spans) {
+                rememberClean(from, stop);
+                return;
+            }
+            for (const auto& [begin, end] : armedSpans) rememberClean(std::max(begin, from), end);
+        };
         if (considered) {
             auto& decisions = armDecisions();
             decisions[0].fetch_add(1, std::memory_order_relaxed);
-            const auto reason = !run.watched ? 1 : run.fresh != 0 && !wide ? 2 : run.writeObserved && !rearm ? 3 : !sized ? 4 : !armed ? 5 : 6;
+            const auto reason = !run.watched ? 1 : run.fresh != 0 && !wide ? 2 : run.writeObserved && !rearm && !spans ? 3 : !sized ? 4 : !armed ? 5 : 6;
             decisions[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
             if (armed && run.fresh != 0) decisions[7].fetch_add(1, std::memory_order_relaxed);
         }
@@ -1186,7 +1256,7 @@ private:
             }
             for (ULONG_PTR index = 0; index < reported; ++index) pages[*count + index] = reinterpret_cast<void*>(std::max(from, reinterpret_cast<std::uintptr_t>(pages[*count + index])));
             *count += reported;
-            if (armed) rememberClean(from, stop);
+            if (armed) rememberArmed();
             return;
         }
         std::vector<std::uintptr_t> written;
@@ -1223,7 +1293,7 @@ private:
             }
         }
         if (collection == Collection::Fresh) flushReset(stop);
-        if (armed) rememberClean(from, stop);
+        if (armed) rememberArmed();
     }
 
     Window open(HANDLE section, std::uint64_t offset, std::size_t bytes) {

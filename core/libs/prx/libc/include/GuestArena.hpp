@@ -75,6 +75,7 @@ void GuestArenaSweepWriteWatch_nid_no_patch(std::uint64_t* out);
 void GuestArenaSetArmResident_nid_no_patch(bool on);
 void GuestArenaSetRearmQuiet_nid_no_patch(bool on);
 void GuestArenaSetArmWide_nid_no_patch(bool on);
+void GuestArenaSetArmSpans_nid_no_patch(bool on);
 std::uint64_t GuestArenaCleanForgetSerial_nid_no_patch();
 bool GuestArenaAllClean_nid_no_patch(const std::uint64_t* pairs, std::size_t count);
 void GuestArenaArmingReport_nid_no_patch(std::uint64_t* out);
