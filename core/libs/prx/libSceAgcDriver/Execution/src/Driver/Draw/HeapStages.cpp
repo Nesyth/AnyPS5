@@ -611,6 +611,7 @@ struct StageRecord {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
     std::shared_ptr<const ShaderRecompiler::HeapStageWords> words;
     std::uint32_t asIsHits = 0;
+    std::uint64_t walkedAt = 0;
 };
 
 enum class StageRecordEvent { Same, Patched, Absent, Identity, NotTemplate, BaseWord, ValueWord, HighWord, FixedWord, Memory, Shape, AsIsTemplate, AsIsBaked, AsIsRefresh, Verified, Differs, Count };
@@ -634,6 +635,11 @@ void noteStageRecord(StageRecordEvent event) {
         line += item;
     }
     std::fprintf(stderr, "%s\n", line.c_str());
+}
+
+std::uint64_t& stageCalls() {
+    struct StageCallsStorage {};
+    return HostThreadLocal<std::uint64_t, StageCallsStorage>();
 }
 
 std::unordered_map<std::uint64_t, StageRecord>& stageRecords() {
@@ -783,7 +789,7 @@ bool asIsStageRecord(const ShaderRecompiler::PreparedShaderInvocation& invocatio
         noteStageRecord(StageRecordEvent::Identity);
         return false;
     }
-    if (++record.asIsHits % 16u == 0u) {
+    if (stageCalls() - record.walkedAt > 4096u) {
         noteStageRecord(StageRecordEvent::AsIsRefresh);
         return false;
     }
@@ -822,6 +828,7 @@ void keepStageRecord(const ShaderRecompiler::PreparedShaderInvocation& invocatio
     record.capture = capture;
     record.result = result;
     record.words = words;
+    record.walkedAt = stageCalls();
 }
 
 bool sameStageWords(const ShaderRecompiler::RecompileResult& shared, const ShaderRecompiler::HeapStageWords& a, const ShaderRecompiler::HeapStageWords& b) {
@@ -855,6 +862,7 @@ HeapStageMaterialized MaterializeHeapStage(const ShaderRecompiler::PreparedShade
     snapshotCost.Stop();
     const auto generation = GuestMemory::TrackerGeneration();
     const bool stagesAsIs = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpStagesAsIs);
+    ++stageCalls();
     const bool records = stagesAsIs || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpReplay);
     HeapStageMaterialized recorded;
     if (stagesAsIs && asIsStageRecord(invocation, userData, shaderBase, recorded)) return recorded;
