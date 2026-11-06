@@ -28,6 +28,7 @@ enum class RuntimeSwitch : std::size_t {
     XpWalksFree,
     NoArmResident,
     PipelineDispatch,
+    NoHeapSetSkip,
     Count,
 };
 

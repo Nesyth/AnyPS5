@@ -6835,6 +6835,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
 
 void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const {
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    if (heapStage && !RuntimeSwitches::Set(RuntimeSwitch::NoHeapSetSkip)) {
+        result.cache = context.descriptorCache;
+        writeAddressedOverlay(result, selected);
+        return;
+    }
     std::array<bool, 2> described{};
     thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
     auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
@@ -6896,24 +6901,27 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         }
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
-    if (addressedBuffers) {
-        std::vector<VkDescriptorBufferInfo> overrides(allocations.size(), VkDescriptorBufferInfo{VK_NULL_HANDLE, 0, 0});
-        bool overridden = false;
-        for (std::size_t index = 0; index < selected.size(); ++index) {
-            const auto& snapshot = result.snapshots[index];
-            overrides[selected[index]] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
-        }
-        for (const auto& binding : bindings) {
-            if (!binding.addressed) continue;
-            for (const auto allocation : binding.allocations) overridden = overridden || overrides[allocation].buffer != VK_NULL_HANDLE;
-        }
-        if (overridden) {
-            result.heapOffsets = addressedOffsets(&overrides);
-            result.addressOffsets = true;
-            result.addressOverrides = std::move(overrides);
-        }
-    }
+    writeAddressedOverlay(result, selected);
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+void ShaderResources::writeAddressedOverlay(DrawBindings& result, std::span<const std::size_t> selected) const {
+    if (!addressedBuffers) return;
+    std::vector<VkDescriptorBufferInfo> overrides(allocations.size(), VkDescriptorBufferInfo{VK_NULL_HANDLE, 0, 0});
+    bool overridden = false;
+    for (std::size_t index = 0; index < selected.size(); ++index) {
+        const auto& snapshot = result.snapshots[index];
+        overrides[selected[index]] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
+    }
+    for (const auto& binding : bindings) {
+        if (!binding.addressed) continue;
+        for (const auto allocation : binding.allocations) overridden = overridden || overrides[allocation].buffer != VK_NULL_HANDLE;
+    }
+    if (overridden) {
+        result.heapOffsets = addressedOffsets(&overrides);
+        result.addressOffsets = true;
+        result.addressOverrides = std::move(overrides);
+    }
 }
 
 ShaderResources::DrawUse::~DrawUse() {
