@@ -247,6 +247,7 @@ function(add_shader_recompiler target runtimeTarget)
             RuntimeAbi::UintStorageImageKind
             StorageElementPointer
             FirstAtomicStorageImageBinding
+            BdaAbi::Supported
             BuildBarycentricGeometryShader
             BuildBarycentricTessellationShaders
             HeapFragmentEligible

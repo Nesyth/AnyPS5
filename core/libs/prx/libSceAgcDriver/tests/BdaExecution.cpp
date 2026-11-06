@@ -2,6 +2,8 @@
 #include "BdaAbi.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaPageTable.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DevicePageTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
 #include <array>
@@ -11,6 +13,7 @@
 #include <limits>
 #include <memory>
 #include <set>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -410,6 +413,210 @@ static void RunBdaAnchorTests(const Context& context) {
     compare(*continuing, {0xfff00}, mixed);
 }
 
+static std::vector<std::byte> PageTableImage(std::uint64_t root, std::span<const ShaderRecompiler::BdaAbi::Range> overlay, std::uint32_t entryBytes = sizeof(ShaderRecompiler::BdaAbi::Range)) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    std::vector<std::byte> image(Abi::PageTableBytes(overlay.size()));
+    const Abi::Header header{Abi::PageTableVersion, static_cast<std::uint32_t>(overlay.size()), entryBytes, 0};
+    std::memcpy(image.data(), &header, sizeof(header));
+    if (!overlay.empty()) std::memcpy(image.data() + sizeof(header), overlay.data(), overlay.size() * sizeof(Abi::Range));
+    std::memcpy(image.data() + sizeof(header) + overlay.size() * sizeof(Abi::Range), &root, sizeof(root));
+    return image;
+}
+
+static void RunBdaPageTableTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    Buffer first(context, 3, usage);
+    Buffer second(context, 2, usage);
+    Buffer far(context, 4, usage);
+    Buffer other(context, 3, usage);
+    const std::array<std::uint8_t, 12> bytes{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xa1, 0xb2, 0xc3};
+    std::memcpy(first.Bytes().data(), bytes.data(), 3);
+    std::memcpy(second.Bytes().data(), bytes.data() + 3, 2);
+    std::memcpy(far.Bytes().data(), bytes.data() + 5, 4);
+    std::memcpy(other.Bytes().data(), bytes.data() + 9, 3);
+    constexpr std::uint64_t guest = 0x7fff12340001ULL;
+    constexpr std::uint64_t distant = 0x123456780000ULL;
+    constexpr std::uint64_t closed = guest + 0x20000u;
+    const std::array<Abi::Range, 4> ranges{{
+        {distant, distant + 4, far.DeviceAddress(), Abi::Read | Abi::Write, 0},
+        {guest, guest + 3, first.DeviceAddress(), Abi::Read, 0},
+        {guest + 3, guest + 5, second.DeviceAddress(), Abi::Read, 0},
+        {closed, closed + 4, far.DeviceAddress(), 0, 0},
+    }};
+    const auto pages = BdaPageTable::Build(context, ranges);
+    Buffer fault(context, sizeof(Abi::Fault), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::vector<std::byte> rangeImage(sizeof(Abi::Header) + sizeof(ranges));
+    const Abi::Header rangeHeader{Abi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(Abi::Range), 0};
+    std::memcpy(rangeImage.data(), &rangeHeader, sizeof(rangeHeader));
+    std::memcpy(rangeImage.data() + sizeof(rangeHeader), ranges.data(), sizeof(ranges));
+    const auto pageTable = PageTableImage(pages->Address(), {});
+    const auto run = [&](const std::vector<std::byte>& image, bool walks, std::uint64_t address, std::uint32_t bits, std::uint32_t expected, Abi::FaultReason reason) {
+        Buffer table(context, image.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memcpy(table.Bytes().data(), image.data(), image.size());
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        const std::uint32_t sentinel = 0xdeadbeef;
+        std::memcpy(output.Bytes().data(), &sentinel, sizeof(sentinel));
+        Pipeline pipeline(context, MakeBdaTestShader(address, bits, 0, walks), {&table, &fault, &output});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::uint32_t result = 0;
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        std::memcpy(&result, output.Bytes().data(), sizeof(result));
+        std::uint32_t version = 0;
+        std::memcpy(&version, image.data(), sizeof(version));
+        const auto what = std::string(walks ? "a page-walking module" : "a range-search module") + " reading " + std::to_string(bits) + " bits at " + Hex(address) + " through a " + (version == Abi::Version ? "range table" : "page table");
+        if (static_cast<std::uint32_t>(reason) == 0) {
+            Require(report.state == Abi::FaultState::Empty && result == expected, what + " returned " + Hex(result) + " instead of " + Hex(expected) + " or faulted");
+        } else {
+            Require(report.state == Abi::FaultState::Ready && report.reason == reason && report.instruction == 0x1234, what + " did not publish fault reason " + std::to_string(static_cast<std::uint32_t>(reason)) + " (state " + std::to_string(static_cast<std::uint32_t>(report.state)) + ", reason " + std::to_string(static_cast<std::uint32_t>(report.reason)) + ")");
+            Require(result == sentinel, what + " continued after its fault");
+        }
+    };
+    constexpr Abi::FaultReason none{};
+    const std::array<const std::vector<std::byte>*, 2> images{&rangeImage, &pageTable};
+    for (const auto* image : images) {
+        run(*image, true, guest, 8, 0x11, none);
+        run(*image, true, guest + 1, 16, 0x3322, none);
+        run(*image, true, guest + 1, 32, 0x55443322, none);
+        run(*image, true, distant + 1, 16, 0x8877, none);
+        run(*image, true, distant, 32, 0x99887766, none);
+        run(*image, true, guest + 5, 8, 0, Abi::FaultReason::Unmapped);
+        run(*image, true, guest - 1, 8, 0, Abi::FaultReason::Unmapped);
+        run(*image, true, distant + 0x10000u, 8, 0, Abi::FaultReason::Unmapped);
+        run(*image, true, 0x10000u, 8, 0, Abi::FaultReason::Unmapped);
+        run(*image, true, Abi::PageTableEnd, 8, 0, Abi::FaultReason::Unmapped);
+        run(*image, true, closed, 8, 0, Abi::FaultReason::Permission);
+        run(*image, true, std::numeric_limits<std::uint64_t>::max() - 1, 32, 0, Abi::FaultReason::Overflow);
+    }
+    const std::array<Abi::Range, 2> overlay{{
+        {distant, distant + 4, far.DeviceAddress(), 0, 0},
+        {guest, guest + 3, other.DeviceAddress(), Abi::Read, 0},
+    }};
+    const auto overlaid = PageTableImage(pages->Address(), overlay);
+    run(overlaid, true, guest + 1, 16, 0xc3b2, none);
+    run(overlaid, true, guest + 3, 16, 0x5544, none);
+    run(overlaid, true, guest + 2, 16, 0x44c3, none);
+    run(overlaid, true, distant + 1, 8, 0, Abi::FaultReason::Permission);
+    run(overlaid, true, guest + 5, 8, 0, Abi::FaultReason::Unmapped);
+    Buffer wide(context, 0x40, usage);
+    Buffer shadow(context, 0x10, usage);
+    for (std::uint32_t at = 0; at < 0x40u; ++at) wide.Bytes()[at] = static_cast<std::byte>(0x40u + at);
+    for (std::uint32_t at = 0; at < 0x10u; ++at) shadow.Bytes()[at] = static_cast<std::byte>(0xa0u + at);
+    constexpr std::uint64_t spaced = 0x7ffe00000100ULL;
+    const std::array<Abi::Range, 1> spaceRange{{{spaced, spaced + 0x40, wide.DeviceAddress(), Abi::Read, 0}}};
+    const auto spacePages = BdaPageTable::Build(context, spaceRange);
+    const std::array<Abi::Range, 2> pieces{{
+        {spaced + 0x10, spaced + 0x18, shadow.DeviceAddress(), Abi::Read, 0},
+        {spaced + 0x30, spaced + 0x34, wide.DeviceAddress() + 0x30, 0, Abi::OverlayHole},
+    }};
+    const auto split = PageTableImage(spacePages->Address(), pieces);
+    run(split, true, spaced + 0xf, 8, 0x4f, none);
+    run(split, true, spaced + 0xf, 16, 0xa04f, none);
+    run(split, true, spaced + 0x10, 8, 0xa0, none);
+    run(split, true, spaced + 0x17, 16, 0x58a7, none);
+    run(split, true, spaced + 0x18, 8, 0x58, none);
+    run(split, true, spaced + 0x2f, 16, 0, Abi::FaultReason::Unmapped);
+    run(split, true, spaced + 0x30, 8, 0, Abi::FaultReason::Unmapped);
+    run(split, true, spaced + 0x34, 8, 0x74, none);
+    {
+        Buffer table(context, split.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memcpy(table.Bytes().data(), split.data(), split.size());
+        Buffer words(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        std::memset(words.Bytes().data(), 0xcd, words.Bytes().size());
+        Pipeline pipeline(context, MakeBdaDwordReadTestShader(spaced + 0x8, 4, false, true, true), {&table, &fault, &words});
+        pipeline.Run(1);
+        std::array<std::uint32_t, 4> read{};
+        std::memcpy(read.data(), words.Bytes().data(), sizeof(read));
+        const std::array<std::uint32_t, 4> expected{0x4b4a4948u, 0x4f4e4d4cu, 0xa3a2a1a0u, 0xa7a6a5a4u};
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        Require(report.state == Abi::FaultState::Empty && read == expected, "a page-walking dword read across the start of an overlay piece read " + Hex(read[2]) + " " + Hex(read[3]) + " past the piece's start instead of the piece");
+    }
+    run(rangeImage, false, guest + 1, 32, 0x55443322, none);
+    run(pageTable, false, guest, 8, 0, Abi::FaultReason::InvalidTable);
+    run(PageTableImage(0, {}), true, guest, 8, 0, Abi::FaultReason::InvalidTable);
+    run(PageTableImage(pages->Address(), {}, sizeof(Abi::PageEntry)), true, guest, 8, 0, Abi::FaultReason::InvalidTable);
+    auto truncated = pageTable;
+    truncated.resize(truncated.size() - sizeof(std::uint32_t));
+    run(truncated, true, guest, 8, 0, Abi::FaultReason::InvalidTable);
+}
+
+static void RunDevicePageTableTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    const std::array<Abi::Range, 3> space{{
+        {0x10000, 0x20000, 0x900000, Abi::Read | Abi::Write, 0},
+        {0x20000, 0x30000, 0x910000, Abi::Read, 0},
+        {0x40000, 0x50000, 0xa00000, Abi::Read, 0},
+    }};
+    const auto same = [](const Abi::Range& left, const Abi::Range& right) { return left.begin == right.begin && left.end == right.end && left.deviceAddress == right.deviceAddress && left.permissions == right.permissions && left.reserved == right.reserved; };
+    Require(DevicePageTable::Overlay(space, space).empty(), "a build equal to its space has an overlay");
+    const std::array<Abi::Range, 5> build{{
+        {0x8000, 0x9000, 0x300000, Abi::Read, 0},
+        {0x10000, 0x18000, 0x900000, Abi::Read | Abi::Write, 0},
+        {0x18000, 0x20000, 0x908000, Abi::Read, 0},
+        {0x20000, 0x30000, 0x777000, Abi::Read, 0},
+        {0x40000, 0x48000, 0xa00000, Abi::Read, 0},
+    }};
+    const auto overlay = DevicePageTable::Overlay(space, build);
+    const std::array<Abi::Range, 4> expected{{
+        {0x8000, 0x9000, 0x300000, Abi::Read, 0},
+        {0x18000, 0x20000, 0x908000, Abi::Read, 0},
+        {0x20000, 0x30000, 0x777000, Abi::Read, 0},
+        {0x48000, 0x50000, 0xa08000, 0, Abi::OverlayHole},
+    }};
+    Require(overlay.size() == expected.size() && std::equal(overlay.begin(), overlay.end(), expected.begin(), same), "a build overlay does not hold exactly the pieces that differ from the space (" + std::to_string(overlay.size()) + " pieces)");
+    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    Buffer memory(context, 4, usage);
+    const std::array<std::uint8_t, 4> bytes{0x5a, 0x6b, 0x7c, 0x8d};
+    std::memcpy(memory.Bytes().data(), bytes.data(), bytes.size());
+    constexpr std::uint64_t guest = 0x7fff23450010ULL;
+    const std::array<Abi::Range, 1> ranges{{{guest, guest + 4, memory.DeviceAddress(), Abi::Read, 0}}};
+    DevicePageTable tables;
+    const DevicePageTable::Key key{1, 0};
+    Require(tables.Find(context, key, ranges) == nullptr, "a space's first page table lookup returned a table before the table was built");
+    tables.WaitIdle();
+    const auto served = tables.Find(context, key, ranges);
+    Require(served != nullptr && served->Address() != 0, "a built space page table was not served");
+    const auto found = served->Find(guest + 1);
+    Require(found.has_value() && found->begin <= guest + 1 && guest + 1 < found->end && found->deviceAddress - found->begin == memory.DeviceAddress() - guest, "a served page table does not map its space");
+    Require(tables.Find(context, {1, 1}, ranges) == nullptr, "a page table was served for another multisample guard of the space");
+    tables.WaitIdle();
+    Require(tables.Find(context, {1, 1}, ranges) != nullptr, "the page table of a filtered space was not built");
+    Buffer table(context, Abi::PageTableBytes(0), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const auto image = PageTableImage(served->Address(), {});
+    std::memcpy(table.Bytes().data(), image.data(), image.size());
+    Buffer fault(context, sizeof(Abi::Fault), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+    std::memset(output.Bytes().data(), 0, output.Bytes().size());
+    Pipeline pipeline(context, MakeBdaTestShader(guest + 1, 16, 0, true), {&table, &fault, &output});
+    pipeline.Run(1);
+    Abi::Fault report{};
+    std::uint32_t result = 0;
+    std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+    std::memcpy(&result, output.Bytes().data(), sizeof(result));
+    Require(report.state == Abi::FaultState::Empty && result == 0x7c6bu, "a page-walking module read " + Hex(result) + " through a served page table instead of 0x7c6b");
+    for (std::uint64_t serial = 2; serial < 2 + DevicePageTable::KeptTables; ++serial) {
+        static_cast<void>(tables.Find(context, {serial, 0}, ranges));
+        tables.WaitIdle();
+    }
+    Require(tables.Find(context, {1, 0}, ranges) == nullptr, "the least recently used page table outlived the cache bound");
+    tables.WaitIdle();
+    const std::array<Abi::Range, 2> unsorted{{ranges[0], {guest - 0x100, guest - 0xf0, memory.DeviceAddress(), Abi::Read, 0}}};
+    const auto refusedBefore = tables.Totals().refused;
+    static_cast<void>(tables.Find(context, {99, 0}, unsorted));
+    tables.WaitIdle();
+    Require(tables.Totals().refused == refusedBefore + 1 && tables.Find(context, {99, 0}, unsorted) == nullptr, "unsorted space ranges built a page table");
+    tables.WaitIdle();
+    Require(tables.Find(context, {100, 0}, std::span<const Abi::Range>{}) == nullptr, "an empty space was given a page table");
+    tables.Release(context.device);
+    Require(tables.Find(context, {2 + DevicePageTable::KeptTables - 1, 0}, ranges) == nullptr, "a page table outlived the release of its device");
+    tables.WaitIdle();
+}
+
 void RunBdaExecutionTests(const Context& context) {
     namespace Abi = ShaderRecompiler::BdaAbi;
     Buffer first(context, 3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
@@ -545,6 +752,8 @@ void RunBdaExecutionTests(const Context& context) {
     sequence({Abi::FaultReason::Unmapped, Abi::FaultReason::Unaligned}, Abi::FaultReason::Unmapped, 1);
     RunBdaDwordWriteTests(context);
     RunBdaAnchorTests(context);
+    RunBdaPageTableTests(context);
+    RunDevicePageTableTests(context);
 }
 
 void RunBdaStoreExecutionTests(const Context& context) {

@@ -6888,6 +6888,11 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
     return merged;
 }
 
+std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::SpaceTable() const {
+    if (space == nullptr) return std::nullopt;
+    return CachedTable{space->serial, &space->ranges};
+}
+
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
     if (space == nullptr) return std::nullopt;
     Require(uploaded && !committed, "guest GPU address ranges are not available");

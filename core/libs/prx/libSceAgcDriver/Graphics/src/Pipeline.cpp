@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DevicePageTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -1505,6 +1506,7 @@ void ClearCachedPipelines(VkDevice device) {
     ClearPipelineLibraries(device);
     ReleasePixelFunctionLds(device);
     ReleaseMeshWindow(device);
+    ReleaseGuestPageTable(device);
 }
 
 }

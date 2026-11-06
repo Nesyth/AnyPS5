@@ -545,6 +545,7 @@ struct VulkanDevice::State {
     bool fusedExactArithmetic = false;
     bool fragmentBarycentricBuiltins = false;
     bool hostInterpolationFirst = false;
+    bool devicePageTable = false;
     bool geometryShader = false;
     bool largePoints = false;
     bool sampleRateShading = false;
@@ -1579,6 +1580,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->fusedExactArithmetic = driver.driverID == VK_DRIVER_ID_MOLTENVK;
         state->tessellationPipelineCache = TessellationPipelineCacheUsable(driver.driverID);
         state->hostInterpolationFirst = HostInterpolationPreferred(driver.driverID) && std::getenv("APS5_NO_HOST_INTERPOLATION_FIRST") == nullptr;
+        state->devicePageTable = std::getenv("APS5_DEVICE_PAGE_TABLE") != nullptr;
         APS5_LOG_OUT("Pixel interpolation driver=%d hostInterpolationFirst=%d", static_cast<int>(driver.driverID), state->hostInterpolationFirst ? 1 : 0);
         state->subgroupControlBarriers = SubgroupControlBarrierUsable(driver.driverID);
         state->workgroupScopeFences = WorkgroupScopeFenceUsable(driver.driverID);
@@ -4471,6 +4473,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::ComputeTarget(std::uint32_t waveSize
     auto target = Target();
     if (waveSize == 32u && state->computeWave32) target.subgroupSize = 32u;
     target.gpuResolvedImages = Graphics::DescriptorHeapEnabled();
+    if (state->devicePageTable) target.bdaAbiVersion = ShaderRecompiler::BdaAbi::PageTableVersion;
     return target;
 }
 

@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_BDARESOURCES_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_BDARESOURCES_HPP
 
+#include "prx/libSceAgcDriver/Graphics/include/BdaPageTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "Recompiler.hpp"
 #include <cstddef>
@@ -20,7 +21,7 @@ struct BdaFaultChunk;
 class BdaResources {
 public:
     explicit BdaResources(const Context& context, bool reportOnly = false);
-    BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly = false);
+    BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly = false, bool pageTables = false);
     ~BdaResources();
     BdaResources(const BdaResources&) = delete;
     BdaResources& operator=(const BdaResources&) = delete;
@@ -82,6 +83,8 @@ private:
     void markWrittenPages(const BdaResources& record) const;
     void checkSrtGuard(const BdaResources& faults) const;
     std::span<std::byte> faultBytes() const;
+    bool servePageTable(const Context& context, const GuestBufferMemory& memory, std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::uint64_t guardSerial);
+    std::shared_ptr<const BdaPageTable> pages;
     std::shared_ptr<Buffer> table;
     VkDevice faultDevice = VK_NULL_HANDLE;
     std::shared_ptr<BdaFaultChunk> faultChunk;

@@ -69,10 +69,18 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     if (!state.BdaAddressed()) state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
     fail(binary(spv::OpULessThan, boolean, length, constant(4)), BdaAbi::FaultReason::InvalidTable);
     const auto count = BdaLoadWord(state, constant(1));
-    const auto available = binary(spv::OpISub, u32, length, constant(4));
+    std::uint32_t pageTable = 0;
+    std::uint32_t tableWords = 0;
+    if (state.devicePageTable) {
+        pageTable = binary(spv::OpIEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::PageTableVersion));
+        tableWords = Select(state, u32, pageTable, constant(4u + BdaAbi::PageTableRootWords), constant(4));
+    }
+    const auto available = binary(spv::OpISub, u32, length, state.devicePageTable ? tableWords : constant(4));
     const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
+    auto otherVersion = binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::Version));
+    if (state.devicePageTable) otherVersion = binary(spv::OpLogicalAnd, boolean, otherVersion, Unary(state, spv::OpLogicalNot, boolean, pageTable));
     failFirst({
-        {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::Version)), BdaAbi::FaultReason::InvalidTable},
+        {otherVersion, BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(2)), constant(sizeof(BdaAbi::Range))), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(3)), constant(0)), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, available, constant(7)), constant(0)), BdaAbi::FaultReason::InvalidTable},
@@ -80,6 +88,17 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         {binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow},
         {binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow},
     });
+    auto searchLow = constant(0);
+    auto searchHigh = count;
+    if (state.devicePageTable) {
+        const auto empty = binary(spv::OpIEqual, boolean, count, constant(0));
+        const auto firstBegin = BdaLoadAddress(state, Select(state, u32, empty, constant(0), constant(4)));
+        const auto lastEnd = BdaLoadAddress(state, Select(state, u32, empty, constant(0), binary(spv::OpIAdd, u32, constant(6), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, count, constant(1)), constant(8)))));
+        const auto below = binary(spv::OpLogicalAnd, boolean, pageTable, binary(spv::OpLogicalOr, boolean, empty, binary(spv::OpULessThan, boolean, address, firstBegin)));
+        const auto above = binary(spv::OpLogicalAnd, boolean, binary(spv::OpLogicalAnd, boolean, pageTable, Unary(state, spv::OpLogicalNot, boolean, empty)), binary(spv::OpUGreaterThanEqual, boolean, address, lastEnd));
+        searchLow = Select(state, u32, above, count, constant(0));
+        searchHigh = Select(state, u32, binary(spv::OpLogicalOr, boolean, below, above), searchLow, count);
+    }
     const auto header = state.module.AllocateId();
     const auto body = state.module.AllocateId();
     const auto continuation = state.module.AllocateId();
@@ -91,8 +110,8 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto upper = state.module.AllocateId();
     const auto newLow = state.module.AllocateId();
     const auto newHigh = state.module.AllocateId();
-    state.module.AddFunction(spv::OpPhi, u32, lower, constant(0), entryLabel, newLow, continuation);
-    state.module.AddFunction(spv::OpPhi, u32, upper, count, entryLabel, newHigh, continuation);
+    state.module.AddFunction(spv::OpPhi, u32, lower, searchLow, entryLabel, newLow, continuation);
+    state.module.AddFunction(spv::OpPhi, u32, upper, searchHigh, entryLabel, newHigh, continuation);
     const auto search = binary(spv::OpULessThan, boolean, lower, upper);
     state.module.AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlMaskNone);
     state.module.AddFunction(spv::OpBranchConditional, search, body, merge);
@@ -107,6 +126,103 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     state.module.AddFunction(spv::OpBranch, header);
     EmitLabel(state, merge);
     const auto index = lower;
+    if (state.devicePageTable) {
+        const auto entryType = TypeU32Vector(state, 4u);
+        const auto widen = [&](std::uint32_t value) { return Unary(state, spv::OpUConvert, u64, value); };
+        const auto pair = [&](std::uint32_t low, std::uint32_t high) { return binary(spv::OpBitwiseOr, u64, widen(low), binary(spv::OpShiftLeftLogical, u64, widen(high), BdaConstant(state, 32u))); };
+        const auto component = [&](std::uint32_t vector, std::uint32_t at) {
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, u32, value, vector, at);
+            return value;
+        };
+        const auto loadDevice = [&](std::uint32_t type, std::uint32_t at, std::uint32_t alignment) {
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, type), pointer, at);
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, type, value, pointer, spv::MemoryAccessAlignedMask, alignment);
+            return value;
+        };
+        const auto none = binary(spv::OpIEqual, boolean, index, constant(0));
+        const auto previousEnd = Select(state, u32, none, constant(0), binary(spv::OpIAdd, u32, constant(6), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, index, constant(1)), constant(8))));
+        const auto gapBegin = Select(state, u64, none, BdaConstant(state, 0u), BdaLoadAddress(state, previousEnd));
+        const auto later = binary(spv::OpULessThan, boolean, index, count);
+        const auto gapEnd = Select(state, u64, later, BdaLoadAddress(state, Select(state, u32, later, binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, index, constant(8))), constant(0))), BdaConstant(state, ~std::uint64_t{0}));
+        const auto outside = binary(spv::OpLogicalOr, boolean, none, binary(spv::OpUGreaterThanEqual, boolean, address, gapBegin));
+        const auto walks = binary(spv::OpLogicalAnd, boolean, pageTable, outside);
+        const auto walk = state.module.AllocateId();
+        const auto overlaid = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, overlaid, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, walks, walk, overlaid);
+        EmitLabel(state, walk);
+        const auto pages = BdaLoadAddress(state, binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, count, constant(8))));
+        failFirst({
+            {binary(spv::OpIEqual, boolean, pages, BdaConstant(state, 0u)), BdaAbi::FaultReason::InvalidTable},
+            {binary(spv::OpUGreaterThanEqual, boolean, address, BdaConstant(state, BdaAbi::PageTableEnd)), BdaAbi::FaultReason::Unmapped},
+        });
+        const auto window = binary(spv::OpShiftLeftLogical, u64, binary(spv::OpShiftRightLogical, u64, address, BdaConstant(state, BdaAbi::WindowShift)), BdaConstant(state, 3u));
+        const auto leaf = loadDevice(u64, binary(spv::OpIAdd, u64, pages, window), sizeof(std::uint64_t));
+        fail(binary(spv::OpIEqual, boolean, leaf, BdaConstant(state, 0u)), BdaAbi::FaultReason::Unmapped);
+        const auto page = binary(spv::OpShiftLeftLogical, u64, binary(spv::OpBitwiseAnd, u64, binary(spv::OpShiftRightLogical, u64, address, BdaConstant(state, BdaAbi::PageShift)), BdaConstant(state, BdaAbi::WindowPages - 1u)), BdaConstant(state, 4u));
+        const auto initial = loadDevice(entryType, binary(spv::OpIAdd, u64, leaf, page), sizeof(BdaAbi::PageEntry));
+        const auto walkHeader = state.module.AllocateId();
+        const auto walkBody = state.module.AllocateId();
+        const auto walkContinue = state.module.AllocateId();
+        const auto walkMerge = state.module.AllocateId();
+        const auto walkEntry = state.currentLabel;
+        state.module.AddFunction(spv::OpBranch, walkHeader);
+        EmitLabel(state, walkHeader);
+        const auto current = state.module.AllocateId();
+        const auto level = state.module.AllocateId();
+        const auto nextEntry = state.module.AllocateId();
+        const auto nextLevel = state.module.AllocateId();
+        state.module.AddFunction(spv::OpPhi, entryType, current, initial, walkEntry, nextEntry, walkContinue);
+        state.module.AddFunction(spv::OpPhi, u32, level, constant(BdaAbi::PageShift), walkEntry, nextLevel, walkContinue);
+        const auto split = binary(spv::OpIEqual, boolean, binary(spv::OpShiftRightLogical, u32, component(current, 2u), constant(BdaAbi::KindShift)), constant(static_cast<std::uint32_t>(BdaAbi::PageKind::Split)));
+        const auto descend = binary(spv::OpLogicalAnd, boolean, split, binary(spv::OpUGreaterThanEqual, boolean, level, constant(BdaAbi::SplitShift)));
+        state.module.AddFunction(spv::OpLoopMerge, walkMerge, walkContinue, spv::LoopControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, descend, walkBody, walkMerge);
+        EmitLabel(state, walkBody);
+        const auto lowered = binary(spv::OpISub, u32, level, constant(BdaAbi::SplitShift));
+        const auto child = binary(spv::OpBitwiseAnd, u32, Unary(state, spv::OpUConvert, u32, binary(spv::OpShiftRightLogical, u64, address, widen(lowered))), constant(BdaAbi::SplitChildren - 1u));
+        const auto children = binary(spv::OpIAdd, u64, leaf, pair(component(current, 0u), component(current, 1u)));
+        const auto loaded = loadDevice(entryType, binary(spv::OpIAdd, u64, children, widen(binary(spv::OpShiftLeftLogical, u32, child, constant(4u)))), sizeof(BdaAbi::PageEntry));
+        state.module.AddFunction(spv::OpCopyObject, entryType, nextEntry, loaded);
+        state.module.AddFunction(spv::OpCopyObject, u32, nextLevel, lowered);
+        state.module.AddFunction(spv::OpBranch, walkContinue);
+        EmitLabel(state, walkContinue);
+        state.module.AddFunction(spv::OpBranch, walkHeader);
+        EmitLabel(state, walkMerge);
+        const auto bounds = component(current, 2u);
+        const auto kind = binary(spv::OpShiftRightLogical, u32, bounds, constant(BdaAbi::KindShift));
+        const auto mask = binary(spv::OpISub, u32, binary(spv::OpShiftLeftLogical, u32, constant(1u), level), constant(1u));
+        const auto offset = widen(binary(spv::OpBitwiseAnd, u32, Unary(state, spv::OpUConvert, u32, address), mask));
+        const auto first = widen(binary(spv::OpBitwiseAnd, u32, bounds, constant(BdaAbi::FirstMask)));
+        const auto limit = pair(component(current, 3u), binary(spv::OpBitwiseAnd, u32, binary(spv::OpShiftRightLogical, u32, bounds, constant(BdaAbi::LimitHighShift)), constant(1u)));
+        const auto permissions = binary(spv::OpBitwiseAnd, u32, binary(spv::OpShiftRightLogical, u32, bounds, constant(BdaAbi::PermissionShift)), constant(BdaAbi::Read | BdaAbi::Write));
+        const auto segment = constant(static_cast<std::uint32_t>(BdaAbi::PageKind::Segment));
+        failFirst({
+            {binary(spv::OpUGreaterThan, boolean, kind, segment), BdaAbi::FaultReason::InvalidTable},
+            {binary(spv::OpINotEqual, boolean, kind, segment), BdaAbi::FaultReason::Unmapped},
+            {binary(spv::OpLogicalOr, boolean, binary(spv::OpULessThan, boolean, offset, first), binary(spv::OpUGreaterThanEqual, boolean, offset, limit)), BdaAbi::FaultReason::Unmapped},
+            {binary(spv::OpUGreaterThan, boolean, binary(spv::OpIAdd, u64, offset, widen(bytes)), limit), BdaAbi::FaultReason::Unmapped},
+            {binary(spv::OpUGreaterThan, boolean, end, gapEnd), BdaAbi::FaultReason::Unmapped},
+            {binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, permissions, constant(permission)), constant(permission)), BdaAbi::FaultReason::Permission},
+        });
+        const auto delta = pair(component(current, 0u), component(current, 1u));
+        if (rangeResult) {
+            const auto nodeBase = binary(spv::OpISub, u64, address, offset);
+            const auto segmentBegin = binary(spv::OpIAdd, u64, nodeBase, first);
+            const auto segmentEnd = binary(spv::OpIAdd, u64, nodeBase, limit);
+            const auto clippedBegin = Select(state, u64, binary(spv::OpULessThan, boolean, segmentBegin, gapBegin), gapBegin, segmentBegin);
+            const auto clippedEnd = Select(state, u64, binary(spv::OpULessThan, boolean, gapEnd, segmentEnd), gapEnd, segmentEnd);
+            const auto range = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeConstruct, rangeType, range, clippedBegin, clippedEnd, binary(spv::OpIAdd, u64, clippedBegin, delta));
+            leave(range);
+        } else {
+            leave(binary(spv::OpIAdd, u64, address, delta));
+        }
+        EmitLabel(state, overlaid);
+    }
     fail(binary(spv::OpIEqual, boolean, index, constant(0)), BdaAbi::FaultReason::Unmapped);
     const auto selected = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, index, constant(1)), constant(8)));
     const auto at = [&](std::uint32_t offset) { return binary(spv::OpIAdd, u32, selected, constant(offset)); };
@@ -117,6 +233,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto offset = binary(spv::OpISub, u64, address, begin);
     const auto result = binary(spv::OpIAdd, u64, base, offset);
     const auto deviceEnd = binary(spv::OpIAdd, u64, result, Unary(state, spv::OpUConvert, u64, bytes));
+    if (state.devicePageTable) fail(binary(spv::OpLogicalAnd, boolean, pageTable, binary(spv::OpIEqual, boolean, BdaLoadWord(state, at(7)), constant(BdaAbi::OverlayHole))), BdaAbi::FaultReason::Unmapped);
     failFirst({
         {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, at(7)), constant(0)), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpUGreaterThanEqual, boolean, begin, finish), BdaAbi::FaultReason::InvalidTable},

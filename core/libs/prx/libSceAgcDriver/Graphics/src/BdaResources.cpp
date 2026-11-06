@@ -1,4 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DevicePageTable.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include <chrono>
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "ImageTableAbi.hpp"
@@ -311,13 +314,92 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
     return true;
 }
 
-BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly) : BdaResources(context, reportOnly) {
+namespace {
+
+struct PageTableServing {
+    std::atomic<std::uint64_t> served{0}, waiting{0}, filtered{0}, uncached{0}, overlaid{0}, largestOverlay{0};
+    std::atomic<std::int64_t> reported{0};
+};
+
+PageTableServing& Serving() {
+    static PageTableServing serving;
+    return serving;
+}
+
+void reportServing() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& serving = Serving();
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = serving.reported.load(std::memory_order_relaxed);
+    if (last == 0) serving.reported.compare_exchange_strong(last, now, std::memory_order_relaxed);
+    if (last == 0 || now - last < 10 || !serving.reported.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    const auto totals = GuestPageTable().Totals();
+    const auto served = serving.served.exchange(0, std::memory_order_relaxed);
+    const auto overlaid = serving.overlaid.exchange(0, std::memory_order_relaxed);
+    const auto windows = BdaPageTable::Totals();
+    AgcDriver::ProfilePrint_nid_no_patch("[page-table] (10 s) address-based builds: %llu walked a page table (overlay %.1f ranges on average, %llu at most), %llu took the range table while theirs was built, %llu had no address space; %llu had multisample targets left out; tables (cumulative): %llu built in %.1f ms (%llu windows encoded, %llu shared), %llu superseded before a build, %llu refused\n", static_cast<unsigned long long>(served), served != 0 ? static_cast<double>(overlaid) / static_cast<double>(served) : 0.0, static_cast<unsigned long long>(serving.largestOverlay.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.waiting.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.uncached.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(serving.filtered.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(totals.built), static_cast<double>(totals.buildNanoseconds) / 1e6, static_cast<unsigned long long>(windows.encodedWindows), static_cast<unsigned long long>(windows.sharedWindows), static_cast<unsigned long long>(totals.superseded), static_cast<unsigned long long>(totals.refused));
+}
+
+}
+
+bool BdaResources::servePageTable(const Context& context, const GuestBufferMemory& memory, std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::uint64_t guardSerial) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    auto& serving = Serving();
+    reportServing();
+    const auto space = memory.SpaceTable();
+    if (!space.has_value()) {
+        serving.uncached.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    auto spaceGuard = guardSerial;
+    const auto filteredSpace = ExcludeMultisampleTargetRanges(context.device, *space->ranges, spaceGuard);
+    const auto filteredBuild = ExcludeMultisampleTargetRanges(context.device, ranges, guardSerial);
+    if (filteredSpace.has_value() || filteredBuild.has_value()) serving.filtered.fetch_add(1, std::memory_order_relaxed);
+    const std::span<const Abi::Range> spaceRanges = filteredSpace.has_value() ? std::span<const Abi::Range>(*filteredSpace) : std::span<const Abi::Range>(*space->ranges);
+    const std::span<const Abi::Range> buildRanges = filteredBuild.has_value() ? std::span<const Abi::Range>(*filteredBuild) : ranges;
+    auto walked = GuestPageTable().Find(context, {space->serial, filteredSpace.has_value() ? spaceGuard + 1u : 0u}, spaceRanges);
+    if (walked == nullptr) {
+        serving.waiting.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (!Abi::RangesOrdered(buildRanges.data(), buildRanges.size())) {
+        serving.waiting.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const auto overlay = DevicePageTable::Overlay(spaceRanges, buildRanges);
+    if (std::any_of(overlay.begin(), overlay.end(), [](const Abi::Range& range) { return (range.permissions & Abi::Write) != 0 && range.end > Abi::WrittenAddressLimit; })) {
+        serving.waiting.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const auto bytes = Abi::PageTableBytes(overlay.size());
+    if (overlay.size() > std::numeric_limits<std::uint32_t>::max() || bytes > context.limits.maxStorageBufferRange) {
+        serving.waiting.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    table = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const Abi::Header header{Abi::PageTableVersion, static_cast<std::uint32_t>(overlay.size()), sizeof(Abi::Range), 0};
+    const auto root = walked->Address();
+    auto* data = table->Bytes().data();
+    std::memcpy(data, &header, sizeof(header));
+    if (!overlay.empty()) std::memcpy(data + sizeof(header), overlay.data(), overlay.size() * sizeof(Abi::Range));
+    std::memcpy(data + sizeof(header) + overlay.size() * sizeof(Abi::Range), &root, sizeof(root));
+    serving.served.fetch_add(1, std::memory_order_relaxed);
+    serving.overlaid.fetch_add(overlay.size(), std::memory_order_relaxed);
+    for (auto largest = serving.largestOverlay.load(std::memory_order_relaxed); largest < overlay.size() && !serving.largestOverlay.compare_exchange_weak(largest, overlay.size(), std::memory_order_relaxed);) {}
+    pages = std::move(walked);
+    tableBytes = bytes;
+    return true;
+}
+
+BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly, bool pageTables) : BdaResources(context, reportOnly) {
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
     const auto& addressRanges = cached.has_value() ? *cached->ranges : built;
     const auto serial = cached.has_value() ? cached->serial : 0;
     auto guardSerial = MultisampleTargetRangeGeneration();
+    if (pageTables && servePageTable(context, memory, addressRanges, guardSerial)) return;
     if (tableCacheEnabled() && serial != 0) {
         auto& cache = Tables();
         std::lock_guard lock(cache.mutex);
