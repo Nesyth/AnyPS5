@@ -367,6 +367,7 @@ public:
         bool audited = false;
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
+    bool AsIsCurrent();
     // Objects whose fast proof came from another template's stamp (FastProofStamp), so far.
     static std::uint64_t FastProofStampsTaken();
     static bool EpochProofs();

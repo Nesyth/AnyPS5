@@ -466,7 +466,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 const auto shape = drawShapes.find(shapeKey);
                 shapeMatters = !drawCache.contains(drawKey) && (shape == drawShapes.end() || !drawCache.contains(shape->second));
             }
-            const bool drain = !DrawFinisher::Overlap() || DrawFinisher::Get().PendingKey(drawKey, shapeMatters ? shapeKey : 0);
+            const bool drain = !DrawFinisher::Overlap() || (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpReplay) && DrawFinisher::Get().PendingKey(drawKey, shapeMatters ? shapeKey : 0));
             if (drain) DrawFinisher::Get().Drain();
             if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Lookup, drain);
         }

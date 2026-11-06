@@ -2189,7 +2189,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                     }
                 }
             }
-            const bool valid = spaceHeld && cached->Revalidate(shaders);
+            const bool valid = spaceHeld && (RuntimeSwitches::Set(RuntimeSwitch::XpReplay) ? cached->AsIsCurrent() : cached->Revalidate(shaders));
             if (counted && spaceHeld && !valid) reuse = AddressDrawReuse::Revalidation;
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
@@ -3733,7 +3733,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto* recorder = prepared.recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     auto& resolved = prepared.resolved;
-    const bool replayOn = RuntimeSwitches::Set(RuntimeSwitch::ReplayHeapStage);
+    const bool replayOn = RuntimeSwitches::Set(RuntimeSwitch::ReplayHeapStage) || RuntimeSwitches::Set(RuntimeSwitch::XpReplay);
     const auto replayDraw = replayOn || ReplayCensusEnabled() ? heapReplayDrawReason(state, draw, shaders, inputs, targets, !stencilReferences.empty(), recordable) : ReplayReason::Count;
     resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared.contentKey, replayDraw, replayOn);
     if (stopAfterResolve.load(std::memory_order_relaxed) != 0) {

@@ -90,7 +90,12 @@ Driver::HeapDirect Driver::materializeHeapDirect(const DrawStageContext& context
     HeapStageMaterialized materialized;
     Graphics::HeapCostScope callCost(Graphics::HeapCost::HeapStageCall);
     try {
-        materialized = MaterializeHeapStage(invocation, program.userData, program.binary.codeAddress);
+        std::uint64_t fixedWords = 0;
+        if (const auto& tail = program.snapshot->userDataTailRegister; tail && *tail >= program.firstUserSgpr) {
+            const auto index = *tail - program.firstUserSgpr;
+            fixedWords = index + 1u < 64u ? std::uint64_t{3} << index : ~std::uint64_t{0};
+        }
+        materialized = MaterializeHeapStage(invocation, program.userData, program.binary.codeAddress, fixedWords);
     } catch (const std::exception& error) {
         throw stageFailure(program, request, error, request.context.memory);
     }

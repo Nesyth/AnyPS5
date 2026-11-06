@@ -10,6 +10,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
@@ -594,8 +595,215 @@ captureWalk(const ShaderRecompiler::PreparedShaderInvocation& invocation, std::s
 
 }
 
+namespace {
+
+struct StageRecord {
+    std::uint64_t variant = 0;
+    std::uint64_t shaderBase = 0;
+    std::uint32_t pushOffset = 0;
+    std::optional<std::array<std::uint8_t, 8>> exportMapping;
+    std::vector<std::uint32_t> userData;
+    AddressRanges ranges;
+    std::vector<std::uint32_t> values;
+    AddressRanges accessible;
+    ShaderRecompiler::SrtUserDataUse userDataUse;
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+    std::shared_ptr<const ShaderRecompiler::HeapStageWords> words;
+};
+
+enum class StageRecordEvent { Same, Patched, Absent, Identity, WalkWord, FixedWord, Memory, Shape, Verified, Differs, Count };
+
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(StageRecordEvent::Count)>& stageRecordEvents() {
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(StageRecordEvent::Count)> events{};
+    return events;
+}
+
+void noteStageRecord(StageRecordEvent event) {
+    auto& events = stageRecordEvents();
+    events[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<std::uint64_t> calls{0};
+    if (event == StageRecordEvent::Verified || event == StageRecordEvent::Differs) return;
+    if ((calls.fetch_add(1, std::memory_order_relaxed) & 0x7ffffu) != 0x7ffffu) return;
+    constexpr std::array<const char*, static_cast<std::size_t>(StageRecordEvent::Count)> names{"same words", "patched", "absent", "other identity", "changed walk word", "changed fixed word", "memory changed", "words shape", "verified", "verify differs"};
+    std::string line = "[xp-replay] stage records (last 524288 stages):";
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        char item[64];
+        std::snprintf(item, sizeof(item), " %s %llu", names[index], static_cast<unsigned long long>(events[index].exchange(0, std::memory_order_relaxed)));
+        line += item;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
+std::unordered_map<std::uint64_t, StageRecord>& stageRecords() {
+    struct StageRecordStorage {};
+    return HostThreadLocal<std::unordered_map<std::uint64_t, StageRecord>, StageRecordStorage>();
+}
+
+bool verifyStageRecords() {
+    static const bool verify = std::getenv("APS5_VERIFY_XP_REPLAY") != nullptr;
+    return verify;
+}
+
+std::optional<std::array<std::uint8_t, 8>> exportMappingOf(const ShaderRecompiler::PreparedShaderInvocation& invocation) {
+    const auto& pixel = invocation.Request().context.pixel;
+    if (!pixel.has_value()) return std::nullopt;
+    return pixel->targetExportMapping;
+}
+
+bool tessellationInstances(const ShaderRecompiler::PreparedShaderInvocation& invocation) {
+    const auto& graphics = invocation.Request().graphics;
+    return graphics.has_value() && graphics->tessellation && graphics->draw.instanceCount > 1u;
+}
+
+bool patchRecordWords(const StageRecord& record, const ShaderRecompiler::PreparedShaderInvocation& invocation, std::span<const std::uint32_t> userData,
+                      std::shared_ptr<const ShaderRecompiler::HeapStageWords>& out) {
+    const auto& result = *record.result;
+    auto words = std::make_shared<ShaderRecompiler::HeapStageWords>(*record.words);
+    if (result.heapUserWords.size() != words->userData.size()) return false;
+    for (std::size_t index = 0; index < result.heapUserWords.size(); ++index) {
+        const auto word = result.heapUserWords[index];
+        if (word >= userData.size()) return false;
+        words->userData[index] = userData[word];
+    }
+    if (!words->bindings.empty()) {
+        if (words->bindings.size() != result.bindings.size()) return false;
+        for (std::size_t index = 0; index < result.bindings.size(); ++index) {
+            if (result.bindings[index].role != ShaderRecompiler::DescriptorRole::ShaderData || words->bindings[index].empty()) continue;
+            auto& descriptor = words->bindings[index];
+            std::copy_n(words->userData.begin(), std::min(words->userData.size(), descriptor.size()), descriptor.begin());
+        }
+    }
+    ShaderRecompiler::CompleteHeapDataWords(result, *words);
+    const auto& vertex = invocation.Request().context.vertex;
+    if (vertex.has_value()) {
+        words->vertexAttributes = result.vertexAttributes;
+        for (auto& attribute : words->vertexAttributes) {
+            if (attribute.location >= vertex->resourcesNum || attribute.location >= vertex->resources.size()) return false;
+            attribute.resource = vertex->resources[attribute.location];
+            if (vertex->fetchEmbedded) attribute.fetchIndex = vertex->resourcesDst[attribute.location].fetchIndex;
+        }
+    }
+    out = std::move(words);
+    return true;
+}
+
+bool replayStageRecord(const ShaderRecompiler::PreparedShaderInvocation& invocation, std::span<const std::uint32_t> userData, std::uint64_t shaderBase,
+                       std::uint64_t fixedWords, const Graphics::Recorder::WriteRanges* before, std::uint64_t generation, HeapStageMaterialized& adopted) {
+    auto& records = stageRecords();
+    const auto key = (invocation.VariantId() * 0x9e3779b97f4a7c15ull ^ shaderBase) + invocation.Request().layout.pushConstantOffsetBytes;
+    const auto found = records.find(key);
+    if (found == records.end() || found->second.result == nullptr) {
+        noteStageRecord(StageRecordEvent::Absent);
+        return false;
+    }
+    auto& record = found->second;
+    if (record.variant != invocation.VariantId() || record.shaderBase != shaderBase || record.pushOffset != invocation.Request().layout.pushConstantOffsetBytes ||
+        record.userData.size() != userData.size() || record.exportMapping != exportMappingOf(invocation) || tessellationInstances(invocation)) {
+        noteStageRecord(StageRecordEvent::Identity);
+        return false;
+    }
+    std::uint64_t changed = 0;
+    for (std::size_t index = 0; index < userData.size(); ++index) {
+        if (userData[index] == record.userData[index]) continue;
+        if (index >= ShaderRecompiler::SrtUserDataUse::TrackedWords) {
+            noteStageRecord(StageRecordEvent::WalkWord);
+            return false;
+        }
+        changed |= std::uint64_t{1} << index;
+    }
+    if ((changed & (record.userDataUse.asBase | record.userDataUse.asValue)) != 0) {
+        noteStageRecord(StageRecordEvent::WalkWord);
+        return false;
+    }
+    if ((changed & fixedWords) != 0) {
+        noteStageRecord(StageRecordEvent::FixedWord);
+        return false;
+    }
+    std::size_t cursor = 0;
+    for (const auto& [begin, end] : record.ranges) {
+        const auto count = static_cast<std::size_t>((end - begin) / WordBytes);
+        if (GuestMemory::CompareMapped(begin, std::as_bytes(std::span(record.values.data() + cursor, count))) != GuestMemory::Compare::Equal) {
+            noteStageRecord(StageRecordEvent::Memory);
+            return false;
+        }
+        cursor += count;
+    }
+    for (const auto& [address, bytes] : record.accessible) {
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes))) {
+            noteStageRecord(StageRecordEvent::Memory);
+            return false;
+        }
+    }
+    if (!rangesSettled(record.ranges, before, generation)) {
+        noteStageRecord(StageRecordEvent::Memory);
+        return false;
+    }
+    std::shared_ptr<const ShaderRecompiler::HeapStageWords> words = record.words;
+    if ((changed != 0 || invocation.Request().context.vertex.has_value()) && !patchRecordWords(record, invocation, userData, words)) {
+        noteStageRecord(StageRecordEvent::Shape);
+        return false;
+    }
+    guardRanges(record.ranges);
+    record.userData.assign(userData.begin(), userData.end());
+    record.words = words;
+    adopted.result = record.result;
+    adopted.words = std::move(words);
+    adopted.reads = {record.ranges, record.values, record.userDataUse, record.capture, true};
+    noteStageRecord(changed == 0 ? StageRecordEvent::Same : StageRecordEvent::Patched);
+    return true;
+}
+
+void keepStageRecord(const ShaderRecompiler::PreparedShaderInvocation& invocation, std::span<const std::uint32_t> userData, std::uint64_t shaderBase,
+                     const AddressRanges& ranges, const std::vector<std::uint32_t>& values, const AddressRanges& accessible,
+                     const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result,
+                     const std::shared_ptr<const ShaderRecompiler::HeapStageWords>& words) {
+    auto& records = stageRecords();
+    if (records.size() >= 16384u) records.clear();
+    const auto key = (invocation.VariantId() * 0x9e3779b97f4a7c15ull ^ shaderBase) + invocation.Request().layout.pushConstantOffsetBytes;
+    auto& record = records[key];
+    record.variant = invocation.VariantId();
+    record.shaderBase = shaderBase;
+    record.pushOffset = invocation.Request().layout.pushConstantOffsetBytes;
+    record.exportMapping = exportMappingOf(invocation);
+    record.userData.assign(userData.begin(), userData.end());
+    record.ranges = ranges;
+    record.values = values;
+    record.accessible = accessible;
+    record.userDataUse = capture->userDataUse;
+    record.capture = capture;
+    record.result = result;
+    record.words = words;
+}
+
+bool sameStageWords(const ShaderRecompiler::HeapStageWords& a, const ShaderRecompiler::HeapStageWords& b) {
+    const auto sameAttributes = [&] {
+        if (a.vertexAttributes.size() != b.vertexAttributes.size()) return false;
+        for (std::size_t index = 0; index < a.vertexAttributes.size(); ++index) {
+            const auto& x = a.vertexAttributes[index];
+            const auto& y = b.vertexAttributes[index];
+            if (x.location != y.location || x.fetchIndex != y.fetchIndex || std::memcmp(&x.resource, &y.resource, sizeof(x.resource)) != 0) return false;
+        }
+        return true;
+    };
+    const auto sameBindings = [&] {
+        const auto count = std::max(a.bindings.size(), b.bindings.size());
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto* x = index < a.bindings.size() ? &a.bindings[index] : nullptr;
+            const auto* y = index < b.bindings.size() ? &b.bindings[index] : nullptr;
+            const bool xEmpty = x == nullptr || x->empty();
+            const bool yEmpty = y == nullptr || y->empty();
+            if (xEmpty != yEmpty || (!xEmpty && *x != *y)) return false;
+        }
+        return true;
+    };
+    return a.userData == b.userData && a.flattenedSrt == b.flattenedSrt && a.pushWords == b.pushWords && sameAttributes() && sameBindings();
+}
+
+}
+
 HeapStageMaterialized MaterializeHeapStage(const ShaderRecompiler::PreparedShaderInvocation& invocation, std::span<const std::uint32_t> userData,
-                                           std::uint64_t shaderBase) {
+                                           std::uint64_t shaderBase, std::uint64_t fixedWords) {
     struct ReadsStorage {};
     struct RangesStorage {};
     struct ValuesStorage {};
@@ -606,7 +814,11 @@ HeapStageMaterialized MaterializeHeapStage(const ShaderRecompiler::PreparedShade
     const auto before = Graphics::Recorder::PendingWriteSnapshot();
     snapshotCost.Stop();
     const auto generation = GuestMemory::TrackerGeneration();
-    const bool memoOn = !invocation.Request().context.vertex.has_value();
+    const bool records = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpReplay);
+    HeapStageMaterialized recorded;
+    const bool replayed = records && replayStageRecord(invocation, userData, shaderBase, fixedWords, before.get(), generation, recorded);
+    if (replayed && !verifyStageRecords()) return recorded;
+    const bool memoOn = !records && !invocation.Request().context.vertex.has_value();
     std::uint64_t memoKey = 0;
     bool memoKnown = false;
 
@@ -642,6 +854,16 @@ HeapStageMaterialized MaterializeHeapStage(const ShaderRecompiler::PreparedShade
     Graphics::HeapCostScope insertCost(Graphics::HeapCost::MemoInsert);
     if (memoOn && complete && (memoKnown || heapWalkMemo().admit(memoKey)))
         rememberWalk(memoKey, invocation, userData, shaderBase, ranges, values, reads.accessible, capture, result, *words);
+    insertCost.Stop();
+    if (replayed) {
+        const bool same = complete && recorded.result == result && sameStageWords(*recorded.words, *words);
+        noteStageRecord(same ? StageRecordEvent::Verified : StageRecordEvent::Differs);
+        static std::atomic<int> reports{0};
+        if (!same && reports.fetch_add(1, std::memory_order_relaxed) < 20)
+            std::fprintf(stderr, "[xp-replay] verify: stage record differs from the walk (variant 0x%llx, shader 0x%llx, same result %d, user words %zu)\n",
+                         static_cast<unsigned long long>(invocation.VariantId()), static_cast<unsigned long long>(shaderBase), recorded.result == result ? 1 : 0, userData.size());
+    }
+    if (records && complete) keepStageRecord(invocation, userData, shaderBase, ranges, values, reads.accessible, capture, result, words);
     materialized.result = std::move(result);
     materialized.words = std::move(words);
     return materialized;

@@ -73,7 +73,7 @@ struct HeapStageMaterialized {
 };
 
 HeapStageMaterialized MaterializeHeapStage(const ShaderRecompiler::PreparedShaderInvocation& invocation, std::span<const std::uint32_t> userData,
-                                           std::uint64_t shaderBase);
+                                           std::uint64_t shaderBase, std::uint64_t fixedWords = 0);
 void NoteHeapDirect();
 void NoteHeapDirectVerify(const ShaderRecompiler::RecompileResult& direct, const ShaderRecompiler::RecompileResult& expected,
                           const ShaderRecompiler::ResourceCapture* expectedCapture = nullptr);

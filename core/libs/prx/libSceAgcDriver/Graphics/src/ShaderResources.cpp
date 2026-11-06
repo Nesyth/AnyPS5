@@ -4305,6 +4305,25 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     return revalidateFull(shaders, report);
 }
 
+bool ShaderResources::AsIsCurrent() {
+    if (!reusable || !registeredImageViewsCurrent(registeredImageViews) || !guestMemory.Writes().empty() || guestMemory.HasGpuCopies() || std::find(storageWritten.begin(), storageWritten.end(), true) != storageWritten.end()) return false;
+    for (const auto& texture : textures) {
+        if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
+    }
+    if (importsReconcilable ? HostImportsReconciledUnchanged(context, importsProof) : HostImportsUnchanged(context, importsProof)) return true;
+    for (const auto& region : directRegions) {
+        auto serial = HostImportSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin), true);
+        if (serial == 0) serial = ImageMirrorSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+        if (serial != region.serial) return false;
+        if (region.regionEnd != 0) {
+            const auto committed = GuestMemory::DescribeCommitted(region.begin, static_cast<std::size_t>(region.regionEnd - region.begin));
+            if (committed.ranges.size() != 1 || committed.ranges.front().first != region.begin || committed.ranges.front().second != region.committedEnd) return false;
+        }
+    }
+    importsProof = HostImportsIdentity(context);
+    return true;
+}
+
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
