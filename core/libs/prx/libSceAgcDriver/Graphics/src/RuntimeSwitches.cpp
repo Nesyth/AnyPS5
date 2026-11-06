@@ -38,6 +38,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_LARGE_BATCHES",
     "APS5_REPLAY_HEAP_STAGE",
     "APS5_XP_REPLAY",
+    "APS5_XP_PROOF_AS_IS",
 };
 
 struct SwitchValues {
@@ -76,6 +77,7 @@ struct SwitchValues {
                 const char* text = std::getenv("APS5_XP_REPLAY");
                 return text != nullptr && text[0] != '\0' && text[0] != '0';
             }(),
+            std::getenv("APS5_XP_PROOF_AS_IS") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

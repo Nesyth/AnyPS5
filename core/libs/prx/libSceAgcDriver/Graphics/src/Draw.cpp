@@ -2189,7 +2189,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                     }
                 }
             }
-            const bool valid = spaceHeld && (RuntimeSwitches::Set(RuntimeSwitch::XpReplay) ? cached->AsIsCurrent() : cached->Revalidate(shaders));
+            const bool valid = spaceHeld && (RuntimeSwitches::Set(RuntimeSwitch::XpProofAsIs) ? cached->AsIsCurrent() : cached->Revalidate(shaders));
             if (counted && spaceHeld && !valid) reuse = AddressDrawReuse::Revalidation;
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;

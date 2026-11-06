@@ -32,6 +32,7 @@ enum class RuntimeSwitch : std::size_t {
     LargeBatches,
     ReplayHeapStage,
     XpReplay,
+    XpProofAsIs,
     Count,
 };
 
