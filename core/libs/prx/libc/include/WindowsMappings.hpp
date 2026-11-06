@@ -286,6 +286,13 @@ public:
         for (std::size_t index = 0; index < 4; ++index) out[index] = armingCounters()[index].exchange(0, std::memory_order_relaxed);
         out[4] = cleanRanges.size();
         out[5] = residentRuns.size();
+        for (std::size_t index = 4; index < 7; ++index) out[index + 2] = armingCounters()[index].exchange(0, std::memory_order_relaxed);
+    }
+
+    // APS5_REARM_QUIET as a runtime switch: a resident run the guest wrote after it was armed is armed again once 8
+    // clearing collects in a row found it unwritten, at most once per 50 ms per run.
+    void SetRearmQuiet(bool on) {
+        rearmQuietFlag().store(on, std::memory_order_relaxed);
     }
 
     void SetArmResident(bool on) {
@@ -921,9 +928,14 @@ private:
         return armResidentFlag().load(std::memory_order_relaxed);
     }
 
-    static std::array<std::atomic<std::uint64_t>, 4>& armingCounters() {
-        static std::array<std::atomic<std::uint64_t>, 4> counters{};
+    static std::array<std::atomic<std::uint64_t>, 8>& armingCounters() {
+        static std::array<std::atomic<std::uint64_t>, 8> counters{};
         return counters;
+    }
+
+    static std::atomic<bool>& rearmQuietFlag() {
+        static std::atomic<bool> rearm{false};
+        return rearm;
     }
 
     bool armResident(std::uintptr_t from, std::uintptr_t stop) {
@@ -958,6 +970,7 @@ private:
         } timed{resumeStart};
         const auto run = std::prev(residentRuns.upper_bound(address));
         if (observed) run->second.writeObserved = true;
+        run->second.quietCollects = 0;
         forgetClean(run->first, run->second.end);
         auto first = views.lower_bound(run->first);
         while (first != views.end() && first->first < run->second.end) {
@@ -1079,6 +1092,8 @@ private:
         bool reset = false;
         bool imported = false;
         bool writeObserved = false;
+        std::uint32_t quietCollects = 0;
+        std::int64_t armedAt = 0;
     };
     struct Window {
         void* view = nullptr;
@@ -1093,11 +1108,25 @@ private:
     void collectResident(std::uintptr_t start, Run& run, std::uintptr_t from, std::uintptr_t stop, void** pages, std::size_t* count, bool clear, Collection collection) {
         if (clear) run.reset = true;
         const auto first = from & ~std::uintptr_t{4095};
-        const bool armed = armResidentRuns() && clear && run.watched && run.fresh == 0 && !run.writeObserved && collection != Collection::Fresh && run.end - start >= 0x40000 && armResident(first, stop);
+        const bool observedBefore = run.writeObserved;
+        const auto now = observedBefore && rearmQuietFlag().load(std::memory_order_relaxed) ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() : std::int64_t{0};
+        const bool rearm = now != 0 && run.quietCollects >= 8 && now - run.armedAt >= 50'000'000;
+        const bool armed = armResidentRuns() && clear && run.watched && run.fresh == 0 && (!run.writeObserved || rearm) && collection != Collection::Fresh && run.end - start >= 0x40000 && armResident(first, stop);
+        if (armed && run.writeObserved) {
+            run.writeObserved = false;
+            run.quietCollects = 0;
+            armingCounters()[6].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (armed && now != 0) run.armedAt = now;
         if (run.fresh == 0 && collection != Collection::Fresh) {
             ULONG_PTR reported = (stop - first + 4095) / 4096;
             DWORD granularity = 0;
             if (collectOwnedWrites(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, pages + *count, &reported, &granularity) != 0) fail("collect resident guest writes");
+            if (clear && observedBefore && !armed) {
+                armingCounters()[4].fetch_add(1, std::memory_order_relaxed);
+                if (reported == 0) armingCounters()[5].fetch_add(1, std::memory_order_relaxed);
+                run.quietCollects = reported == 0 ? run.quietCollects + 1 : 0;
+            }
             for (ULONG_PTR index = 0; index < reported; ++index) pages[*count + index] = reinterpret_cast<void*>(std::max(from, reinterpret_cast<std::uintptr_t>(pages[*count + index])));
             *count += reported;
             if (armed) rememberClean(from, stop);

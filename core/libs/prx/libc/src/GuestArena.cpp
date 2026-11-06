@@ -826,6 +826,10 @@ void GuestArenaSetArmResident_nid_no_patch(bool on) {
     WindowsMappings::Get().SetArmResident(on);
 }
 
+void GuestArenaSetRearmQuiet_nid_no_patch(bool on) {
+    WindowsMappings::Get().SetRearmQuiet(on);
+}
+
 void GuestArenaArmingReport_nid_no_patch(std::uint64_t* out) {
     WindowsMappings::Get().ArmingReport(out);
 }

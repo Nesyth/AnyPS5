@@ -1775,6 +1775,9 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     static std::atomic<int> armResident{-1};
     const int armWanted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoArmResident) ? 0 : 1;
     if (armResident.load(std::memory_order_relaxed) != armWanted && armResident.exchange(armWanted, std::memory_order_relaxed) != armWanted) GuestArena::GuestArenaSetArmResident_nid_no_patch(armWanted != 0);
+    static std::atomic<int> rearmQuiet{-1};
+    const int rearmWanted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RearmQuiet) ? 1 : 0;
+    if (rearmQuiet.load(std::memory_order_relaxed) != rearmWanted && rearmQuiet.exchange(rearmWanted, std::memory_order_relaxed) != rearmWanted) GuestArena::GuestArenaSetRearmQuiet_nid_no_patch(rearmWanted != 0);
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
     writeRates[0].fetch_add(1, std::memory_order_relaxed);
     writeRates[1].fetch_add(stop - first, std::memory_order_relaxed);
@@ -2111,6 +2114,9 @@ std::string SweepCostReport() {
     std::snprintf(text, sizeof(text), "write-watch sweep %.1f us in %llu calls over %.1f MiB private (%llu pages written) and %.1f MiB watched resident (%llu pages written); %llu epoch bumps since the last report; walks %llu over %.1f MiB found %llu pages written (%llu walks with any); compares %llu over %.1f MiB, %llu differed over %.1f MiB", static_cast<double>(out[5]) / 1e3, static_cast<unsigned long long>(out[4]), static_cast<double>(out[0]) / 1048576.0, static_cast<unsigned long long>(out[1]), static_cast<double>(out[2]) / 1048576.0, static_cast<unsigned long long>(out[3]), static_cast<unsigned long long>(bumps - reportedBumps), rates[0], static_cast<double>(rates[1]) / 1048576.0, rates[2], rates[3], rates[4], static_cast<double>(rates[5]) / 1048576.0, rates[6], static_cast<double>(rates[7]) / 1048576.0);
     reportedBumps = bumps;
 #ifdef _WIN32
+    std::array<std::uint64_t, 9> arming{};
+    GuestArena::GuestArenaArmingReport_nid_no_patch(arming.data());
+    AgcDriver::ProfilePrint_nid_no_patch("[arming] 10 s: %llu arms in %.1f ms, %llu resumes in %.1f ms; %llu clean ranges, %llu resident runs; %llu collects of runs written after arming, %llu of them unwritten, %llu runs armed again\n", static_cast<unsigned long long>(arming[0]), static_cast<double>(arming[1]) / 1e6, static_cast<unsigned long long>(arming[2]), static_cast<double>(arming[3]) / 1e6, static_cast<unsigned long long>(arming[4]), static_cast<unsigned long long>(arming[5]), static_cast<unsigned long long>(arming[6]), static_cast<unsigned long long>(arming[7]), static_cast<unsigned long long>(arming[8]));
     // APS5_FAULT_SITES: every write-fault site on armed pages so far, with the main module's base, as
     // [fault-site] lines after the report (cumulative; the 256 most frequent).
     if (std::getenv("APS5_FAULT_SITES") != nullptr) {
@@ -2123,9 +2129,6 @@ std::string SweepCostReport() {
         std::vector<std::size_t> order(taken);
         for (std::size_t index = 0; index < taken; ++index) order[index] = index;
         std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return counts[a] > counts[b]; });
-        std::array<std::uint64_t, 6> arming{};
-        GuestArena::GuestArenaArmingReport_nid_no_patch(arming.data());
-        AgcDriver::ProfilePrint_nid_no_patch("[arming] 10 s: %llu arms in %.1f ms, %llu resumes in %.1f ms; %llu clean ranges, %llu resident runs\n", static_cast<unsigned long long>(arming[0]), static_cast<double>(arming[1]) / 1e6, static_cast<unsigned long long>(arming[2]), static_cast<double>(arming[3]) / 1e6, static_cast<unsigned long long>(arming[4]), static_cast<unsigned long long>(arming[5]));
         AgcDriver::ProfilePrint_nid_no_patch("[fault-sites] base 0x%llx sites %zu faults %llu dropped %llu\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))), taken, static_cast<unsigned long long>(total), static_cast<unsigned long long>(dropped));
         for (std::size_t index = 0; index < taken && index < 256; ++index) {
             const auto rip = rips[order[index]];
