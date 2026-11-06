@@ -40,18 +40,19 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
 struct SwitchValues {
     std::array<std::atomic<bool>, SwitchCount> set{};
     SwitchValues() {
+        const bool lateMsOff = std::getenv("APS5_LATE_MS") == nullptr;
         const std::array<bool, SwitchCount> environment{
             std::getenv("APS5_NO_BARRIER_BATCH") != nullptr,
-            std::getenv("APS5_NO_TEXTURE_PROOF_STAMPS") != nullptr,
-            std::getenv("APS5_NO_RANGE_PROOFS") != nullptr,
-            std::getenv("APS5_NO_LEAN_RUNS") != nullptr,
-            std::getenv("APS5_NO_PASS_ACCESS_MEMO") != nullptr,
-            std::getenv("APS5_NO_RANGED_DISPATCH_BREAKS") != nullptr,
-            std::getenv("APS5_NO_STAGE_DATA_SIDE_CARS") != nullptr,
-            std::getenv("APS5_NO_DATA_RECIPES") != nullptr,
+            lateMsOff || std::getenv("APS5_NO_TEXTURE_PROOF_STAMPS") != nullptr,
+            lateMsOff || std::getenv("APS5_NO_RANGE_PROOFS") != nullptr,
+            lateMsOff || std::getenv("APS5_NO_LEAN_RUNS") != nullptr,
+            lateMsOff || std::getenv("APS5_NO_PASS_ACCESS_MEMO") != nullptr,
+            lateMsOff || std::getenv("APS5_NO_RANGED_DISPATCH_BREAKS") != nullptr,
+            lateMsOff || std::getenv("APS5_NO_STAGE_DATA_SIDE_CARS") != nullptr,
+            lateMsOff || std::getenv("APS5_NO_DATA_RECIPES") != nullptr,
             std::getenv("APS5_NO_HEAP_RECIPES") != nullptr,
-            std::getenv("APS5_NO_INTERVAL_COLLECT_MEMO") != nullptr,
-            std::getenv("APS5_NO_INPUT_MEMO") != nullptr,
+            lateMsOff || std::getenv("APS5_NO_INTERVAL_COLLECT_MEMO") != nullptr,
+            lateMsOff || std::getenv("APS5_NO_INPUT_MEMO") != nullptr,
             std::getenv("APS5_NO_PASS_ATTACHMENT_MEMO") != nullptr,
             std::getenv("APS5_NO_GUARD_SPANS") != nullptr,
             std::getenv("APS5_NO_HTILE_FIXUP_CARRY") != nullptr,
