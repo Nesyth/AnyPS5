@@ -6740,18 +6740,32 @@ std::size_t ShaderResources::DrawUploadLimit() {
     return limit;
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord) const {
+namespace {
+
+std::uint64_t HeapReplayKeyHash(std::span<const std::uint32_t> key) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const auto word : key) {
+        hash ^= word;
+        hash *= 0x100000001b3ull;
+    }
+    return hash == 0u ? 1u : hash;
+}
+
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord, bool census) const {
     thread_local std::vector<std::size_t>* selectedSlot = nullptr;
     auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
-    auto result = selectDrawSnapshots(recorder, moved, movedOnly, selected);
+    auto result = selectDrawSnapshots(recorder, moved, movedOnly, selected, census);
     return finishDrawBindings(recorder, std::move(result), selected, faultRecord);
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareReplayDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, std::span<const CompiledShader> shaders, const BdaResources* faultRecord, HeapReplayProof& proof) {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareReplayDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, std::span<const CompiledShader> shaders, const BdaResources* faultRecord, HeapReplayProof& proof, bool census, std::span<const std::uint32_t> contentKey) {
     thread_local std::vector<std::size_t>* selectedSlot = nullptr;
     auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
-    auto result = selectDrawSnapshots(recorder, moved, false, selected);
+    auto result = selectDrawSnapshots(recorder, moved, false, selected, census);
     auto& record = heapReplayRecord();
+    if (record.keyHash == 0u && !contentKey.empty()) record.keyHash = HeapReplayKeyHash(contentKey);
     const bool overlay = result != nullptr && addressedBuffers && std::ranges::any_of(selected, [&](std::size_t index) { return index < record.addressed.size() && record.addressed[index]; });
     proof = ReplayHeapStages(shaders, overlay);
     return finishDrawBindings(recorder, std::move(result), selected, faultRecord);
@@ -6765,7 +6779,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::finishDrawBindin
     return result;
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, std::vector<std::size_t>& selected) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, std::vector<std::size_t>& selected, bool census) const {
     selected.clear();
     requireGuestBuffers(moved);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE && !heapStage) || (usesBda && !spaceReuse)) return {};
@@ -6779,6 +6793,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
     auto result = std::make_shared<DrawBindings>();
     std::array<std::uint64_t, 3> stamp{};
     bool stamped = false;
+    struct SnapshotCensus {
+        std::size_t moved = 0;
+        std::size_t unmoved = 0;
+        std::size_t bytes = 0;
+        std::size_t memoHits = 0;
+        std::size_t uploads = 0;
+        std::size_t large = 0;
+    } counted;
     const auto keep = [&](DrawBindings::Snapshot snapshot) {
         if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
         result->snapshots.push_back(std::move(snapshot));
@@ -6794,6 +6816,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
             }
             selected.push_back(index);
             keep({0, std::move(slice.buffer), slice.offset, override->size});
+            if (census) {
+                ++counted.moved;
+                ++counted.uploads;
+                counted.bytes += override->size;
+            }
             continue;
         }
         std::uint64_t address = item.address;
@@ -6816,6 +6843,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
         }
         VkDeviceSize offset = 0;
         auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
+        if (census && buffer != nullptr) ++counted.memoHits;
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
         if (verifySnapshots && buffer != nullptr) {
             static std::atomic<std::uint64_t> checked{0}, differing{0};
@@ -6828,6 +6856,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
         }
         if (buffer == nullptr) {
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
+            if (census) {
+                if (uploaded) ++counted.uploads;
+                else ++counted.large;
+            }
             if (uploaded) {
                 auto slice = recorder.DrawUpload(bytes);
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
@@ -6848,8 +6880,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
         selected.push_back(index);
         keep({begin, std::move(buffer), offset, bytes});
         totalSnapshotBytes += bytes;
+        if (census) {
+            if (override != moved.end()) ++counted.moved;
+            else ++counted.unmoved;
+            counted.bytes += bytes;
+        }
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
+    if (census) NoteReplaySnapshots(counted.moved, counted.unmoved, counted.bytes, counted.memoHits, counted.uploads, counted.large);
     return result;
 }
 
@@ -6989,10 +7027,10 @@ std::size_t DataOffsetIndex(std::size_t stage, ShaderRecompiler::RuntimeAbi::Bin
 }
 
 void ShaderResources::RefreshMovedAddresses(DrawBindings& rewritten) const {
-    if (rewritten.addressOffsets) rewritten.heapOffsets = addressedOffsets(&rewritten.addressOverrides);
+    if (rewritten.addressOffsets) rewritten.heapOffsets = addressedOffsets(&rewritten.addressOverrides, false);
 }
 
-std::array<std::uint32_t, 2u * ShaderRecompiler::RuntimeAbi::StageCount> ShaderResources::addressedOffsets(const std::vector<VkDescriptorBufferInfo>* overrides) const {
+std::array<std::uint32_t, 2u * ShaderRecompiler::RuntimeAbi::StageCount> ShaderResources::addressedOffsets(const std::vector<VkDescriptorBufferInfo>* overrides, bool census) const {
     auto offsets = heapOffsets;
     auto& heap = BindlessHeap::For(context);
     for (std::size_t stage = 0; stage < stageDataWords.size(); ++stage) {
@@ -7007,7 +7045,7 @@ std::array<std::uint32_t, 2u * ShaderRecompiler::RuntimeAbi::StageCount> ShaderR
         if (!ringDescriptorStages[stage]) continue;
         RingDescriptors moved;
         offsets[DataOffsetIndex(stage, ShaderRecompiler::RuntimeAbi::Binding::FlattenedSrt)] = ringDescriptors(stage, overrides, moved);
-        if (ReplayCensusEnabled() && heapReplay != nullptr) {
+        if (census && ReplayCensusEnabled() && heapReplay != nullptr) {
             auto& last = heapReplay->stages[stage].censusRun;
             if (!last.empty()) {
                 const bool resized = last.size() != moved.ranges.size();
@@ -7746,17 +7784,18 @@ void ShaderResources::noteHeapStageCensus(const CompiledShader& shader, bool cur
     }
     const auto size = words.size();
     auto change = ReplayStageChange::Same;
+    bool underUserData = false;
     if (!current || state.dataInput.size() != size + userData.size()) {
         change = ReplayStageChange::Reshaped;
-    } else if (!std::equal(words.begin(), words.end(), state.dataInput.begin())) {
+    } else if (const auto copied = std::min(userData.size(), size); !std::equal(words.begin() + static_cast<std::ptrdiff_t>(copied), words.end(), state.dataInput.begin() + static_cast<std::ptrdiff_t>(copied))) {
         change = ReplayStageChange::WordsChanged;
     } else {
+        underUserData = !std::equal(words.begin(), words.begin() + static_cast<std::ptrdiff_t>(copied), state.dataInput.begin());
         thread_local std::vector<std::uint64_t>* maskSlot = nullptr;
         auto& mask = ShaderRecompiler::ThreadOwned(maskSlot);
         heapStageMask(shader, size, mask);
         std::size_t changed = 0;
         bool masked = false;
-        const auto copied = std::min(userData.size(), size);
         for (std::size_t index = 0; index < copied; ++index) {
             if (userData[index] == state.dataInput[size + index]) continue;
             ++changed;
@@ -7764,7 +7803,13 @@ void ShaderResources::noteHeapStageCensus(const CompiledShader& shader, bool cur
         }
         change = masked ? ReplayStageChange::Masked : changed == 0 ? ReplayStageChange::Same : changed == 1 ? ReplayStageChange::One : changed <= 4 ? ReplayStageChange::UpToFour : changed <= 16 ? ReplayStageChange::UpToSixteen : ReplayStageChange::More;
     }
-    NoteReplayStageChange(change, srtChanged, &words == &data->guestDescriptor);
+    if (current) {
+        const auto& heap = BindlessHeap::For(context);
+        const bool dataSame = change == ReplayStageChange::Same;
+        const bool srtSame = srt != nullptr && !srtChanged;
+        NoteReplayOpenSpans(dataSame, dataSame && heap.SpanCurrent(state.data.mark), srtSame, srtSame && heap.SpanCurrent(state.flat.mark));
+    }
+    NoteReplayStageChange(change, srtChanged, &words == &data->guestDescriptor, underUserData);
 }
 
 void ShaderResources::seedHeapReplayStage(HeapReplayStage& stage, const CompiledShader& shader) const {
@@ -8017,10 +8062,11 @@ void ShaderResources::verifyHeapReplay(Recorder& recorder, std::span<const Compi
     namespace Abi = ShaderRecompiler::RuntimeAbi;
     auto& heap = BindlessHeap::For(context);
     const bool shadow = ReplayVerifyLevel() == 1;
+    const auto keyHash = heapReplay != nullptr ? heapReplay->keyHash : 0u;
     std::string failure;
     const auto mismatch = [&](ReplayField field, std::size_t stageIndex, const std::string& what) {
-        char prefix[96];
-        std::snprintf(prefix, sizeof(prefix), "template %p stage %zu: ", static_cast<const void*>(this), stageIndex);
+        char prefix[128];
+        std::snprintf(prefix, sizeof(prefix), "template key %016llx (%p) stage %zu: ", static_cast<unsigned long long>(keyHash), static_cast<const void*>(this), stageIndex);
         if (NoteReplayMismatch(field, prefix + what) && failure.empty()) failure = std::string("APS5_VERIFY_REPLAY_STRICT: the heap stage replay's ") + ReplayFieldName(field) + " differs from today's: " + prefix + what;
     };
     const auto difference = [](std::span<const std::uint32_t> found, std::span<const std::uint32_t> expected) -> std::string {

@@ -71,7 +71,10 @@ const char* ReplayReasonName(ReplayReason reason);
 void NoteReplayReason(ReplayReason reason);
 
 enum class ReplayStageChange : std::size_t { Same, One, UpToFour, UpToSixteen, More, WordsChanged, Masked, Reshaped, Count };
-void NoteReplayStageChange(ReplayStageChange change, bool srtChanged, bool wordsFromProgram);
+void NoteReplayStageChange(ReplayStageChange change, bool srtChanged, bool wordsFromProgram, bool wordsUnderUserData);
+void NoteReplayOpenSpans(bool dataUnchanged, bool dataOpen, bool srtUnchanged, bool srtOpen);
+void NoteReplaySnapshots(std::size_t moved, std::size_t unmoved, std::size_t bytes, std::size_t memoHits, std::size_t uploads, std::size_t large);
+void NoteReplayPass(bool continued, bool sameTemplate, bool sameShape);
 void NoteReplayRunChange(std::size_t changed, bool resized);
 void NoteReplayRingSubmit(std::size_t keptChunks);
 void NoteReplayGenerations(bool allocations, bool imports, bool slots);

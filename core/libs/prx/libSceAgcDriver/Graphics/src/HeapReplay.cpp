@@ -22,16 +22,20 @@ template<typename TEnum>
 using Counters = std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TEnum::Count)>;
 
 Counters<ReplayEvent> events{};
-Counters<ReplayEvent> eventTotals{};
+std::array<std::uint64_t, static_cast<std::size_t>(ReplayEvent::Count)> eventsReported{};
 Counters<ReplayReason> reasons{};
 Counters<ReplayStageChange> stageChanges{};
 Counters<ReplayField> mismatches{};
-Counters<ReplayField> mismatchTotals{};
-std::atomic<std::uint64_t> srtChanges{0}, programWords{0}, drawWords{0};
+std::array<std::uint64_t, static_cast<std::size_t>(ReplayField::Count)> mismatchesReported{};
+std::atomic<std::uint64_t> srtChanges{0}, programWords{0}, drawWords{0}, wordsUnderUserData{0};
 std::array<std::atomic<std::uint64_t>, 5> runChanges{};
 std::atomic<std::uint64_t> ringSubmits{0}, keptChunks{0}, keptChunksMax{0};
 std::array<std::atomic<std::uint64_t>, 4> generationMoves{};
-std::atomic<std::uint64_t> checks{0}, checkTotal{0}, dumped{0};
+std::array<std::atomic<std::uint64_t>, 4> openSpans{};
+std::array<std::atomic<std::uint64_t>, 7> snapshotCounts{};
+std::array<std::atomic<std::uint64_t>, 4> passCounts{};
+std::atomic<std::uint64_t> checks{0}, dumped{0};
+std::uint64_t checksReported = 0;
 std::atomic<std::uint64_t> notes{0};
 std::atomic<std::int64_t> reportedAt{0};
 std::mutex reportMutex;
@@ -40,6 +44,19 @@ std::atomic<void (*)()> refreshHookForTest{nullptr};
 bool reporting() {
     static const bool on = ThreadReport::Enabled() || ReplayCensusEnabled() || ReplayVerifyLevel() != 0;
     return on;
+}
+
+std::uint64_t bump(std::atomic<std::uint64_t>& counter) {
+    const auto value = counter.load(std::memory_order_relaxed) + 1u;
+    counter.store(value, std::memory_order_relaxed);
+    return value;
+}
+
+unsigned long long since(const std::atomic<std::uint64_t>& counter, std::uint64_t& reported) {
+    const auto value = counter.load(std::memory_order_relaxed);
+    const auto delta = value - reported;
+    reported = value;
+    return static_cast<unsigned long long>(delta);
 }
 
 void tick() {
@@ -78,14 +95,12 @@ bool ReplayVerifyStrict() {
 }
 
 void NoteReplay(ReplayEvent event) {
-    const auto index = static_cast<std::size_t>(event);
-    events[index].fetch_add(1, std::memory_order_relaxed);
-    eventTotals[index].fetch_add(1, std::memory_order_relaxed);
-    if (event == ReplayEvent::Draws) tick();
+    const auto value = bump(events[static_cast<std::size_t>(event)]);
+    if (event == ReplayEvent::Draws && (value & 4095u) == 0u && reporting()) ReportHeapReplay(false);
 }
 
 std::uint64_t ReplayEvents(ReplayEvent event) {
-    return eventTotals[static_cast<std::size_t>(event)].load(std::memory_order_relaxed);
+    return events[static_cast<std::size_t>(event)].load(std::memory_order_relaxed);
 }
 
 const char* ReplayReasonName(ReplayReason reason) {
@@ -101,10 +116,30 @@ void NoteReplayReason(ReplayReason reason) {
     tick();
 }
 
-void NoteReplayStageChange(ReplayStageChange change, bool srtChanged, bool wordsFromProgram) {
+void NoteReplayStageChange(ReplayStageChange change, bool srtChanged, bool wordsFromProgram, bool underUserData) {
     stageChanges[static_cast<std::size_t>(change)].fetch_add(1, std::memory_order_relaxed);
     if (srtChanged) srtChanges.fetch_add(1, std::memory_order_relaxed);
+    if (underUserData) wordsUnderUserData.fetch_add(1, std::memory_order_relaxed);
     (wordsFromProgram ? programWords : drawWords).fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteReplayOpenSpans(bool dataUnchanged, bool dataOpen, bool srtUnchanged, bool srtOpen) {
+    const std::array<bool, 4> counted{dataUnchanged, dataUnchanged && dataOpen, srtUnchanged, srtUnchanged && srtOpen};
+    for (std::size_t index = 0; index < counted.size(); ++index) {
+        if (counted[index]) openSpans[index].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void NoteReplaySnapshots(std::size_t moved, std::size_t unmoved, std::size_t bytes, std::size_t memoHits, std::size_t uploads, std::size_t large) {
+    const std::array<std::size_t, 7> added{1u, moved, unmoved, bytes, memoHits, uploads, large};
+    for (std::size_t index = 0; index < added.size(); ++index) snapshotCounts[index].fetch_add(added[index], std::memory_order_relaxed);
+}
+
+void NoteReplayPass(bool continued, bool sameTemplate, bool sameShape) {
+    const std::array<bool, 4> counted{true, continued, continued && sameTemplate, continued && sameTemplate && sameShape};
+    for (std::size_t index = 0; index < counted.size(); ++index) {
+        if (counted[index]) passCounts[index].fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void NoteReplayRunChange(std::size_t changed, bool resized) {
@@ -132,24 +167,21 @@ const char* ReplayFieldName(ReplayField field) {
 }
 
 void NoteReplayCheck() {
-    checks.fetch_add(1, std::memory_order_relaxed);
-    checkTotal.fetch_add(1, std::memory_order_relaxed);
+    bump(checks);
 }
 
 bool NoteReplayMismatch(ReplayField field, const std::string& detail) {
-    const auto index = static_cast<std::size_t>(field);
-    mismatches[index].fetch_add(1, std::memory_order_relaxed);
-    mismatchTotals[index].fetch_add(1, std::memory_order_relaxed);
+    bump(mismatches[static_cast<std::size_t>(field)]);
     if (dumped.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[replay-verify] %s differs: %s\n", ReplayFieldName(field), detail.c_str());
     return ReplayVerifyStrict();
 }
 
 std::uint64_t ReplayChecks() {
-    return checkTotal.load(std::memory_order_relaxed);
+    return checks.load(std::memory_order_relaxed);
 }
 
 std::uint64_t ReplayMismatches(ReplayField field) {
-    return mismatchTotals[static_cast<std::size_t>(field)].load(std::memory_order_relaxed);
+    return mismatches[static_cast<std::size_t>(field)].load(std::memory_order_relaxed);
 }
 
 void SetHeapReplayRefreshHookForTest(void (*hook)()) {
@@ -172,9 +204,11 @@ void ReportHeapReplay(bool force) {
     if (!force && now - last < 10000) return;
     reportedAt.store(now, std::memory_order_relaxed);
     const double seconds = last == 0 ? 0.0 : static_cast<double>(now - last) / 1000.0;
-    const auto event = [](ReplayEvent which) { return taken(events[static_cast<std::size_t>(which)]); };
+    std::array<unsigned long long, static_cast<std::size_t>(ReplayEvent::Count)> eventCounts{};
+    for (std::size_t index = 0; index < eventCounts.size(); ++index) eventCounts[index] = since(events[index], eventsReported[index]);
+    const auto event = [&](ReplayEvent which) { return eventCounts[static_cast<std::size_t>(which)]; };
     const auto draws = event(ReplayEvent::Draws);
-    if (draws != 0 || events[static_cast<std::size_t>(ReplayEvent::NonReplayWrites)].load(std::memory_order_relaxed) != 0) {
+    if (draws != 0) {
         const auto stages = event(ReplayEvent::Stages);
         const auto created = event(ReplayEvent::NewRecord);
         const auto writes = event(ReplayEvent::NonReplayWrites);
@@ -225,25 +259,33 @@ void ReportHeapReplay(bool force) {
         for (std::size_t index = 0; index < runs.size(); ++index) runs[index] = taken(runChanges[index]);
         std::array<unsigned long long, 4> moves{};
         for (std::size_t index = 0; index < moves.size(); ++index) moves[index] = taken(generationMoves[index]);
+        std::array<unsigned long long, 4> open{};
+        for (std::size_t index = 0; index < open.size(); ++index) open[index] = taken(openSpans[index]);
+        std::array<unsigned long long, 7> shots{};
+        for (std::size_t index = 0; index < shots.size(); ++index) shots[index] = taken(snapshotCounts[index]);
+        const auto perHit = [&](std::size_t index) { return shots[0] == 0 ? 0.0 : static_cast<double>(shots[index]) / static_cast<double>(shots[0]); };
+        std::array<unsigned long long, 4> passes{};
+        for (std::size_t index = 0; index < passes.size(); ++index) passes[index] = taken(passCounts[index]);
         const auto submits = taken(ringSubmits);
         const auto chunks = taken(keptChunks);
         const auto peak = taken(keptChunksMax);
         AgcDriver::ProfilePrint_nid_no_patch(
-            "[replay-census] %.1f s: heap template hits %llu, eligible %llu, refused by%s; stage refreshes: same %llu, user data only 1: %llu, 2-4: %llu, 5-16: %llu, 17+: %llu, words changed %llu, patched dwords changed %llu, slots or size changed %llu; srt changed %llu; words from the program %llu, per draw %llu; ring runs: unchanged %llu, 1 entry %llu, 2-4 %llu, 5+ %llu, resized %llu; between hits of a template (%llu): allocations generation moved %llu, import set moved %llu, slot serial moved %llu; submits %llu with %llu other chunks open (most %llu)\n",
-            seconds, static_cast<unsigned long long>(hits), reasonCounts[0], refusals.empty() ? " nothing" : refusals.c_str(), change[0], change[1], change[2], change[3], change[4], change[5], change[6], change[7], taken(srtChanges), taken(programWords), taken(drawWords), runs[0], runs[1], runs[2], runs[3], runs[4], moves[0], moves[1], moves[2], moves[3], submits, chunks, peak);
+            "[replay-census] %.1f s: heap template hits %llu, eligible %llu, refused by%s; stage refreshes: same %llu, user data only 1: %llu, 2-4: %llu, 5-16: %llu, 17+: %llu, words changed at or above the user data %llu, patched dwords changed %llu, slots or size changed %llu, words changed only under the user data %llu; srt changed %llu; words from the program %llu, per draw %llu; unchanged stage data %llu (span in an open chunk %llu), unchanged srt %llu (in an open chunk %llu); ring runs: unchanged %llu, 1 entry %llu, 2-4 %llu, 5+ %llu, resized %llu; snapshots per hit (%llu hits): moved %.2f, unmoved %.2f, %.0f bytes, unwritten-memo hits %.2f, draw uploads %.2f, large %.2f; recorded hits %llu, continuing the pass %llu, after a draw of the same template %llu, with its pipeline and framebuffer %llu; between hits of a template (%llu): allocations generation moved %llu, import set moved %llu, slot serial moved %llu; submits %llu with %llu other chunks open (most %llu)\n",
+            seconds, static_cast<unsigned long long>(hits), reasonCounts[0], refusals.empty() ? " nothing" : refusals.c_str(), change[0], change[1], change[2], change[3], change[4], change[5], change[6], change[7], taken(wordsUnderUserData), taken(srtChanges), taken(programWords), taken(drawWords), open[0], open[1], open[2], open[3], runs[0], runs[1], runs[2], runs[3], runs[4], shots[0], perHit(1), perHit(2), perHit(3), perHit(4), perHit(5), perHit(6), passes[0], passes[1], passes[2], passes[3], moves[0], moves[1], moves[2], moves[3], submits, chunks, peak);
     }
     if (ReplayVerifyLevel() != 0) {
         std::string fields;
         unsigned long long total = 0;
         for (std::size_t index = 0; index < mismatches.size(); ++index) {
-            const auto count = taken(mismatches[index]);
+            const auto count = since(mismatches[index], mismatchesReported[index]);
             total += count;
             if (count == 0) continue;
             char item[64];
             std::snprintf(item, sizeof(item), "%s %s %llu", fields.empty() ? "" : ",", ReplayFieldName(static_cast<ReplayField>(index)), count);
             fields += item;
         }
-        AgcDriver::ProfilePrint_nid_no_patch("[replay-verify] %.1f s: level %d, %llu stage checks, %llu mismatches%s%s\n", seconds, ReplayVerifyLevel(), taken(checks), total, fields.empty() ? "" : ":", fields.c_str());
+        AgcDriver::ProfilePrint_nid_no_patch("[replay-verify] %.1f s: level %d, %llu stage checks, %llu mismatches%s%s\n", seconds, ReplayVerifyLevel(), since(checks, checksReported), total, fields.empty() ? "" : ":", fields.c_str());
+        dumped.store(0, std::memory_order_relaxed);
     }
 }
 

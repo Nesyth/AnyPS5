@@ -2576,6 +2576,7 @@ struct RecordedDraw {
     std::vector<StagedWrite> staged;
     const IndirectRecord* indirect = nullptr;
     std::span<const ShaderResources::MovedBuffer> moved;
+    std::span<const std::uint32_t> contentKey;
     bool replay = false;
     bool listed = false;
     bool completion = false;
@@ -2803,6 +2804,13 @@ void notePassAccessCheck(bool differed) {
     if (differed || count % 262144u == 0u || (count & (count - 1u)) == 0u) std::fprintf(stderr, "[pass-access-verify] %llu checked, %llu differed\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differences.load()));
 }
 
+void noteReplayPassCensus(const Recorder* recorder, const ShaderResources* resources, const Pipeline* pipeline, const Framebuffer* framebuffer, bool continued, bool counted) {
+    thread_local std::array<const void*, 4> last{};
+    const std::array<const void*, 4> now{recorder, resources, pipeline, framebuffer};
+    if (counted) NoteReplayPass(continued, last[0] == now[0] && last[1] == now[1], last[2] == now[2] && last[3] == now[3]);
+    last = now;
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
@@ -2867,7 +2875,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
     const auto drawUse = resources.BeginDrawUse(*recorder);
     ShaderResources::HeapReplayProof replayProof;
-    const auto drawBindings = record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, drawUse != nullptr ? drawUse->record.get() : nullptr, replayProof) : resources.PrepareDrawBindings(*recorder, record.moved, false, drawUse != nullptr ? drawUse->record.get() : nullptr);
+    const bool hitCensus = ReplayCensusEnabled() && outcome.kind == KindTemplateHit && resources.HeapStage();
+    const auto* faultRecord = drawUse != nullptr ? drawUse->record.get() : nullptr;
+    const auto drawBindings = record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus);
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
     const bool readOnlyBda = addressReadPasses && resources.BdaReadOnly();
     outcome.addressDraw = addressBased;
@@ -2910,6 +2920,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (UsesMeshWindow(shaders)) PrepareMeshWindow(context);
     if (record.replay) resources.ConfirmHeapReplay(*recorder, shaders, drawBindings, replayProof);
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || captured || !record.staged.empty() || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
+    if (ReplayCensusEnabled()) noteReplayPassCensus(recorder, &resources, record.pipeline.get(), record.framebuffer.get(), start.continued, hitCensus);
     // The memo names the pass the draw now records in.
     if (memoUsable && !memoHit) {
         memo.recorder = recorder;
@@ -4017,6 +4028,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.resources = resources;
         record.moved = resolved.moved;
         record.replay = resolved.replay;
+        if (record.replay) record.contentKey = resolved.contentKey;
         record.pipeline = pipeline;
         record.framebuffer = framebuffer;
         record.targetViews = targetViews;
