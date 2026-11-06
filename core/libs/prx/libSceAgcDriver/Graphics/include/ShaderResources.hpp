@@ -201,6 +201,8 @@ public:
     bool SplitSets() const { return splitSets; }
     PipelineSetLayouts SetLayouts() const;
     bool HeapStage() const { return heapStage; }
+    std::uint64_t CoverageSerial() const { return coverageSerial; }
+    void NoteCoverageSerial(std::uint64_t serial) const { coverageSerial = serial; }
     void RefreshHeapStage(std::span<const CompiledShader> shaders);
     void RequireGuestBuffers() const { requireGuestBuffers(); }
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
@@ -702,6 +704,7 @@ private:
         RingDescriptors descriptors;
     };
     std::array<HeapStageState, ShaderRecompiler::RuntimeAbi::StageCount> heapStages;
+    mutable std::uint64_t coverageSerial = 0;
     std::uint32_t heapSpan(HeapStageState::KeptSpan& kept, std::span<const std::uint32_t> words);
     bool ownsHeapBinding(const Binding& binding, VkShaderStageFlags stageBit) const;
     VkImageView heapPlaceholderView(std::uint32_t kind) const;

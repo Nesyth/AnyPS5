@@ -2103,6 +2103,30 @@ bool KeyForDevice(const std::vector<std::uint32_t>& key, VkDevice device) {
     return key.size() >= 3 && key[0] == 0xffffffffu && key[1] == static_cast<std::uint32_t>(handle) && key[2] == static_cast<std::uint32_t>(handle >> 32u);
 }
 
+void noteLeanCoverage(const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, const Recorder* recorder) {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!stats) return;
+    enum : std::size_t { Hits, BackToBack, SameBatch, Moved0, Moved1, Moved2, Moved3, MovedBytes, Count };
+    static std::array<std::atomic<std::uint64_t>, Count> counts{};
+    static std::atomic<std::int64_t> reportedAt{0};
+    thread_local const ShaderResources* previous = nullptr;
+    counts[Hits].fetch_add(1, std::memory_order_relaxed);
+    if (previous == &resources) counts[BackToBack].fetch_add(1, std::memory_order_relaxed);
+    previous = &resources;
+    const auto serial = recorder != nullptr ? recorder->OpenSerial() : 0;
+    if (serial != 0 && resources.CoverageSerial() == serial) counts[SameBatch].fetch_add(1, std::memory_order_relaxed);
+    resources.NoteCoverageSerial(serial);
+    counts[Moved0 + std::min<std::size_t>(moved.size(), 3)].fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t bytes = 0;
+    for (const auto& entry : moved) bytes += entry.size;
+    counts[MovedBytes].fetch_add(bytes, std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    std::array<unsigned long long, Count> taken{};
+    for (std::size_t index = 0; index < Count; ++index) taken[index] = counts[index].exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[lean-coverage] template hits (10 s): %llu; same template as the previous draw %llu; template already used in the open batch %llu; moved buffers per hit 0: %llu, 1: %llu, 2: %llu, 3+: %llu; moved bytes %llu\n", taken[Hits], taken[BackToBack], taken[SameBatch], taken[Moved0], taken[Moved1], taken[Moved2], taken[Moved3], taken[MovedBytes]);
+}
+
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const std::vector<std::uint32_t>* contentKey) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
@@ -2176,6 +2200,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 static_cast<void>(heldSpace.release());
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
+                noteLeanCoverage(*resolved.resources, resolved.moved, recorder);
                 if (resolved.resources->HeapStage()) resolved.resources->RefreshHeapStage(shaders);
                 outcome.addressBased = resolved.resources->HoldsLease();
                 outcome.kind = KindTemplateHit;

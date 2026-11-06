@@ -7505,6 +7505,35 @@ void ShaderResources::patchHeapSlotWords(const CompiledShader& shader, const Hea
     if (!slotWords) std::copy(samplerSlots.begin(), samplerSlots.end(), patched.begin() + program.samplerSlotDword);
 }
 
+namespace {
+
+void noteHeapInputChange(std::span<const std::uint32_t> before, std::span<const std::uint32_t> words, std::span<const std::uint32_t> userData, bool current, bool same) {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!stats) return;
+    enum : std::size_t { Same, One, UpToFour, UpToSixteen, More, Reshaped, Count };
+    static std::array<std::atomic<std::uint64_t>, Count> counts{};
+    static std::atomic<std::int64_t> reportedAt{0};
+    std::size_t bucket = Same;
+    if (!same) {
+        if (!current || before.size() != words.size() + userData.size()) {
+            bucket = Reshaped;
+        } else {
+            std::size_t changed = 0;
+            for (std::size_t index = 0; index < words.size(); ++index) changed += before[index] != words[index] ? 1u : 0u;
+            for (std::size_t index = 0; index < userData.size(); ++index) changed += before[words.size() + index] != userData[index] ? 1u : 0u;
+            bucket = changed <= 1 ? One : changed <= 4 ? UpToFour : changed <= 16 ? UpToSixteen : More;
+        }
+    }
+    counts[bucket].fetch_add(1, std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    std::array<unsigned long long, Count> taken{};
+    for (std::size_t index = 0; index < Count; ++index) taken[index] = counts[index].exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[heap-inputs] stage data refreshes (10 s): same %llu; words changed 1: %llu, 2-4: %llu, 5-16: %llu, 17+: %llu; slots or size changed %llu\n", taken[Same], taken[One], taken[UpToFour], taken[UpToSixteen], taken[More], taken[Reshaped]);
+}
+
+}
+
 void ShaderResources::writeHeapStage(const CompiledShader& shader) {
     namespace Abi = ShaderRecompiler::RuntimeAbi;
     HeapCostScope slotsCost(HeapCost::Slots);
@@ -7554,6 +7583,7 @@ void ShaderResources::writeHeapStage(const CompiledShader& shader) {
             stageState.dataInput.size() == words.size() + userData.size() &&
             std::equal(words.begin(), words.end(), stageState.dataInput.begin()) &&
             std::equal(userData.begin(), userData.end(), stageState.dataInput.begin() + static_cast<std::ptrdiff_t>(words.size()));
+        if (shaderData) noteHeapInputChange(stageState.dataInput, words, userData, current, sameInput);
         if (sameInput && verifySlots && heap.Held(stageState.data.mark)) inputsKept = true;
         if (sameInput && !verifySlots) {
             if (heap.Held(stageState.data.mark)) {
