@@ -292,7 +292,17 @@ struct ProcessSampler {
             std::uint64_t leaves = 0;
             for (const auto& [address, count] : hot) leaves += count.first;
             if (leaves == 0) continue;
-            std::fprintf(file, "thread %lu samples %llu\n", static_cast<unsigned long>(id), static_cast<unsigned long long>(thread.samples));
+            std::string name;
+            PWSTR description = nullptr;
+            if (SUCCEEDED(GetThreadDescription(thread.target, &description)) && description != nullptr) {
+                const int bytes = WideCharToMultiByte(CP_UTF8, 0, description, -1, nullptr, 0, nullptr, nullptr);
+                if (bytes > 1) {
+                    name.resize(static_cast<std::size_t>(bytes - 1));
+                    WideCharToMultiByte(CP_UTF8, 0, description, -1, name.data(), bytes, nullptr, nullptr);
+                }
+                LocalFree(description);
+            }
+            std::fprintf(file, "thread %lu samples %llu name %s\n", static_cast<unsigned long>(id), static_cast<unsigned long long>(thread.samples), name.c_str());
             for (std::size_t i = 0; i < hot.size() && i < 40; ++i) {
                 const auto address = hot[i].first;
                 HMODULE module = nullptr;
