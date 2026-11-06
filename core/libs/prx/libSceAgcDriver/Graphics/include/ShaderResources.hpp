@@ -372,6 +372,9 @@ public:
         std::uint64_t release = 0;
         std::uint64_t pending = 0;
         std::uint64_t imports = 0;
+        std::uint64_t allocations = 0;
+        std::uint64_t unwatched = 0;
+        std::uint64_t depthSurfaces = 0;
     };
     bool AsIsCurrent();
     // Objects whose fast proof came from another template's stamp (FastProofStamp), so far.
@@ -876,6 +879,7 @@ private:
     bool cleanProved = false;
     std::uint8_t cleanEligibility = 0;
     std::uint32_t cleanMisses = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> cleanRangeList;
     CleanStamp cleanAt;
     std::uint64_t provedEpoch = 0;
     std::uint64_t provedProof = 0;
