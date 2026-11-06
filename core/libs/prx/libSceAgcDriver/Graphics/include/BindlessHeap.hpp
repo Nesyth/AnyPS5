@@ -76,11 +76,15 @@ public:
     };
     DataSpan Allocate(std::size_t words, SpanMark& mark);
     bool Held(const SpanMark& mark);
+    bool SpanCurrent(const SpanMark& mark) const;
+    std::span<const std::uint32_t> RingWords(const SpanMark& mark) const;
     std::uint32_t RingBufferDescriptors(std::span<const VkDeviceAddressRangeEXT> buffers, SpanMark& mark);
     static constexpr std::uint32_t BufferSlotBytes = 16u;
 
     static constexpr std::uint32_t SamplerKind = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers);
     void Submitted(Recorder& recorder, std::uint64_t serial);
+    std::uint64_t SubmitEpoch() const { return submitEpoch.load(std::memory_order_acquire); }
+    std::uint64_t Identity() const { return identity; }
 
     struct Counts {
         std::uint64_t ringWraps = 0, encodes = 0, encodedCopies = 0;
@@ -122,6 +126,8 @@ private:
     };
     std::vector<Chunk> ringChunks;
     std::uint64_t ringEntries = 0;
+    std::atomic<std::uint64_t> submitEpoch{0};
+    std::uint64_t identity = 0;
     std::size_t ringChunk = ~std::size_t{0};
     void enterRingChunk(std::size_t index);
     std::size_t wrapRingOffset(std::size_t offset, std::size_t bytes);

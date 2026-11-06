@@ -43,10 +43,15 @@ void registry() {
     Require(RuntimeSwitches::Find("APS5_NO_BARRIER_BATCH") == RuntimeSwitch::NoBarrierBatch, "APS5_NO_BARRIER_BATCH is not a runtime switch");
     Require(RuntimeSwitches::Set(RuntimeSwitch::NoBarrierBatch), "a switch set in the environment did not start set");
     Require(!RuntimeSwitches::Find("APS5_FULL_BARRIERS").has_value() && !RuntimeSwitches::Find("APS5_NO_BARRIER_BATCH ").has_value(), "a name that is not a runtime switch was found");
+    const auto generation = RuntimeSwitches::Generation();
     RuntimeSwitches::Assign(RuntimeSwitch::NoBarrierBatch, false);
     Require(!RuntimeSwitches::Set(RuntimeSwitch::NoBarrierBatch), "an assigned switch did not read back unset");
+    Require(RuntimeSwitches::Generation() == generation + 1, "flipping a switch did not move the switch generation");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoBarrierBatch, false);
+    Require(RuntimeSwitches::Generation() == generation + 1, "assigning a switch its own value moved the switch generation");
     RuntimeSwitches::Assign(RuntimeSwitch::NoBarrierBatch, true);
     Require(RuntimeSwitches::Set(RuntimeSwitch::NoBarrierBatch), "an assigned switch did not read back set");
+    Require(RuntimeSwitches::Generation() == generation + 2, "flipping a switch back did not move the switch generation");
 }
 
 void parse() {

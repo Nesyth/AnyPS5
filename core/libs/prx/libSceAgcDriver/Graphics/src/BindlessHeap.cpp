@@ -205,6 +205,8 @@ std::uint32_t configuredSlotCap() {
 }
 
 BindlessHeap::BindlessHeap(const Context& context) : context(context) {
+    static std::atomic<std::uint64_t> identities{0};
+    identity = identities.fetch_add(1, std::memory_order_relaxed) + 1;
     Require(context.descriptorHeap, "the GPU heap needs VK_EXT_descriptor_heap");
     const auto& heapProperties = context.descriptorHeapProperties;
     const auto sizes = heapSizes(heapProperties);
@@ -541,6 +543,23 @@ bool BindlessHeap::Held(const SpanMark& mark) {
     for (auto chunk = first; chunk <= last; ++chunk) ringChunks[chunk].open = true;
     ++counts.spansKept;
     return true;
+}
+
+bool BindlessHeap::SpanCurrent(const SpanMark& mark) const {
+    if (mark.entry == 0u || mark.words == 0u) return false;
+    const auto first = chunkOf(mark.offset);
+    const auto last = lastChunkOf(mark.offset, static_cast<std::size_t>(mark.words) * sizeof(std::uint32_t));
+    std::lock_guard lock(mutex);
+    if (last >= ringChunks.size()) return false;
+    for (auto chunk = first; chunk <= last; ++chunk) {
+        if (ringChunks[chunk].entered > mark.entry || !(ringChunks[chunk].open || chunk == ringChunk)) return false;
+    }
+    return true;
+}
+
+std::span<const std::uint32_t> BindlessHeap::RingWords(const SpanMark& mark) const {
+    Require(static_cast<std::size_t>(mark.offset) + static_cast<std::size_t>(mark.words) * sizeof(std::uint32_t) <= ringBytes, "a ring span lies outside the shader data ring");
+    return {reinterpret_cast<const std::uint32_t*>(ringData + mark.offset), mark.words};
 }
 
 BindlessHeap::DataSpan BindlessHeap::Allocate(std::size_t words, SpanMark& mark) {
@@ -1205,6 +1224,7 @@ void BindlessHeap::Submitted(Recorder& recorder, std::uint64_t serial) {
         ringChunks[index].serial = serial;
         ringChunks[index].open = index == ringChunk;
     }
+    submitEpoch.fetch_add(1, std::memory_order_release);
     if (ReplayCensusEnabled()) NoteReplayRingSubmit(kept);
 }
 

@@ -40,6 +40,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
 
 struct SwitchValues {
     std::array<std::atomic<bool>, SwitchCount> set{};
+    std::atomic<std::uint64_t> generation{1};
     SwitchValues() {
         const bool lateMsOff = std::getenv("APS5_LATE_MS") == nullptr;
         const std::array<bool, SwitchCount> environment{
@@ -108,7 +109,12 @@ bool Set(RuntimeSwitch id) {
 }
 
 void Assign(RuntimeSwitch id, bool set) {
-    Values().set.at(static_cast<std::size_t>(id)).store(set, std::memory_order_relaxed);
+    auto& values = Values();
+    if (values.set.at(static_cast<std::size_t>(id)).exchange(set, std::memory_order_relaxed) != set) values.generation.fetch_add(1, std::memory_order_release);
+}
+
+std::uint64_t Generation() {
+    return Values().generation.load(std::memory_order_acquire);
 }
 
 std::optional<RuntimeSwitch> Find(std::string_view name) {
