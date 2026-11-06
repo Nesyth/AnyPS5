@@ -35,6 +35,7 @@ std::atomic<std::uint64_t> checks{0}, checkTotal{0}, dumped{0};
 std::atomic<std::uint64_t> notes{0};
 std::atomic<std::int64_t> reportedAt{0};
 std::mutex reportMutex;
+std::atomic<void (*)()> refreshHookForTest{nullptr};
 
 bool reporting() {
     static const bool on = ThreadReport::Enabled() || ReplayCensusEnabled() || ReplayVerifyLevel() != 0;
@@ -151,6 +152,14 @@ std::uint64_t ReplayMismatches(ReplayField field) {
     return mismatchTotals[static_cast<std::size_t>(field)].load(std::memory_order_relaxed);
 }
 
+void SetHeapReplayRefreshHookForTest(void (*hook)()) {
+    refreshHookForTest.store(hook, std::memory_order_release);
+}
+
+void RunHeapReplayRefreshHookForTest() {
+    if (const auto hook = refreshHookForTest.load(std::memory_order_acquire)) hook();
+}
+
 void ReportHeapReplay(bool force) {
     if (!reporting()) return;
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -172,11 +181,14 @@ void ReportHeapReplay(bool force) {
         const auto interrupted = event(ReplayEvent::Interrupted);
         const auto identity = event(ReplayEvent::HeapOrSwitches);
         const auto program = event(ReplayEvent::NewProgram);
+        const auto unreplayable = event(ReplayEvent::NotReplayable);
         const auto slots = event(ReplayEvent::SlotsMoved);
         const auto shape = event(ReplayEvent::ShapeChanged);
         const auto masked = event(ReplayEvent::MaskedChange);
         const auto refresh = event(ReplayEvent::SubmitDuringRefresh);
         const auto pass = event(ReplayEvent::SubmitBeforePass);
+        const auto fallback = event(ReplayEvent::SubmitDuringFallback);
+        const auto missing = event(ReplayEvent::OverlayMissing);
         const auto dataSame = event(ReplayEvent::DataSame);
         const auto dataProven = event(ReplayEvent::DataProven);
         const auto dataHeld = event(ReplayEvent::DataHeld);
@@ -190,8 +202,8 @@ void ReportHeapReplay(bool force) {
         const auto built = event(ReplayEvent::RunsBuilt);
         const auto skipped = event(ReplayEvent::RunsSkipped);
         AgcDriver::ProfilePrint_nid_no_patch(
-            "[replay-heap-stage] %.1f s: %llu draws, %llu stages replayed; today's refresh: new record %llu, after another writer %llu, after a failed replay %llu, heap or switches changed %llu, new program %llu, slots moved %llu, words or shape changed %llu, patched dword changed %llu; submits: during the refresh %llu, before the pass %llu; stage data same %llu (span proven %llu, held %llu, rewritten %llu), patched %llu; srt same %llu (proven %llu, held %llu, rewritten %llu), changed %llu; template runs built %llu, skipped %llu\n",
-            seconds, draws, stages, created, writes, interrupted, identity, program, slots, shape, masked, refresh, pass, dataSame, dataProven, dataHeld, dataRewritten, dataPatched, srtSame, srtProven, srtHeld, srtRewritten, srtChanged, built, skipped);
+            "[replay-heap-stage] %.1f s: %llu draws, %llu stages replayed; today's refresh: new record %llu, after another writer %llu, after a failed replay %llu, heap or switches changed %llu, new program %llu, stage not replayable %llu, slots moved %llu, words or shape changed %llu, patched dword changed %llu; submits: during the refresh %llu, before the pass %llu, during a fallback refresh %llu; stage data same %llu (span proven %llu, held %llu, rewritten %llu), patched %llu; srt same %llu (proven %llu, held %llu, rewritten %llu), changed %llu; template runs built %llu, skipped %llu, built for a missing overlay %llu\n",
+            seconds, draws, stages, created, writes, interrupted, identity, program, unreplayable, slots, shape, masked, refresh, pass, fallback, dataSame, dataProven, dataHeld, dataRewritten, dataPatched, srtSame, srtProven, srtHeld, srtRewritten, srtChanged, built, skipped, missing);
     }
     if (ReplayCensusEnabled()) {
         std::uint64_t hits = 0;

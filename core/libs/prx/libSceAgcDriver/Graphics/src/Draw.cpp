@@ -3876,6 +3876,10 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     // transitions of every target and one pass per draw, as before.
     static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
     const bool lean = prepared.lean = recorded && !drawTransitions;
+    if (resolved.replay && !lean) {
+        resolved.replay = false;
+        resources->RefreshHeapStage(shaders);
+    }
     const bool multisampled = prepared.multisampled = std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.multisampled; });
     Require(lean || !multisampled, "multisampled draws are only rendered as recorded draws");
     for (const auto& binding : targets) {

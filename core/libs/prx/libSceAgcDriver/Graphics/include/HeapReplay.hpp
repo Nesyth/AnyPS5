@@ -19,11 +19,14 @@ enum class ReplayEvent : std::size_t {
     Interrupted,
     HeapOrSwitches,
     NewProgram,
+    NotReplayable,
     SlotsMoved,
     ShapeChanged,
     MaskedChange,
     SubmitDuringRefresh,
     SubmitBeforePass,
+    SubmitDuringFallback,
+    OverlayMissing,
     DataSame,
     DataProven,
     DataHeld,
@@ -81,6 +84,9 @@ std::uint64_t ReplayChecks();
 std::uint64_t ReplayMismatches(ReplayField field);
 
 void ReportHeapReplay(bool force);
+
+void SetHeapReplayRefreshHookForTest(void (*hook)());
+void RunHeapReplayRefreshHookForTest();
 
 }
 

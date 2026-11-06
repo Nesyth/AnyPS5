@@ -749,12 +749,14 @@ private:
     HeapReplay& heapReplayRecord();
     void heapStageMask(const CompiledShader& shader, std::size_t dataDwords, std::vector<std::uint64_t>& mask) const;
     void seedHeapReplayStage(HeapReplayStage& stage, const CompiledShader& shader) const;
+    void reseedHeapReplay(std::span<const CompiledShader> shaders);
+    void refreshHeapReplayFallback(Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& bindings, std::uint64_t provenEpoch);
     bool replayHeapStage(const CompiledShader& shader, HeapReplayStage& stage, std::uint64_t epoch, bool overlay);
     bool keepReplaySpan(HeapStageState::KeptSpan& kept, bool proven, bool srt);
-    std::uint32_t writeReplaySpan(HeapStageState::KeptSpan& kept);
+    void writeReplaySpan(HeapStageState::KeptSpan& kept, std::span<const std::uint32_t> words);
     void noteHeapStageCensus(const CompiledShader& shader, bool current) const;
     void buildHeapStageWords(const CompiledShader& shader, const HeapStageState& state, std::span<const std::uint32_t> words, std::span<const std::uint32_t> userData, std::vector<std::uint32_t>& patched) const;
-    void verifyHeapReplay(std::span<const CompiledShader> shaders, DrawBindings* bindings, const HeapReplayProof& proof);
+    void verifyHeapReplay(Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& bindings, const HeapReplayProof& proof, bool overlaid);
     std::shared_ptr<DrawBindings> selectDrawSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, std::vector<std::size_t>& selected) const;
     std::shared_ptr<DrawBindings> finishDrawBindings(Recorder& recorder, std::shared_ptr<DrawBindings> result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
     bool ownsHeapBinding(const Binding& binding, VkShaderStageFlags stageBit) const;

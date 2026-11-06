@@ -3,8 +3,10 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/HeapReplay.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -48,13 +50,37 @@ namespace Graphics {
 struct ShaderResourcesTestAccess {
     static std::vector<std::uint32_t>& Block(ShaderResources& resources, ShaderRecompiler::ShaderStage stage) { return resources.heapStages[HeapStageIndex(stage)].data.words; }
     static BindlessHeap::SpanMark DataMark(const ShaderResources& resources, ShaderRecompiler::ShaderStage stage) { return resources.heapStages[HeapStageIndex(stage)].data.mark; }
+    static const std::vector<std::uint32_t>& Srt(const ShaderResources& resources, ShaderRecompiler::ShaderStage stage) { return resources.heapStages[HeapStageIndex(stage)].flat.words; }
+    static BindlessHeap::SpanMark SrtMark(const ShaderResources& resources, ShaderRecompiler::ShaderStage stage) { return resources.heapStages[HeapStageIndex(stage)].flat.mark; }
+    static std::uint32_t SrtOffset(const ShaderResources& resources, ShaderRecompiler::ShaderStage stage) { return resources.heapSrtOffsets[HeapStageIndex(stage)]; }
+    static std::uint32_t SrtDwords(const ShaderResources& resources, ShaderRecompiler::ShaderStage stage) { return resources.heapSrtDwords[HeapStageIndex(stage)]; }
     static std::uint32_t DataOffset(const ShaderResources& resources, ShaderRecompiler::ShaderStage stage) { return resources.heapOffsets[HeapStageIndex(stage) * 2u]; }
     static std::uint32_t RunOffset(const ShaderResources& resources, ShaderRecompiler::ShaderStage stage) { return resources.heapOffsets[HeapStageIndex(stage) * 2u + 1u]; }
+    static std::uint32_t RunFirst(const ShaderResources& resources, ShaderRecompiler::ShaderStage stage) { return resources.heapStages[HeapStageIndex(stage)].descriptors.first; }
+    static BindlessHeap::SpanMark RunMark(const ShaderResources& resources, ShaderRecompiler::ShaderStage stage) { return resources.heapStages[HeapStageIndex(stage)].descriptors.mark; }
+    static std::vector<VkDeviceAddressRangeEXT> RunRanges(const ShaderResources& resources, ShaderRecompiler::ShaderStage stage) { return resources.heapStages[HeapStageIndex(stage)].descriptors.ranges; }
+    static std::vector<VkDeviceAddressRangeEXT> RangesBuiltAnew(const ShaderResources& resources, ShaderRecompiler::ShaderStage stage) {
+        const auto index = HeapStageIndex(stage);
+        std::vector<VkDeviceAddressRangeEXT> ranges{resources.srtRange(index)};
+        resources.writeBufferAddresses({}, static_cast<std::uint32_t>(index), nullptr, &ranges);
+        return ranges;
+    }
     static std::optional<std::size_t> GuestAllocation(const ShaderResources& resources, std::uint64_t address) {
         for (std::size_t index = 0; index < resources.allocations.size(); ++index) {
             if (resources.allocations[index].guest && !resources.allocations[index].written && resources.allocations[index].address == address) return index;
         }
         return std::nullopt;
+    }
+    static const HeapSlotOwner* SlotOwner(const ShaderResources& resources, ShaderRecompiler::ShaderStage stage) {
+        const VkShaderStageFlags stageBit = VulkanStage(stage);
+        for (const auto& binding : resources.bindings) {
+            if (!resources.ownsHeapBinding(binding, stageBit)) continue;
+            for (const auto index : binding.imageAllocations) {
+                if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER && index < resources.samplers.size() && resources.samplers[index] != nullptr) return resources.samplers[index].get();
+                if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && index < resources.textures.size() && resources.textures[index] != nullptr) return resources.textures[index].get();
+            }
+        }
+        return nullptr;
     }
     static bool Masked(const ShaderResources& resources, ShaderRecompiler::ShaderStage stage, std::size_t dword) {
         if (resources.heapReplay == nullptr) return true;
@@ -175,18 +201,44 @@ ShaderRecompiler::RecompileResult Compile(const AgcDriver::VulkanDevice& device,
     return ShaderRecompiler::Recompile(request);
 }
 
-const std::vector<std::uint32_t>* ShaderDataWords(const ShaderRecompiler::RecompileResult& program) {
-    for (const auto& binding : program.bindings) {
-        if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData) return &binding.guestDescriptor;
+std::optional<std::size_t> BindingOf(const ShaderRecompiler::RecompileResult& program, ShaderRecompiler::DescriptorRole role) {
+    for (std::size_t index = 0; index < program.bindings.size(); ++index) {
+        if (program.bindings[index].role == role) return index;
     }
-    return nullptr;
+    return std::nullopt;
 }
 
 std::uint64_t Count(ReplayEvent event) {
     return ReplayEvents(event);
 }
 
+std::uint64_t Mismatches() {
+    std::uint64_t total = 0;
+    for (std::size_t field = 0; field < static_cast<std::size_t>(ReplayField::Count); ++field) total += AgcDriver::Graphics::ReplayMismatches(static_cast<ReplayField>(field));
+    return total;
+}
+
+void RequireMore(std::uint64_t before, ReplayEvent event, const std::string& what) {
+    Require(Count(event) > before, "heap stage replay: " + what);
+}
+
+void RequireSame(std::uint64_t before, ReplayEvent event, const std::string& what) {
+    Require(Count(event) == before, "heap stage replay: " + what);
+}
+
+AgcDriver::Graphics::BindlessHeap* hookHeap = nullptr;
+AgcDriver::Graphics::Recorder* hookRecorder = nullptr;
+int hookSubmits = 0;
+
+void SubmitInsideTheFirstLoop() {
+    if (hookSubmits == 0) return;
+    --hookSubmits;
+    hookHeap->Submitted(*hookRecorder, 0u);
+}
+
 struct Replay {
+    AgcDriver::Graphics::Context context;
+    CompiledShader built;
     std::shared_ptr<ShaderResources> resources;
     std::shared_ptr<ShaderResources> twin;
     AgcDriver::Graphics::BindlessHeap& heap;
@@ -195,30 +247,50 @@ struct Replay {
 
     CompiledShader Shader(const ShaderRecompiler::HeapStageWords& words) const { return {ShaderStage::Compute, &program, 0, nullptr, &words}; }
 
-    void Check(const char* what) const {
-        auto& block = Access::Block(*resources, ShaderStage::Compute);
-        Require(block == Access::Block(*twin, ShaderStage::Compute), std::string("heap stage replay: ") + what + ": the stage data differs from the one today's refresh builds");
-        const auto mark = Access::DataMark(*resources, ShaderStage::Compute);
-        Require(Access::DataOffset(*resources, ShaderStage::Compute) == mark.offset, std::string("heap stage replay: ") + what + ": the root's shader data offset is not the stage data span");
-        Require(heap.SpanCurrent(mark), std::string("heap stage replay: ") + what + ": the stage data span is not current");
-        const auto ring = heap.RingWords(mark);
-        Require(std::ranges::equal(ring, block), std::string("heap stage replay: ") + what + ": the ring does not hold the stage data");
+    void Check(const std::string& what, bool overlaid = false) const {
+        const auto stage = ShaderStage::Compute;
+        const auto fail = [&](const char* why) { return "heap stage replay: " + what + ": " + why; };
+        auto& block = Access::Block(*resources, stage);
+        Require(block == Access::Block(*twin, stage), fail("the stage data differs from the one today's refresh builds"));
+        const auto mark = Access::DataMark(*resources, stage);
+        Require(Access::DataOffset(*resources, stage) == mark.offset, fail("the root's shader data offset is not the stage data span"));
+        Require(heap.SpanCurrent(mark), fail("the stage data span is not current"));
+        Require(std::ranges::equal(heap.RingWords(mark), block), fail("the ring does not hold the stage data"));
+        const auto& srt = Access::Srt(*resources, stage);
+        Require(srt == Access::Srt(*twin, stage), fail("the srt words differ from the ones today's refresh writes"));
+        if (!srt.empty()) {
+            const auto srtMark = Access::SrtMark(*resources, stage);
+            Require(Access::SrtOffset(*resources, stage) == srtMark.offset && Access::SrtDwords(*resources, stage) == srt.size(), fail("the root's srt offset or dwords are not the srt span's"));
+            Require(heap.SpanCurrent(srtMark) && std::ranges::equal(heap.RingWords(srtMark), srt), fail("the ring does not hold the srt words in a current span"));
+        }
+        if (overlaid) return;
+        Require(Access::RunOffset(*resources, stage) == Access::RunFirst(*resources, stage), fail("the root's descriptor index is not the template run's"));
+        Require(heap.SpanCurrent(Access::RunMark(*resources, stage)), fail("the template run is not current"));
+        const auto ranges = Access::RunRanges(*resources, stage);
+        const auto expected = Access::RangesBuiltAnew(*resources, stage);
+        const bool same = std::ranges::equal(ranges, expected, [](const VkDeviceAddressRangeEXT& a, const VkDeviceAddressRangeEXT& b) { return a.address == b.address && a.size == b.size; });
+        Require(same, fail("the template run's ranges differ from the ranges built anew"));
     }
 
-    void Draw(const ShaderRecompiler::HeapStageWords& words, const char* what, bool overlay = false, bool submitBeforePass = false) {
+    void Fresh(const ShaderRecompiler::HeapStageWords& words, const std::string& what) const {
+        auto fresh = std::make_shared<ShaderResources>(context, built);
+        const auto shader = Shader(words);
+        fresh->RefreshHeapStage(std::span<const CompiledShader>(&shader, 1));
+        auto& block = Access::Block(*resources, ShaderStage::Compute);
+        Require(block == Access::Block(*fresh, ShaderStage::Compute), "heap stage replay: " + what + ": the stage data differs from a build from scratch");
+        Require(std::ranges::equal(heap.RingWords(Access::DataMark(*resources, ShaderStage::Compute)), Access::Block(*fresh, ShaderStage::Compute)), "heap stage replay: " + what + ": the ring words differ from a build from scratch");
+    }
+
+    void Draw(const ShaderRecompiler::HeapStageWords& words, const std::string& what, bool submitBeforePass = false) {
         const auto shader = Shader(words);
         const std::span<const CompiledShader> shaders(&shader, 1);
-        const auto proof = resources->ReplayHeapStages(shaders, overlay);
+        const auto proof = resources->ReplayHeapStages(shaders, false);
         if (submitBeforePass) heap.Submitted(recorder, 0u);
         resources->ConfirmHeapReplay(recorder, shaders, nullptr, proof);
         twin->RefreshHeapStage(shaders);
         Check(what);
     }
 };
-
-void RequireMore(std::uint64_t before, ReplayEvent event, const char* what) {
-    Require(Count(event) > before, std::string("heap stage replay: ") + what);
-}
 
 int Run(const AgcDriver::VulkanDevice& device, const GuestBlock& block, std::string_view mode) {
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
@@ -229,15 +301,22 @@ int Run(const AgcDriver::VulkanDevice& device, const GuestBlock& block, std::str
     Require(context.recorder != nullptr, "heap stage replay: the device has no recorder");
     const auto program = Compile(device, block);
     Require(program.gpuResolvedImages && program.dataAddressPush, "heap stage replay: the program is not in the heap's GPU-resolved form");
-    const auto* dataWords = ShaderDataWords(program);
-    Require(dataWords != nullptr && !dataWords->empty(), "heap stage replay: the program has no shader data");
+    const auto dataBinding = BindingOf(program, ShaderRecompiler::DescriptorRole::ShaderData);
+    Require(dataBinding.has_value() && !program.bindings[*dataBinding].guestDescriptor.empty(), "heap stage replay: the program has no shader data");
+    const auto& dataWords = program.bindings[*dataBinding].guestDescriptor;
+    const auto level = AgcDriver::Graphics::ReplayVerifyLevel();
+    const bool strict = AgcDriver::Graphics::ReplayVerifyStrict();
+    if (mode != "replay") Require(level == (mode == "shadow" ? 1 : 2), "heap stage replay: the verify mode does not have the level the test runs with");
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     const CompiledShader built{ShaderStage::Compute, &program, 0};
-    Replay replay{std::make_shared<ShaderResources>(context, built), std::make_shared<ShaderResources>(context, built), AgcDriver::Graphics::BindlessHeap::For(context), *context.recorder, program};
+    Replay replay{context, built, std::make_shared<ShaderResources>(context, built), std::make_shared<ShaderResources>(context, built), AgcDriver::Graphics::BindlessHeap::For(context), *context.recorder, program};
     Require(replay.resources->HeapStage(), "heap stage replay: the set was not built on the heap");
-    const auto userDwords = std::min<std::size_t>(dataWords->size(), 8u);
+    hookHeap = &replay.heap;
+    hookRecorder = &replay.recorder;
+    AgcDriver::Graphics::SetHeapReplayRefreshHookForTest(&SubmitInsideTheFirstLoop);
+    const auto userDwords = std::min<std::size_t>(dataWords.size(), 8u);
     ShaderRecompiler::HeapStageWords first;
-    first.userData.assign(dataWords->begin(), dataWords->begin() + static_cast<std::ptrdiff_t>(userDwords));
+    first.userData.assign(dataWords.begin(), dataWords.begin() + static_cast<std::ptrdiff_t>(userDwords));
 
     const auto created = Count(ReplayEvent::NewRecord);
     replay.Draw(first, "the first replay draw");
@@ -249,31 +328,51 @@ int Run(const AgcDriver::VulkanDevice& device, const GuestBlock& block, std::str
     RequireMore(stages, ReplayEvent::Stages, "a repeated draw did not replay its stage");
     RequireMore(proven, ReplayEvent::DataProven, "a repeated draw in the same batch did not keep its stage data span by the submit epoch");
 
-    std::optional<std::size_t> free;
+    std::vector<std::size_t> free;
+    std::optional<std::size_t> maskedSlotWord;
     for (std::size_t dword = 0; dword < userDwords; ++dword) {
-        if (!Access::Masked(*replay.resources, ShaderStage::Compute, dword)) {
-            free = dword;
-            break;
-        }
+        if (!Access::Masked(*replay.resources, ShaderStage::Compute, dword)) free.push_back(dword);
     }
+    for (const auto& word : program.heapSlotWords) {
+        if (word.dword < userDwords && Access::Masked(*replay.resources, ShaderStage::Compute, word.dword)) maskedSlotWord = word.dword;
+    }
+    std::optional<std::size_t> tail;
+    for (std::size_t dword = userDwords; dword < dataWords.size() && !tail.has_value(); ++dword) {
+        if (!Access::Masked(*replay.resources, ShaderStage::Compute, dword)) tail = dword;
+    }
+    std::printf("heap stage replay: %zu shader data dwords, %zu of user data, %zu of them outside the template's patched dwords, %s, %s\n", dataWords.size(), userDwords, free.size(),
+                maskedSlotWord.has_value() ? "a slot word under the user data" : "no slot word under the user data", tail.has_value() ? "a word after the user data outside the patched dwords" : "no plain word after the user data");
+    Require(!free.empty(), "heap stage replay: every user data dword of the test program is patched by the template, so the patch path cannot be exercised");
+
     auto changed = first;
-    if (free.has_value()) {
-        changed.userData[*free] ^= 0x5a5a0000u;
-        const auto patched = Count(ReplayEvent::DataPatched);
-        replay.Draw(changed, "a draw with one changed user data dword");
-        RequireMore(patched, ReplayEvent::DataPatched, "a changed user data dword was not patched into the stage data");
-    } else {
-        std::puts("every user data dword of the test program is patched by the template; the patch step is not exercised");
-    }
+    const auto patchedCount = std::min<std::size_t>(free.size(), 3u);
+    for (std::size_t index = 0; index < patchedCount; ++index) changed.userData[free[index]] ^= 0x5a5a0000u + static_cast<std::uint32_t>(index);
+    const auto patched = Count(ReplayEvent::DataPatched);
+    const auto rebuiltBeforePatch = Count(ReplayEvent::ShapeChanged) + Count(ReplayEvent::MaskedChange) + Count(ReplayEvent::SlotsMoved);
+    replay.Draw(changed, "a draw with changed user data dwords");
+    RequireMore(patched, ReplayEvent::DataPatched, "changed user data dwords were not patched into the stage data");
+    Require(Count(ReplayEvent::ShapeChanged) + Count(ReplayEvent::MaskedChange) + Count(ReplayEvent::SlotsMoved) == rebuiltBeforePatch, "heap stage replay: a draw with changed unpatched user data dwords was rebuilt instead of patched");
+    replay.Fresh(changed, "a draw with changed user data dwords");
 
     replay.heap.Submitted(replay.recorder, 0u);
     const auto held = Count(ReplayEvent::DataHeld);
     replay.Draw(changed, "a repeated draw after a submit");
     RequireMore(held, ReplayEvent::DataHeld, "a repeated draw after a submit did not hold its stage data span again");
 
+    if (maskedSlotWord.has_value()) {
+        auto masked = changed;
+        masked.userData[*maskedSlotWord] ^= 0x00010000u;
+        const auto maskedBefore = Count(ReplayEvent::MaskedChange);
+        replay.Draw(masked, "a draw whose changed user data dword is a slot word the template patches");
+        RequireMore(maskedBefore, ReplayEvent::MaskedChange, "a changed slot word under the user data did not send the stage to today's refresh");
+        replay.Draw(changed, "a draw after the masked change");
+    } else {
+        std::puts("heap stage replay: the test program has no slot word under its user data; the masked-dword rebuild is not exercised");
+    }
+
     const auto writes = Count(ReplayEvent::NonReplayWrites);
     auto other = first;
-    if (free.has_value()) other.userData[*free] ^= 0x00a50000u;
+    other.userData[free.front()] ^= 0x00a50000u;
     {
         const auto shader = replay.Shader(other);
         replay.resources->RefreshHeapStage(std::span<const CompiledShader>(&shader, 1));
@@ -282,53 +381,129 @@ int Run(const AgcDriver::VulkanDevice& device, const GuestBlock& block, std::str
     RequireMore(writes, ReplayEvent::NonReplayWrites, "a refresh outside the replay did not invalidate the template's record");
     replay.Draw(other, "a replay draw after the record was rebuilt");
 
-    const auto skipped = Count(ReplayEvent::RunsSkipped);
-    const auto run = Access::RunOffset(*replay.resources, ShaderStage::Compute);
-    {
-        const auto shader = replay.Shader(other);
-        const std::span<const CompiledShader> shaders(&shader, 1);
-        const auto proof = replay.resources->ReplayHeapStages(shaders, true);
-        Require(Access::RunOffset(*replay.resources, ShaderStage::Compute) == run, "heap stage replay: a draw whose overlay follows rewrote the template's descriptor run index");
-        replay.resources->ConfirmHeapReplay(replay.recorder, shaders, nullptr, proof);
+    if (const auto srtBinding = BindingOf(program, ShaderRecompiler::DescriptorRole::FlattenedSrt); srtBinding.has_value() && !program.bindings[*srtBinding].guestDescriptor.empty()) {
+        auto srtChanged = other;
+        srtChanged.flattenedSrt = program.bindings[*srtBinding].guestDescriptor;
+        srtChanged.flattenedSrt.back() ^= 0x00000100u;
+        const auto changes = Count(ReplayEvent::SrtChanged);
+        replay.Draw(srtChanged, "a draw whose flattened srt changed");
+        RequireMore(changes, ReplayEvent::SrtChanged, "a changed flattened srt was not written to a new span");
+        const auto same = Count(ReplayEvent::SrtSame);
+        replay.Draw(srtChanged, "a repeated draw with the changed srt");
+        RequireMore(same, ReplayEvent::SrtSame, "a repeated srt was not kept");
+        replay.Draw(other, "a draw back on the program's srt");
+    } else {
+        std::puts("heap stage replay: the test program binds no flattened srt; the srt change is not exercised");
     }
-    RequireMore(skipped, ReplayEvent::RunsSkipped, "a draw whose overlay follows built the template's descriptor run");
+
+    if (const auto* owner = Access::SlotOwner(*replay.resources, ShaderStage::Compute); owner != nullptr) {
+        const auto moved = Count(ReplayEvent::SlotsMoved);
+        replay.heap.ReleaseSlots(owner);
+        replay.Draw(other, "a draw after the heap released a slot the stage binds");
+        RequireMore(moved, ReplayEvent::SlotsMoved, "a released slot the stage binds did not send the stage to today's refresh");
+        replay.Draw(other, "a replay draw after the slots were taken again");
+    } else {
+        std::puts("heap stage replay: the stage binds no slot of its own; the slot release is not exercised");
+    }
+
+    Require(tail.has_value(), "heap stage replay: the test program's shader data has no plain word after the user data, so the per-draw words cannot differ from the program's where the block keeps them");
+    auto perDraw = first;
+    perDraw.bindings.assign(program.bindings.size(), {});
+    perDraw.bindings[*dataBinding] = dataWords;
+    perDraw.bindings[*dataBinding][*tail] ^= 0x00100000u;
+    replay.Draw(first, "a program words draw before the per-draw words");
+    const auto reshaped = Count(ReplayEvent::ShapeChanged);
+    replay.Draw(perDraw, "a draw whose per-draw shader data words differ from the program's");
+    RequireMore(reshaped, ReplayEvent::ShapeChanged, "per-draw shader data words that differ from the program's did not send the stage to today's refresh");
+    replay.Draw(perDraw, "a repeated draw with the per-draw words");
+    const auto back = Count(ReplayEvent::ShapeChanged);
+    replay.Draw(first, "a draw back on the program's shader data words");
+    RequireMore(back, ReplayEvent::ShapeChanged, "program words after per-draw words did not send the stage to today's refresh");
+
+    replay.Draw(first, "a program words draw before a submit inside the first loop");
+    const auto duringRefresh = Count(ReplayEvent::SubmitDuringRefresh);
+    hookSubmits = 1;
+    replay.Draw(perDraw, "a per-draw words draw whose batch was submitted inside the replay's first loop");
+    Require(hookSubmits == 0, "heap stage replay: the replay's first loop did not run the submit hook");
+    RequireMore(duringRefresh, ReplayEvent::SubmitDuringRefresh, "a submit inside the first loop did not send the draw to today's refresh");
+    replay.Draw(first, "a program words draw after the per-draw words absorbed by the submit fallback");
+    auto patchedFirst = first;
+    patchedFirst.userData[free.front()] ^= 0x00330000u;
+    replay.Draw(patchedFirst, "a patched program words draw after the submit fallback");
+    replay.Fresh(patchedFirst, "a patched program words draw after the submit fallback");
 
     if (const auto input = Access::GuestAllocation(*replay.resources, block.At(InputOffset)); input.has_value() && Access::GuestAllocation(*replay.twin, block.At(InputOffset)) == input) {
         const std::array<ShaderResources::MovedBuffer, 1> moved{{{*input, block.At(InputOffset + 1024u), Lanes * 4u, {}}}};
         const auto shader = replay.Shader(other);
         const std::span<const CompiledShader> shaders(&shader, 1);
         const auto overlays = Count(ReplayEvent::RunsSkipped);
+        const auto missing = Count(ReplayEvent::OverlayMissing);
+        const auto run = Access::RunOffset(*replay.resources, ShaderStage::Compute);
         ShaderResources::HeapReplayProof proof;
         const auto bindings = replay.resources->PrepareReplayDrawBindings(replay.recorder, moved, shaders, nullptr, proof);
         Require(bindings != nullptr && bindings->addressOffsets && proof.overlay, "heap stage replay: a moved read-only buffer did not give the draw an overlay");
         RequireMore(overlays, ReplayEvent::RunsSkipped, "a draw with an overlay built the template's descriptor run");
+        Require(Access::RunOffset(*replay.resources, ShaderStage::Compute) == run, "heap stage replay: a draw whose overlay follows rewrote the template's descriptor run index");
         replay.resources->ConfirmHeapReplay(replay.recorder, shaders, bindings, proof);
+        RequireSame(missing, ReplayEvent::OverlayMissing, "a draw with its predicted overlay rebuilt the template's descriptor run");
         Require(bindings->heapOffsets[0] == Access::DataOffset(*replay.resources, ShaderStage::Compute), "heap stage replay: the overlay does not carry the stage data offset the draw pushes");
+        Require(bindings->heapOffsets[1] != Access::RunOffset(*replay.resources, ShaderStage::Compute), "heap stage replay: the overlay pushes the template's descriptor run instead of its own");
         replay.twin->RefreshHeapStage(shaders);
         const auto reference = replay.twin->PrepareDrawBindings(replay.recorder, moved, false, nullptr);
         Require(reference != nullptr && reference->addressOffsets, "heap stage replay: today's bindings for the moved buffer have no overlay");
         Require(reference->snapshots.size() == bindings->snapshots.size(), "heap stage replay: the replay draw and today's draw took different snapshots");
-        replay.Check("a draw whose moved buffer gives it an overlay");
+        for (std::size_t index = 0; index < bindings->snapshots.size(); ++index) {
+            const auto& found = bindings->snapshots[index];
+            const auto& expected = reference->snapshots[index];
+            Require(found.address == expected.address && found.bytes == expected.bytes, "heap stage replay: the replay draw's snapshot of the moved buffer covers other memory than today's");
+            Require(std::memcmp(found.buffer->Bytes().data() + found.offset, expected.buffer->Bytes().data() + expected.offset, found.bytes) == 0, "heap stage replay: the replay draw's snapshot of the moved buffer holds other bytes than today's");
+        }
+        Require(bindings->addressOverrides.size() == reference->addressOverrides.size(), "heap stage replay: the replay draw's overlay overrides other allocations than today's");
+        replay.Check("a draw whose moved buffer gives it an overlay", true);
     } else {
-        std::puts("the test program's input buffer is not a read-only guest allocation; the overlay path is not exercised");
+        Require(false, "heap stage replay: the test program's input buffer is not a read-only guest allocation, so the overlay path cannot be exercised");
     }
 
     const auto beforePass = Count(ReplayEvent::SubmitBeforePass);
-    replay.Draw(first, "a draw whose batch was submitted between the span proof and the pass", false, true);
+    replay.Draw(first, "a draw whose batch was submitted between the span proof and the pass", true);
     RequireMore(beforePass, ReplayEvent::SubmitBeforePass, "a submit between the span proof and the pass did not send the draw to today's refresh");
     replay.Draw(first, "a replay draw after the submit fallback");
 
+    if (level != 0) {
+        Require(AgcDriver::Graphics::ReplayChecks() != 0, "heap stage replay: the verify mode checked nothing");
+        for (std::size_t field = 0; field < static_cast<std::size_t>(ReplayField::Count); ++field) {
+            Require(AgcDriver::Graphics::ReplayMismatches(static_cast<ReplayField>(field)) == 0, std::string("heap stage replay: the verify mode found the replay's ") + AgcDriver::Graphics::ReplayFieldName(static_cast<ReplayField>(field)) + " wrong on correct draws");
+        }
+    }
+
+    {
+        replay.Draw(first, "a draw before a wrong overlay prediction");
+        const auto shader = replay.Shader(first);
+        const std::span<const CompiledShader> shaders(&shader, 1);
+        const auto missing = Count(ReplayEvent::OverlayMissing);
+        const auto before = Mismatches();
+        const auto proof = replay.resources->ReplayHeapStages(shaders, true);
+        bool thrown = false;
+        try {
+            replay.resources->ConfirmHeapReplay(replay.recorder, shaders, nullptr, proof);
+        } catch (const std::runtime_error& error) {
+            thrown = true;
+            Require(std::string_view(error.what()).find("descriptor runs") != std::string_view::npos, std::string("heap stage replay: the strict verify mode failed a wrong overlay prediction on something other than the descriptor runs: ") + error.what());
+        }
+        RequireMore(missing, ReplayEvent::OverlayMissing, "a predicted overlay the draw does not have did not rebuild the template's descriptor run");
+        Require(thrown == (level != 0 && strict), "heap stage replay: a wrong overlay prediction did not fail the draw exactly in the strict verify modes");
+        Require((Mismatches() > before) == (level != 0), "heap stage replay: the verify mode did not report a wrong overlay prediction");
+        if (!thrown) {
+            replay.twin->RefreshHeapStage(shaders);
+            replay.Check("a draw whose predicted overlay was missing");
+        }
+    }
+
     if (mode == "replay") {
         AgcDriver::ThreadReport::Phase();
+        AgcDriver::ThreadReport::FlushForTest();
         std::puts("heap stage replay record tests passed");
         return 0;
-    }
-    const auto level = AgcDriver::Graphics::ReplayVerifyLevel();
-    Require(level == (mode == "shadow" ? 1 : 2), "heap stage replay: the verify mode does not have the level the test runs with");
-    const auto checks = AgcDriver::Graphics::ReplayChecks();
-    Require(checks != 0, "heap stage replay: the verify mode checked nothing");
-    for (std::size_t field = 0; field < static_cast<std::size_t>(ReplayField::Count); ++field) {
-        Require(AgcDriver::Graphics::ReplayMismatches(static_cast<ReplayField>(field)) == 0, std::string("heap stage replay: the verify mode found the replay's ") + AgcDriver::Graphics::ReplayFieldName(static_cast<ReplayField>(field)) + " wrong on correct draws");
     }
     replay.Draw(first, "a draw before the record is damaged");
     auto& record = Access::Block(*replay.resources, ShaderStage::Compute);
@@ -379,8 +554,11 @@ int main(int argc, char** argv) {
         GuestBlock block(BlockBytes, true);
         GuestBlock surfaces(SurfaceBlockBytes, false);
         Prepare(block, surfaces);
-        return Run(*device, block, mode);
+        const auto result = Run(*device, block, mode);
+        AgcDriver::Graphics::SetHeapReplayRefreshHookForTest(nullptr);
+        return result;
     } catch (const std::exception& error) {
+        AgcDriver::Graphics::SetHeapReplayRefreshHookForTest(nullptr);
         std::cerr << error.what() << '\n';
         return 1;
     }

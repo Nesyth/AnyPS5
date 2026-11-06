@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HeapReplay.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
@@ -14,6 +16,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -304,6 +307,24 @@ void RecordsKeepThePacketsFragmentWord(bool libraries) {
     }
 }
 
+void ReplayedTheHeapStages() {
+    using AgcDriver::Graphics::ReplayEvent;
+    using AgcDriver::Graphics::ReplayEvents;
+    using AgcDriver::Graphics::ReplayField;
+    Require(AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::ReplayHeapStage), "heap stage replay: the replay run does not have APS5_REPLAY_HEAP_STAGE on");
+    const auto draws = ReplayEvents(ReplayEvent::Draws);
+    const auto stages = ReplayEvents(ReplayEvent::Stages);
+    Require(draws != 0 && stages != 0, "heap stage replay: the repeated draws replayed no heap stage (" + std::to_string(draws) + " draws, " + std::to_string(stages) + " stages)");
+    if (AgcDriver::Graphics::ReplayVerifyLevel() != 0) {
+        Require(AgcDriver::Graphics::ReplayChecks() != 0, "heap stage replay: the verify mode checked no replayed stage");
+        for (std::size_t field = 0; field < static_cast<std::size_t>(ReplayField::Count); ++field) {
+            const auto found = AgcDriver::Graphics::ReplayMismatches(static_cast<ReplayField>(field));
+            Require(found == 0, std::string("heap stage replay: the verify mode found the replay's ") + AgcDriver::Graphics::ReplayFieldName(static_cast<ReplayField>(field)) + " wrong " + std::to_string(found) + " times");
+        }
+    }
+    std::cout << "The heap stage replay replayed " << stages << " stages in " << draws << " draws with " << AgcDriver::Graphics::ReplayChecks() << " stage checks\n";
+}
+
 void SightingsKeepCollidingKeys() {
     DrawKeySightings sightings(DrawKeySightings::Ways);
     Require(!sightings.SeenBefore(0) && sightings.SeenBefore(0), "draw key 0 was not admitted at its second sight");
@@ -316,7 +337,8 @@ void SightingsKeepCollidingKeys() {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const bool replay = argc > 1 && std::string_view(argv[1]) == "replay";
     try {
         SightingsKeepCollidingKeys();
         bool libraries = false;
@@ -338,6 +360,7 @@ int main() {
         }
         AgcDriverShutdown_nid_postfix();
         Require(AgcDriver::Graphics::PipelineLibraryWorkers() == 0, "the driver's shutdown left the pipeline library worker running");
+        if (replay) ReplayedTheHeapStages();
         std::cout << "A repeated draw reused the cached draw " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
         return 0;
     } catch (const std::exception& error) {
