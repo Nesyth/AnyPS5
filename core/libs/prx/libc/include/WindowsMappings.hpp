@@ -287,12 +287,19 @@ public:
         out[4] = cleanRanges.size();
         out[5] = residentRuns.size();
         for (std::size_t index = 4; index < 7; ++index) out[index + 2] = armingCounters()[index].exchange(0, std::memory_order_relaxed);
+        for (std::size_t index = 0; index < 8; ++index) out[9 + index] = armDecisions()[index].exchange(0, std::memory_order_relaxed);
     }
 
     // APS5_REARM_QUIET as a runtime switch: a resident run the guest wrote after it was armed is armed again once 8
     // clearing collects in a row found it unwritten, at most once per 50 ms per run.
     void SetRearmQuiet(bool on) {
         rearmQuietFlag().store(on, std::memory_order_relaxed);
+    }
+
+    // APS5_ARM_WIDE as a runtime switch: a clearing collect also arms the span it collects in a run that is only
+    // partly settled, or of at least 16 KiB instead of 256 KiB; fresh pages in it are still reported written once.
+    void SetArmWide(bool on) {
+        armWideFlag().store(on, std::memory_order_relaxed);
     }
 
     // A serial bumped whenever a remembered clean range is dropped (a write fault, an unmap, a host write or an
@@ -955,6 +962,18 @@ private:
         return counters;
     }
 
+    static std::atomic<bool>& armWideFlag() {
+        static std::atomic<bool> wide{false};
+        return wide;
+    }
+
+    // Clearing collects of resident runs: [0] all, [1] not watched, [2] fresh pages, [3] written after arming,
+    // [4] run under the size floor, [5] refused by armResident, [6] armed, [7] partly fresh runs armed (APS5_ARM_WIDE).
+    static std::array<std::atomic<std::uint64_t>, 8>& armDecisions() {
+        static std::array<std::atomic<std::uint64_t>, 8> decisions{};
+        return decisions;
+    }
+
     static std::atomic<std::uint64_t>& cleanForgetSerial() {
         static std::atomic<std::uint64_t> serial{1};
         return serial;
@@ -1138,7 +1157,18 @@ private:
         const bool observedBefore = run.writeObserved;
         const auto now = observedBefore && rearmQuietFlag().load(std::memory_order_relaxed) ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() : std::int64_t{0};
         const bool rearm = now != 0 && run.quietCollects >= 8 && now - run.armedAt >= 50'000'000;
-        const bool armed = armResidentRuns() && clear && run.watched && run.fresh == 0 && (!run.writeObserved || rearm) && collection != Collection::Fresh && run.end - start >= 0x40000 && armResident(first, stop);
+        const bool wide = armWideFlag().load(std::memory_order_relaxed);
+        const bool considered = armResidentRuns() && clear && collection != Collection::Fresh;
+        const bool sized = run.end - start >= (wide ? 0x4000u : 0x40000u);
+        const bool settled = run.fresh == 0 || wide;
+        const bool armed = considered && run.watched && settled && (!run.writeObserved || rearm) && sized && armResident(first, stop);
+        if (considered) {
+            auto& decisions = armDecisions();
+            decisions[0].fetch_add(1, std::memory_order_relaxed);
+            const auto reason = !run.watched ? 1 : run.fresh != 0 && !wide ? 2 : run.writeObserved && !rearm ? 3 : !sized ? 4 : !armed ? 5 : 6;
+            decisions[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+            if (armed && run.fresh != 0) decisions[7].fetch_add(1, std::memory_order_relaxed);
+        }
         if (armed && run.writeObserved) {
             run.writeObserved = false;
             run.quietCollects = 0;
@@ -1193,6 +1223,7 @@ private:
             }
         }
         if (collection == Collection::Fresh) flushReset(stop);
+        if (armed) rememberClean(from, stop);
     }
 
     Window open(HANDLE section, std::uint64_t offset, std::size_t bytes) {

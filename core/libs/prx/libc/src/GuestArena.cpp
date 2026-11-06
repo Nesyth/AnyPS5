@@ -830,6 +830,10 @@ void GuestArenaSetRearmQuiet_nid_no_patch(bool on) {
     WindowsMappings::Get().SetRearmQuiet(on);
 }
 
+void GuestArenaSetArmWide_nid_no_patch(bool on) {
+    WindowsMappings::Get().SetArmWide(on);
+}
+
 std::uint64_t GuestArenaCleanForgetSerial_nid_no_patch() {
     return WindowsMappings::CleanForgetSerial();
 }
