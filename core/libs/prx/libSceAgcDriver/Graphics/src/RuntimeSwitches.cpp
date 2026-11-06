@@ -35,6 +35,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_ARM_RESIDENT",
     "APS5_PIPELINE_DISPATCH",
     "APS5_NO_HEAP_SET_SKIP",
+    "APS5_LARGE_BATCHES",
 };
 
 struct SwitchValues {
@@ -63,6 +64,7 @@ struct SwitchValues {
                 return text != nullptr && text[0] != '\0' && text[0] != '0';
             }(),
             std::getenv("APS5_NO_HEAP_SET_SKIP") != nullptr,
+            std::getenv("APS5_LARGE_BATCHES") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -91,7 +92,11 @@ std::uint64_t Driver::batchCap() {
         const char* text = std::getenv("APS5_BATCH_CAP");
         return text ? std::strtoull(text, nullptr, 10) : 64ull;
     }();
-    return value;
+    static const std::uint64_t large = [] {
+        const char* text = std::getenv("APS5_LARGE_BATCH_CAP");
+        return text ? std::strtoull(text, nullptr, 10) : 256ull;
+    }();
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::LargeBatches) ? large : value;
 }
 
 void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue) {
