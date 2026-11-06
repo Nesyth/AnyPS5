@@ -27,7 +27,6 @@ enum class RuntimeSwitch : std::size_t {
     NoHtileFixupCarry,
     XpWalksFree,
     NoArmResident,
-    XpViewDisarm,
     Count,
 };
 

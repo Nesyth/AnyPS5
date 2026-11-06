@@ -826,10 +826,6 @@ void GuestArenaSetArmResident_nid_no_patch(bool on) {
     WindowsMappings::Get().SetArmResident(on);
 }
 
-void GuestArenaSetViewDisarm_nid_no_patch(bool on) {
-    WindowsMappings::Get().SetViewDisarm(on);
-}
-
 // Compared-memory arming, on unless APS5_NO_ARM_COMPARED (needs every red-zone leaf framed or relocated, #361): no page is marked to
 // be compared, so clearing collects arm shared pages again and their writes fault.
 bool armCompared() {
