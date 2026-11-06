@@ -2038,6 +2038,7 @@ struct ResolvedResources {
     std::vector<ShaderResources::MovedBuffer> moved;
     ResourceCache::Key contentKey;
     bool cacheable = false;
+    bool replay = false;
     const ShaderResources::BuildTiming* built = nullptr;
 };
 
@@ -2127,7 +2128,7 @@ void noteLeanCoverage(const ShaderResources& resources, std::span<const ShaderRe
     std::fprintf(stderr, "[lean-coverage] template hits (10 s): %llu; same template as the previous draw %llu; template already used in the open batch %llu; moved buffers per hit 0: %llu, 1: %llu, 2: %llu, 3+: %llu; moved bytes %llu\n", taken[Hits], taken[BackToBack], taken[SameBatch], taken[Moved0], taken[Moved1], taken[Moved2], taken[Moved3], taken[MovedBytes]);
 }
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const std::vector<std::uint32_t>* contentKey, ReplayReason replayDraw) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const std::vector<std::uint32_t>* contentKey, ReplayReason replayDraw, bool replayOn) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -2202,11 +2203,13 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 resolved.moved = std::move(*moved);
                 noteLeanCoverage(*resolved.resources, resolved.moved, recorder);
                 if (resolved.resources->HeapStage()) {
+                    const auto reason = replayDraw == ReplayReason::Eligible ? resolved.resources->HeapReplayRefusal(shaders) : replayDraw;
                     if (ReplayCensusEnabled() && replayDraw != ReplayReason::Count) {
-                        NoteReplayReason(replayDraw == ReplayReason::Eligible ? resolved.resources->HeapReplayRefusal(shaders) : replayDraw);
+                        NoteReplayReason(reason);
                         resolved.resources->NoteHeapReplayCensus();
                     }
-                    resolved.resources->RefreshHeapStage(shaders);
+                    resolved.replay = replayOn && reason == ReplayReason::Eligible;
+                    if (!resolved.replay) resolved.resources->RefreshHeapStage(shaders);
                 }
                 outcome.addressBased = resolved.resources->HoldsLease();
                 outcome.kind = KindTemplateHit;
@@ -2573,6 +2576,7 @@ struct RecordedDraw {
     std::vector<StagedWrite> staged;
     const IndirectRecord* indirect = nullptr;
     std::span<const ShaderResources::MovedBuffer> moved;
+    bool replay = false;
     bool listed = false;
     bool completion = false;
     bool waited = false;
@@ -2862,7 +2866,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
     const auto drawUse = resources.BeginDrawUse(*recorder);
-    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, false, drawUse != nullptr ? drawUse->record.get() : nullptr);
+    ShaderResources::HeapReplayProof replayProof;
+    const auto drawBindings = record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, drawUse != nullptr ? drawUse->record.get() : nullptr, replayProof) : resources.PrepareDrawBindings(*recorder, record.moved, false, drawUse != nullptr ? drawUse->record.get() : nullptr);
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
     const bool readOnlyBda = addressReadPasses && resources.BdaReadOnly();
     outcome.addressDraw = addressBased;
@@ -2903,6 +2908,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     resources.RequireGuestBuffers();
     if (UsesMeshWindow(shaders)) PrepareMeshWindow(context);
+    if (record.replay) resources.ConfirmHeapReplay(*recorder, shaders, drawBindings, replayProof);
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || captured || !record.staged.empty() || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
     // The memo names the pass the draw now records in.
     if (memoUsable && !memoHit) {
@@ -3716,8 +3722,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto* recorder = prepared.recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     auto& resolved = prepared.resolved;
-    const auto replayDraw = ReplayCensusEnabled() ? heapReplayDrawReason(state, draw, shaders, inputs, targets, !stencilReferences.empty(), recordable) : ReplayReason::Count;
-    resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared.contentKey, replayDraw);
+    const bool replayOn = RuntimeSwitches::Set(RuntimeSwitch::ReplayHeapStage);
+    const auto replayDraw = replayOn || ReplayCensusEnabled() ? heapReplayDrawReason(state, draw, shaders, inputs, targets, !stencilReferences.empty(), recordable) : ReplayReason::Count;
+    resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared.contentKey, replayDraw, replayOn);
     if (stopAfterResolve.load(std::memory_order_relaxed) != 0) {
         const auto stop = stopAfterResolve.exchange(0, std::memory_order_relaxed);
         if (stop == 1) return false;
@@ -4005,6 +4012,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.recorder = recorder;
         record.resources = resources;
         record.moved = resolved.moved;
+        record.replay = resolved.replay;
         record.pipeline = pipeline;
         record.framebuffer = framebuffer;
         record.targetViews = targetViews;

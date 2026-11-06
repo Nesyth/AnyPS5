@@ -5465,6 +5465,7 @@ VkBuffer ShaderResources::shaderDataBuffer(const CompiledShader& shader) const {
 
 void ShaderResources::forgetShaderDataWords(const CompiledShader& shader) {
     if (HeapShader(shader)) {
+        ++heapStageWrites;
         auto& stageState = heapStages[HeapStageIndex(shader.stage)];
         stageState.data.mark.entry = 0;
         stageState.data.words.clear();
@@ -6740,6 +6741,32 @@ std::size_t ShaderResources::DrawUploadLimit() {
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord) const {
+    thread_local std::vector<std::size_t>* selectedSlot = nullptr;
+    auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
+    auto result = selectDrawSnapshots(recorder, moved, movedOnly, selected);
+    return finishDrawBindings(recorder, std::move(result), selected, faultRecord);
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareReplayDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, std::span<const CompiledShader> shaders, const BdaResources* faultRecord, HeapReplayProof& proof) {
+    thread_local std::vector<std::size_t>* selectedSlot = nullptr;
+    auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
+    auto result = selectDrawSnapshots(recorder, moved, false, selected);
+    auto& record = heapReplayRecord();
+    const bool overlay = result != nullptr && addressedBuffers && std::ranges::any_of(selected, [&](std::size_t index) { return index < record.addressed.size() && record.addressed[index]; });
+    proof = ReplayHeapStages(shaders, overlay);
+    return finishDrawBindings(recorder, std::move(result), selected, faultRecord);
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::finishDrawBindings(Recorder& recorder, std::shared_ptr<DrawBindings> result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const {
+    if (result == nullptr || selected.empty()) return {};
+    writeDrawSets(*result, selected, faultRecord);
+    recorder.Keep(result);
+    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    return result;
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, std::vector<std::size_t>& selected) const {
+    selected.clear();
     requireGuestBuffers(moved);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE && !heapStage) || (usesBda && !spaceReuse)) return {};
     prepareFaultSlot();
@@ -6750,9 +6777,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const auto uploadLimit = DrawUploadLimit();
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
-    thread_local std::vector<std::size_t>* selectedSlot = nullptr;
-    auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
-    selected.clear();
     std::array<std::uint64_t, 3> stamp{};
     bool stamped = false;
     const auto keep = [&](DrawBindings::Snapshot snapshot) {
@@ -6826,10 +6850,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
-    if (selected.empty()) return {};
-    writeDrawSets(*result, selected, faultRecord);
-    recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;
 }
 
@@ -7546,6 +7566,7 @@ void noteHeapInputChange(std::span<const std::uint32_t> before, std::span<const 
 
 void ShaderResources::writeHeapStage(const CompiledShader& shader) {
     namespace Abi = ShaderRecompiler::RuntimeAbi;
+    ++heapStageWrites;
     HeapCostScope slotsCost(HeapCost::Slots);
     auto& heap = BindlessHeap::For(context);
     const VkShaderStageFlags stageBit = VulkanStage(shader.stage);
@@ -7569,7 +7590,7 @@ void ShaderResources::writeHeapStage(const CompiledShader& shader) {
     static const bool verifySlots = std::getenv("APS5_VERIFY_GPU_HEAP") != nullptr;
     if (verifySlots) verifyHeapSlots(heap, stageState, stageBit);
     slotsCost.Stop();
-    if (ReplayCensusEnabled() && heapReplay != nullptr) noteHeapStageCensus(shader, current);
+    if (ReplayCensusEnabled() && heapReplay != nullptr && !heapReplaying) noteHeapStageCensus(shader, current);
 
     HeapCostScope dataCost(HeapCost::StageData);
     const std::size_t dataIndex = DataOffsetIndex(stageIndex, Abi::Binding::ShaderData);
@@ -7669,6 +7690,13 @@ ReplayReason ShaderResources::HeapReplayRefusal(std::span<const CompiledShader> 
 ShaderResources::HeapReplay& ShaderResources::heapReplayRecord() {
     if (heapReplay == nullptr) {
         heapReplay = std::make_unique<HeapReplay>();
+        heapReplay->addressed.assign(allocations.size(), false);
+        for (const auto& binding : bindings) {
+            if (!binding.addressed) continue;
+            for (const auto allocation : binding.allocations) {
+                if (allocation < heapReplay->addressed.size()) heapReplay->addressed[allocation] = true;
+            }
+        }
     }
     return *heapReplay;
 }
@@ -7737,6 +7765,369 @@ void ShaderResources::noteHeapStageCensus(const CompiledShader& shader, bool cur
         change = masked ? ReplayStageChange::Masked : changed == 0 ? ReplayStageChange::Same : changed == 1 ? ReplayStageChange::One : changed <= 4 ? ReplayStageChange::UpToFour : changed <= 16 ? ReplayStageChange::UpToSixteen : ReplayStageChange::More;
     }
     NoteReplayStageChange(change, srtChanged, &words == &data->guestDescriptor);
+}
+
+void ShaderResources::seedHeapReplayStage(HeapReplayStage& stage, const CompiledShader& shader) const {
+    const auto& program = *shader.program;
+    stage.program = shader.program;
+    stage.ready = true;
+    stage.replayable = false;
+    stage.spanEpoch = 0;
+    std::size_t dataBindings = 0;
+    std::size_t srtBindings = 0;
+    for (std::size_t index = 0; index < program.bindings.size(); ++index) {
+        const auto role = program.bindings[index].role;
+        if (role == ShaderRecompiler::DescriptorRole::ShaderData) {
+            ++dataBindings;
+            stage.dataBinding = index;
+        } else if (role == ShaderRecompiler::DescriptorRole::FlattenedSrt) {
+            ++srtBindings;
+            stage.srtBinding = index;
+        }
+    }
+    stage.srt = srtBindings == 1;
+    if (!program.dataAddressPush || !context.heapBufferDescriptors || dataBindings != 1 || srtBindings > 1) return;
+    const auto& data = program.bindings[stage.dataBinding];
+    const auto& words = DrawGuestWords(shader, data);
+    stage.userDwords = shader.heap != nullptr ? shader.heap->userData.size() : 0u;
+    stage.dataDwords = words.size();
+    stage.wordsFromProgram = &words == &data.guestDescriptor;
+    heapStageMask(shader, words.size(), stage.mask);
+    stage.replayable = true;
+}
+
+bool ShaderResources::keepReplaySpan(HeapStageState::KeptSpan& kept, bool proven, bool srt) {
+    if (kept.mark.entry == 0u || kept.mark.words == 0u) return false;
+    if (proven) {
+        NoteReplay(srt ? ReplayEvent::SrtProven : ReplayEvent::DataProven);
+        return true;
+    }
+    if (!BindlessHeap::For(context).Held(kept.mark)) return false;
+    NoteReplay(srt ? ReplayEvent::SrtHeld : ReplayEvent::DataHeld);
+    return true;
+}
+
+std::uint32_t ShaderResources::writeReplaySpan(HeapStageState::KeptSpan& kept) {
+    auto span = BindlessHeap::For(context).Allocate(kept.words.size(), kept.mark);
+    if (!kept.words.empty()) std::memcpy(span.words.data(), kept.words.data(), kept.words.size() * sizeof(std::uint32_t));
+    return span.offset;
+}
+
+bool ShaderResources::replayHeapStage(const CompiledShader& shader, HeapReplayStage& stage, std::uint64_t epoch, bool overlay) {
+    namespace Abi = ShaderRecompiler::RuntimeAbi;
+    auto& heap = BindlessHeap::For(context);
+    const auto stageIndex = HeapStageIndex(shader.stage);
+    auto& state = heapStages[stageIndex];
+    const auto& program = *shader.program;
+    const auto rebuild = [&](ReplayEvent why) {
+        NoteReplay(why);
+        writeHeapStage(shader);
+        seedHeapReplayStage(stage, shader);
+        return false;
+    };
+    const auto slotSerial = heap.SlotSerial();
+    if (!(EpochProofs() && state.slotSerial == slotSerial)) {
+        if (!heap.GenerationsCurrent(state.slots, state.slotGenerations, state.samplerSlots, state.samplerGenerations)) {
+            if (ReplayCensusEnabled()) noteHeapStageCensus(shader, false);
+            return rebuild(ReplayEvent::SlotsMoved);
+        }
+        state.slotSerial = slotSerial;
+    }
+    if (ReplayCensusEnabled()) noteHeapStageCensus(shader, true);
+    static const bool verifySlots = std::getenv("APS5_VERIFY_GPU_HEAP") != nullptr;
+    if (verifySlots) verifyHeapSlots(heap, state, VulkanStage(shader.stage));
+    const auto& dataBinding = program.bindings[stage.dataBinding];
+    const auto& words = DrawGuestWords(shader, dataBinding);
+    const auto userData = shader.heap != nullptr ? std::span<const std::uint32_t>(shader.heap->userData) : std::span<const std::uint32_t>{};
+    const auto size = words.size();
+    if (size != stage.dataDwords || userData.size() != stage.userDwords || state.dataInput.size() != size + userData.size() || state.data.words.size() != size) return rebuild(ReplayEvent::ShapeChanged);
+    const bool fromProgram = &words == &dataBinding.guestDescriptor;
+    if (!(fromProgram && stage.wordsFromProgram) && !std::equal(words.begin(), words.end(), state.dataInput.begin())) return rebuild(ReplayEvent::ShapeChanged);
+    thread_local std::vector<std::uint32_t>* changedSlot = nullptr;
+    auto& changed = ShaderRecompiler::ThreadOwned(changedSlot);
+    changed.clear();
+    const auto copied = std::min(userData.size(), size);
+    const auto* recorded = state.dataInput.data() + size;
+    for (std::size_t index = 0; index < copied; ++index) {
+        if (userData[index] == recorded[index]) continue;
+        if (((stage.mask[index / 64u] >> (index % 64u)) & 1u) != 0u) return rebuild(ReplayEvent::MaskedChange);
+        changed.push_back(static_cast<std::uint32_t>(index));
+    }
+    if (fromProgram) stage.wordsFromProgram = true;
+    std::copy(userData.begin(), userData.end(), state.dataInput.begin() + static_cast<std::ptrdiff_t>(size));
+    for (const auto index : changed) state.data.words[index] = userData[index];
+    const bool proven = stage.spanEpoch == epoch;
+    if (stage.srt) {
+        const auto& srtWords = shader.heap != nullptr && !shader.heap->flattenedSrt.empty() ? shader.heap->flattenedSrt : DrawGuestWords(shader, program.bindings[stage.srtBinding]);
+        if (std::ranges::equal(state.flat.words, srtWords)) {
+            NoteReplay(ReplayEvent::SrtSame);
+            if (!keepReplaySpan(state.flat, proven, true)) {
+                NoteReplay(ReplayEvent::SrtRewritten);
+                writeReplaySpan(state.flat);
+            }
+        } else {
+            NoteReplay(ReplayEvent::SrtChanged);
+            state.flat.words.assign(srtWords.begin(), srtWords.end());
+            writeReplaySpan(state.flat);
+        }
+        heapSrtOffsets[stageIndex] = state.flat.mark.offset;
+        heapSrtDwords[stageIndex] = static_cast<std::uint32_t>(srtWords.size());
+    } else {
+        heapSrtDwords[stageIndex] = 0u;
+    }
+    if (!changed.empty()) {
+        NoteReplay(ReplayEvent::DataPatched);
+        writeReplaySpan(state.data);
+    } else {
+        NoteReplay(ReplayEvent::DataSame);
+        if (!keepReplaySpan(state.data, proven, false)) {
+            NoteReplay(ReplayEvent::DataRewritten);
+            writeReplaySpan(state.data);
+        }
+    }
+    heapOffsets[DataOffsetIndex(stageIndex, Abi::Binding::ShaderData)] = state.data.mark.offset;
+    if (overlay) {
+        NoteReplay(ReplayEvent::RunsSkipped);
+    } else {
+        NoteReplay(ReplayEvent::RunsBuilt);
+        heapOffsets[DataOffsetIndex(stageIndex, Abi::Binding::FlattenedSrt)] = ringDescriptors(stageIndex, nullptr, state.descriptors);
+    }
+    return true;
+}
+
+ShaderResources::HeapReplayProof ShaderResources::ReplayHeapStages(std::span<const CompiledShader> shaders, bool overlay) {
+    auto& heap = BindlessHeap::For(context);
+    auto& record = heapReplayRecord();
+    const auto switches = RuntimeSwitches::Generation();
+    if (record.open || record.heap != &heap || record.heapIdentity != heap.Identity() || record.switches != switches || record.writes != heapStageWrites) {
+        NoteReplay(record.heap == nullptr ? ReplayEvent::NewRecord : record.open ? ReplayEvent::Interrupted : record.writes != heapStageWrites ? ReplayEvent::NonReplayWrites : ReplayEvent::HeapOrSwitches);
+        for (auto& stage : record.stages) stage.ready = false;
+        record.heap = &heap;
+        record.heapIdentity = heap.Identity();
+        record.switches = switches;
+    }
+    record.open = true;
+    NoteReplay(ReplayEvent::Draws);
+    struct Replaying {
+        bool& active;
+        explicit Replaying(bool& active) : active(active) { active = true; }
+        ~Replaying() { active = false; }
+        Replaying(const Replaying&) = delete;
+        Replaying& operator=(const Replaying&) = delete;
+    } replaying{heapReplaying};
+    const auto before = heap.SubmitEpoch();
+    std::array<bool, ShaderRecompiler::RuntimeAbi::StageCount> current{};
+    for (const auto& shader : shaders) {
+        if (!HeapShader(shader)) continue;
+        const auto stageIndex = HeapStageIndex(shader.stage);
+        auto& stage = record.stages[stageIndex];
+        if (stage.ready && stage.replayable && stage.program == shader.program) {
+            if (shader.program->dataAddressPush) writeHeapTableMap(shader, stageIndex);
+            current[stageIndex] = true;
+            continue;
+        }
+        if (stage.ready) NoteReplay(stage.program != shader.program ? ReplayEvent::NewProgram : ReplayEvent::ShapeChanged);
+        writeHeapStage(shader);
+        seedHeapReplayStage(stage, shader);
+    }
+    const auto epoch = heap.SubmitEpoch();
+    if (epoch != before) {
+        NoteReplay(ReplayEvent::SubmitDuringRefresh);
+        RefreshHeapStage(shaders);
+        for (auto& stage : record.stages) stage.spanEpoch = 0;
+        record.writes = heapStageWrites;
+        record.open = false;
+        return {heap.SubmitEpoch(), overlay};
+    }
+    for (const auto& shader : shaders) {
+        if (!HeapShader(shader)) continue;
+        const auto stageIndex = HeapStageIndex(shader.stage);
+        auto& stage = record.stages[stageIndex];
+        if (current[stageIndex] && replayHeapStage(shader, stage, epoch, overlay)) NoteReplay(ReplayEvent::Stages);
+        stage.spanEpoch = epoch;
+    }
+    record.writes = heapStageWrites;
+    record.open = false;
+    return {epoch, overlay};
+}
+
+void ShaderResources::ConfirmHeapReplay(Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& bindings, const HeapReplayProof& proof) {
+    if (BindlessHeap::For(context).SubmitEpoch() != proof.epoch) {
+        NoteReplay(ReplayEvent::SubmitBeforePass);
+        RefreshHeapStage(shaders);
+        if (bindings != nullptr) {
+            RefreshMovedAddresses(*bindings);
+            recorder.Keep(bindings);
+            for (const auto& snapshot : bindings->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+        }
+        return;
+    }
+    if (ReplayVerifyLevel() != 0) verifyHeapReplay(shaders, bindings.get(), proof);
+}
+
+void ShaderResources::buildHeapStageWords(const CompiledShader& shader, const HeapStageState& state, std::span<const std::uint32_t> words, std::span<const std::uint32_t> userData, std::vector<std::uint32_t>& patched) const {
+    ValidateRuntimeResources(shader, words);
+    patched.assign(words.begin(), words.end());
+    std::copy_n(userData.begin(), std::min(userData.size(), patched.size()), patched.begin());
+    for (const auto& [byte, adjustment] : state.dataPatches) {
+        Require(byte < patched.size() * sizeof(std::uint32_t), "a GPU-mode guest buffer offset lies outside the shader data");
+        reinterpret_cast<std::byte*>(patched.data())[byte] = static_cast<std::byte>(adjustment);
+    }
+    patchHeapSlotWords(shader, state, patched, true);
+}
+
+void ShaderResources::verifyHeapReplay(std::span<const CompiledShader> shaders, DrawBindings* bindings, const HeapReplayProof& proof) {
+    namespace Abi = ShaderRecompiler::RuntimeAbi;
+    auto& heap = BindlessHeap::For(context);
+    const bool shadow = ReplayVerifyLevel() == 1;
+    std::string failure;
+    const auto mismatch = [&](ReplayField field, std::size_t stageIndex, const std::string& what) {
+        char prefix[96];
+        std::snprintf(prefix, sizeof(prefix), "template %p stage %zu: ", static_cast<const void*>(this), stageIndex);
+        if (NoteReplayMismatch(field, prefix + what) && failure.empty()) failure = std::string("APS5_VERIFY_REPLAY_STRICT: the heap stage replay's ") + ReplayFieldName(field) + " differs from today's: " + prefix + what;
+    };
+    const auto difference = [](std::span<const std::uint32_t> found, std::span<const std::uint32_t> expected) -> std::string {
+        if (found.size() != expected.size()) return std::to_string(found.size()) + " dwords, expected " + std::to_string(expected.size());
+        for (std::size_t index = 0; index < found.size(); ++index) {
+            if (found[index] == expected[index]) continue;
+            char text[96];
+            std::snprintf(text, sizeof(text), "dword %zu is 0x%08x, expected 0x%08x", index, found[index], expected[index]);
+            return text;
+        }
+        return {};
+    };
+    const auto sameRanges = [](std::span<const VkDeviceAddressRangeEXT> a, std::span<const VkDeviceAddressRangeEXT> b) {
+        return std::ranges::equal(a, b, [](const VkDeviceAddressRangeEXT& left, const VkDeviceAddressRangeEXT& right) { return left.address == right.address && left.size == right.size; });
+    };
+    const auto spanHolds = [&](const HeapStageState::KeptSpan& kept, std::size_t stageIndex, const char* what) {
+        if (kept.words.empty()) return;
+        if (!heap.SpanCurrent(kept.mark)) mismatch(ReplayField::Spans, stageIndex, std::string(what) + " span is not in an open chunk of this batch");
+        else if (const auto text = difference(heap.RingWords(kept.mark), kept.words); !text.empty()) mismatch(ReplayField::Ring, stageIndex, std::string(what) + " ring words differ from the CPU copy: " + text);
+    };
+    struct Facts {
+        std::size_t stageIndex = 0;
+        std::vector<std::uintptr_t> key;
+        std::array<std::vector<std::uint32_t>, static_cast<std::size_t>(Abi::Binding::Count)> slots;
+        std::vector<std::uint32_t> samplerSlots;
+        std::vector<std::uint32_t> block;
+        std::vector<std::uint32_t> srt;
+        std::uint32_t srtDwords = 0;
+        std::vector<std::uint32_t> map;
+        std::vector<VkDeviceAddressRangeEXT> run;
+    };
+    std::vector<Facts> replayed;
+    for (const auto& shader : shaders) {
+        if (!HeapShader(shader)) continue;
+        NoteReplayCheck();
+        const auto stageIndex = HeapStageIndex(shader.stage);
+        const auto stageBit = static_cast<VkShaderStageFlags>(VulkanStage(shader.stage));
+        auto& state = heapStages[stageIndex];
+        const auto dataIndex = DataOffsetIndex(stageIndex, Abi::Binding::ShaderData);
+        const auto flatIndex = DataOffsetIndex(stageIndex, Abi::Binding::FlattenedSrt);
+        if (heapOffsets[dataIndex] != state.data.mark.offset) mismatch(ReplayField::Offsets, stageIndex, "the root's shader data offset is not the stage data span");
+        spanHolds(state.data, stageIndex, "the stage data");
+        const ShaderRecompiler::DescriptorBinding* data = nullptr;
+        const ShaderRecompiler::DescriptorBinding* srt = nullptr;
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData) data = &binding;
+            else if (binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt) srt = &binding;
+        }
+        std::span<const std::uint32_t> srtWords;
+        if (srt != nullptr) {
+            srtWords = shader.heap != nullptr && !shader.heap->flattenedSrt.empty() ? std::span<const std::uint32_t>(shader.heap->flattenedSrt) : std::span<const std::uint32_t>(DrawGuestWords(shader, *srt));
+            if (heapSrtOffsets[stageIndex] != state.flat.mark.offset || heapSrtDwords[stageIndex] != srtWords.size()) mismatch(ReplayField::Offsets, stageIndex, "the root's srt offset or dwords are not the srt span's");
+            spanHolds(state.flat, stageIndex, "the srt");
+        } else if (heapSrtDwords[stageIndex] != 0u) {
+            mismatch(ReplayField::Offsets, stageIndex, "a stage without an srt has srt dwords");
+        }
+        if (heapTableMapSet[stageIndex]) {
+            if (heapTableMaps[stageIndex] != state.map.mark.offset) mismatch(ReplayField::Map, stageIndex, "the root's table map offset is not the table map span");
+            spanHolds(state.map, stageIndex, "the table map");
+        }
+        if (!proof.overlay) {
+            if (heapOffsets[flatIndex] != state.descriptors.first) mismatch(ReplayField::Offsets, stageIndex, "the root's descriptor index is not the template run's");
+            if (!heap.SpanCurrent(state.descriptors.mark)) mismatch(ReplayField::Spans, stageIndex, "the template run is not in an open chunk of this batch");
+            const std::array<VkDeviceAddressRangeEXT, 1> srtEntry{srtRange(stageIndex)};
+            if (state.descriptors.ranges.empty() || !sameRanges(std::span(state.descriptors.ranges).first(1), srtEntry)) mismatch(ReplayField::Runs, stageIndex, "the template run's first entry is not the srt span");
+        }
+        if (bindings != nullptr && bindings->addressOffsets && bindings->heapOffsets[dataIndex] != heapOffsets[dataIndex]) mismatch(ReplayField::Offsets, stageIndex, "the overlay's shader data offset is not the replayed one");
+        if (data == nullptr) continue;
+        const auto& words = DrawGuestWords(shader, *data);
+        const auto userData = shader.heap != nullptr ? std::span<const std::uint32_t>(shader.heap->userData) : std::span<const std::uint32_t>{};
+        if (shadow) {
+            Facts facts;
+            facts.stageIndex = stageIndex;
+            facts.key = state.key;
+            facts.slots = state.slots;
+            facts.samplerSlots = state.samplerSlots;
+            facts.block = state.data.words;
+            facts.srt = state.flat.words;
+            facts.srtDwords = heapSrtDwords[stageIndex];
+            if (heapTableMapSet[stageIndex]) facts.map = state.map.words;
+            if (!proof.overlay) facts.run = state.descriptors.ranges;
+            replayed.push_back(std::move(facts));
+            continue;
+        }
+        std::vector<std::uintptr_t> key;
+        appendHeapSlotKey(stageBit, key);
+        if (key != state.key) mismatch(ReplayField::Key, stageIndex, "the slot key built anew differs from the record's");
+        HeapStageState reference;
+        reference.dataPatches = state.dataPatches;
+        takeHeapSlots(heap, reference, stageBit, key);
+        if (reference.slots != state.slots || reference.samplerSlots != state.samplerSlots || !heap.GenerationsCurrent(state.slots, state.slotGenerations, state.samplerSlots, state.samplerGenerations)) mismatch(ReplayField::Slots, stageIndex, "the slots taken anew differ from the record's or their generations moved");
+        std::vector<std::uint32_t> block;
+        buildHeapStageWords(shader, reference, words, userData, block);
+        if (const auto text = difference(state.data.words, block); !text.empty()) mismatch(ReplayField::Block, stageIndex, "the stage data: " + text);
+        const bool inputs = state.dataInput.size() == words.size() + userData.size() && std::equal(words.begin(), words.end(), state.dataInput.begin()) && std::equal(userData.begin(), userData.end(), state.dataInput.begin() + static_cast<std::ptrdiff_t>(words.size()));
+        if (!inputs) mismatch(ReplayField::Inputs, stageIndex, "the recorded inputs are not this draw's");
+        if (srt != nullptr) {
+            if (const auto text = difference(state.flat.words, srtWords); !text.empty()) mismatch(ReplayField::Srt, stageIndex, "the srt words: " + text);
+        }
+        if (!proof.overlay) {
+            std::vector<VkDeviceAddressRangeEXT> ranges{srtRange(stageIndex)};
+            writeBufferAddresses({}, static_cast<std::uint32_t>(stageIndex), nullptr, &ranges);
+            if (!sameRanges(ranges, state.descriptors.ranges)) mismatch(ReplayField::Runs, stageIndex, "the template run's ranges differ from the ranges built anew");
+        }
+    }
+    if (shadow) {
+        for (const auto& shader : shaders) {
+            if (!HeapShader(shader)) continue;
+            auto& state = heapStages[HeapStageIndex(shader.stage)];
+            state.key.clear();
+            state.data.mark.entry = 0;
+            state.flat.mark.entry = 0;
+            state.map.mark.entry = 0;
+            state.descriptors.mark.entry = 0;
+        }
+        RefreshHeapStage(shaders);
+        if (bindings != nullptr) RefreshMovedAddresses(*bindings);
+        for (const auto& facts : replayed) {
+            const auto stageIndex = facts.stageIndex;
+            const auto& state = heapStages[stageIndex];
+            if (facts.key != state.key) mismatch(ReplayField::Key, stageIndex, "the record's slot key differs from the one today's refresh built");
+            if (facts.slots != state.slots || facts.samplerSlots != state.samplerSlots) mismatch(ReplayField::Slots, stageIndex, "the record's slots differ from the ones today's refresh took");
+            if (const auto text = difference(facts.block, state.data.words); !text.empty()) mismatch(ReplayField::Block, stageIndex, "the replayed stage data against today's refresh: " + text);
+            if (const auto text = difference(facts.srt, state.flat.words); !text.empty() || facts.srtDwords != heapSrtDwords[stageIndex]) mismatch(ReplayField::Srt, stageIndex, "the replayed srt against today's refresh: " + text);
+            if (heapTableMapSet[stageIndex]) {
+                if (const auto text = difference(facts.map, state.map.words); !text.empty()) mismatch(ReplayField::Map, stageIndex, "the table map against today's refresh: " + text);
+            }
+            if (!facts.run.empty()) {
+                std::vector<VkDeviceAddressRangeEXT> expected(state.descriptors.ranges.begin(), state.descriptors.ranges.end());
+                if (!expected.empty()) expected.front() = facts.run.front();
+                if (!sameRanges(facts.run, expected)) mismatch(ReplayField::Runs, stageIndex, "the replayed template run binds other buffers than today's");
+            }
+        }
+        auto& record = heapReplayRecord();
+        const auto epoch = heap.SubmitEpoch();
+        for (const auto& shader : shaders) {
+            if (!HeapShader(shader)) continue;
+            auto& stage = record.stages[HeapStageIndex(shader.stage)];
+            seedHeapReplayStage(stage, shader);
+            stage.spanEpoch = epoch == proof.epoch ? epoch : 0u;
+        }
+        record.writes = heapStageWrites;
+    }
+    if (!failure.empty()) throw std::runtime_error(failure);
 }
 
 namespace {

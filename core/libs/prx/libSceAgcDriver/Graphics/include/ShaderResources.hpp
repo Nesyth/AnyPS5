@@ -33,6 +33,7 @@ namespace AgcDriver::Graphics {
 
 
 class Recorder;
+struct ShaderResourcesTestAccess;
 
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
@@ -252,6 +253,14 @@ public:
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr) const;
     ReplayReason HeapReplayRefusal(std::span<const CompiledShader> shaders) const;
     void NoteHeapReplayCensus();
+    struct HeapReplayProof {
+        std::uint64_t epoch = 0;
+        bool overlay = false;
+    };
+    HeapReplayProof ReplayHeapStages(std::span<const CompiledShader> shaders, bool overlay);
+    std::shared_ptr<DrawBindings> PrepareReplayDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, std::span<const CompiledShader> shaders, const BdaResources* faultRecord, HeapReplayProof& proof);
+    void ConfirmHeapReplay(Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& bindings, const HeapReplayProof& proof);
+    std::uint64_t HeapStageWrites() const { return heapStageWrites; }
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
@@ -425,6 +434,7 @@ public:
 
 private:
     friend class AgcDriver::VulkanDevice;
+    friend struct ShaderResourcesTestAccess;
     bool refreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder);
     std::optional<std::size_t> shaderDataAllocation(const CompiledShader& shader) const;
     VkBuffer shaderDataBuffer(const CompiledShader& shader) const;
@@ -710,16 +720,43 @@ private:
     mutable std::uint64_t coverageSerial = 0;
     std::uint32_t heapSpan(HeapStageState::KeptSpan& kept, std::span<const std::uint32_t> words);
     struct HeapReplayStage {
+        const ShaderRecompiler::RecompileResult* program = nullptr;
+        bool ready = false;
+        bool replayable = false;
+        bool srt = false;
+        bool wordsFromProgram = false;
+        std::size_t dataBinding = 0;
+        std::size_t srtBinding = 0;
+        std::size_t userDwords = 0;
+        std::size_t dataDwords = 0;
+        std::uint64_t spanEpoch = 0;
+        std::vector<std::uint64_t> mask;
         std::vector<VkDeviceAddressRangeEXT> censusRun;
     };
     struct HeapReplay {
+        std::uint64_t writes = 0;
+        const BindlessHeap* heap = nullptr;
+        std::uint64_t heapIdentity = 0;
+        std::uint64_t switches = 0;
+        bool open = false;
+        std::vector<bool> addressed;
         std::array<std::uint64_t, 3> censusGenerations{};
         std::array<HeapReplayStage, ShaderRecompiler::RuntimeAbi::StageCount> stages;
     };
     std::unique_ptr<HeapReplay> heapReplay;
+    std::uint64_t heapStageWrites = 0;
+    bool heapReplaying = false;
     HeapReplay& heapReplayRecord();
     void heapStageMask(const CompiledShader& shader, std::size_t dataDwords, std::vector<std::uint64_t>& mask) const;
+    void seedHeapReplayStage(HeapReplayStage& stage, const CompiledShader& shader) const;
+    bool replayHeapStage(const CompiledShader& shader, HeapReplayStage& stage, std::uint64_t epoch, bool overlay);
+    bool keepReplaySpan(HeapStageState::KeptSpan& kept, bool proven, bool srt);
+    std::uint32_t writeReplaySpan(HeapStageState::KeptSpan& kept);
     void noteHeapStageCensus(const CompiledShader& shader, bool current) const;
+    void buildHeapStageWords(const CompiledShader& shader, const HeapStageState& state, std::span<const std::uint32_t> words, std::span<const std::uint32_t> userData, std::vector<std::uint32_t>& patched) const;
+    void verifyHeapReplay(std::span<const CompiledShader> shaders, DrawBindings* bindings, const HeapReplayProof& proof);
+    std::shared_ptr<DrawBindings> selectDrawSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, std::vector<std::size_t>& selected) const;
+    std::shared_ptr<DrawBindings> finishDrawBindings(Recorder& recorder, std::shared_ptr<DrawBindings> result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
     bool ownsHeapBinding(const Binding& binding, VkShaderStageFlags stageBit) const;
     VkImageView heapPlaceholderView(std::uint32_t kind) const;
     VkImageView heapSampledView(std::size_t index) const;

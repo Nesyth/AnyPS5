@@ -52,6 +52,7 @@ void registry() {
     RuntimeSwitches::Assign(RuntimeSwitch::NoBarrierBatch, true);
     Require(RuntimeSwitches::Set(RuntimeSwitch::NoBarrierBatch), "an assigned switch did not read back set");
     Require(RuntimeSwitches::Generation() == generation + 2, "flipping a switch back did not move the switch generation");
+    Require(RuntimeSwitches::Find("APS5_REPLAY_HEAP_STAGE") == RuntimeSwitch::ReplayHeapStage, "APS5_REPLAY_HEAP_STAGE is not a runtime switch");
 }
 
 void parse() {

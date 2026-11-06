@@ -8,6 +8,38 @@
 namespace AgcDriver::Graphics {
 
 bool ReplayCensusEnabled();
+int ReplayVerifyLevel();
+bool ReplayVerifyStrict();
+
+enum class ReplayEvent : std::size_t {
+    Draws,
+    Stages,
+    NewRecord,
+    NonReplayWrites,
+    Interrupted,
+    HeapOrSwitches,
+    NewProgram,
+    SlotsMoved,
+    ShapeChanged,
+    MaskedChange,
+    SubmitDuringRefresh,
+    SubmitBeforePass,
+    DataSame,
+    DataProven,
+    DataHeld,
+    DataRewritten,
+    DataPatched,
+    SrtSame,
+    SrtProven,
+    SrtHeld,
+    SrtRewritten,
+    SrtChanged,
+    RunsBuilt,
+    RunsSkipped,
+    Count
+};
+void NoteReplay(ReplayEvent event);
+std::uint64_t ReplayEvents(ReplayEvent event);
 
 enum class ReplayReason : std::size_t {
     Eligible,
@@ -40,6 +72,13 @@ void NoteReplayStageChange(ReplayStageChange change, bool srtChanged, bool words
 void NoteReplayRunChange(std::size_t changed, bool resized);
 void NoteReplayRingSubmit(std::size_t keptChunks);
 void NoteReplayGenerations(bool allocations, bool imports, bool slots);
+
+enum class ReplayField : std::size_t { Key, Slots, Block, Inputs, Srt, Offsets, Spans, Ring, Runs, Map, Count };
+const char* ReplayFieldName(ReplayField field);
+void NoteReplayCheck();
+bool NoteReplayMismatch(ReplayField field, const std::string& detail);
+std::uint64_t ReplayChecks();
+std::uint64_t ReplayMismatches(ReplayField field);
 
 void ReportHeapReplay(bool force);
 
