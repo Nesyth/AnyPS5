@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
+#include <optional>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
@@ -206,6 +208,8 @@ void Driver::run(std::uint32_t id) noexcept {
 #endif
                 };
 
+                std::optional<ThreadReport::WorkerStateScope> waiting;
+                if (id == 0 && !ready()) waiting.emplace(ThreadReport::WorkerState::NoSubmission);
                 while (!ready()) {
                     if (!completionsPending() || (id != 0 && Graphics::Recorder::PendingCompletionLabels() == 0)) {
                         const auto idleEpochAtCheck = idleEpoch.load(std::memory_order_acquire);
@@ -243,6 +247,7 @@ void Driver::run(std::uint32_t id) noexcept {
                     reapCompletionLabels();
                     lock.lock();
                 }
+                waiting.reset();
                 timing.Mark("idle_and_completion_poll");
                 rethrowFailure();
                 if (stopping || shutdownToken.stop_requested() || pending.empty()) {
@@ -262,6 +267,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 if (id == 0 && !submission.suspend) {
                     {
                         OrderHold hold{orderHolders};
+                        const ThreadReport::WorkerStateScope ordered(ThreadReport::WorkerState::Order);
                         const auto released = [&] { return failure || stopping || !waitFreeBefore(submission.received); };
                         StallWatch stall(id);
                         while (!released() && !poll(released)) stall.Check("order behind other queues for event", submission.received);
@@ -275,6 +281,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 if (submission.waitFree) {
                     {
                         OrderHold hold{orderHolders};
+                        const ThreadReport::WorkerStateScope ordered(ThreadReport::WorkerState::Order, id == 0);
                         const auto released = [&] { return failure || stopping || orderReleased(id, submission.received); };
                         StallWatch stall(id);
                         while (!released() && !poll(released)) stall.Check("order behind queue 0 for event", submission.received);

@@ -175,6 +175,7 @@ void Driver::execute(const Submission& submission) {
             ThreadReport::LeaveQueue0Worker(previous);
         }
     } submissionReport{ThreadReport::Enabled(), submission.queue == 0};
+    const ThreadReport::WorkerStateScope executing(ThreadReport::WorkerState::Packets, submission.queue == 0);
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
         Driver& driver;

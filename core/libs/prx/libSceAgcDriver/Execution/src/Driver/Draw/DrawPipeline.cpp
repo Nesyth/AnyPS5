@@ -198,7 +198,10 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     }
     if (jobs.size() >= depth && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
     const auto roomStart = jobs.size() >= depth && ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
+    std::optional<ThreadReport::WorkerStateScope> room;
+    if (roomStart != ThreadReport::Clock::time_point{} && ThreadReport::OnQueue0Worker()) room.emplace(ThreadReport::WorkerState::RoomFinisher);
     idle.wait(lock, [&] { return jobs.size() < depth; });
+    room.reset();
     if (roomStart != ThreadReport::Clock::time_point{}) {
         const bool worker = ThreadReport::OnQueue0Worker();
         ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherRoomWaits : ThreadReport::Count::OtherRoomWaits, 1);
@@ -237,6 +240,7 @@ void DrawFinisher::run() {
             failed = failure != nullptr;
         }
         const auto jobStart = ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
+        if (jobStart != ThreadReport::Clock::time_point{}) ThreadReport::FinisherBusy(true, jobStart);
         std::exception_ptr error;
         try {
             if (!failed) (*job)();
@@ -245,6 +249,7 @@ void DrawFinisher::run() {
         }
         if (jobStart != ThreadReport::Clock::time_point{}) {
             const auto end = ThreadReport::Clock::now();
+            ThreadReport::FinisherBusy(false, end);
             ThreadReport::Add(ThreadReport::Count::FinisherJobs, 1);
             ThreadReport::Add(ThreadReport::Count::FinisherJobNs, ThreadReport::Nanoseconds(jobStart, end));
             if (lastEnd != ThreadReport::Clock::time_point{}) ThreadReport::Add(ThreadReport::Count::FinisherIdleNs, ThreadReport::Nanoseconds(lastEnd, jobStart));
@@ -273,6 +278,7 @@ void DrawFinisher::Drain() {
     if (OnFinisherThread()) return;
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
     const auto drainStart = ThreadReport::Enabled() && Busy() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
+    const ThreadReport::WorkerStateScope draining(ThreadReport::WorkerState::DrainFinisher, drainStart != ThreadReport::Clock::time_point{} && ThreadReport::OnQueue0Worker());
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
     if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
@@ -380,6 +386,7 @@ void DrawPipeline::enqueue(Item item) {
     if (items.size() >= Depth()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
+        const ThreadReport::WorkerStateScope room(ThreadReport::WorkerState::RoomCommitter, ThreadReport::OnQueue0Worker());
         resumeAt = Depth() - 1;
         ++idleWaiters;
         idle.wait(lock, [&] { return items.size() <= resumeAt; });
@@ -468,6 +475,7 @@ void DrawPipeline::run() {
     std::optional<std::unique_lock<GuestMemory::GpuMutexType>> runHold;
     std::size_t runLength = 0;
     ThreadReport::Clock::time_point lastEnd{};
+    ThreadReport::StateTimes idleFrom{};
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
@@ -489,6 +497,7 @@ void DrawPipeline::run() {
             }
         }
         const auto start = std::chrono::steady_clock::now();
+        const auto idleTo = ThreadReport::Enabled() && lastEnd != ThreadReport::Clock::time_point{} ? ThreadReport::SnapshotStates(start) : ThreadReport::StateTimes{};
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
@@ -520,8 +529,12 @@ void DrawPipeline::run() {
             const auto end = start + std::chrono::nanoseconds(spent);
             ThreadReport::Add(isDraw ? ThreadReport::Count::CommitterDraws : ThreadReport::Count::CommitterOther, 1);
             ThreadReport::Add(isDraw ? ThreadReport::Count::CommitterDrawNs : ThreadReport::Count::CommitterOtherNs, spent);
-            if (lastEnd != ThreadReport::Clock::time_point{}) ThreadReport::Add(ThreadReport::Count::CommitterIdleNs, ThreadReport::Nanoseconds(lastEnd, start));
+            if (lastEnd != ThreadReport::Clock::time_point{}) {
+                ThreadReport::Add(ThreadReport::Count::CommitterIdleNs, ThreadReport::Nanoseconds(lastEnd, start));
+                ThreadReport::NoteCommitterIdle(idleFrom, idleTo);
+            }
             lastEnd = end;
+            idleFrom = ThreadReport::SnapshotStates(end);
             ThreadReport::Tick(end);
         }
         if (fatal != nullptr) runHold.reset();
@@ -576,6 +589,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     if (finisherBusy) DrawFinisher::Get().Drain();
     if (!Busy()) return;
+    const ThreadReport::WorkerStateScope draining(ThreadReport::WorkerState::DrainCommitter, ThreadReport::OnQueue0Worker());
     const auto start = std::chrono::steady_clock::now();
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);

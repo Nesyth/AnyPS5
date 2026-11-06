@@ -23,6 +23,13 @@ std::atomic<std::int64_t> windowStart{0};
 std::mutex printMutex;
 thread_local bool queue0Worker = false;
 thread_local Clock::time_point lastSubmissionEnd{};
+constexpr std::size_t StateCount = static_cast<std::size_t>(WorkerState::Count);
+std::array<std::atomic<std::uint64_t>, StateCount> workerStateNs{};
+std::atomic<std::uint32_t> workerState{0};
+std::atomic<std::int64_t> workerStateSince{0};
+std::atomic<std::uint64_t> finisherBusyNs{0};
+std::atomic<std::int64_t> finisherBusySince{0};
+std::array<Counter, StateCount + 1> committerIdleBy{};
 
 std::int64_t sinceEpoch(Clock::time_point now) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
@@ -48,6 +55,22 @@ void print(std::int64_t now, std::int64_t since, const char* why) {
         items(Count::WorkerFinisherDrains), ms(Count::WorkerFinisherDrainNs), items(Count::WorkerCommitterDrains), ms(Count::WorkerCommitterDrainNs),
         items(Count::WorkerFinisherRoomWaits), ms(Count::WorkerFinisherRoomNs), items(Count::WorkerCommitterRoomWaits), ms(Count::WorkerCommitterRoomNs),
         items(Count::OtherDrains), ms(Count::OtherDrainNs), items(Count::OtherRoomWaits), ms(Count::OtherRoomNs));
+    std::array<double, StateCount + 1> idle{};
+    for (std::size_t index = 0; index < idle.size(); ++index) idle[index] = static_cast<double>(committerIdleBy[index].value.exchange(0, std::memory_order_relaxed)) / 1e6;
+    const auto state = [&](WorkerState which) { return idle[static_cast<std::size_t>(which)]; };
+    AgcDriver::ProfilePrint_nid_no_patch(
+        "[idle] %.1f s%s: committer idle %.1f ms; meanwhile the queue-0 worker was executing packets %.1f ms, waiting on GPU memory %.1f ms, draining the finisher %.1f ms, draining the committer %.1f ms, waiting for finisher room %.1f ms, for committer room %.1f ms, waiting for a submission %.1f ms, ordered behind other queues %.1f ms, outside these %.1f ms; the finisher was running jobs %.1f ms of it\n",
+        seconds, why, ms(Count::CommitterIdleNs), state(WorkerState::Packets), state(WorkerState::WaitMemory), state(WorkerState::DrainFinisher), state(WorkerState::DrainCommitter),
+        state(WorkerState::RoomFinisher), state(WorkerState::RoomCommitter), state(WorkerState::NoSubmission), state(WorkerState::Order), state(WorkerState::Outside), idle[StateCount]);
+}
+
+void setWorkerState(WorkerState state) {
+    const auto now = sinceEpoch(Clock::now());
+    const auto old = workerState.load(std::memory_order_relaxed);
+    const auto since = workerStateSince.load(std::memory_order_relaxed);
+    if (since != 0 && now > since) workerStateNs[old].fetch_add(static_cast<std::uint64_t>(now - since), std::memory_order_relaxed);
+    workerStateSince.store(now, std::memory_order_relaxed);
+    workerState.store(static_cast<std::uint32_t>(state), std::memory_order_relaxed);
 }
 
 }
@@ -107,6 +130,46 @@ void WorkerSubmission(Clock::time_point start, Clock::time_point end) {
     if (lastSubmissionEnd != Clock::time_point{}) Add(Count::WorkerIdleNs, Nanoseconds(lastSubmissionEnd, start));
     lastSubmissionEnd = end;
     Tick(end);
+}
+
+WorkerStateScope::WorkerStateScope(WorkerState state, bool active) : active(active && Enabled()) {
+    if (!this->active) return;
+    previous = static_cast<WorkerState>(workerState.load(std::memory_order_relaxed));
+    setWorkerState(state);
+}
+
+WorkerStateScope::~WorkerStateScope() {
+    if (active) setWorkerState(previous);
+}
+
+StateTimes SnapshotStates(Clock::time_point now) {
+    StateTimes times;
+    const auto at = sinceEpoch(now);
+    for (std::size_t index = 0; index < StateCount; ++index) times.worker[index] = workerStateNs[index].load(std::memory_order_relaxed);
+    const auto current = workerState.load(std::memory_order_relaxed);
+    const auto since = workerStateSince.load(std::memory_order_relaxed);
+    if (since != 0 && at > since && current < StateCount) times.worker[current] += static_cast<std::uint64_t>(at - since);
+    times.finisherBusy = finisherBusyNs.load(std::memory_order_relaxed);
+    const auto busySince = finisherBusySince.load(std::memory_order_relaxed);
+    if (busySince != 0 && at > busySince) times.finisherBusy += static_cast<std::uint64_t>(at - busySince);
+    return times;
+}
+
+void NoteCommitterIdle(const StateTimes& from, const StateTimes& to) {
+    for (std::size_t index = 0; index < StateCount; ++index) {
+        if (to.worker[index] > from.worker[index]) committerIdleBy[index].value.fetch_add(to.worker[index] - from.worker[index], std::memory_order_relaxed);
+    }
+    if (to.finisherBusy > from.finisherBusy) committerIdleBy[StateCount].value.fetch_add(to.finisherBusy - from.finisherBusy, std::memory_order_relaxed);
+}
+
+void FinisherBusy(bool busy, Clock::time_point now) {
+    const auto at = sinceEpoch(now);
+    if (busy) {
+        finisherBusySince.store(at, std::memory_order_relaxed);
+        return;
+    }
+    const auto since = finisherBusySince.exchange(0, std::memory_order_relaxed);
+    if (since != 0 && at > since) finisherBusyNs.fetch_add(static_cast<std::uint64_t>(at - since), std::memory_order_relaxed);
 }
 
 void FlushForTest() {

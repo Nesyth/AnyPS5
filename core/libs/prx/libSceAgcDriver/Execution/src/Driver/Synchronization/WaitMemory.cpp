@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
@@ -113,6 +114,7 @@ void Driver::landPendingWaits(std::uint32_t queue) {
 }
 
 void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory) {
+    const ThreadReport::WorkerStateScope waitingState(ThreadReport::WorkerState::WaitMemory, ThreadReport::OnQueue0Worker());
 
     auto start = std::chrono::steady_clock::now();
     auto lastDone = packetsDone.load();
