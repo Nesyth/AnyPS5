@@ -59,8 +59,8 @@ void print(std::int64_t now, std::int64_t since, const char* why) {
     for (std::size_t index = 0; index < idle.size(); ++index) idle[index] = static_cast<double>(committerIdleBy[index].value.exchange(0, std::memory_order_relaxed)) / 1e6;
     const auto state = [&](WorkerState which) { return idle[static_cast<std::size_t>(which)]; };
     AgcDriver::ProfilePrint_nid_no_patch(
-        "[idle] %.1f s%s: committer idle %.1f ms; meanwhile the queue-0 worker was executing packets %.1f ms, waiting on GPU memory %.1f ms, draining the finisher %.1f ms, draining the committer %.1f ms, waiting for finisher room %.1f ms, for committer room %.1f ms, waiting for a submission %.1f ms, ordered behind other queues %.1f ms, outside these %.1f ms; the finisher was running jobs %.1f ms of it\n",
-        seconds, why, ms(Count::CommitterIdleNs), state(WorkerState::Packets), state(WorkerState::WaitMemory), state(WorkerState::DrainFinisher), state(WorkerState::DrainCommitter),
+        "[idle] %.1f s%s: committer idle %.1f ms; meanwhile the queue-0 worker was in draw packets %.1f ms and dispatch packets %.1f ms (net of the waits below), executing other packets %.1f ms, waiting on GPU memory %.1f ms, draining the finisher %.1f ms, draining the committer %.1f ms, waiting for finisher room %.1f ms, for committer room %.1f ms, waiting for a submission %.1f ms, ordered behind other queues %.1f ms, outside these %.1f ms; the finisher was running jobs %.1f ms of it\n",
+        seconds, why, ms(Count::CommitterIdleNs), state(WorkerState::Draw), state(WorkerState::Dispatch), state(WorkerState::Packets), state(WorkerState::WaitMemory), state(WorkerState::DrainFinisher), state(WorkerState::DrainCommitter),
         state(WorkerState::RoomFinisher), state(WorkerState::RoomCommitter), state(WorkerState::NoSubmission), state(WorkerState::Order), state(WorkerState::Outside), idle[StateCount]);
 }
 

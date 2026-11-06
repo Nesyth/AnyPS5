@@ -54,7 +54,7 @@ bool EnterQueue0Worker(bool queue0);
 void LeaveQueue0Worker(bool previous);
 void WorkerSubmission(Clock::time_point start, Clock::time_point end);
 
-enum class WorkerState : std::uint32_t { Outside, Packets, WaitMemory, DrainFinisher, DrainCommitter, RoomFinisher, RoomCommitter, NoSubmission, Order, Count };
+enum class WorkerState : std::uint32_t { Outside, Packets, WaitMemory, DrainFinisher, DrainCommitter, RoomFinisher, RoomCommitter, NoSubmission, Order, Draw, Dispatch, Count };
 
 class WorkerStateScope {
 public:

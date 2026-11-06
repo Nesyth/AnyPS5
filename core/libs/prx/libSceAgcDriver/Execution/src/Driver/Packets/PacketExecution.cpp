@@ -139,6 +139,7 @@ std::optional<std::uint32_t> Driver::releaseInterrupt(std::span<const std::uint3
 
 template <typename TWork>
 void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
+    const ThreadReport::WorkerStateScope state(bucket == &WorkerProfile::dispatchMs ? ThreadReport::WorkerState::Dispatch : ThreadReport::WorkerState::Draw, bucket != &WorkerProfile::waitMs && ThreadReport::OnQueue0Worker());
     static const bool report = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!report) {
         work();
