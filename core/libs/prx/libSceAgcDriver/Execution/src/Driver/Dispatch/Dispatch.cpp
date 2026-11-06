@@ -45,7 +45,8 @@ void NoteItemFallback(ItemFallback reason) {
 
 void ReportDispatchItems(bool profile) {
     static auto lastReport = std::chrono::steady_clock::now();
-    if (!profile) return;
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!profile && !stats) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
     lastReport = now;
@@ -363,6 +364,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (!readsClear) NoteItemFallback(ItemFallback::Reads);
         }
         if (!readsClear && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        ReportDispatchItems(profile);
     }
     if (fromAhead) {
         compiledResult = std::move(ahead.compiledResult);
