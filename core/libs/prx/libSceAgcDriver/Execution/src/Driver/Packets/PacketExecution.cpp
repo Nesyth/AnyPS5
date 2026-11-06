@@ -158,15 +158,23 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 
 void Driver::execute(const Submission& submission) {
     struct SubmissionReport {
+        bool reported = false;
+        bool queue0 = false;
+        bool previous = false;
         ThreadReport::Clock::time_point start;
-        ~SubmissionReport() {
-            if (start == ThreadReport::Clock::time_point{}) return;
-            const auto end = ThreadReport::Clock::now();
-            ThreadReport::Add(ThreadReport::Count::WorkerSubmissions, 1);
-            ThreadReport::Add(ThreadReport::Count::WorkerSubmissionNs, ThreadReport::Nanoseconds(start, end));
-            ThreadReport::Tick(end);
+        SubmissionReport(bool reported, bool queue0) : reported(reported), queue0(queue0) {
+            if (!reported) return;
+            previous = ThreadReport::EnterQueue0Worker(queue0);
+            if (queue0) start = ThreadReport::Clock::now();
         }
-    } submissionReport{submission.queue == 0 && ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{}};
+        SubmissionReport(const SubmissionReport&) = delete;
+        SubmissionReport& operator=(const SubmissionReport&) = delete;
+        ~SubmissionReport() {
+            if (!reported) return;
+            if (queue0) ThreadReport::WorkerSubmission(start, ThreadReport::Clock::now());
+            ThreadReport::LeaveQueue0Worker(previous);
+        }
+    } submissionReport{ThreadReport::Enabled(), submission.queue == 0};
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
         Driver& driver;

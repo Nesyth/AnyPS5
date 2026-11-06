@@ -200,8 +200,9 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     const auto roomStart = jobs.size() >= depth && ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
     idle.wait(lock, [&] { return jobs.size() < depth; });
     if (roomStart != ThreadReport::Clock::time_point{}) {
-        ThreadReport::Add(ThreadReport::Count::WorkerFinisherRoomWaits, 1);
-        ThreadReport::Add(ThreadReport::Count::WorkerFinisherRoomNs, ThreadReport::Nanoseconds(roomStart, ThreadReport::Clock::now()));
+        const bool worker = ThreadReport::OnQueue0Worker();
+        ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherRoomWaits : ThreadReport::Count::OtherRoomWaits, 1);
+        ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherRoomNs : ThreadReport::Count::OtherRoomNs, ThreadReport::Nanoseconds(roomStart, ThreadReport::Clock::now()));
     }
     jobs.push_back(std::move(job));
     pending.push_back(std::move(held));
@@ -276,8 +277,9 @@ void DrawFinisher::Drain() {
     std::unique_lock lock(mutex);
     if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
     if (drainStart != ThreadReport::Clock::time_point{}) {
-        ThreadReport::Add(ThreadReport::Count::FinisherDrains, 1);
-        ThreadReport::Add(ThreadReport::Count::FinisherDrainNs, ThreadReport::Nanoseconds(drainStart, ThreadReport::Clock::now()));
+        const bool worker = ThreadReport::OnQueue0Worker();
+        ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherDrains : ThreadReport::Count::OtherDrains, 1);
+        ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherDrainNs : ThreadReport::Count::OtherDrainNs, ThreadReport::Nanoseconds(drainStart, ThreadReport::Clock::now()));
     }
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
@@ -387,8 +389,9 @@ void DrawPipeline::enqueue(Item item) {
         fullWaitNs += waited;
         if (ThreadReport::Enabled()) {
             const bool finisher = DrawFinisher::OnFinisherThread();
-            ThreadReport::Add(finisher ? ThreadReport::Count::FinisherRoomWaits : ThreadReport::Count::WorkerCommitterRoomWaits, 1);
-            ThreadReport::Add(finisher ? ThreadReport::Count::FinisherRoomNs : ThreadReport::Count::WorkerCommitterRoomNs, waited);
+            const bool worker = !finisher && ThreadReport::OnQueue0Worker();
+            ThreadReport::Add(finisher ? ThreadReport::Count::FinisherRoomWaits : worker ? ThreadReport::Count::WorkerCommitterRoomWaits : ThreadReport::Count::OtherRoomWaits, 1);
+            ThreadReport::Add(finisher ? ThreadReport::Count::FinisherRoomNs : worker ? ThreadReport::Count::WorkerCommitterRoomNs : ThreadReport::Count::OtherRoomNs, waited);
         }
         rethrowFailure();
     }
@@ -585,8 +588,10 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     const auto waited = elapsedNs(start);
     drainWaitNs[index] += waited;
     if (ThreadReport::Enabled()) {
-        ThreadReport::Add(ThreadReport::Count::CommitterDrains, 1);
-        ThreadReport::Add(ThreadReport::Count::CommitterDrainNs, waited);
+        const bool finisher = DrawFinisher::OnFinisherThread();
+        const bool worker = !finisher && ThreadReport::OnQueue0Worker();
+        ThreadReport::Add(finisher ? ThreadReport::Count::FinisherCommitterDrains : worker ? ThreadReport::Count::WorkerCommitterDrains : ThreadReport::Count::OtherDrains, 1);
+        ThreadReport::Add(finisher ? ThreadReport::Count::FinisherCommitterDrainNs : worker ? ThreadReport::Count::WorkerCommitterDrainNs : ThreadReport::Count::OtherDrainNs, waited);
     }
     rethrowFailure();
 }
