@@ -6987,6 +6987,16 @@ std::array<std::uint32_t, 2u * ShaderRecompiler::RuntimeAbi::StageCount> ShaderR
         if (!ringDescriptorStages[stage]) continue;
         RingDescriptors moved;
         offsets[DataOffsetIndex(stage, ShaderRecompiler::RuntimeAbi::Binding::FlattenedSrt)] = ringDescriptors(stage, overrides, moved);
+        if (ReplayCensusEnabled() && heapReplay != nullptr) {
+            auto& last = heapReplay->stages[stage].censusRun;
+            if (!last.empty()) {
+                const bool resized = last.size() != moved.ranges.size();
+                std::size_t changed = 0;
+                for (std::size_t entry = 0; !resized && entry < last.size(); ++entry) changed += last[entry].address != moved.ranges[entry].address || last[entry].size != moved.ranges[entry].size ? 1u : 0u;
+                NoteReplayRunChange(changed, resized);
+            }
+            last = moved.ranges;
+        }
     }
     return offsets;
 }
@@ -7559,6 +7569,7 @@ void ShaderResources::writeHeapStage(const CompiledShader& shader) {
     static const bool verifySlots = std::getenv("APS5_VERIFY_GPU_HEAP") != nullptr;
     if (verifySlots) verifyHeapSlots(heap, stageState, stageBit);
     slotsCost.Stop();
+    if (ReplayCensusEnabled() && heapReplay != nullptr) noteHeapStageCensus(shader, current);
 
     HeapCostScope dataCost(HeapCost::StageData);
     const std::size_t dataIndex = DataOffsetIndex(stageIndex, Abi::Binding::ShaderData);
@@ -7641,6 +7652,91 @@ void ShaderResources::writeHeapStage(const CompiledShader& shader) {
     heapOffsets[flatIndex] = ringDescriptors(stageIndex, nullptr, kept);
     if (kept.first != first || !std::ranges::equal(before, kept.ranges, [](const auto& a, const auto& b) { return a.address == b.address && a.size == b.size; }))
         throw std::runtime_error("AGC graphics: a GPU-mode stage's kept buffer descriptor run would bind other buffers although its inputs did not change");
+}
+
+ReplayReason ShaderResources::HeapReplayRefusal(std::span<const CompiledShader> shaders) const {
+    if (usesBda || bda != nullptr) return ReplayReason::AddressBased;
+    if (guestMemory.HoldsLease()) return ReplayReason::Lease;
+    if (!reusable) return ReplayReason::NotReusable;
+    if (spaceReuse) return ReplayReason::SpaceReuse;
+    if (guestMemory.HasCopiedWrites()) return ReplayReason::CopiedWrites;
+    for (const auto& shader : shaders) {
+        if (HeapShader(shader) && !(shader.program->dataAddressPush && context.heapBufferDescriptors)) return ReplayReason::NotRingStage;
+    }
+    return ReplayReason::Eligible;
+}
+
+ShaderResources::HeapReplay& ShaderResources::heapReplayRecord() {
+    if (heapReplay == nullptr) {
+        heapReplay = std::make_unique<HeapReplay>();
+    }
+    return *heapReplay;
+}
+
+void ShaderResources::NoteHeapReplayCensus() {
+    auto& record = heapReplayRecord();
+    const std::array<std::uint64_t, 3> now{GuestAllocations::GuestAllocationsGeneration_nid_postfix(), HostImportSetGeneration(), BindlessHeap::For(context).SlotSerial()};
+    if (record.censusGenerations != std::array<std::uint64_t, 3>{}) NoteReplayGenerations(now[0] != record.censusGenerations[0], now[1] != record.censusGenerations[1], now[2] != record.censusGenerations[2]);
+    record.censusGenerations = now;
+}
+
+void ShaderResources::heapStageMask(const CompiledShader& shader, std::size_t dataDwords, std::vector<std::uint64_t>& mask) const {
+    namespace Abi = ShaderRecompiler::RuntimeAbi;
+    const auto& program = *shader.program;
+    const auto& state = heapStages[HeapStageIndex(shader.stage)];
+    mask.assign((dataDwords + 63u) / 64u, 0u);
+    const auto mark = [&](std::size_t dword) {
+        if (dword < dataDwords) mask[dword / 64u] |= std::uint64_t{1} << (dword % 64u);
+    };
+    for (const auto& patch : state.dataPatches) mark(patch.first / sizeof(std::uint32_t));
+    constexpr std::size_t metadataWords = sizeof(Abi::ResourceMetadata) / sizeof(std::uint32_t);
+    for (std::uint32_t image = 0; image < program.runtimeImageCount; ++image) {
+        for (std::size_t word = 0; word < metadataWords; ++word) mark(program.imageMetadataDword + image * metadataWords + word);
+    }
+    for (const auto& word : program.heapSlotWords) mark(word.dword);
+    if (program.registrationModule) {
+        for (std::size_t index = 0; index < state.samplerSlots.size(); ++index) mark(program.samplerSlotDword + index);
+    }
+}
+
+void ShaderResources::noteHeapStageCensus(const CompiledShader& shader, bool current) const {
+    const auto& program = *shader.program;
+    const auto& state = heapStages[HeapStageIndex(shader.stage)];
+    const ShaderRecompiler::DescriptorBinding* data = nullptr;
+    const ShaderRecompiler::DescriptorBinding* srt = nullptr;
+    for (const auto& binding : program.bindings) {
+        if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData) data = &binding;
+        else if (binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt) srt = &binding;
+    }
+    if (data == nullptr) return;
+    const auto& words = DrawGuestWords(shader, *data);
+    const auto userData = shader.heap != nullptr ? std::span<const std::uint32_t>(shader.heap->userData) : std::span<const std::uint32_t>{};
+    bool srtChanged = false;
+    if (srt != nullptr) {
+        const auto& srtWords = shader.heap != nullptr && !shader.heap->flattenedSrt.empty() ? shader.heap->flattenedSrt : DrawGuestWords(shader, *srt);
+        srtChanged = !std::ranges::equal(state.flat.words, srtWords);
+    }
+    const auto size = words.size();
+    auto change = ReplayStageChange::Same;
+    if (!current || state.dataInput.size() != size + userData.size()) {
+        change = ReplayStageChange::Reshaped;
+    } else if (!std::equal(words.begin(), words.end(), state.dataInput.begin())) {
+        change = ReplayStageChange::WordsChanged;
+    } else {
+        thread_local std::vector<std::uint64_t>* maskSlot = nullptr;
+        auto& mask = ShaderRecompiler::ThreadOwned(maskSlot);
+        heapStageMask(shader, size, mask);
+        std::size_t changed = 0;
+        bool masked = false;
+        const auto copied = std::min(userData.size(), size);
+        for (std::size_t index = 0; index < copied; ++index) {
+            if (userData[index] == state.dataInput[size + index]) continue;
+            ++changed;
+            masked = masked || ((mask[index / 64u] >> (index % 64u)) & 1u) != 0u;
+        }
+        change = masked ? ReplayStageChange::Masked : changed == 0 ? ReplayStageChange::Same : changed == 1 ? ReplayStageChange::One : changed <= 4 ? ReplayStageChange::UpToFour : changed <= 16 ? ReplayStageChange::UpToSixteen : ReplayStageChange::More;
+    }
+    NoteReplayStageChange(change, srtChanged, &words == &data->guestDescriptor);
 }
 
 namespace {

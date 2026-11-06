@@ -132,6 +132,7 @@ std::string TakeProofBreakReport();
 // and the collect epoch bumps since the last report ([proof-breaks] line).
 std::string SweepCostReport();
 void MarkProofThread();
+bool OnProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();

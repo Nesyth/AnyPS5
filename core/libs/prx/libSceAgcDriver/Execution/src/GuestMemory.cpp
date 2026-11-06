@@ -2096,6 +2096,10 @@ void MarkProofThread() {
     proofThread = true;
 }
 
+bool OnProofThread() {
+    return proofThread;
+}
+
 std::string SweepCostReport() {
     static std::uint64_t reportedBumps = 0;
     std::array<std::uint64_t, 6> out{};

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HeapReplay.hpp"
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -65,12 +66,15 @@ void Tick(Clock::time_point now) {
     }
     if (at - start < WindowNs || !windowStart.compare_exchange_strong(start, at, std::memory_order_relaxed)) return;
     print(at, start, "");
+    Graphics::ReportHeapReplay(true);
 }
 
 void Phase() {
-    if (!Enabled()) return;
-    const auto at = sinceEpoch(Clock::now());
-    print(at, windowStart.exchange(at, std::memory_order_relaxed), " to the A/B phase event");
+    if (Enabled()) {
+        const auto at = sinceEpoch(Clock::now());
+        print(at, windowStart.exchange(at, std::memory_order_relaxed), " to the A/B phase event");
+    }
+    Graphics::ReportHeapReplay(true);
 }
 
 }

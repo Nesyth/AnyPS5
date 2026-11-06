@@ -2127,7 +2127,7 @@ void noteLeanCoverage(const ShaderResources& resources, std::span<const ShaderRe
     std::fprintf(stderr, "[lean-coverage] template hits (10 s): %llu; same template as the previous draw %llu; template already used in the open batch %llu; moved buffers per hit 0: %llu, 1: %llu, 2: %llu, 3+: %llu; moved bytes %llu\n", taken[Hits], taken[BackToBack], taken[SameBatch], taken[Moved0], taken[Moved1], taken[Moved2], taken[Moved3], taken[MovedBytes]);
 }
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const std::vector<std::uint32_t>* contentKey) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const std::vector<std::uint32_t>* contentKey, ReplayReason replayDraw) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -2201,7 +2201,13 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 noteLeanCoverage(*resolved.resources, resolved.moved, recorder);
-                if (resolved.resources->HeapStage()) resolved.resources->RefreshHeapStage(shaders);
+                if (resolved.resources->HeapStage()) {
+                    if (ReplayCensusEnabled() && replayDraw != ReplayReason::Count) {
+                        NoteReplayReason(replayDraw == ReplayReason::Eligible ? resolved.resources->HeapReplayRefusal(shaders) : replayDraw);
+                        resolved.resources->NoteHeapReplayCensus();
+                    }
+                    resolved.resources->RefreshHeapStage(shaders);
+                }
                 outcome.addressBased = resolved.resources->HoldsLease();
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
@@ -3495,6 +3501,25 @@ bool storesIntoResident(const ShaderResources& resources, const StorageTexture& 
     return std::ranges::any_of(resources.StorageImages(), [&](const std::pair<VkImage, bool>& image) { return image.first == resident.Image() && image.second; });
 }
 
+ReplayReason heapReplayDrawReason(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawInputs& inputs, std::span<const TargetBinding> targets, bool stencil, bool recordable) {
+    static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!recordable) return ReplayReason::NotRecordable;
+    if (drawTransitions) return ReplayReason::Transitions;
+    if (stencil) return ReplayReason::Stencil;
+    if (draw.indirect) return ReplayReason::Indirect;
+    if (state.stages.mesh) return ReplayReason::Mesh;
+    if (state.stages.tessellation || state.tessellationCapture != nullptr) return ReplayReason::Tessellation;
+    if (state.quadList) return ReplayReason::QuadList;
+    if (StripPatches(state, shaders)) return ReplayReason::StripPatches;
+    if (inputs.listRestartPrimitive != 0 || !inputs.restartTable.empty()) return ReplayReason::Restart;
+    if (std::ranges::any_of(targets, [](const TargetBinding& binding) { return binding.multisampled || binding.proxied || binding.stagedTemporary != nullptr || binding.color.partialWriteMask != 0; })) return ReplayReason::Targets;
+    if (CaptureInputsEnabled()) return ReplayReason::Capture;
+    if (profile) return ReplayReason::Profile;
+    if (!GuestMemory::OnProofThread()) return ReplayReason::Worker;
+    return ReplayReason::Eligible;
+}
+
 bool prepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, PreparedDraw& prepared) {
     auto*& recipeOut = prepared.recipeOut;
     auto& stencilReferences = prepared.stencilReferences;
@@ -3691,7 +3716,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto* recorder = prepared.recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     auto& resolved = prepared.resolved;
-    resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared.contentKey);
+    const auto replayDraw = ReplayCensusEnabled() ? heapReplayDrawReason(state, draw, shaders, inputs, targets, !stencilReferences.empty(), recordable) : ReplayReason::Count;
+    resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared.contentKey, replayDraw);
     if (stopAfterResolve.load(std::memory_order_relaxed) != 0) {
         const auto stop = stopAfterResolve.exchange(0, std::memory_order_relaxed);
         if (stop == 1) return false;

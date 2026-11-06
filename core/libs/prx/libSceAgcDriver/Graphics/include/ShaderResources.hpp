@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HeapReplay.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
@@ -249,6 +250,8 @@ public:
     void CompleteDrawUse(const DrawUse& use) const;
     void BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const;
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr) const;
+    ReplayReason HeapReplayRefusal(std::span<const CompiledShader> shaders) const;
+    void NoteHeapReplayCensus();
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
@@ -706,6 +709,17 @@ private:
     std::array<HeapStageState, ShaderRecompiler::RuntimeAbi::StageCount> heapStages;
     mutable std::uint64_t coverageSerial = 0;
     std::uint32_t heapSpan(HeapStageState::KeptSpan& kept, std::span<const std::uint32_t> words);
+    struct HeapReplayStage {
+        std::vector<VkDeviceAddressRangeEXT> censusRun;
+    };
+    struct HeapReplay {
+        std::array<std::uint64_t, 3> censusGenerations{};
+        std::array<HeapReplayStage, ShaderRecompiler::RuntimeAbi::StageCount> stages;
+    };
+    std::unique_ptr<HeapReplay> heapReplay;
+    HeapReplay& heapReplayRecord();
+    void heapStageMask(const CompiledShader& shader, std::size_t dataDwords, std::vector<std::uint64_t>& mask) const;
+    void noteHeapStageCensus(const CompiledShader& shader, bool current) const;
     bool ownsHeapBinding(const Binding& binding, VkShaderStageFlags stageBit) const;
     VkImageView heapPlaceholderView(std::uint32_t kind) const;
     VkImageView heapSampledView(std::size_t index) const;

@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DescriptorHeapObjects.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HeapReplay.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
@@ -1196,12 +1197,15 @@ VkDeviceSize BindlessHeap::RingOffset() const {
 
 void BindlessHeap::Submitted(Recorder& recorder, std::uint64_t serial) {
     std::lock_guard lock(mutex);
+    std::size_t kept = 0;
     for (std::size_t index = 0; index < ringChunks.size(); ++index) {
         if (!ringChunks[index].open && index != ringChunk) continue;
+        if (index != ringChunk) ++kept;
         ringChunks[index].recorder = &recorder;
         ringChunks[index].serial = serial;
         ringChunks[index].open = index == ringChunk;
     }
+    if (ReplayCensusEnabled()) NoteReplayRingSubmit(kept);
 }
 
 BindlessHeap::Counts BindlessHeap::Statistics() const {
