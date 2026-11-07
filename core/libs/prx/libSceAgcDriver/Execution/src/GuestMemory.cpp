@@ -3123,8 +3123,20 @@ void GuardRead(std::uint64_t address, std::size_t bytes) {
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
 }
 
+struct UnflushedReadsSlot {};
+using UnflushedReads = HostThreadSlot<bool, UnflushedReadsSlot>;
+
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
+    if (UnflushedReads::Get()) return;
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
+}
+
+UnflushedReadScope::UnflushedReadScope(bool active) : previous(UnflushedReads::Get()) {
+    if (active) UnflushedReads::Set(true);
+}
+
+UnflushedReadScope::~UnflushedReadScope() {
+    UnflushedReads::Set(previous);
 }
 
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {

@@ -39,6 +39,7 @@ enum class RuntimeSwitch : std::size_t {
     ArmWide,
     ArmSpans,
     ReplayBind,
+    XpUploadNoSync,
     Count,
 };
 
