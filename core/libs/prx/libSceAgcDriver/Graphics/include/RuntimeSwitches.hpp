@@ -41,6 +41,7 @@ enum class RuntimeSwitch : std::size_t {
     ReplayBind,
     XpUploadNoSync,
     XpNoEagerStore,
+    AsyncSubmit,
     Count,
 };
 

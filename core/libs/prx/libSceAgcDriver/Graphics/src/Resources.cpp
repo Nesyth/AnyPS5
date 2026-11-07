@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/QueueSubmitter.hpp"
 #include <algorithm>
 #include <array>
 #include <exception>
@@ -416,7 +417,10 @@ CommandBatch::~CommandBatch() {
 void CommandBatch::release() noexcept {
     if (pending) {
         auto result = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, fence);
-        if (result == VK_NOT_READY) result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+        if (result == VK_NOT_READY) {
+            const QueueAccess access(context.queue);
+            result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+        }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) std::terminate();
     }
     if (commands) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
@@ -441,7 +445,10 @@ void CommandBatch::Submit() {
     submission.pCommandBuffers = &commands;
     timing.Mark("command_end");
     DestroyDeferredAtIdle(context);
-    Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
+    {
+        const QueueAccess access(context.queue);
+        Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
+    }
     pending = true;
     submitted = true;
     timing.Mark("queue_submit");
