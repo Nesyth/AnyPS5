@@ -6970,6 +6970,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
     requireGuestBuffers(moved);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE && !heapStage) || (usesBda && !spaceReuse)) return {};
     prepareFaultSlot();
+    bindingsChecked = heapStage && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind);
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
     guestMemory.InPlaceReads(reads);
@@ -7276,8 +7277,10 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
 }
 
 void ShaderResources::BindDescriptorHeaps(VkCommandBuffer commands) const {
-    requireGuestBuffers();
-    prepareFaultSlot();
+    if (!std::exchange(bindingsChecked, false)) {
+        requireGuestBuffers();
+        prepareFaultSlot();
+    }
     BindlessHeap::For(context).BindDescriptorHeaps(commands);
 }
 
@@ -8085,6 +8088,10 @@ bool ShaderResources::replayHeapStage(const CompiledShader& shader, HeapReplaySt
         if (userData[index] == recorded[index]) continue;
         if (((stage.mask[index / 64u] >> (index % 64u)) & 1u) != 0u) return rebuild(ReplayEvent::MaskedChange);
         changed.push_back(static_cast<std::uint32_t>(index));
+    }
+    if (auto& overlayWords = stageDataWords[stageIndex]; !overlayWords.empty() && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind)) {
+        if (overlayWords.size() != size) return rebuild(ReplayEvent::ShapeChanged);
+        for (const auto index : changed) overlayWords[index] = userData[index];
     }
     if (fromProgram) stage.wordsFromProgram = true;
     const bool proven = stage.spanEpoch == epoch;
