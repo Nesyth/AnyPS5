@@ -1,12 +1,9 @@
-add_test_executable(agc_vertex_input_tests EXCLUDE_FROM_ALL tests/VertexInput.cpp Execution/src/Mutex.cpp)
+add_test_executable(agc_vertex_input_tests EXCLUDE_FROM_ALL tests/VertexInput.cpp)
 target_include_directories(agc_vertex_input_tests PRIVATE
         ${LIBS_INCLUDE_DIR}
         ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
 )
 target_link_libraries(agc_vertex_input_tests PRIVATE shader_recompiler_agc_driver libc)
-if(WIN32)
-    target_link_libraries(agc_vertex_input_tests PRIVATE synchronization)
-endif()
 set_target_properties(agc_vertex_input_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_vertex_input_tests)
 

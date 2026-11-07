@@ -2,16 +2,12 @@ if(BUILD_TESTING)
     add_test_executable(agc_preparation_inputs_tests
             tests/PreparationInputs.cpp
             Execution/src/Driver/Shaders/ShaderDiagnostics.cpp
-            Execution/src/Mutex.cpp
             ${CMAKE_SOURCE_DIR}/core/shader/recompiler/ControlFlow/src/RequestSerializer.cpp)
     target_include_directories(agc_preparation_inputs_tests PRIVATE
             ${LIBS_INCLUDE_DIR}
             $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
             ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
     target_link_libraries(agc_preparation_inputs_tests PRIVATE libc)
-    if(WIN32)
-        target_link_libraries(agc_preparation_inputs_tests PRIVATE synchronization)
-    endif()
     configure_windows_unwind(agc_preparation_inputs_tests)
     foreach(mode enabled disabled selected failure concurrent write-failure capture-write-failure)
         add_test(NAME agc_preparation_inputs_${mode} COMMAND agc_preparation_inputs_tests ${mode})
@@ -57,9 +53,9 @@ endfunction()
 ensure_agc_glslang()
 
 if(BUILD_TESTING AND WIN32)
-    add_test_executable(agc_process_sampler_stack_tests tests/ProcessSamplerStack.cpp Execution/src/WorkerSampler.cpp Execution/src/Mutex.cpp)
+    add_test_executable(agc_process_sampler_stack_tests tests/ProcessSamplerStack.cpp Execution/src/WorkerSampler.cpp)
     target_include_directories(agc_process_sampler_stack_tests PRIVATE ${LIBS_INCLUDE_DIR})
-    target_link_libraries(agc_process_sampler_stack_tests PRIVATE libc synchronization)
+    target_link_libraries(agc_process_sampler_stack_tests PRIVATE libc)
     configure_windows_unwind(agc_process_sampler_stack_tests)
     add_test(NAME agc_process_sampler_stack COMMAND agc_process_sampler_stack_tests)
     set_tests_properties(agc_process_sampler_stack PROPERTIES TIMEOUT 20 ENVIRONMENT_MODIFICATION
@@ -428,7 +424,6 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Mutex.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -583,7 +578,7 @@ target_link_libraries(libSceAgcDriver PRIVATE
         ${CMAKE_DL_LIBS}
 )
 if(WIN32)
-    target_link_libraries(libSceAgcDriver PRIVATE pdh synchronization)
+    target_link_libraries(libSceAgcDriver PRIVATE pdh)
 endif()
 target_include_directories(libSceAgcDriver SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -603,7 +598,7 @@ if(WIN32)
 endif()
 
 if(WIN32)
-    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Mutex.cpp PROPERTIES COMPILE_DEFINITIONS _WIN32_WINNT=0x0602)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp PROPERTIES COMPILE_DEFINITIONS _WIN32_WINNT=0x0602)
 endif()
 
 foreach(runtimeLinkFlag IN ITEMS -static-libgcc -static-libstdc++ -static)
