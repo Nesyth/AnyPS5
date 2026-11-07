@@ -401,6 +401,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return *verdict;
     }
     phaseTiming.Phase(DrawRowPrecheck);
+    static std::atomic<std::uint64_t> halfWorkerDraws{0};
+    if (pipelined && !drawParameters.indirect && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpHalfWorkerDraws) && deferredLabels().labels.empty() && (halfWorkerDraws.fetch_add(1, std::memory_order_relaxed) & 1u) != 0) return drawn();
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
 
