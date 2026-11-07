@@ -50,8 +50,16 @@ struct ClearOnExit {
 }
 
 namespace {
-thread_local bool finisherThread = false;
-thread_local bool finisherProducer = false;
+struct FinisherThreadSlot {};
+struct FinisherProducerSlot {};
+struct FinisherSeqSlot {};
+using FinisherThread = HostThreadSlot<bool, FinisherThreadSlot>;
+using FinisherProducer = HostThreadSlot<bool, FinisherProducerSlot>;
+using FinisherSeq = HostThreadSlot<std::uint64_t, FinisherSeqSlot>;
+
+bool secondFinisher() {
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SecondFinisher);
+}
 }
 
 DrawFinisher& DrawFinisher::Get() {
@@ -84,7 +92,7 @@ bool DrawFinisher::Overlap() {
 }
 
 bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
-    if (!Busy() || !finisherProducer) return false;
+    if (!Busy() || !FinisherProducer::Get()) return false;
     std::lock_guard lock(mutex);
     for (const auto& held : pending) {
         if (held.unknown) return true;
@@ -96,7 +104,7 @@ bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
 }
 
 DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value) {
-    if (!Busy() || !finisherProducer) return LabelLookup::NotHeld;
+    if (!Busy() || !FinisherProducer::Get()) return LabelLookup::NotHeld;
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
     for (auto held = pending.rbegin(); held != pending.rend(); ++held) {
@@ -112,7 +120,7 @@ DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std:
 }
 
 bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
-    if (!Busy() || !finisherProducer) return false;
+    if (!Busy() || !FinisherProducer::Get()) return false;
     std::lock_guard lock(mutex);
     for (const auto& held : pending) {
         if (held.unknown) return true;
@@ -126,7 +134,7 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
 }
 
 bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
-    if (!Busy() || !finisherProducer) return false;
+    if (!Busy() || !FinisherProducer::Get()) return false;
     const bool precise = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PreciseLookupDrain);
     std::lock_guard lock(mutex);
     return std::any_of(pending.begin(), pending.end(), [&](const Pending& held) { return (held.key == key || (shape != 0 && held.shape == shape)) && (held.inserts || !precise); });
@@ -173,7 +181,21 @@ std::string DrawFinisher::DrainText() {
 }
 
 bool DrawFinisher::OnFinisherThread() {
-    return finisherThread;
+    return FinisherThread::Get();
+}
+
+DrawFinisher::Slot* DrawFinisher::untaken() {
+    for (auto& slot : jobs) {
+        if (!slot.taken) return &slot;
+    }
+    return nullptr;
+}
+
+void DrawFinisher::AwaitTurn() {
+    const auto seq = FinisherSeq::Get();
+    if (seq == 0) return;
+    std::unique_lock lock(mutex);
+    turnWake.wait(lock, [&] { return closing || jobs.empty() || jobs.front().seq == seq; });
 }
 
 unsigned DrawFinisher::Finishers() {
@@ -185,7 +207,7 @@ void DrawFinisher::Enqueue(Job job) {
 }
 
 void DrawFinisher::Enqueue(Job job, Pending held) {
-    finisherProducer = true;
+    FinisherProducer::Set(true);
     constexpr std::size_t depth = 16;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
@@ -209,46 +231,59 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherRoomWaits : ThreadReport::Count::OtherRoomWaits, 1);
         ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherRoomNs : ThreadReport::Count::OtherRoomNs, ThreadReport::Nanoseconds(roomStart, ThreadReport::Clock::now()));
     }
-    jobs.push_back(std::move(job));
+    jobs.push_back({std::move(job), nextSeq++});
     pending.push_back(std::move(held));
     outstanding.fetch_add(1, std::memory_order_release);
     if (!running) {
         running = true;
         thread = std::thread([this] {
-            finisherThread = true;
+            FinisherThread::Set(true);
             RaiseWorkerThreadPriority("draw finisher");
             PlaceFinisherThread("draw finisher");
-            run();
+            run(false);
         });
         runningFinishers.fetch_add(1, std::memory_order_acq_rel);
     }
-    if (sleeping) wake.notify_one();
+    if (!secondRunning && secondFinisher()) {
+        secondRunning = true;
+        second = std::thread([this] {
+            FinisherThread::Set(true);
+            RaiseWorkerThreadPriority("draw finisher 2");
+            PlaceFinisherThread("draw finisher 2");
+            run(true);
+        });
+        runningFinishers.fetch_add(1, std::memory_order_acq_rel);
+    }
+    if (sleepers != 0) wake.notify_all();
 }
 
-void DrawFinisher::run() {
-    PerformanceTrace::BindThread("draw finisher");
+void DrawFinisher::run(bool second) {
+    PerformanceTrace::BindThread(second ? "draw finisher 2" : "draw finisher");
     ThreadReport::Clock::time_point lastEnd{};
     for (;;) {
-        Job* job = nullptr;
+        Slot* slot = nullptr;
         bool failed = false;
-        SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
+        if (!second || secondFinisher()) SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
-            sleeping = true;
-            wake.wait(lock, [&] { return !jobs.empty() || closing; });
-            sleeping = false;
-            if (jobs.empty()) break;
-            job = &jobs.front();
+            ++sleepers;
+            wake.wait(lock, [&] { return closing || (untaken() != nullptr && (!second || secondFinisher())); });
+            --sleepers;
+            slot = untaken();
+            if (slot == nullptr) break;
+            slot->taken = true;
             failed = failure != nullptr;
         }
+        FinisherSeq::Set(slot->seq);
         const auto jobStart = ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
         if (jobStart != ThreadReport::Clock::time_point{}) ThreadReport::FinisherBusy(true, jobStart);
         std::exception_ptr error;
         try {
-            if (!failed) (*job)();
+            if (!failed) slot->job();
         } catch (...) {
             error = std::current_exception();
         }
+        FinisherSeq::Set(0);
         if (jobStart != ThreadReport::Clock::time_point{}) {
             const auto end = ThreadReport::Clock::now();
             ThreadReport::FinisherBusy(false, end);
@@ -260,11 +295,15 @@ void DrawFinisher::run() {
         }
         std::lock_guard lock(mutex);
         if (error != nullptr && failure == nullptr) failure = error;
-        ran.push_back(std::move(jobs.front()));
-        jobs.pop_front();
-        pending.pop_front();
-        outstanding.fetch_sub(1, std::memory_order_release);
+        slot->done = true;
+        while (!jobs.empty() && jobs.front().done) {
+            ran.push_back(std::move(jobs.front().job));
+            jobs.pop_front();
+            pending.pop_front();
+            outstanding.fetch_sub(1, std::memory_order_release);
+        }
         idle.notify_all();
+        turnWake.notify_all();
     }
     runningFinishers.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -293,16 +332,20 @@ void DrawFinisher::Drain() {
 }
 
 void DrawFinisher::Stop() {
-    std::thread finisher;
+    std::thread finishers[2];
     {
         std::lock_guard lock(mutex);
         closing = true;
-        finisher = std::move(thread);
+        finishers[0] = std::move(thread);
+        finishers[1] = std::move(second);
     }
     wake.notify_all();
-    if (!finisher.joinable()) return;
-    if (finisher.get_id() == std::this_thread::get_id()) finisher.detach();
-    else finisher.join();
+    turnWake.notify_all();
+    for (auto& finisher : finishers) {
+        if (!finisher.joinable()) continue;
+        if (finisher.get_id() == std::this_thread::get_id()) finisher.detach();
+        else finisher.join();
+    }
 }
 
 void DrawFinisher::ReleaseRan() {
@@ -371,6 +414,7 @@ void DrawPipeline::EnqueueStore(Commit commit, std::uint64_t address, std::vecto
 }
 
 void DrawPipeline::enqueue(Item item) {
+    if (DrawFinisher::OnFinisherThread()) DrawFinisher::Get().AwaitTurn();
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct ReclaimStorage {};
@@ -586,6 +630,7 @@ void DrawPipeline::ReleaseRetired() {
 }
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
+    if (DrawFinisher::OnFinisherThread()) DrawFinisher::Get().AwaitTurn();
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
     reasonRequests[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
@@ -723,7 +768,7 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
 }
 
 bool DrawPipeline::Busy() const {
-    return outstanding.load(std::memory_order_acquire) != 0 || (finisherProducer && DrawFinisher::Busy() && DrawFinisher::Overlap());
+    return outstanding.load(std::memory_order_acquire) != 0 || (FinisherProducer::Get() && DrawFinisher::Busy() && DrawFinisher::Overlap());
 }
 
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {

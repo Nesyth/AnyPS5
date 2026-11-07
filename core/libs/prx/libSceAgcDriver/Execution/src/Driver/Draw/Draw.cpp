@@ -1247,6 +1247,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         require(tail.queue != nullptr, "the draw finisher reached a draw it cannot commit through the pipeline");
         if (gpuLock.owns_lock()) return;
         phaseTiming.Phase(DrawRowVectors);
+        if (DrawFinisher::OnFinisherThread()) DrawFinisher::Get().AwaitTurn();
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
         timing.Mark("gpu_mutex_wait");

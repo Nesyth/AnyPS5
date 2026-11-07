@@ -149,22 +149,34 @@ public:
     void Settle();
     void Stop();
     void ReleaseRan();
+    void AwaitTurn();
 
 private:
+    struct Slot {
+        Job job;
+        std::uint64_t seq = 0;
+        bool taken = false;
+        bool done = false;
+    };
     DrawFinisher() = default;
-    void run();
+    void run(bool second);
+    Slot* untaken();
     inline static std::atomic<std::size_t> outstanding{0};
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable idle;
-    std::deque<Job> jobs;
+    std::deque<Slot> jobs;
     std::deque<Pending> pending;
     std::vector<Job> ran;
     std::exception_ptr failure;
     bool running = false;
-    bool sleeping = false;
+    bool secondRunning = false;
+    unsigned sleepers = 0;
     bool closing = false;
+    std::uint64_t nextSeq = 1;
+    std::condition_variable turnWake;
     std::thread thread;
+    std::thread second;
 };
 
 }
