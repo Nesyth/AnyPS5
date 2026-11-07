@@ -55,6 +55,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_XP_HALF_DRAWS",
     "APS5_XP_HALF_WORKER_DRAWS",
     "APS5_SPIN_HANDOFF",
+    "APS5_BESIDE_SAMPLE_DUMPS",
 };
 
 struct SwitchValues {
@@ -110,6 +111,7 @@ struct SwitchValues {
             std::getenv("APS5_XP_HALF_DRAWS") != nullptr,
             std::getenv("APS5_XP_HALF_WORKER_DRAWS") != nullptr,
             std::getenv("APS5_SPIN_HANDOFF") != nullptr,
+            std::getenv("APS5_BESIDE_SAMPLE_DUMPS") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }
