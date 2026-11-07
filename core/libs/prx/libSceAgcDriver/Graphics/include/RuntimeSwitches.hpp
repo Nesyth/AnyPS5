@@ -45,6 +45,7 @@ enum class RuntimeSwitch : std::size_t {
     PreciseLookupDrain,
     SecondFinisher,
     ThirdFinisher,
+    LocklessHazards,
     Count,
 };
 

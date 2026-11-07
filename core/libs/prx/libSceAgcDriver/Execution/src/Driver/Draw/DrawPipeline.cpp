@@ -63,6 +63,134 @@ bool finisherTakes(unsigned index) {
 }
 
 constexpr const char* FinisherNames[3] = {"draw finisher", "draw finisher 2", "draw finisher 3"};
+
+constexpr unsigned PublishedReadAttempts = 8;
+
+bool lockless() {
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::LocklessHazards);
+}
+
+bool countRange(std::vector<std::pair<DrawPipeline::Range, std::uint32_t>>& counted, const DrawPipeline::Range& range, bool added) {
+    const auto found = std::find_if(counted.begin(), counted.end(), [&](const auto& entry) { return entry.first == range; });
+    if (added) {
+        if (found != counted.end()) {
+            ++found->second;
+            return false;
+        }
+        counted.emplace_back(range, 1u);
+        return true;
+    }
+    if (found == counted.end() || --found->second != 0) return false;
+    *found = counted.back();
+    counted.pop_back();
+    return true;
+}
+}
+
+void PublishedRanges::Publish(std::span<const std::pair<Range, std::uint32_t>> entries, std::uint32_t unknownHeld) {
+    const auto before = seq.load(std::memory_order_relaxed);
+    seq.store(before + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    const auto size = entries.size() <= Capacity ? static_cast<std::uint32_t>(entries.size()) : Capacity + 1;
+    for (std::uint32_t index = 0; index < size && index < Capacity; ++index) {
+        bounds[index * 2].store(entries[index].first.first, std::memory_order_relaxed);
+        bounds[index * 2 + 1].store(entries[index].first.second, std::memory_order_relaxed);
+    }
+    count.store(size, std::memory_order_relaxed);
+    unknown.store(unknownHeld, std::memory_order_relaxed);
+    seq.store(before + 2, std::memory_order_release);
+}
+
+PublishedRanges::Answer PublishedRanges::Overlaps(std::span<const Range> ranges) const {
+    for (unsigned attempt = 0; attempt < PublishedReadAttempts; ++attempt) {
+        const auto before = seq.load(std::memory_order_acquire);
+        if ((before & 1u) != 0) {
+            SpinPause();
+            continue;
+        }
+        const auto held = unknown.load(std::memory_order_relaxed);
+        const auto size = count.load(std::memory_order_relaxed);
+        bool hit = false;
+        for (std::uint32_t index = 0; held == 0 && index < size && index < Capacity && !hit; ++index) {
+            const auto first = bounds[index * 2].load(std::memory_order_relaxed);
+            const auto last = bounds[index * 2 + 1].load(std::memory_order_relaxed);
+            hit = std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.first < last && first < range.second; });
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (seq.load(std::memory_order_relaxed) != before) continue;
+        if (held != 0) return Answer::Hit;
+        if (size > Capacity) return Answer::Unsure;
+        return hit ? Answer::Hit : Answer::Clear;
+    }
+    return Answer::Unsure;
+}
+
+bool PublishedRanges::Copy(std::array<Range, Capacity>& out, std::uint32_t& size) const {
+    for (unsigned attempt = 0; attempt < PublishedReadAttempts; ++attempt) {
+        const auto before = seq.load(std::memory_order_acquire);
+        if ((before & 1u) != 0) {
+            SpinPause();
+            continue;
+        }
+        const auto held = unknown.load(std::memory_order_relaxed);
+        const auto stored = count.load(std::memory_order_relaxed);
+        for (std::uint32_t index = 0; held == 0 && index < stored && index < Capacity; ++index) {
+            out[index] = {bounds[index * 2].load(std::memory_order_relaxed), bounds[index * 2 + 1].load(std::memory_order_relaxed)};
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (seq.load(std::memory_order_relaxed) != before) continue;
+        if (held != 0 || stored > Capacity) return false;
+        size = stored;
+        return true;
+    }
+    return false;
+}
+
+void PublishedKeys::Push(std::uint64_t seqNumber, std::uint64_t key, std::uint64_t shape, bool inserts) {
+    const auto before = seq.load(std::memory_order_relaxed);
+    seq.store(before + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    const auto slot = static_cast<std::size_t>(seqNumber % Capacity) * 3;
+    slots[slot].store(key, std::memory_order_relaxed);
+    slots[slot + 1].store(shape, std::memory_order_relaxed);
+    slots[slot + 2].store(inserts ? 1u : 0u, std::memory_order_relaxed);
+    tail.store(seqNumber + 1, std::memory_order_relaxed);
+    seq.store(before + 2, std::memory_order_release);
+}
+
+void PublishedKeys::Retire(std::uint64_t frontSeq) {
+    if (head.load(std::memory_order_relaxed) == frontSeq) return;
+    const auto before = seq.load(std::memory_order_relaxed);
+    seq.store(before + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    head.store(frontSeq, std::memory_order_relaxed);
+    seq.store(before + 2, std::memory_order_release);
+}
+
+PublishedKeys::Answer PublishedKeys::Find(std::uint64_t key, std::uint64_t shape, bool insertsOnly) const {
+    for (unsigned attempt = 0; attempt < PublishedReadAttempts; ++attempt) {
+        const auto before = seq.load(std::memory_order_acquire);
+        if ((before & 1u) != 0) {
+            SpinPause();
+            continue;
+        }
+        const auto first = head.load(std::memory_order_relaxed);
+        const auto last = tail.load(std::memory_order_relaxed);
+        const bool fits = first <= last && last - first <= Capacity;
+        bool hit = false;
+        for (auto number = first; fits && number < last && !hit; ++number) {
+            const auto slot = static_cast<std::size_t>(number % Capacity) * 3;
+            const auto heldKey = slots[slot].load(std::memory_order_relaxed);
+            const auto heldShape = slots[slot + 1].load(std::memory_order_relaxed);
+            const bool heldInserts = slots[slot + 2].load(std::memory_order_relaxed) != 0;
+            hit = (heldKey == key || (shape != 0 && heldShape == shape)) && (heldInserts || !insertsOnly);
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (seq.load(std::memory_order_relaxed) != before) continue;
+        if (!fits) return Answer::Unsure;
+        return hit ? Answer::Hit : Answer::Clear;
+    }
+    return Answer::Unsure;
 }
 
 DrawFinisher& DrawFinisher::Get() {
@@ -96,6 +224,11 @@ bool DrawFinisher::Overlap() {
 
 bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
     if (!Busy() || !FinisherProducer::Get()) return false;
+    if (lockless()) {
+        const Range range{begin, end};
+        const auto answer = published.Overlaps({&range, 1});
+        if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Hit;
+    }
     std::lock_guard lock(mutex);
     for (const auto& held : pending) {
         if (held.unknown) return true;
@@ -109,6 +242,10 @@ bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
 DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value) {
     if (!Busy() || !FinisherProducer::Get()) return LabelLookup::NotHeld;
     const auto end = address + bytes;
+    if (lockless()) {
+        const Range range{address, end};
+        if (published.Overlaps({&range, 1}) == PublishedRanges::Answer::Clear) return LabelLookup::NotHeld;
+    }
     std::lock_guard lock(mutex);
     for (auto held = pending.rbegin(); held != pending.rend(); ++held) {
         if (held->unknown) return LabelLookup::Unknown;
@@ -124,6 +261,10 @@ DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std:
 
 bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
     if (!Busy() || !FinisherProducer::Get()) return false;
+    if (lockless()) {
+        const auto answer = published.Overlaps(ranges);
+        if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Hit;
+    }
     std::lock_guard lock(mutex);
     for (const auto& held : pending) {
         if (held.unknown) return true;
@@ -139,6 +280,10 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
 bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
     if (!Busy() || !FinisherProducer::Get()) return false;
     const bool precise = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PreciseLookupDrain);
+    if (lockless()) {
+        const auto answer = keys.Find(key, shape, precise);
+        if (answer != PublishedKeys::Answer::Unsure) return answer == PublishedKeys::Answer::Hit;
+    }
     std::lock_guard lock(mutex);
     return std::any_of(pending.begin(), pending.end(), [&](const Pending& held) { return (held.key == key || (shape != 0 && held.shape == shape)) && (held.inserts || !precise); });
 }
@@ -205,13 +350,24 @@ unsigned DrawFinisher::Finishers() {
     return runningFinishers.load(std::memory_order_acquire);
 }
 
+bool DrawFinisher::countPending(const Pending& held, bool added) {
+    if (held.unknown) {
+        const bool before = pendingUnknown != 0;
+        pendingUnknown = added ? pendingUnknown + 1 : pendingUnknown - 1;
+        return before != (pendingUnknown != 0);
+    }
+    bool changed = false;
+    for (const auto& range : held.writes) changed = countRange(pendingWrites, range, added) || changed;
+    return changed;
+}
+
 void DrawFinisher::Enqueue(Job job) {
     Enqueue(std::move(job), Pending{});
 }
 
 void DrawFinisher::Enqueue(Job job, Pending held) {
     FinisherProducer::Set(true);
-    constexpr std::size_t depth = 16;
+    constexpr std::size_t depth = PublishedKeys::Capacity;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
     const ClearOnExit<Job> clearReclaim{reclaim};
@@ -235,6 +391,8 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherRoomNs : ThreadReport::Count::OtherRoomNs, ThreadReport::Nanoseconds(roomStart, ThreadReport::Clock::now()));
     }
     jobs.push_back({std::move(job), nextSeq++});
+    if (countPending(held, true)) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
+    keys.Push(jobs.back().seq, held.key, held.shape, held.inserts);
     pending.push_back(std::move(held));
     outstanding.fetch_add(1, std::memory_order_release);
     if (!running) {
@@ -300,12 +458,16 @@ void DrawFinisher::run(unsigned index) {
         std::lock_guard lock(mutex);
         if (error != nullptr && failure == nullptr) failure = error;
         slot->done = true;
+        bool republish = false;
         while (!jobs.empty() && jobs.front().done) {
             ran.push_back(std::move(jobs.front().job));
             jobs.pop_front();
+            republish = countPending(pending.front(), false) || republish;
             pending.pop_front();
             outstanding.fetch_sub(1, std::memory_order_release);
         }
+        if (republish) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
+        keys.Retire(jobs.empty() ? nextSeq : jobs.front().seq);
         idle.notify_all();
         turnWake.notify_all();
     }
@@ -458,6 +620,7 @@ void DrawPipeline::enqueue(Item item) {
     ++enqueued;
     heldReadRanges.fetch_add(item.reads.size(), std::memory_order_relaxed);
     countWrites(item.writes, true);
+    enqueuedItems.fetch_add(1, std::memory_order_release);
     items.push_back(std::move(item));
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
@@ -597,10 +760,10 @@ void DrawPipeline::run() {
         bool keepRun = false;
         {
             std::lock_guard lock(mutex);
+            retiredItems.fetch_add(1, std::memory_order_release);
             countWrites(items.front().writes, false);
             retired.push_back(std::move(items.front()));
             items.pop_front();
-            retiredItems.fetch_add(1, std::memory_order_release);
             ++commits;
             commitNs += spent;
             if (failed) ++commitErrors;
@@ -706,6 +869,10 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
         if (lookup == DrawFinisher::LabelLookup::Unknown) return std::nullopt;
     }
     const auto end = address + bytes;
+    if (lockless()) {
+        const Range range{address, end};
+        if (published.Overlaps({&range, 1}) == PublishedRanges::Answer::Clear) return std::nullopt;
+    }
     std::lock_guard lock(mutex);
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
         const bool overlaps = std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
@@ -721,6 +888,10 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
 DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out) {
     const auto end = address + bytes;
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) return QueuedWrite::Unknown;
+    if (lockless()) {
+        const Range range{address, end};
+        if (published.Overlaps({&range, 1}) == PublishedRanges::Answer::Clear) return QueuedWrite::None;
+    }
     auto answer = QueuedWrite::None;
     std::lock_guard lock(mutex);
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
@@ -738,20 +909,23 @@ DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::
 }
 
 void DrawPipeline::countWrites(const std::vector<Range>& writes, bool added) {
-    for (const auto& range : writes) {
-        const auto found = std::find_if(queuedWrites.begin(), queuedWrites.end(), [&](const auto& entry) { return entry.first == range; });
-        if (added) {
-            if (found != queuedWrites.end()) ++found->second;
-            else queuedWrites.emplace_back(range, 1u);
-        } else if (found != queuedWrites.end() && --found->second == 0) {
-            *found = queuedWrites.back();
-            queuedWrites.pop_back();
-        }
-    }
+    bool changed = false;
+    for (const auto& range : writes) changed = countRange(queuedWrites, range, added) || changed;
+    if (changed) published.Publish(queuedWrites, 0);
 }
 
 DrawPipeline::Watch DrawPipeline::WatchWrites() {
     if (!Busy()) return {Retired(), 0, {}};
+    if (lockless()) {
+        Watch watch;
+        const auto enqueuedBefore = enqueuedItems.load(std::memory_order_acquire);
+        if (published.Copy(watch.snapshotWrites, watch.snapshotCount)) {
+            watch.retired = retiredItems.load(std::memory_order_acquire);
+            watch.items = enqueuedBefore > watch.retired ? static_cast<std::size_t>(enqueuedBefore - watch.retired) : 0;
+            watch.snapshot = true;
+            return watch;
+        }
+    }
     std::lock_guard lock(mutex);
     Watch watch{retiredItems.load(std::memory_order_relaxed), items.size(), {}};
     for (const auto& item : items) watch.writes.insert(watch.writes.end(), item.writes.begin(), item.writes.end());
@@ -759,17 +933,27 @@ DrawPipeline::Watch DrawPipeline::WatchWrites() {
 }
 
 bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& reads) {
-    const auto overlaps = [&reads](const std::vector<Range>& writes) {
+    const auto overlaps = [&reads](std::span<const Range> writes) {
         return std::any_of(reads.begin(), reads.end(), [&writes](const Range& read) {
             return std::any_of(writes.begin(), writes.end(), [&read](const Range& write) { return read.first < write.second && write.first < read.second; });
         });
     };
+    const auto watched = watch.snapshot ? std::span<const Range>(watch.snapshotWrites.data(), watch.snapshotCount) : std::span<const Range>(watch.writes);
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(reads)) return true;
+    if (lockless()) {
+        const auto queued = published.Overlaps(reads);
+        if (queued == PublishedRanges::Answer::Hit) return true;
+        if (queued == PublishedRanges::Answer::Clear) {
+            const auto retiredNow = retiredItems.load(std::memory_order_acquire);
+            if (retiredNow == watch.retired) return false;
+            return retiredNow - watch.retired > watch.items || overlaps(watched);
+        }
+    }
     std::lock_guard lock(mutex);
     if (std::any_of(items.begin(), items.end(), [&](const Item& item) { return overlaps(item.writes); })) return true;
     const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
     if (retiredNow == watch.retired) return false;
-    return retiredNow - watch.retired > watch.items || overlaps(watch.writes);
+    return retiredNow - watch.retired > watch.items || overlaps(watched);
 }
 
 bool DrawPipeline::Busy() const {
@@ -778,6 +962,10 @@ bool DrawPipeline::Busy() const {
 
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(ranges)) return true;
+    if (lockless()) {
+        const auto answer = published.Overlaps(ranges);
+        if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Hit;
+    }
     std::lock_guard lock(mutex);
     for (const auto& [range, count] : queuedWrites) {
         for (const auto& [address, end] : ranges) {
@@ -790,6 +978,11 @@ bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uin
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) return true;
+    if (lockless()) {
+        const Range range{address, end};
+        const auto answer = published.Overlaps({&range, 1});
+        if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Hit;
+    }
     std::lock_guard lock(mutex);
     for (const auto& [range, count] : queuedWrites) {
         if (address < range.second && range.first < end) return true;

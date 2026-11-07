@@ -20,6 +20,37 @@
 
 namespace AgcDriver::DriverDetail {
 
+class PublishedRanges {
+public:
+    using Range = std::pair<std::uint64_t, std::uint64_t>;
+    static constexpr std::uint32_t Capacity = 32;
+    enum class Answer : std::uint8_t { Clear, Hit, Unsure };
+    void Publish(std::span<const std::pair<Range, std::uint32_t>> entries, std::uint32_t unknownHeld);
+    Answer Overlaps(std::span<const Range> ranges) const;
+    bool Copy(std::array<Range, Capacity>& out, std::uint32_t& size) const;
+
+private:
+    std::atomic<std::uint32_t> seq{0};
+    std::atomic<std::uint32_t> count{0};
+    std::atomic<std::uint32_t> unknown{0};
+    std::array<std::atomic<std::uint64_t>, Capacity * 2> bounds{};
+};
+
+class PublishedKeys {
+public:
+    static constexpr std::uint32_t Capacity = 16;
+    enum class Answer : std::uint8_t { Clear, Hit, Unsure };
+    void Push(std::uint64_t seqNumber, std::uint64_t key, std::uint64_t shape, bool inserts);
+    void Retire(std::uint64_t frontSeq);
+    Answer Find(std::uint64_t key, std::uint64_t shape, bool insertsOnly) const;
+
+private:
+    std::atomic<std::uint32_t> seq{0};
+    std::atomic<std::uint64_t> head{1};
+    std::atomic<std::uint64_t> tail{1};
+    std::array<std::atomic<std::uint64_t>, Capacity * 3> slots{};
+};
+
 class DrawPipeline {
 public:
     using Commit = std::function<void()>;
@@ -28,6 +59,9 @@ public:
         std::uint64_t retired = 0;
         std::size_t items = 0;
         std::vector<Range> writes;
+        bool snapshot = false;
+        std::uint32_t snapshotCount = 0;
+        std::array<Range, PublishedRanges::Capacity> snapshotWrites{};
     };
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
     enum class QueuedWrite : std::uint8_t { None, Stored, Unknown };
@@ -87,6 +121,8 @@ private:
     std::condition_variable idle;
     std::deque<Item> items;
     std::vector<std::pair<Range, std::uint32_t>> queuedWrites;
+    PublishedRanges published;
+    std::atomic<std::uint64_t> enqueuedItems{0};
     std::vector<Item> retired;
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
@@ -161,12 +197,17 @@ private:
     DrawFinisher() = default;
     void run(unsigned index);
     Slot* untaken();
+    bool countPending(const Pending& held, bool added);
     inline static std::atomic<std::size_t> outstanding{0};
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable idle;
     std::deque<Slot> jobs;
     std::deque<Pending> pending;
+    std::vector<std::pair<Range, std::uint32_t>> pendingWrites;
+    std::uint32_t pendingUnknown = 0;
+    PublishedRanges published;
+    PublishedKeys keys;
     std::vector<Job> ran;
     std::exception_ptr failure;
     bool running = false;
