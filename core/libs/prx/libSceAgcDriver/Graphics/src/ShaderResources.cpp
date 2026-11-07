@@ -6960,6 +6960,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareReplayDra
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::finishDrawBindings(Recorder& recorder, std::shared_ptr<DrawBindings> result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const {
     if (result == nullptr || selected.empty()) return {};
     writeDrawSets(*result, selected, faultRecord);
+    if (heapStage && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind) && !RuntimeSwitches::Set(RuntimeSwitch::NoHeapSetSkip)) {
+        for (const auto& snapshot : result->snapshots) recorder.KeepOnce(snapshot.buffer, snapshot.buffer->Bytes().size());
+        return result;
+    }
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;
@@ -8112,7 +8116,12 @@ bool ShaderResources::replayHeapStage(const CompiledShader& shader, HeapReplaySt
     } else {
         heapSrtDwords[stageIndex] = 0u;
     }
-    if (!changed.empty()) {
+    const bool overlayWrites = overlay && !stageDataWords[stageIndex].empty() && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind) && !RuntimeSwitches::Set(RuntimeSwitch::NoHeapSetSkip);
+    if (overlayWrites) {
+        NoteReplay(changed.empty() ? ReplayEvent::DataSame : ReplayEvent::DataPatched);
+        for (const auto index : changed) state.data.words[index] = userData[index];
+        state.data.mark = {};
+    } else if (!changed.empty()) {
         NoteReplay(ReplayEvent::DataPatched);
         BindlessHeap::SpanMark mark;
         const auto span = heap.Allocate(size, mark);
