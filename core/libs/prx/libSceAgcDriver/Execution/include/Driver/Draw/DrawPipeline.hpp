@@ -38,7 +38,7 @@ private:
 
 class PublishedKeys {
 public:
-    static constexpr std::uint32_t Capacity = 16;
+    static constexpr std::uint32_t Capacity = 64;
     enum class Answer : std::uint8_t { Clear, Hit, Unsure };
     void Push(std::uint64_t seqNumber, std::uint64_t key, std::uint64_t shape, bool inserts);
     void Retire(std::uint64_t frontSeq);

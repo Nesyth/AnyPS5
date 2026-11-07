@@ -70,6 +70,10 @@ bool lockless() {
     return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::LocklessHazards);
 }
 
+bool deepQueues() {
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DeepQueues);
+}
+
 bool spinHandoff() {
     return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SpinHandoff);
 }
@@ -384,7 +388,7 @@ void DrawFinisher::Enqueue(Job job) {
 
 void DrawFinisher::Enqueue(Job job, Pending held) {
     FinisherProducer::Set(true);
-    constexpr std::size_t depth = PublishedKeys::Capacity;
+    const std::size_t depth = deepQueues() ? PublishedKeys::Capacity : 16;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
     const ClearOnExit<Job> clearReclaim{reclaim};
@@ -632,11 +636,12 @@ void DrawPipeline::enqueue(Item item) {
         item.commit();
         return;
     }
-    if (items.size() >= Depth()) {
+    const auto roomLimit = deepQueues() ? std::max<std::size_t>(Depth(), 32) : Depth();
+    if (items.size() >= roomLimit) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
         const ThreadReport::WorkerStateScope room(ThreadReport::WorkerState::RoomCommitter, ThreadReport::OnQueue0Worker());
-        resumeAt = Depth() - 1;
+        resumeAt = roomLimit - 1;
         ++idleWaiters;
         idle.wait(lock, [&] { return items.size() <= resumeAt; });
         --idleWaiters;

@@ -50,6 +50,7 @@ enum class RuntimeSwitch : std::size_t {
     XpHalfWorkerDraws,
     SpinHandoff,
     BesideSampleDumps,
+    DeepQueues,
     Count,
 };
 
