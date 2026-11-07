@@ -159,7 +159,7 @@ private:
         bool done = false;
     };
     DrawFinisher() = default;
-    void run(bool second);
+    void run(unsigned index);
     Slot* untaken();
     inline static std::atomic<std::size_t> outstanding{0};
     std::mutex mutex;
@@ -170,13 +170,13 @@ private:
     std::vector<Job> ran;
     std::exception_ptr failure;
     bool running = false;
-    bool secondRunning = false;
+    std::array<bool, 2> extraRunning{};
     unsigned sleepers = 0;
     bool closing = false;
     std::uint64_t nextSeq = 1;
     std::condition_variable turnWake;
     std::thread thread;
-    std::thread second;
+    std::array<std::thread, 2> extra;
 };
 
 }

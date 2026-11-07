@@ -57,9 +57,12 @@ using FinisherThread = HostThreadSlot<bool, FinisherThreadSlot>;
 using FinisherProducer = HostThreadSlot<bool, FinisherProducerSlot>;
 using FinisherSeq = HostThreadSlot<std::uint64_t, FinisherSeqSlot>;
 
-bool secondFinisher() {
-    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SecondFinisher);
+bool finisherTakes(unsigned index) {
+    if (index == 0) return true;
+    return Graphics::RuntimeSwitches::Set(index == 1 ? Graphics::RuntimeSwitch::SecondFinisher : Graphics::RuntimeSwitch::ThirdFinisher);
 }
+
+constexpr const char* FinisherNames[3] = {"draw finisher", "draw finisher 2", "draw finisher 3"};
 }
 
 DrawFinisher& DrawFinisher::Get() {
@@ -240,34 +243,35 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
             FinisherThread::Set(true);
             RaiseWorkerThreadPriority("draw finisher");
             PlaceFinisherThread("draw finisher");
-            run(false);
+            run(0);
         });
         runningFinishers.fetch_add(1, std::memory_order_acq_rel);
     }
-    if (!secondRunning && secondFinisher()) {
-        secondRunning = true;
-        second = std::thread([this] {
+    for (unsigned index = 1; index <= extra.size(); ++index) {
+        if (extraRunning[index - 1] || !finisherTakes(index)) continue;
+        extraRunning[index - 1] = true;
+        extra[index - 1] = std::thread([this, index] {
             FinisherThread::Set(true);
-            RaiseWorkerThreadPriority("draw finisher 2");
-            PlaceFinisherThread("draw finisher 2");
-            run(true);
+            RaiseWorkerThreadPriority(FinisherNames[index]);
+            PlaceFinisherThread(FinisherNames[index]);
+            run(index);
         });
         runningFinishers.fetch_add(1, std::memory_order_acq_rel);
     }
     if (sleepers != 0) wake.notify_all();
 }
 
-void DrawFinisher::run(bool second) {
-    PerformanceTrace::BindThread(second ? "draw finisher 2" : "draw finisher");
+void DrawFinisher::run(unsigned index) {
+    PerformanceTrace::BindThread(FinisherNames[index]);
     ThreadReport::Clock::time_point lastEnd{};
     for (;;) {
         Slot* slot = nullptr;
         bool failed = false;
-        if (!second || secondFinisher()) SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
+        if (finisherTakes(index)) SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
             ++sleepers;
-            wake.wait(lock, [&] { return closing || (untaken() != nullptr && (!second || secondFinisher())); });
+            wake.wait(lock, [&] { return closing || (untaken() != nullptr && finisherTakes(index)); });
             --sleepers;
             slot = untaken();
             if (slot == nullptr) break;
@@ -332,12 +336,13 @@ void DrawFinisher::Drain() {
 }
 
 void DrawFinisher::Stop() {
-    std::thread finishers[2];
+    std::thread finishers[3];
     {
         std::lock_guard lock(mutex);
         closing = true;
         finishers[0] = std::move(thread);
-        finishers[1] = std::move(second);
+        finishers[1] = std::move(extra[0]);
+        finishers[2] = std::move(extra[1]);
     }
     wake.notify_all();
     turnWake.notify_all();
