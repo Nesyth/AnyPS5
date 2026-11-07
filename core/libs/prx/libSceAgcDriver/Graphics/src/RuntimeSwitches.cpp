@@ -48,6 +48,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_XP_UPLOAD_NO_SYNC",
     "APS5_XP_NO_EAGER_STORE",
     "APS5_ASYNC_SUBMIT",
+    "APS5_PRECISE_LOOKUP_DRAIN",
 };
 
 struct SwitchValues {
@@ -96,6 +97,7 @@ struct SwitchValues {
             std::getenv("APS5_XP_UPLOAD_NO_SYNC") != nullptr,
             std::getenv("APS5_XP_NO_EAGER_STORE") != nullptr,
             std::getenv("APS5_ASYNC_SUBMIT") != nullptr,
+            std::getenv("APS5_PRECISE_LOOKUP_DRAIN") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

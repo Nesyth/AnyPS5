@@ -285,6 +285,7 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
     DrawFinisher::Pending held;
     held.key = tail.drawKey;
     held.shape = tail.shapeKey;
+    held.inserts = tail.entry == nullptr || !tail.drawHit;
     if (tail.decode == nullptr) {
         noteHeld(HeldReason::NoDecode);
         return held;

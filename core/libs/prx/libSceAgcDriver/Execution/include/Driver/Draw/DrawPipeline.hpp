@@ -122,6 +122,7 @@ public:
     struct Pending {
         std::uint64_t key = 0;
         std::uint64_t shape = 0;
+        bool inserts = true;
         bool unknown = true;
         std::vector<Range> writes;
         std::uint64_t labelAddress = 0;

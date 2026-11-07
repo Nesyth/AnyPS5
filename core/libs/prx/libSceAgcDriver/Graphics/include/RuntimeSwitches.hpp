@@ -42,6 +42,7 @@ enum class RuntimeSwitch : std::size_t {
     XpUploadNoSync,
     XpNoEagerStore,
     AsyncSubmit,
+    PreciseLookupDrain,
     Count,
 };
 
