@@ -199,6 +199,7 @@ private:
     Slot* untaken();
     bool countPending(const Pending& held, bool added);
     inline static std::atomic<std::size_t> outstanding{0};
+    std::atomic<std::size_t> untakenJobs{0};
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable idle;
@@ -213,6 +214,9 @@ private:
     bool running = false;
     std::array<bool, 2> extraRunning{};
     unsigned sleepers = 0;
+    unsigned turnSleepers = 0;
+    unsigned idleWaiters = 0;
+    std::atomic<std::uint64_t> frontSeq{1};
     bool closing = false;
     std::uint64_t nextSeq = 1;
     std::condition_variable turnWake;
