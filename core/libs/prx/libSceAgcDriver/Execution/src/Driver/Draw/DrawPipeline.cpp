@@ -421,6 +421,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
 
 void DrawFinisher::run(unsigned index) {
     PerformanceTrace::BindThread(FinisherNames[index]);
+    if (index == 0) StartFinisherSampler();
     ThreadReport::Clock::time_point lastEnd{};
     for (;;) {
         Slot* slot = nullptr;
