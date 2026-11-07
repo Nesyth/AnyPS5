@@ -40,6 +40,7 @@ enum class RuntimeSwitch : std::size_t {
     ArmSpans,
     ReplayBind,
     XpUploadNoSync,
+    XpNoEagerStore,
     Count,
 };
 
