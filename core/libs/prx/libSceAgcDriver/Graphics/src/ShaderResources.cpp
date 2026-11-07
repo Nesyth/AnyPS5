@@ -2036,8 +2036,8 @@ struct ThreadBuildProfile {
 };
 
 ThreadBuildProfile& ThreadBuilds() {
-    thread_local ThreadBuildProfile* profileSlot = nullptr;
-    auto& profile = ShaderRecompiler::ThreadOwned(profileSlot);
+    struct ProfileStorage {};
+    auto& profile = HostThreadLocal<ThreadBuildProfile, ProfileStorage>();
     return profile;
 }
 
@@ -2141,8 +2141,8 @@ struct ReusedTable {
 constexpr std::size_t ReusedTableCount = 4;
 
 std::vector<ReusedTable>& ReusedTables() {
-    thread_local std::vector<ReusedTable>* slot = nullptr;
-    return ShaderRecompiler::ThreadOwned(slot);
+    struct ReusedTablesStorage {};
+    return HostThreadLocal<std::vector<ReusedTable>, ReusedTablesStorage>();
 }
 
 bool SameTable(const ReusedTable& table, VkDevice device, const ShaderRecompiler::DescriptorBinding& binding, std::span<const std::uint32_t> words) {
@@ -3548,8 +3548,8 @@ bool ImportAuditAdmitted() {
 
 void LastRecordIndices(std::span<const void* const> logged, std::span<const void* const> objects, std::vector<std::size_t>& indices) {
     indices.assign(objects.size(), logged.size());
-    thread_local std::vector<std::pair<const void*, std::size_t>>* wantedSlot = nullptr;
-    auto& wanted = ShaderRecompiler::ThreadOwned(wantedSlot);
+    struct WantedStorage {};
+    auto& wanted = HostThreadLocal<std::vector<std::pair<const void*, std::size_t>>, WantedStorage>();
     wanted.clear();
     for (std::size_t i = 0; i < objects.size(); ++i) wanted.emplace_back(objects[i], i);
     const auto byObject = [](const std::pair<const void*, std::size_t>& left, const std::pair<const void*, std::size_t>& right) { return std::less<const void*>{}(left.first, right.first); };
@@ -3592,12 +3592,12 @@ void ShaderResources::captureValidation() {
         return;
     }
     const auto& log = lookupLog();
-    thread_local std::vector<const void*>* loggedSlot = nullptr;
-    auto& logged = ShaderRecompiler::ThreadOwned(loggedSlot);
-    thread_local std::vector<const void*>* objectsSlot = nullptr;
-    auto& objects = ShaderRecompiler::ThreadOwned(objectsSlot);
-    thread_local std::vector<std::size_t>* indicesSlot = nullptr;
-    auto& indices = ShaderRecompiler::ThreadOwned(indicesSlot);
+    struct LoggedStorage {};
+    auto& logged = HostThreadLocal<std::vector<const void*>, LoggedStorage>();
+    struct ObjectsStorage {};
+    auto& objects = HostThreadLocal<std::vector<const void*>, ObjectsStorage>();
+    struct IndicesStorage {};
+    auto& indices = HostThreadLocal<std::vector<std::size_t>, IndicesStorage>();
     logged.clear();
     for (const auto& entry : log) logged.push_back(entry.object);
     objects.clear();
@@ -3709,19 +3709,19 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     if (validatedTextures.size() != textures.size()) return fail(FastFail::NoRecord);
     const bool unchanged = pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
     const bool keyProofs = KeyFastPath();
-    thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
-    auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
-    thread_local std::vector<StorageTexture::PendingQuery>* pendingSlot = nullptr;
-    auto& pending = ShaderRecompiler::ThreadOwned(pendingSlot);
+    struct QueriesStorage {};
+    auto& queries = HostThreadLocal<std::vector<GuestMemory::UnchangedQuery>, QueriesStorage>();
+    struct PendingStorage {};
+    auto& pending = HostThreadLocal<std::vector<StorageTexture::PendingQuery>, PendingStorage>();
     // The element each pending query stands for, in query order.
-    thread_local std::vector<PendingOverlap>* ownersSlot = nullptr;
-    auto& owners = ShaderRecompiler::ThreadOwned(ownersSlot);
-    thread_local std::vector<const StorageTexture*>* imagesSlot = nullptr;
-    auto& images = ShaderRecompiler::ThreadOwned(imagesSlot);
-    thread_local std::vector<DccKeys>* scannedKeysSlot = nullptr;
-    auto& scannedKeys = ShaderRecompiler::ThreadOwned(scannedKeysSlot);
-    thread_local std::vector<std::pair<std::size_t, std::array<std::uint64_t, 4>>>* reproofsSlot = nullptr;
-    auto& reproofs = ShaderRecompiler::ThreadOwned(reproofsSlot);
+    struct OwnersStorage {};
+    auto& owners = HostThreadLocal<std::vector<PendingOverlap>, OwnersStorage>();
+    struct ImagesStorage {};
+    auto& images = HostThreadLocal<std::vector<const StorageTexture*>, ImagesStorage>();
+    struct ScannedKeysStorage {};
+    auto& scannedKeys = HostThreadLocal<std::vector<DccKeys>, ScannedKeysStorage>();
+    struct ReproofsStorage {};
+    auto& reproofs = HostThreadLocal<std::vector<std::pair<std::size_t, std::array<std::uint64_t, 4>>>, ReproofsStorage>();
     queries.clear();
     pending.clear();
     owners.clear();
@@ -3752,8 +3752,8 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         return stamps && now.epoch != 0 && stamp.epoch == now.epoch && stamp.proof == now.proof && stamp.pending == now.pending && stamp.release == now.release && stamp.unwatched == now.unwatched && stamp.mapping == now.mapping && stamp.depthSurfaces == now.depthSurfaces && stamp.depthReleased == now.depthReleased && stamp.stalePlanes == now.stalePlanes && stamp.address == address && stamp.bytes == bytes && stamp.source == source;
     };
     // Per texture, then per storage image: 0 proved here, 1 taken from a stamp, 2 untracked.
-    thread_local std::vector<std::uint8_t>* takenSlot = nullptr;
-    auto& taken = ShaderRecompiler::ThreadOwned(takenSlot);
+    struct TakenStorage {};
+    auto& taken = HostThreadLocal<std::vector<std::uint8_t>, TakenStorage>();
     taken.assign(textures.size() + storageTextures.size(), 0);
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
@@ -4605,10 +4605,10 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         captureValidation();
         return true;
     };
-    thread_local std::vector<PendingOverlap>* overlappingSlot = nullptr;
-    auto& overlapping = ShaderRecompiler::ThreadOwned(overlappingSlot);
-    thread_local std::vector<PendingOverlap>* refreshedSlot = nullptr;
-    auto& refreshed = ShaderRecompiler::ThreadOwned(refreshedSlot);
+    struct OverlappingStorage {};
+    auto& overlapping = HostThreadLocal<std::vector<PendingOverlap>, OverlappingStorage>();
+    struct RefreshedStorage {};
+    auto& refreshed = HostThreadLocal<std::vector<PendingOverlap>, RefreshedStorage>();
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
@@ -4678,8 +4678,8 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             // The walk after the refresh, or beside a proof that accepted a foreign overlap, must
             // find every object in place and current: another object, or an upload (a moved
             // content version), is a decision the proof got wrong.
-            thread_local std::vector<std::pair<const StorageTexture*, std::uint64_t>>* versionsSlot = nullptr;
-            auto& versions = ShaderRecompiler::ThreadOwned(versionsSlot);
+            struct VersionsStorage {};
+            auto& versions = HostThreadLocal<std::vector<std::pair<const StorageTexture*, std::uint64_t>>, VersionsStorage>();
             versions.clear();
             for (const auto& surface : validatedTextures) {
                 if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
@@ -4716,8 +4716,8 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     };
     if (EpochRevalidate()) {
         if ((!directRegions.empty() || !guestMemory.Writes().empty()) && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
-            thread_local std::vector<StorageTexture::PendingQuery>* regionsSlot = nullptr;
-            auto& regions = ShaderRecompiler::ThreadOwned(regionsSlot);
+            struct RegionsStorage {};
+            auto& regions = HostThreadLocal<std::vector<StorageTexture::PendingQuery>, RegionsStorage>();
             regions.clear();
             for (const auto& region : directRegions) regions.push_back({region.begin, region.end, nullptr, nullptr, false});
             for (const auto& [begin, end] : guestMemory.Writes()) regions.push_back({begin, end, nullptr, nullptr, false});
@@ -6940,15 +6940,15 @@ std::uint64_t HeapReplayKeyHash(std::span<const std::uint32_t> key) {
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord, bool census) const {
-    thread_local std::vector<std::size_t>* selectedSlot = nullptr;
-    auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
+    struct SelectedStorage {};
+    auto& selected = HostThreadLocal<std::vector<std::size_t>, SelectedStorage>();
     auto result = selectDrawSnapshots(recorder, moved, movedOnly, selected, census);
     return finishDrawBindings(recorder, std::move(result), selected, faultRecord);
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareReplayDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, std::span<const CompiledShader> shaders, const BdaResources* faultRecord, HeapReplayProof& proof, bool census, std::span<const std::uint32_t> contentKey) {
-    thread_local std::vector<std::size_t>* selectedSlot = nullptr;
-    auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
+    struct SelectedStorage {};
+    auto& selected = HostThreadLocal<std::vector<std::size_t>, SelectedStorage>();
     auto result = selectDrawSnapshots(recorder, moved, false, selected, census);
     auto& record = heapReplayRecord();
     if (record.keyHash == 0u && !contentKey.empty()) record.keyHash = HeapReplayKeyHash(contentKey);
@@ -6975,8 +6975,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE && !heapStage) || (usesBda && !spaceReuse)) return {};
     prepareFaultSlot();
     bindingsChecked = heapStage && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind);
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
-    auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+    struct ReadsStorage {};
+    auto& reads = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ReadsStorage>();
     guestMemory.InPlaceReads(reads);
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     const auto uploadLimit = DrawUploadLimit();
@@ -7090,8 +7090,8 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         return;
     }
     std::array<bool, 2> described{};
-    thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
-    auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
+    struct CountsStorage {};
+    auto& counts = HostThreadLocal<std::array<std::vector<VkDescriptorPoolSize>, 2>, CountsStorage>();
     for (auto& sizes : counts) sizes.clear();
     for (const auto& binding : bindings) {
         if (binding.heap) continue;
@@ -7118,17 +7118,17 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         result.fragmentLayout = fragment.layout;
         Require(result.fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
-    thread_local std::vector<VkDescriptorBufferInfo>* buffersSlot = nullptr;
-    auto& buffers = ShaderRecompiler::ThreadOwned(buffersSlot);
+    struct BuffersStorage {};
+    auto& buffers = HostThreadLocal<std::vector<VkDescriptorBufferInfo>, BuffersStorage>();
     buffers = descriptorBuffers;
     if (faultRecord != nullptr) {
         for (const auto& fault : faultDescriptors) buffers[fault.buffer] = faultRecord->Fault();
     }
-    thread_local std::vector<VkWriteDescriptorSet>* writesSlot = nullptr;
-    auto& writes = ShaderRecompiler::ThreadOwned(writesSlot);
+    struct WritesStorage {};
+    auto& writes = HostThreadLocal<std::vector<VkWriteDescriptorSet>, WritesStorage>();
     writes = descriptorWrites;
-    thread_local std::vector<std::size_t>* indicesSlot = nullptr;
-    auto& snapshotIndices = ShaderRecompiler::ThreadOwned(indicesSlot);
+    struct IndicesStorage {};
+    auto& snapshotIndices = HostThreadLocal<std::vector<std::size_t>, IndicesStorage>();
     snapshotIndices.assign(allocations.size(), selected.size());
     for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
     auto nextWrite = writes.begin();
@@ -7984,8 +7984,8 @@ void ShaderResources::noteHeapStageCensus(const CompiledShader& shader, bool cur
         change = ReplayStageChange::WordsChanged;
     } else {
         underUserData = !std::equal(words.begin(), words.begin() + static_cast<std::ptrdiff_t>(copied), state.dataInput.begin());
-        thread_local std::vector<std::uint64_t>* maskSlot = nullptr;
-        auto& mask = ShaderRecompiler::ThreadOwned(maskSlot);
+        struct MaskStorage {};
+        auto& mask = HostThreadLocal<std::vector<std::uint64_t>, MaskStorage>();
         heapStageMask(shader, size, mask);
         std::size_t changed = 0;
         bool masked = false;
@@ -8083,8 +8083,8 @@ bool ShaderResources::replayHeapStage(const CompiledShader& shader, HeapReplaySt
     if (size != stage.dataDwords || userData.size() != stage.userDwords || state.dataInput.size() != size + userData.size() || state.data.words.size() != size) return rebuild(ReplayEvent::ShapeChanged);
     const bool fromProgram = &words == &dataBinding.guestDescriptor;
     if (!(fromProgram && stage.wordsFromProgram) && !std::equal(words.begin(), words.end(), state.dataInput.begin())) return rebuild(ReplayEvent::ShapeChanged);
-    thread_local std::vector<std::uint32_t>* changedSlot = nullptr;
-    auto& changed = ShaderRecompiler::ThreadOwned(changedSlot);
+    struct ChangedStorage {};
+    auto& changed = HostThreadLocal<std::vector<std::uint32_t>, ChangedStorage>();
     changed.clear();
     const auto copied = std::min(userData.size(), size);
     const auto* recorded = state.dataInput.data() + size;
@@ -8137,8 +8137,8 @@ bool ShaderResources::replayHeapStage(const CompiledShader& shader, HeapReplaySt
     }
     std::copy(userData.begin(), userData.end(), state.dataInput.begin() + static_cast<std::ptrdiff_t>(size));
     if (verifySlots) {
-        thread_local std::vector<std::uint32_t>* rebuiltSlot = nullptr;
-        auto& rebuilt = ShaderRecompiler::ThreadOwned(rebuiltSlot);
+        struct RebuiltStorage {};
+        auto& rebuilt = HostThreadLocal<std::vector<std::uint32_t>, RebuiltStorage>();
         buildHeapStageWords(shader, state, words, userData, rebuilt);
         if (!std::ranges::equal(state.data.words, rebuilt)) throw std::runtime_error("AGC graphics: a replayed GPU-mode stage's shader data differs from the block built anew from its inputs and slots");
     }

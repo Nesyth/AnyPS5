@@ -1,7 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
-#include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -9,6 +8,7 @@
 #include <algorithm>
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <bit>
 #include <cstdlib>
 #include <initializer_list>
@@ -422,8 +422,8 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
         ++cpuFills;
 
         localDevice->WaitIdle();
-        static thread_local std::vector<std::byte>* blockSlot = nullptr;
-        auto& block = ShaderRecompiler::ThreadOwned(blockSlot);
+        struct BlockStorage {};
+        auto& block = HostThreadLocal<std::vector<std::byte>, BlockStorage>();
         const auto chunk = std::min<std::size_t>(bytes, 1u << 20u);
         block.resize(chunk);
         for (std::size_t at = 0; at < chunk; at += 16) std::memcpy(block.data() + at, pattern.data(), 16);

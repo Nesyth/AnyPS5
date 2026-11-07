@@ -5,6 +5,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/PrimedSharedMutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FirstSampleCopy.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -3407,9 +3408,10 @@ bool DepthPlanesStale() {
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes, DepthPlaneScope scope) {
-    static thread_local bool flushing = false;
+    struct FlushingSlot {};
+    using Flushing = HostThreadSlot<bool, FlushingSlot>;
     const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
-    if (flushing || !overlapsStalePlane(address, end)) return {};
+    if (Flushing::Get() || !overlapsStalePlane(address, end)) return {};
     if (scope == DepthPlaneScope::Overlapped) {
         std::lock_guard lock(surfacesMutex());
         const auto staleInRange = [&](const auto& surface) {
@@ -3422,9 +3424,9 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
         };
         if (std::none_of(surfaces().begin(), surfaces().end(), staleInRange)) return {};
     }
-    flushing = true;
+    Flushing::Set(true);
     struct Reset {
-        ~Reset() { flushing = false; }
+        ~Reset() { Flushing::Set(false); }
     } reset;
     struct Stored {
         DepthSurface* surface;
@@ -3855,7 +3857,8 @@ VkDeviceSize DepthPlaneCopyBytes() {
 
 namespace {
 
-thread_local bool depthCopySourceActive = false;
+struct DepthCopySourceSlot {};
+using DepthCopySourceActive = HostThreadSlot<bool, DepthCopySourceSlot>;
 
 }
 
@@ -3890,7 +3893,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         Require(base.samples > 1u, "multisample reader overlaps a single-sample depth attachment");
         auto* recorder = RecorderFor(context);
         Require(recorder != nullptr, "a native multisampled depth target is sampled only by recorded draws and dispatches");
-        if (depthCopySourceActive) {
+        if (DepthCopySourceActive::Get()) {
             found->CheckResource(resource);
             found->ApplyFastClear();
         } else {
@@ -3901,7 +3904,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         }
         RecordMemoryBarrier(context, recorder->Commands(), VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         Recorder::CountBarriers(Recorder::CommandClass::Draw, 1);
-        return found->Sampled(words, resource, components, found == drawnDepth, multisampleViewType, depthCopySourceActive);
+        return found->Sampled(words, resource, components, found == drawnDepth, multisampleViewType, DepthCopySourceActive::Get());
     }
     const bool exact = resource.width == base.extent.width && resource.height == base.extent.height;
     const bool cropped = !exact && base.gcn && !stencil && found->hostFormat == base.format && (resource.gcnPitch == 0 || resource.gcnPitch == base.extent.width) && resource.width <= base.extent.width && resource.height <= base.extent.height && resource.baseArray == 0 && resource.lastLevel == 0 && resource.dimension == TextureDimension::k2D;
@@ -3961,7 +3964,7 @@ bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resou
     std::lock_guard lock(surfacesMutex());
     auto* found = planeSurface(context.device, address);
     if (found == nullptr || !found->Holds(texture)) return false;
-    if (!depthCopySourceActive) found->CheckCurrent();
+    if (!DepthCopySourceActive::Get()) found->CheckCurrent();
     found->CheckResource(resource);
     return true;
 }
@@ -4192,12 +4195,12 @@ std::shared_ptr<StorageTexture> DepthSurfaceStorage(const Context& context, std:
     return layeredDepthStorage(context, surface, resource, mip);
 }
 
-DepthCopySourceScope::DepthCopySourceScope(bool active) : previous(depthCopySourceActive) {
-    depthCopySourceActive = active;
+DepthCopySourceScope::DepthCopySourceScope(bool active) : previous(DepthCopySourceActive::Get()) {
+    DepthCopySourceActive::Set(active);
 }
 
 DepthCopySourceScope::~DepthCopySourceScope() {
-    depthCopySourceActive = previous;
+    DepthCopySourceActive::Set(previous);
 }
 
 std::array<std::uint32_t, 8> DepthCopySourceWords(const DepthTarget& target) {

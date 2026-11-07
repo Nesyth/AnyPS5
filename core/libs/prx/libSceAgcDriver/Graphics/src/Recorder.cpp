@@ -248,9 +248,14 @@ bool RecorderAlive(std::uint64_t id) {
 
 // Completion actions in progress on this thread (finish()): a pending-write sync the flush hook
 // makes from inside one (a copied buffer's write-back store) is skipped, see SyncThrough.
-thread_local int completionDepth = 0;
-// This thread's hook syncs that waited for an unsignaled target (Recorder::ThreadHookWaits).
-thread_local std::uint64_t hookRealWaits = 0;
+struct CompletionThread {
+    int depth = 0;
+    // This thread's hook syncs that waited for an unsignaled target (Recorder::ThreadHookWaits).
+    std::uint64_t hookWaits = 0;
+};
+CompletionThread& completionThread() {
+    return HostThreadLocal<CompletionThread, CompletionThread>();
+}
 
 }
 
@@ -259,7 +264,7 @@ bool Recorder::Alive(std::uint64_t id) {
 }
 
 bool Recorder::InCompletion() {
-    return completionDepth != 0;
+    return completionThread().depth != 0;
 }
 
 namespace {
@@ -431,6 +436,7 @@ struct ReleaseQueue {
     // Set by a joiner under `mutex` until the thread was joined: the thread leaves once the queue
     // is empty, and hand-offs meanwhile destroy inline (nothing may be queued without a taker).
     bool stop = false;
+    bool waiting = false;
     AgcDriver::Mutex joinMutex;
 };
 
@@ -444,7 +450,11 @@ void ReleaseThreadMain() {
     auto& queue = ReleaseThreadQueue();
     std::unique_lock lock(queue.mutex);
     for (;;) {
-        queue.wake.wait(lock, [&] { return !queue.items.empty() || queue.stop; });
+        while (queue.items.empty() && !queue.stop) {
+            queue.waiting = true;
+            queue.wake.wait(lock);
+            queue.waiting = false;
+        }
         if (queue.items.empty()) return;
         auto items = std::move(queue.items);
         queue.items.clear();
@@ -489,6 +499,7 @@ void ReleaseDeferredKeeps() {
     const bool profile = DrawProfiled();
     bool handedOff = false;
     bool overBound = false;
+    bool sleeping = false;
     try {
         std::lock_guard lock(queue.mutex);
         if (queue.items.size() + releasing.size() > ReleaseQueueBound()) {
@@ -505,6 +516,7 @@ void ReleaseDeferredKeeps() {
             queue.items.reserve(queue.items.size() + releasing.size());
             for (auto& batch : releasing) queue.items.push_back(std::move(batch));
             handedOff = true;
+            sleeping = queue.waiting;
             if (profile) {
                 const auto queued = static_cast<std::uint64_t>(queue.items.size());
                 auto seen = releaseQueueMax.load(std::memory_order_relaxed);
@@ -519,7 +531,7 @@ void ReleaseDeferredKeeps() {
         DestroyDeferred(std::move(releasing), false);
         return;
     }
-    queue.wake.notify_one();
+    if (sleeping) queue.wake.notify_one();
 }
 // Lock-free state of the active recorder's open batch, read by the queue workers between packets
 // and inside WAIT_REG_MEM polls (see the static readers in Recorder.hpp). Written under the mutex.
@@ -1057,7 +1069,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     // rest of this one's, and this queue's queued label follows every batch of its own in flight
     // anyway, so the write-back landing first is the order the hardware gives.
     if (!QueuedLabelRanges().empty() && QueuedLabelOverlaps(address, bytes)) {
-        if (completionDepth != 0 && HookCompletionGuard()) {
+        if (completionThread().depth != 0 && HookCompletionGuard()) {
             queuedLabelHookInCompletion.fetch_add(1, std::memory_order_relaxed);
         } else if (auto* record = queuedLabelRecorder.load(std::memory_order_acquire); record != nullptr) {
             queuedLabelHookRecords.fetch_add(1, std::memory_order_relaxed);
@@ -1078,7 +1090,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     }
     const auto site = GuestMemory::CurrentReadSite();
     const auto scope = site != GuestMemory::ReadSite::Store ? PublishScope::Whole : PublishScope::PartialUnits;
-    const bool waited = completionDepth != 0;
+    const bool waited = completionThread().depth != 0;
     bool published = false;
     // The classification is made before the store (the store changes what it measures); profile only.
     StorageTexture::AccessClassification classification{};
@@ -1098,7 +1110,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     } else {
         stored = StorageTexture::FlushPending(address, bytes, nullptr, "memory access", scope, &published, waited);
     }
-    if (stored || published || (completionDepth == 0 && SnapshotOverlaps(address, bytes))) {
+    if (stored || published || (completionThread().depth == 0 && SnapshotOverlaps(address, bytes))) {
         // Stores into imported memory were only recorded; the CPU is about to read them. The wait
         // targets the batch holding them (the open one: SyncThrough submits it) and runs with the
         // mutex released when this acquisition is the outermost; a nested hook waits locked through
@@ -1110,7 +1122,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         if (auto* recorder = Recorder::Active(); recorder != nullptr) {
             const RecordedStoreSyncScope attribution(*recorder, address, bytes, classification, stored, HookSyncProfiled() ? RecordedStoreKey() : HookSyncKey{});
             Recorder::CountSync(2);
-            if (HookFullSync() || completionDepth != 0) recorder->Sync();
+            if (HookFullSync() || completionThread().depth != 0) recorder->Sync();
             else recorder->SyncThrough(address, bytes, true);
         }
     }
@@ -1123,6 +1135,7 @@ struct Recorder::ProgressWatcher {
     std::condition_variable wake;
     std::uint64_t submitted = 0;
     bool stop = false;
+    bool waiting = false;
     std::thread thread;
 
     ProgressWatcher(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, PFN_vkGetSemaphoreCounterValueKHR counterValue) {
@@ -1132,7 +1145,11 @@ struct Recorder::ProgressWatcher {
             for (;;) {
                 {
                     std::unique_lock lock(mutex);
-                    wake.wait(lock, [&] { return stop || submitted > seen; });
+                    while (!stop && submitted <= seen) {
+                        waiting = true;
+                        wake.wait(lock);
+                        waiting = false;
+                    }
                     if (stop) return;
                 }
                 const std::uint64_t target = seen + 1;
@@ -1155,11 +1172,13 @@ struct Recorder::ProgressWatcher {
     }
 
     void Submitted(std::uint64_t serial) {
+        bool sleeping = false;
         {
             std::lock_guard lock(mutex);
             submitted = serial;
+            sleeping = waiting;
         }
-        wake.notify_one();
+        if (sleeping) wake.notify_one();
     }
 
     ~ProgressWatcher() {
@@ -1495,7 +1514,7 @@ Recorder::StoreStatistics Recorder::StoreCounts() {
 }
 
 std::uint64_t Recorder::ThreadHookWaits() {
-    return hookRealWaits;
+    return completionThread().hookWaits;
 }
 
 namespace {
@@ -4214,7 +4233,7 @@ void Recorder::FlushDeferredReleases() {
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
     if (bytes == 0) return;
     const auto end = address + bytes;
-    if (completionDepth != 0 && !CompletionStoreSyncs()) {
+    if (completionThread().depth != 0 && !CompletionStoreSyncs()) {
         // A store made by a completion action (a copied buffer's write-back, GuestBufferMemory::
         // WriteBack) reached the flush hook, and a batch still in flight notes the range. Every
         // batch in flight now was recorded after the completing one (finish runs front to back),
@@ -4230,8 +4249,8 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
         ++holdCounters.completionSyncsSkipped;
         return;
     }
-    if (completionDepth != 0) ++holdCounters.completionSyncsWaited;
-    const auto completionWaitStart = completionDepth != 0 && DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (completionThread().depth != 0) ++holdCounters.completionSyncsWaited;
+    const auto completionWaitStart = completionThread().depth != 0 && DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     struct CompletionWait {
         std::chrono::steady_clock::time_point start;
         ~CompletionWait() {
@@ -4244,13 +4263,13 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
         const void* site = announcedSite != nullptr ? announcedSite : __builtin_return_address(0);
         if (syncThroughUnlocked(address, end, source, site)) return;
         // A completion-store wait (kill switch above) is already counted as 'waited'.
-        if (completionDepth == 0) ++holdCounters.hookLockedWaits;
+        if (completionThread().depth == 0) ++holdCounters.hookLockedWaits;
     }
     if (!SyncThroughEnabled() || (open != nullptr && overlaps(*open, address, end))) {
         // The announced site (or this call's caller) names the sync, not this function.
         if (announcedSite == nullptr) announcedSite = __builtin_return_address(0);
         // The open batch's work has not run; without one the newest in flight is the target.
-        if (open != nullptr || (!inFlight.empty() && unsignaled(inFlight.back()->serial))) ++hookRealWaits;
+        if (open != nullptr || (!inFlight.empty() && unsignaled(inFlight.back()->serial))) ++completionThread().hookWaits;
         Sync();
         return;
     }
@@ -4264,7 +4283,7 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
         }
     }
     if (targetSerial == 0) return;
-    if (unsignaled(targetSerial)) ++hookRealWaits;
+    if (unsignaled(targetSerial)) ++completionThread().hookWaits;
     targetedSyncs.fetch_add(1, std::memory_order_relaxed);
     const RestoreSyncSite restoreSite{BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0))};
     // Batches are in flight in serial order. A completion's own guest access can sync re-entrantly
@@ -4358,7 +4377,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     announcedSource = 4;
     announcedSite = nullptr;
     if (targetSerial == 0) return true;
-    if (unsignaled(targetSerial)) ++hookRealWaits;
+    if (unsignaled(targetSerial)) ++completionThread().hookWaits;
     // Everything the wait needs is copied out: the recorder may be torn down while the mutex is
     // released (its destructor completes every batch and waits for the semaphore to be left, see
     // WaitTimeline), after which `this` must not be touched. The id re-check below relies on the
@@ -4590,8 +4609,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     const auto completionStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     {
         struct InCompletion {
-            InCompletion() { ++completionDepth; }
-            ~InCompletion() { --completionDepth; }
+            InCompletion() { ++completionThread().depth; }
+            ~InCompletion() { --completionThread().depth; }
         } inCompletion;
         for (auto& action : batch->completions) {
             try {

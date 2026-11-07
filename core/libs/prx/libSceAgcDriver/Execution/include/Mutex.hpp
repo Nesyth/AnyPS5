@@ -6,6 +6,11 @@
 
 namespace AgcDriver {
 
+#ifdef _WIN32
+void WaitWhile(const std::atomic<std::uint32_t>& word, std::uint32_t value) noexcept;
+void WakeOne(std::atomic<std::uint32_t>& word) noexcept;
+void WakeAll(std::atomic<std::uint32_t>& word) noexcept;
+#else
 inline void WaitWhile(const std::atomic<std::uint32_t>& word, std::uint32_t value) noexcept {
     word.wait(value, std::memory_order_relaxed);
 }
@@ -17,6 +22,7 @@ inline void WakeOne(std::atomic<std::uint32_t>& word) noexcept {
 inline void WakeAll(std::atomic<std::uint32_t>& word) noexcept {
     word.notify_all();
 }
+#endif
 
 class Mutex {
 public:

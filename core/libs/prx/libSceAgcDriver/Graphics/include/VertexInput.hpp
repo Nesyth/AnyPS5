@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_VERTEXINPUT_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_VERTEXINPUT_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <algorithm>
 #include <atomic>
@@ -269,7 +270,7 @@ private:
     Context context;
     std::size_t capacity;
     std::array<std::atomic<std::uint64_t>, 1024> bypassBits{};
-    mutable std::mutex mutex;
+    mutable AgcDriver::Mutex mutex;
     std::list<std::uint64_t> order;
     std::unordered_map<std::uint64_t, Entry> entries;
 };

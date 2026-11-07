@@ -4125,7 +4125,7 @@ void StorageTexture::noteLayersBehind(std::uint32_t firstLayer, std::uint32_t la
 namespace {
 
 struct WriteRecords {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::unordered_map<std::uint64_t, StorageTexture::WriteRecord> byAddress;
     std::uint64_t serial = 0;
 };

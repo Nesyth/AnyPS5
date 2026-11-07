@@ -1,5 +1,4 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
-#include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
@@ -7,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -15,8 +15,8 @@
 namespace AgcDriver::DriverDetail {
 
 std::map<std::size_t, Driver::ResolvedDispatch>& Driver::resolvedAhead() {
-    static thread_local std::map<std::size_t, ResolvedDispatch>* resolved = nullptr;
-    return ShaderRecompiler::ThreadOwned(resolved);
+    struct ResolvedStorage {};
+    return HostThreadLocal<std::map<std::size_t, ResolvedDispatch>, ResolvedStorage>();
 }
 
 Driver::GroupCaptureStats& Driver::groupCaptureStats() {
@@ -161,8 +161,8 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
         }
         PreviewedUntil() = limit;
         if (hasFurtherDispatch) {
-            static thread_local QueueState* previewSlot = nullptr;
-            auto& preview = ShaderRecompiler::ThreadOwned(previewSlot);
+            struct PreviewStorage {};
+            auto& preview = HostThreadLocal<QueueState, PreviewStorage>();
             preview.shader = live.shader;
             preview.predication = live.predication;
             std::vector<PreparedShaders*> pendingShaders;

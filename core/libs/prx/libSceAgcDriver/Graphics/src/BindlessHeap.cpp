@@ -290,7 +290,7 @@ BindlessHeap& BindlessHeap::For(const Context& context) {
         BindlessHeap* heap = nullptr;
         std::uint64_t epoch = ~std::uint64_t{0};
     };
-    thread_local Cached cached;
+    auto& cached = HostThreadLocal<Cached, Cached>();
     if (cached.heap != nullptr && cached.device == context.device && cached.epoch == heapsEpoch.load(std::memory_order_acquire)) {
         return *cached.heap;
     }

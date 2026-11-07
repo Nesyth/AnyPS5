@@ -7,7 +7,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
-#include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SnapshotCopies.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -3126,8 +3125,8 @@ void refreshMirror(ImageMirror& mirror, std::uint64_t address, std::uint64_t byt
 
 void appendChangedBlocks(std::span<ImageMirror* const> mirrors, std::uint64_t generation, std::vector<RefreshBlock>& blocks) {
     constexpr std::uint64_t block = 65536;
-    thread_local std::vector<std::uint8_t>* changedSlot = nullptr;
-    auto& changed = ShaderRecompiler::ThreadOwned(changedSlot);
+    struct ChangedStorage {};
+    auto& changed = HostThreadLocal<std::vector<std::uint8_t>, ChangedStorage>();
     Mirrors().heapChecks += mirrors.size();
     for (auto* const pointer : mirrors) {
         auto& mirror = *pointer;
@@ -3230,8 +3229,8 @@ void forgetCommitChanges(ImageMirror& mirror, const Pieces& pieces) {
 
 void appendSparseBlocks(ImageMirror& mirror, Pieces pieces, std::uint64_t generation, std::vector<RefreshBlock>& blocks) {
     constexpr std::uint64_t block = 65536;
-    thread_local std::vector<std::uint8_t>* changedSlot = nullptr;
-    auto& changed = ShaderRecompiler::ThreadOwned(changedSlot);
+    struct ChangedStorage {};
+    auto& changed = HostThreadLocal<std::vector<std::uint8_t>, ChangedStorage>();
     forgetCommitChanges(mirror, pieces);
     ++Mirrors().heapChecks;
     changed.assign(mirror.generations.size(), 0);

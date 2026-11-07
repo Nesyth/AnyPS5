@@ -226,8 +226,8 @@ struct ThreadMemoryCounters {
 
 MemoryCounter& CounterFor(MemoryCounterKind kind) {
     if (SharedMemoryCounters()) return Profile().shared.counters[kind];
-    thread_local ThreadMemoryCounters* thread = nullptr;
-    return ShaderRecompiler::ThreadOwned(thread).counters.counters[kind];
+    struct ThreadStorage {};
+    return HostThreadLocal<ThreadMemoryCounters, ThreadStorage>().counters.counters[kind];
 }
 
 // Every thread's counters, the retired and the shared ones summed: calls, bytes, nanoseconds per kind.
@@ -894,7 +894,7 @@ bool onOwnLiveStack(std::uintptr_t address, std::size_t bytes) {
 #endif
         }
     };
-    thread_local const Bounds bounds;
+    const auto& bounds = HostThreadLocal<Bounds, Bounds>();
     const auto frame = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
     return bounds.high != 0 && frame >= bounds.low && frame < bounds.high && address >= frame && address < bounds.high && bytes <= bounds.high - address;
 }
@@ -1619,8 +1619,7 @@ struct EpochCollectMap {
 };
 
 EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
-    thread_local EpochCollectMap* slot = nullptr;
-    auto& map = ShaderRecompiler::ThreadOwned(slot);
+    auto& map = HostThreadLocal<EpochCollectMap, EpochCollectMap>();
     if (map.epoch != epoch) {
         map.ranges.clear();
         map.intervals.clear();
@@ -2000,9 +1999,12 @@ std::uint64_t CollectEpochBumps() {
 
 namespace {
 std::atomic<std::uint64_t> proofSerial{1};
-thread_local bool proofThread = false;
-thread_local std::uint8_t proofBreakLockSite = 0;
-thread_local GpuLockSite proofLockSite = GpuLockSite::Other;
+struct ProofThreadSlot {};
+struct ProofBreakLockSiteSlot {};
+struct ProofLockSiteSlot {};
+using ProofThread = HostThreadSlot<bool, ProofThreadSlot>;
+using ProofBreakLockSite = HostThreadSlot<std::uint8_t, ProofBreakLockSiteSlot>;
+using ProofLockSite = HostThreadSlot<GpuLockSite, ProofLockSiteSlot>;
 bool proofBreakStats() {
     static const bool on = std::getenv("APS5_STAGE_STATS") != nullptr;
     return on;
@@ -2026,7 +2028,7 @@ ProofLog& proofLog() {
 void countProofBreak(ProofBreak site) {
     if (!proofBreakStats()) return;
     proofBreaks[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
-    if (site == ProofBreak::GpuLock) proofBreakLocks[proofBreakLockSite % proofBreakLocks.size()].fetch_add(1, std::memory_order_relaxed);
+    if (site == ProofBreak::GpuLock) proofBreakLocks[ProofBreakLockSite::Get() % proofBreakLocks.size()].fetch_add(1, std::memory_order_relaxed);
 }
 }
 
@@ -2102,11 +2104,11 @@ std::string TakeProofBreakReport() {
 }
 
 void MarkProofThread() {
-    proofThread = true;
+    ProofThread::Set(true);
 }
 
 bool OnProofThread() {
-    return proofThread;
+    return ProofThread::Get();
 }
 
 std::string SweepCostReport() {
@@ -2794,8 +2796,7 @@ struct GpuLockStats {
 };
 
 GpuLockStats& LockStats() {
-    thread_local GpuLockStats stats;
-    return stats;
+    return HostThreadLocal<GpuLockStats, GpuLockStats>();
 }
 
 bool GpuLockProfiled() {
@@ -2872,7 +2873,8 @@ bool GpuMutexType::tryEnter() {
 void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     // The tag belongs to this acquisition only, nested or not.
-    const auto site = std::exchange(proofLockSite, GpuLockSite::Other);
+    const auto site = ProofLockSite::Get();
+    ProofLockSite::Set(GpuLockSite::Other);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
         // Range proofs leave out other threads' GPU locks whose changes break proofs where they
@@ -2881,8 +2883,8 @@ void GpuMutexType::acquired() {
         // and labels. Other dispatches, indirect work, inline draws, labels, fills, copies and
         // untagged holds still break every proof.
         const bool selfBreaking = site == GpuLockSite::Hook || site == GpuLockSite::Wait || site == GpuLockSite::Flush || site == GpuLockSite::Present || site == GpuLockSite::Try || site == GpuLockSite::RangedDispatch;
-        if (!proofThread && !(RangeProofs() && selfBreaking)) BreakProofs(ProofBreak::GpuLock);
-        proofBreakLockSite = 0;
+        if (!ProofThread::Get() && !(RangeProofs() && selfBreaking)) BreakProofs(ProofBreak::GpuLock);
+        ProofBreakLockSite::Set(0);
     }
 }
 
@@ -3052,8 +3054,8 @@ void GpuMutexType::lock() {
 }
 
 void TagGpuLockSite(GpuLockSite site) {
-    proofLockSite = site;
-    if (proofBreakStats()) proofBreakLockSite = static_cast<std::uint8_t>(site);
+    ProofLockSite::Set(site);
+    if (proofBreakStats()) ProofBreakLockSite::Set(static_cast<std::uint8_t>(site));
     // Off the profiled path the tag is never read, so the thread-local is not touched either.
     if (!GpuLockProfiled() && !PerformanceTrace::Recording()) return;
     LockStats().nextSite = site;

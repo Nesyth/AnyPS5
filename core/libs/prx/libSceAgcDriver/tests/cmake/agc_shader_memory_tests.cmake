@@ -2,6 +2,7 @@ add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
         Execution/src/ShaderMemory.cpp
         Execution/src/GuestMemory.cpp
+        Execution/src/Mutex.cpp
         Execution/src/PerformanceTraceThread.cpp
         Graphics/src/RuntimeSwitches.cpp
         Graphics/src/GuestTextureResource.cpp
@@ -10,6 +11,9 @@ add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
 target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
+if(WIN32)
+    target_link_libraries(agc_shader_memory_tests PRIVATE synchronization)
+endif()
 set_target_properties(agc_shader_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_memory_tests)
 

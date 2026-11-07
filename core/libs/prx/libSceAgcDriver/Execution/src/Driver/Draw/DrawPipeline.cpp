@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
 #include <mutex>
 #include <optional>
@@ -332,8 +333,8 @@ std::size_t DrawPipeline::QueuedItems() {
 }
 
 bool& DrawPipeline::Active() {
-    static thread_local bool active = false;
-    return active;
+    struct ActiveStorage {};
+    return HostThreadLocal<bool, ActiveStorage>();
 }
 
 std::atomic<std::uint64_t>& DrawPipeline::EpochToken() {
@@ -342,9 +343,10 @@ std::atomic<std::uint64_t>& DrawPipeline::EpochToken() {
 }
 
 void DrawPipeline::FollowEpoch(std::uint64_t token) {
-    static thread_local std::uint64_t followed = 0;
-    if (followed == token) return;
-    followed = token;
+    struct FollowedSlot {};
+    using Followed = HostThreadSlot<std::uint64_t, FollowedSlot>;
+    if (Followed::Get() == token) return;
+    Followed::Set(token);
     GuestMemory::BumpCollectEpoch();
 }
 

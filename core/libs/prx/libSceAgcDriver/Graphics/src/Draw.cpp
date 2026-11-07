@@ -22,12 +22,10 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
-#include "ThreadOwned.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
-#include "ThreadOwned.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -1147,8 +1145,8 @@ std::map<std::vector<std::uint64_t>, std::string>& validationFailures() {
 }
 
 std::vector<std::uint64_t>& validationKeyScratch() {
-    thread_local std::vector<std::uint64_t>* keySlot = nullptr;
-    auto& key = ShaderRecompiler::ThreadOwned(keySlot);
+    struct KeyStorage {};
+    auto& key = HostThreadLocal<std::vector<std::uint64_t>, KeyStorage>();
     key.clear();
     return key;
 }
@@ -1159,15 +1157,17 @@ std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const Comp
     auto& key = validationKeyScratch();
     const bool keyed = ValidationKey(context, shaders, state, key);
     static std::map<std::vector<std::uint64_t>, std::uint32_t> memo;
-    struct LastKeyStorage {};
-    auto& lastKey = HostThreadLocal<std::vector<std::uint64_t>, LastKeyStorage>();
-    thread_local std::uint32_t lastOutputs = 0;
-    thread_local bool lastValid = false;
+    struct LastOutputs {
+        std::vector<std::uint64_t> key;
+        std::uint32_t outputs = 0;
+        bool valid = false;
+    };
+    auto& last = HostThreadLocal<LastOutputs, LastOutputs>();
     const bool trims = keyed && CommitTrims();
-    if (trims && lastValid && key == lastKey) {
+    if (trims && last.valid && key == last.key) {
         memoized = true;
         hit = true;
-        return lastOutputs;
+        return last.outputs;
     }
     if (keyed) {
         memoized = true;
@@ -1175,9 +1175,9 @@ std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const Comp
         if (const auto found = memo.find(key); found != memo.end()) {
             hit = true;
             if (trims) {
-                lastKey = key;
-                lastOutputs = found->second;
-                lastValid = true;
+                last.key = key;
+                last.outputs = found->second;
+                last.valid = true;
             }
             return found->second;
         }
@@ -2851,8 +2851,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool captured = state.stages.mesh && state.tessellationCapture != nullptr;
     const bool addressBased = resources.HoldsLease();
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* passReadsSlot = nullptr;
-    auto& passReads = ShaderRecompiler::ThreadOwned(passReadsSlot);
+    struct PassReadsStorage {};
+    auto& passReads = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, PassReadsStorage>();
     passReads.clear();
     if (memoHit) passReads.assign(memo.reads.begin(), memo.reads.end());
     else if (!addressBased) resources.DeviceReads(passReads);
@@ -2885,7 +2885,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     GuestRangeList passWrites = resources.GpuWrites();
     GuestRangeList passWriteOnly{};
     std::size_t ownReads = deviceReads;
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* hazardWritesSlot = nullptr;
+    struct HazardWritesStorage {};
     if (memoHit) {
         passWrites = memo.writes;
         passWriteOnly = memo.writeOnly;
@@ -2902,7 +2902,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         const auto kept = std::remove_if(passReads.begin(), ownEnd, [&](const auto& range) { return listed(range, true); });
         ownReads = static_cast<std::size_t>(kept - passReads.begin());
         passReads.erase(kept, ownEnd);
-        auto& hazardWrites = ShaderRecompiler::ThreadOwned(hazardWritesSlot);
+        auto& hazardWrites = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, HazardWritesStorage>();
         hazardWrites.clear();
         for (const auto& range : resources.GpuWrites()) {
             if (!listed(range, false)) hazardWrites.push_back(range);

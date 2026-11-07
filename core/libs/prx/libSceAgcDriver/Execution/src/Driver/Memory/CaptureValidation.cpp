@@ -1,6 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
-#include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
 #include <cstring>
 
@@ -15,8 +15,8 @@ bool Driver::captureStable(std::span<const ShaderRecompiler::MemoryRegion> captu
     double waited = 0;
     PendingView pending;
     pending.Load();
-    thread_local std::vector<std::byte>* knownSlot = nullptr;
-    auto& known = ShaderRecompiler::ThreadOwned(knownSlot);
+    struct KnownStorage {};
+    auto& known = HostThreadLocal<std::vector<std::byte>, KnownStorage>();
     for (const auto& region : captured) {
         if (!stable) break;
         known.resize(region.bytes.size());
@@ -60,11 +60,11 @@ bool Driver::captureStable(std::span<const ShaderRecompiler::MemoryRegion> captu
 bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderRecompiler::RecompileResult& compiled, bool inPlace, const PendingView& view, bool* unmapped, std::optional<SampledReadScope>* sampling, const DataMask* data, std::span<const VouchedRegions> vouched) {
     using Policy = ShaderMemory::PendingWrite;
 
-    thread_local std::vector<std::size_t>* pendingSlot = nullptr;
-    auto& pending = ShaderRecompiler::ThreadOwned(pendingSlot);
+    struct PendingStorage {};
+    auto& pending = HostThreadLocal<std::vector<std::size_t>, PendingStorage>();
     pending.clear();
-    thread_local std::vector<VouchedRegions>* skippedSlot = nullptr;
-    auto& skipped = ShaderRecompiler::ThreadOwned(skippedSlot);
+    struct SkippedStorage {};
+    auto& skipped = HostThreadLocal<std::vector<VouchedRegions>, SkippedStorage>();
     skipped.clear();
     for (const auto& range : vouched) {
         if (range.begin < range.end && range.end <= captured.size() && (skipped.empty() || skipped.back().end <= range.begin) && !view.Overlaps(range.low, static_cast<std::size_t>(range.high - range.low))) skipped.push_back(range);
@@ -79,8 +79,8 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
     }
 
     const auto compareMasked = [&](const ShaderRecompiler::MemoryRegion& region, std::size_t first) {
-        thread_local std::vector<std::byte>* liveSlot = nullptr;
-        auto& live = ShaderRecompiler::ThreadOwned(liveSlot);
+        struct LiveStorage {};
+        auto& live = HostThreadLocal<std::vector<std::byte>, LiveStorage>();
         live.resize(region.bytes.size());
         const auto copied = GuestMemory::CopyMapped(region.guestAddress, live);
         if (copied != GuestMemory::Compare::Equal) return copied;
@@ -98,12 +98,12 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
     };
 
     static constexpr std::size_t NoKnownValue = std::numeric_limits<std::size_t>::max();
-    thread_local std::vector<Policy>* policiesSlot = nullptr;
-    thread_local std::vector<std::size_t>* knownOffsetsSlot = nullptr;
-    thread_local std::vector<std::byte>* knownBytesSlot = nullptr;
-    auto& policies = ShaderRecompiler::ThreadOwned(policiesSlot);
-    auto& knownOffsets = ShaderRecompiler::ThreadOwned(knownOffsetsSlot);
-    auto& knownBytes = ShaderRecompiler::ThreadOwned(knownBytesSlot);
+    struct PoliciesStorage {};
+    struct KnownOffsetsStorage {};
+    struct KnownBytesStorage {};
+    auto& policies = HostThreadLocal<std::vector<Policy>, PoliciesStorage>();
+    auto& knownOffsets = HostThreadLocal<std::vector<std::size_t>, KnownOffsetsStorage>();
+    auto& knownBytes = HostThreadLocal<std::vector<std::byte>, KnownBytesStorage>();
     policies.assign(pending.size(), Policy::None);
     knownOffsets.assign(pending.size(), NoKnownValue);
     knownBytes.clear();

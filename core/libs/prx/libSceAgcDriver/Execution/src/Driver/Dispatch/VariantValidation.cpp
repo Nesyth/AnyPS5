@@ -1,9 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
-#include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -172,15 +172,15 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     }
     const bool masked = live != nullptr && !variant.dataPositions.empty();
     const DataMask mask{variant.dataPositions, live};
-    thread_local std::vector<VouchedRegions>* vouchedSlot = nullptr;
-    auto& vouched = ShaderRecompiler::ThreadOwned(vouchedSlot);
+    struct VouchedStorage {};
+    auto& vouched = HostThreadLocal<std::vector<VouchedRegions>, VouchedStorage>();
     vouched.clear();
     if (!variant.shared.empty() && vouchedValidation() && !validateLegacy() && variant.runs.size() == regions.size()) VouchSharedRegions(variant.shared, regions.size(), &QueryPendingSpan, vouched);
     PendingView pending;
     pending.Load();
     std::erase_if(vouched, [&](const VouchedRegions& range) { return pending.Overlaps(range.low, static_cast<std::size_t>(range.high - range.low)); });
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* checkedSlot = nullptr;
-    auto& checked = ShaderRecompiler::ThreadOwned(checkedSlot);
+    struct CheckedStorage {};
+    auto& checked = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, CheckedStorage>();
     checked.clear();
     if (!vouched.empty()) {
         for (std::size_t index = 0, range = 0; index < variant.runs.size(); ++index) {

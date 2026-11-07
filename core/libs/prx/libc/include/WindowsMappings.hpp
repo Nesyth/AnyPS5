@@ -3,6 +3,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1223,7 +1224,8 @@ private:
         const bool sized = run.end - start >= (wide ? 0x4000u : 0x40000u);
         const bool settled = run.fresh == 0 || wide;
         const bool spans = armSpansFlag().load(std::memory_order_relaxed);
-        thread_local std::vector<std::pair<std::uintptr_t, std::uintptr_t>> armedSpans;
+        struct ArmedSpansStorage {};
+        auto& armedSpans = HostThreadLocal<std::vector<std::pair<std::uintptr_t, std::uintptr_t>>, ArmedSpansStorage>();
         const bool armed = considered && run.watched && settled && (spans || !run.writeObserved || rearm) && sized && (spans ? armResidentSpans(first, stop, armedSpans) : armResident(first, stop));
         const auto rememberArmed = [&] {
             if (!spans) {

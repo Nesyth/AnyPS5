@@ -1,6 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
-#include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -15,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -277,8 +277,8 @@ void Driver::execute(const Submission& submission) {
 
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 
-    thread_local PacketProfile* packetProfileSlot = nullptr;
-    auto& packetProfile = ShaderRecompiler::ThreadOwned(packetProfileSlot);
+    struct PacketProfileStorage {};
+    auto& packetProfile = HostThreadLocal<PacketProfile, PacketProfileStorage>();
     ++packetProfile.submissions;
     auto& packetCounters = PacketCounters::ThisThread();
 

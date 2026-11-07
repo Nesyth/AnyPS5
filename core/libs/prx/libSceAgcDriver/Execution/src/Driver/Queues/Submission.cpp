@@ -11,7 +11,6 @@
 #include "prx/libSceAgcDriver/Execution/include/SubmissionCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
-#include "ThreadOwned.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <atomic>
@@ -112,8 +111,8 @@ std::deque<const std::uint32_t*>& Driver::releasedTails() {
 void Driver::noteReleasedTails(const Submission& submission) {
     auto& released = releasedTails();
     released.clear();
-    thread_local Submission* scratchSlot = nullptr;
-    auto& scratch = ShaderRecompiler::ThreadOwned(scratchSlot);
+    struct ScratchStorage {};
+    auto& scratch = HostThreadLocal<Submission, ScratchStorage>();
     const std::uint32_t* tail = submission.rewindTail;
     std::size_t words = submission.rewindWords;
     for (std::size_t chunk = 0; chunk < 256 && tail != nullptr; ++chunk) {

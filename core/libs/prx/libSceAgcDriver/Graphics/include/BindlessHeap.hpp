@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_BINDLESSHEAP_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_BINDLESSHEAP_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "RuntimeAbi.hpp"
 #include <atomic>
@@ -133,7 +134,7 @@ private:
     std::size_t wrapRingOffset(std::size_t offset, std::size_t bytes);
     std::size_t ringCursor = 0;
     std::uint32_t ringAlignment = 256;
-    mutable std::mutex mutex;
+    mutable AgcDriver::Mutex mutex;
     std::atomic<std::uint64_t> slotSerial{1};
     struct ImageSlotKey {
         std::uint32_t kind;
