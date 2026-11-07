@@ -46,6 +46,7 @@ enum class RuntimeSwitch : std::size_t {
     SecondFinisher,
     ThirdFinisher,
     LocklessHazards,
+    XpHalfDraws,
     Count,
 };
 

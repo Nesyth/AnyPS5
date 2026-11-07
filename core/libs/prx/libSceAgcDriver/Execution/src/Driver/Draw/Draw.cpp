@@ -1546,6 +1546,8 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     } submitDue{*this, localDevice};
     recordLabelsForPacket(localDevice.get(), queue);
     noteDrawWriters(stages, queue);
+    static std::atomic<std::uint64_t> halfDraws{0};
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpHalfDraws) && (halfDraws.fetch_add(1, std::memory_order_relaxed) & 1u) != 0) return;
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr) == RecipeOutcome::Recorded) return;
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
