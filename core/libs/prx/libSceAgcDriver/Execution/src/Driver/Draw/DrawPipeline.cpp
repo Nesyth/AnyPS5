@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -65,6 +67,13 @@ bool finisherTakes(unsigned index) {
 constexpr const char* FinisherNames[3] = {"draw finisher", "draw finisher 2", "draw finisher 3"};
 
 constexpr unsigned PublishedReadAttempts = 8;
+
+#ifdef _WIN32
+const bool hostLargeCacheHooked = [] {
+    SetHostLargeCacheQuery(+[] { return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::HostLargeCache); });
+    return true;
+}();
+#endif
 
 bool lockless() {
     return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::LocklessHazards);
@@ -706,6 +715,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held, %llu decode drains", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(decodeDrainCount - reportedDecodeDrains));
     reportedDecodeDrains = decodeDrainCount;
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[indirect-draws] (cumulative): %s\n", Graphics::IndirectDrawTotalsText().c_str());
     // The census of what moves template proofs (APS5_STAGE_STATS counts them): breaks by site, why
     // the epoch shortcut missed, and the objects taken from another template's proof.
     static const bool census = std::getenv("APS5_STAGE_STATS") != nullptr;

@@ -1,6 +1,7 @@
 #ifdef _WIN32
 
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -14,17 +15,32 @@ namespace {
 constexpr std::size_t Granule = 16;
 constexpr std::size_t LargestCached = 1024;
 constexpr std::size_t Classes = LargestCached / Granule;
+constexpr std::size_t LargeClasses = 6;
+constexpr std::size_t LargestLarge = std::size_t{2048} << (LargeClasses - 1);
+constexpr std::size_t AllClasses = Classes + LargeClasses;
 
 constexpr std::uint16_t Depth(std::size_t sizeClass) {
-    return sizeClass < 256 / Granule ? 64 : 16;
+    return sizeClass >= Classes ? 4 : sizeClass < 256 / Granule ? 64 : 16;
 }
 
 struct Cache {
-    void* heads[Classes];
-    std::uint16_t counts[Classes];
+    void* heads[AllClasses];
+    std::uint16_t counts[AllClasses];
 };
 
 constexpr std::uint16_t KeptLists = 8;
+constexpr std::uint16_t KeptLargeLists = 2;
+
+std::atomic<bool (*)()> largeCacheQuery{nullptr};
+
+bool LargeCache() noexcept {
+    const auto query = largeCacheQuery.load(std::memory_order_acquire);
+    return query != nullptr && query();
+}
+
+std::size_t LargeClassOf(std::size_t bytes) noexcept {
+    return Classes + static_cast<std::size_t>(std::bit_width(bytes - 1)) - 11;
+}
 
 struct Depot {
     SRWLOCK lock = SRWLOCK_INIT;
@@ -32,12 +48,12 @@ struct Depot {
     std::uint16_t count = 0;
 };
 
-Depot depots[Classes];
+Depot depots[AllClasses];
 
 bool KeepList(std::size_t sizeClass, void* list) noexcept {
     auto& depot = depots[sizeClass];
     AcquireSRWLockExclusive(&depot.lock);
-    const bool kept = depot.count < KeptLists;
+    const bool kept = depot.count < (sizeClass >= Classes ? KeptLargeLists : KeptLists);
     if (kept) {
         static_cast<void**>(list)[1] = depot.lists;
         depot.lists = list;
@@ -70,7 +86,7 @@ std::atomic<DWORD> tlsSlot{Unset};
 std::atomic<DWORD> flsSlot{FLS_OUT_OF_INDEXES};
 
 void Drain(Cache* cache) noexcept {
-    for (std::size_t sizeClass = 0; sizeClass < Classes; ++sizeClass) {
+    for (std::size_t sizeClass = 0; sizeClass < AllClasses; ++sizeClass) {
         while (void* block = cache->heads[sizeClass]) {
             cache->heads[sizeClass] = *static_cast<void**>(block);
             std::free(block);
@@ -146,8 +162,10 @@ Cache* CurrentCache() noexcept {
 
 void* TryAllocate(std::size_t bytes) noexcept {
     if (bytes == 0) bytes = 1;
-    if (bytes <= LargestCached) {
-        const auto sizeClass = (bytes - 1) / Granule;
+    const bool large = bytes > LargestCached && bytes <= LargestLarge && LargeCache();
+    if (bytes <= LargestCached || large) {
+        const auto sizeClass = large ? LargeClassOf(bytes) : (bytes - 1) / Granule;
+        const auto blockBytes = large ? std::size_t{2048} << (sizeClass - Classes) : (sizeClass + 1) * Granule;
         if (auto* cache = CurrentCache()) {
             if (cache->heads[sizeClass] == nullptr) {
                 if (void* list = TakeList(sizeClass)) {
@@ -161,7 +179,7 @@ void* TryAllocate(std::size_t bytes) noexcept {
                 return block;
             }
         }
-        return std::malloc((sizeClass + 1) * Granule);
+        return std::malloc(blockBytes);
     }
     return std::malloc(bytes);
 }
@@ -178,9 +196,11 @@ void* Allocate(std::size_t bytes) {
 void Release(void* block, std::size_t bytes = 0) noexcept {
     if (block == nullptr) return;
     if (auto* cache = CurrentCache()) {
-        const auto usable = bytes != 0 && bytes % Granule == 0 ? bytes : _msize(block);
-        if (usable >= Granule && usable < LargestCached + Granule) {
-            const auto sizeClass = usable / Granule - 1;
+        const bool large = LargeCache();
+        const auto usable = bytes != 0 && bytes % Granule == 0 && (bytes <= LargestCached || !large) ? bytes : _msize(block);
+        const bool largeBlock = large && usable > LargestCached && usable <= LargestLarge && std::has_single_bit(usable);
+        if ((usable >= Granule && usable < LargestCached + Granule) || largeBlock) {
+            const auto sizeClass = largeBlock ? LargeClassOf(usable) : usable / Granule - 1;
             if (cache->counts[sizeClass] == Depth(sizeClass) && KeepList(sizeClass, cache->heads[sizeClass])) {
                 cache->heads[sizeClass] = nullptr;
                 cache->counts[sizeClass] = 0;
@@ -194,6 +214,14 @@ void Release(void* block, std::size_t bytes = 0) noexcept {
         }
     }
     std::free(block);
+}
+
+}
+
+namespace AgcDriver {
+
+void SetHostLargeCacheQuery(bool (*query)()) noexcept {
+    largeCacheQuery.store(query, std::memory_order_release);
 }
 
 }

@@ -129,6 +129,7 @@ bool DrawRecipes();
 enum class IndirectDrawPath : std::uint8_t { Gpu, NotFolded, FetchUnknown, NonVertexPath, IndxOffset, DrawIndex, VertexRange, FeatureGap, PendingImage, PendingLabelOrCopy, NotImported, Disabled, IndexRange, IndexLimitUnknown, Count };
 void CountIndirectDraw(IndirectDrawPath path, double readMs, bool rewritten = false);
 std::array<std::uint64_t, static_cast<std::size_t>(IndirectDrawPath::Count)> IndirectDrawCounts();
+std::string IndirectDrawTotalsText();
 void CountEmptyIndirectDraw(double readMs);
 std::uint64_t EmptyIndirectDrawCount();
 

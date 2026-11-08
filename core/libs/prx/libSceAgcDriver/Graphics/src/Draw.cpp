@@ -1329,7 +1329,23 @@ const char* IndirectDrawPathName(IndirectDrawPath path) {
     return IndirectDrawPathNames[static_cast<std::size_t>(path)];
 }
 
+namespace {
+std::array<std::atomic<std::uint64_t>, IndirectPathCount> indirectTotals{};
+std::atomic<std::uint64_t> indirectReadTotalUs{0};
+}
+
+std::string IndirectDrawTotalsText() {
+    std::string text = "gpu-side " + std::to_string(indirectTotals[0].load(std::memory_order_relaxed)) + "; cpu-side:";
+    for (std::size_t i = 1; i < IndirectPathCount; ++i) {
+        const auto count = indirectTotals[i].load(std::memory_order_relaxed);
+        if (count != 0) text += std::string(" ") + IndirectDrawPathNames[i] + " " + std::to_string(count);
+    }
+    return text + "; CPU argument reads " + std::to_string(indirectReadTotalUs.load(std::memory_order_relaxed) / 1000) + " ms";
+}
+
 void CountIndirectDraw(IndirectDrawPath path, double readMs, bool rewritten) {
+    indirectTotals[static_cast<std::size_t>(path)].fetch_add(1, std::memory_order_relaxed);
+    indirectReadTotalUs.fetch_add(static_cast<std::uint64_t>(readMs * 1000.0), std::memory_order_relaxed);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
     auto& stats = Profile();

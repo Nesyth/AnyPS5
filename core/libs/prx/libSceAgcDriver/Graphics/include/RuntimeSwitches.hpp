@@ -52,6 +52,7 @@ enum class RuntimeSwitch : std::size_t {
     BesideSampleDumps,
     DeepQueues,
     SpeculativeLookup,
+    HostLargeCache,
     Count,
 };
 

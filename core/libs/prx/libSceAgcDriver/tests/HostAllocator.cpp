@@ -18,6 +18,12 @@
 #include <psapi.h>
 #endif
 
+#ifdef _WIN32
+namespace AgcDriver {
+void SetHostLargeCacheQuery(bool (*query)()) noexcept;
+}
+#endif
+
 namespace {
 
 int failures = 0;
@@ -159,6 +165,7 @@ void BlocksFlowToAnotherThread() {
 
 void ThreadsEndWithCachedBlocks() {
     constexpr int waves = 24;
+    exitedThreads.store(0);
     std::size_t afterEarlyWaves = 0;
     for (int wave = 0; wave < waves; ++wave) {
         std::vector<std::thread> threads;
@@ -184,13 +191,70 @@ void ThreadsEndWithCachedBlocks() {
 
 }
 
-int main() {
+void LargeBlocksRoundTrip() {
+    const std::size_t sizes[] = {1025, 1040, 2047, 2048, 2049, 3000, 4096, 4097, 8191, 8192, 12000, 16384, 30000, 32768, 32769, 65535, 65536, 65537, 100000};
+    for (int round = 0; round < 64; ++round) {
+        std::vector<std::pair<unsigned char*, std::size_t>> blocks;
+        for (const auto size : sizes) {
+            auto* block = static_cast<unsigned char*>(::operator new(size));
+#ifdef _WIN32
+            Check(_msize(block) >= size, "a large block holds at least the bytes asked for");
+#endif
+            Check(reinterpret_cast<std::uintptr_t>(block) % alignof(std::max_align_t) == 0, "a large block is aligned");
+            FillAndVerify(block, size, static_cast<unsigned char>(size + round));
+            blocks.emplace_back(block, size);
+        }
+        for (std::size_t i = 0; i < blocks.size(); ++i) {
+            if (i % 2 == 0) ::operator delete(blocks[i].first, blocks[i].second);
+            else ::operator delete(blocks[i].first);
+        }
+    }
+    std::vector<std::pair<unsigned char*, std::size_t>> handed;
+    for (int i = 0; i < 256; ++i) {
+        const auto size = sizes[static_cast<std::size_t>(i) % (sizeof(sizes) / sizeof(sizes[0]))];
+        auto* block = static_cast<unsigned char*>(::operator new(size));
+        FillAndVerify(block, size, static_cast<unsigned char>(i));
+        handed.emplace_back(block, size);
+    }
+    std::thread other([&] {
+        for (const auto& [block, size] : handed) ::operator delete(block, size);
+        for (int i = 0; i < 256; ++i) {
+            auto* block = static_cast<unsigned char*>(::operator new(4096));
+            FillAndVerify(block, 4096, 9);
+            ::operator delete(block);
+        }
+    });
+    other.join();
+    for (int i = 0; i < 256; ++i) {
+        auto* block = static_cast<unsigned char*>(::operator new(6000));
+        FillAndVerify(block, 6000, 11);
+        ::operator delete(block, 6000);
+    }
+}
+
+void RunAll() {
     EverySizeRoundTrips();
     SizedDeletesKeepTheirClass();
     BlocksCrossIntoLibstdcxx();
     BlocksMoveBetweenThreads();
     BlocksFlowToAnotherThread();
     ThreadsEndWithCachedBlocks();
+    LargeBlocksRoundTrip();
+}
+
+std::atomic<bool> largeCacheOn{false};
+
+int main() {
+    RunAll();
+#ifdef _WIN32
+    AgcDriver::SetHostLargeCacheQuery(+[] { return largeCacheOn.load(std::memory_order_relaxed); });
+    largeCacheOn.store(true, std::memory_order_relaxed);
+    RunAll();
+    largeCacheOn.store(false, std::memory_order_relaxed);
+    LargeBlocksRoundTrip();
+    largeCacheOn.store(true, std::memory_order_relaxed);
+    LargeBlocksRoundTrip();
+#endif
     if (failures != 0) {
         std::fprintf(stderr, "%d host allocator checks failed\n", failures);
         return 1;
