@@ -6999,6 +6999,31 @@ std::uint64_t HeapReplayKeyHash(std::span<const std::uint32_t> key) {
     return hash == 0u ? 1u : hash;
 }
 
+constexpr std::size_t MovedUploadBytes = Recorder::DrawUploadChunk / 16u;
+
+bool MovedSnapshotStats() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return stats;
+}
+
+struct MovedSnapshotTally {
+    std::atomic<std::uint64_t> cached{0};
+    std::atomic<std::uint64_t> reused{0};
+    std::atomic<std::uint64_t> cachedBytes{0};
+    std::atomic<std::uint64_t> uploaded{0};
+    std::atomic<std::uint64_t> uploadedBytes{0};
+};
+
+MovedSnapshotTally& movedSnapshotTally() {
+    static MovedSnapshotTally tally;
+    return tally;
+}
+
+}
+
+ShaderResources::MovedSnapshotCounts ShaderResources::TakeMovedSnapshotCounts() {
+    auto& tally = movedSnapshotTally();
+    return {tally.cached.exchange(0, std::memory_order_relaxed), tally.reused.exchange(0, std::memory_order_relaxed), tally.cachedBytes.exchange(0, std::memory_order_relaxed), tally.uploaded.exchange(0, std::memory_order_relaxed), tally.uploadedBytes.exchange(0, std::memory_order_relaxed)};
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord, bool census) const {
@@ -7108,10 +7133,15 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
         if (buffer == nullptr) {
-            const bool uploaded = bytes != 0 && bytes <= uploadLimit;
+            const bool movedUpload = override != moved.end() && bytes > uploadLimit && bytes <= MovedUploadBytes && RuntimeSwitches::Set(RuntimeSwitch::MovedLargeUploads);
+            const bool uploaded = bytes != 0 && (bytes <= uploadLimit || movedUpload);
             if (census) {
                 if (uploaded) ++counted.uploads;
                 else ++counted.large;
+            }
+            if (movedUpload && MovedSnapshotStats()) {
+                movedSnapshotTally().uploaded.fetch_add(1, std::memory_order_relaxed);
+                movedSnapshotTally().uploadedBytes.fetch_add(bytes, std::memory_order_relaxed);
             }
             if (uploaded) {
                 auto slice = recorder.DrawUpload(bytes);
@@ -7121,6 +7151,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
             } else {
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
                 buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, &offset);
+                if (override != moved.end() && bytes <= MovedUploadBytes && MovedSnapshotStats()) {
+                    movedSnapshotTally().cached.fetch_add(1, std::memory_order_relaxed);
+                    if (buffer != nullptr) movedSnapshotTally().reused.fetch_add(1, std::memory_order_relaxed);
+                    movedSnapshotTally().cachedBytes.fetch_add(bytes, std::memory_order_relaxed);
+                }
                 if (buffer == nullptr) {
                     buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);

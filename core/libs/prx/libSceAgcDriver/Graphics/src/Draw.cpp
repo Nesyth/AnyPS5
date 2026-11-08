@@ -2225,7 +2225,8 @@ void noteLeanCoverage(const ShaderResources& resources, std::span<const ShaderRe
     if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
     std::array<unsigned long long, Count> taken{};
     for (std::size_t index = 0; index < Count; ++index) taken[index] = counts[index].exchange(0, std::memory_order_relaxed);
-    std::fprintf(stderr, "[lean-coverage] template hits (10 s): %llu; same template as the previous draw %llu; template already used in the open batch %llu; moved buffers per hit 0: %llu, 1: %llu, 2: %llu, 3+: %llu; moved bytes %llu\n", taken[Hits], taken[BackToBack], taken[SameBatch], taken[Moved0], taken[Moved1], taken[Moved2], taken[Moved3], taken[MovedBytes]);
+    const auto snapshots = ShaderResources::TakeMovedSnapshotCounts();
+    std::fprintf(stderr, "[lean-coverage] template hits (10 s): %llu; same template as the previous draw %llu; template already used in the open batch %llu; moved buffers per hit 0: %llu, 1: %llu, 2: %llu, 3+: %llu; moved bytes %llu; moved snapshots up to 64 KiB through the snapshot cache %llu (%llu reused, %llu bytes), copied into the upload chunk %llu (%llu bytes)\n", taken[Hits], taken[BackToBack], taken[SameBatch], taken[Moved0], taken[Moved1], taken[Moved2], taken[Moved3], taken[MovedBytes], static_cast<unsigned long long>(snapshots.cached), static_cast<unsigned long long>(snapshots.reused), static_cast<unsigned long long>(snapshots.cachedBytes), static_cast<unsigned long long>(snapshots.uploaded), static_cast<unsigned long long>(snapshots.uploadedBytes));
 }
 
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const std::vector<std::uint32_t>* contentKey, ReplayReason replayDraw, bool replayOn) {

@@ -5841,6 +5841,103 @@ void drawSnapshotUploadTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+void movedLargeUploadTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t movedBytes = 16384;
+    constexpr std::size_t largeBytes = 98304;
+    if (ShaderResources::DrawUploadLimit() >= movedBytes) {
+        std::cout << "draw upload limit reaches the moved input: moved large uploads not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 4u * 65536u;
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports or write watching unavailable: moved large uploads not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    for (std::size_t index = 0; index < bytes; ++index) static_cast<std::uint8_t*>(block)[index] = static_cast<std::uint8_t>(index * 5u + 3u);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        bool moved;
+        ~Unregister() {
+            RuntimeSwitches::Assign(RuntimeSwitch::MovedLargeUploads, moved);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block, RuntimeSwitches::Set(RuntimeSwitch::MovedLargeUploads)};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the watched block refused: moved large uploads not tested\n";
+        return;
+    }
+    const std::array<std::uint64_t, 2> elements{address + 4096, address + 65536};
+    const std::array<std::uint64_t, 2> targets{address + 32768, address + 2u * 65536u + 4096};
+    const std::array<std::size_t, 2> sizes{movedBytes, largeBytes};
+    ShaderRecompiler::RecompileResult program;
+    for (std::uint32_t index = 0; index < elements.size(); ++index) {
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.descriptorSet = 0;
+        binding.binding = index;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(elements[index]), static_cast<std::uint32_t>(elements[index] >> 32u) & 0xffffu, static_cast<std::uint32_t>(sizes[index]), 0x31000000u};
+        binding.bufferWritten = {false};
+        program.bindings.push_back(binding);
+    }
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    const std::array<ShaderResources::MovedBuffer, 2> moved{{{0, targets[0], sizes[0], {}}, {1, targets[1], sizes[1], {}}}};
+    for (const bool upload : {false, true, false}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::MovedLargeUploads, upload);
+        auto snapshotContext = context;
+        DescriptorCache cache(snapshotContext);
+        snapshotContext.descriptorCache = &cache;
+        Recorder snapshotRecorder(snapshotContext);
+        snapshotRecorder.Activate();
+        ShaderResources resources(snapshotContext, compute);
+        const auto alignment = std::max<VkDeviceSize>(snapshotContext.limits.minStorageBufferOffsetAlignment, 16);
+        const auto check = [&](const std::shared_ptr<ShaderResources::DrawBindings>& bindings) {
+            Require(bindings != nullptr && bindings->snapshots.size() == moved.size(), "moved read-only draw inputs were not snapshotted");
+            for (std::size_t index = 0; index < moved.size(); ++index) {
+                const auto& snapshot = bindings->snapshots[index];
+                Require(snapshot.address == targets[index] && snapshot.bytes == sizes[index] && snapshot.offset % alignment == 0, "a moved draw snapshot is not an aligned copy of its moved input");
+                Require(std::memcmp(snapshot.Bytes().data(), reinterpret_cast<const void*>(targets[index]), sizes[index]) == 0, "a moved draw snapshot does not hold the guest bytes at its new address");
+            }
+            const auto slice = snapshotRecorder.DrawUpload(16);
+            Require((bindings->snapshots[0].buffer == slice.buffer) == upload, upload ? "a moved input up to 64 KiB was not copied into the upload chunk" : "a moved input above the upload limit was copied into the upload chunk with the switch off");
+            Require(bindings->snapshots[1].buffer != slice.buffer && bindings->snapshots[1].offset == 0, "a moved input above 64 KiB was copied into the upload chunk");
+        };
+        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder, moved);
+        check(bindings);
+        if (AgcDriver::GuestMemory::Watched(targets[0], sizes[0])) {
+            Require((snapshotRecorder.ReusableDrawSnapshot(targets[0], sizes[0]) == nullptr) == upload, upload ? "a moved input copied into the upload chunk was kept as a tracked snapshot" : "a moved input above the upload limit was not kept as a tracked snapshot with the switch off");
+            const auto earlier = bindings->snapshots[0].Bytes();
+            const std::vector<std::byte> before(earlier.begin(), earlier.end());
+            std::memset(reinterpret_cast<void*>(targets[0]), upload ? 0x5a : 0xa5, sizes[0]);
+            AgcDriver::GuestMemory::MarkWritten(targets[0], sizes[0]);
+            check(resources.PrepareDrawBindings(snapshotRecorder, moved));
+            Require(std::equal(before.begin(), before.end(), earlier.begin()), "taking a moved draw input again changed the copy an earlier draw reads");
+        } else {
+            std::cout << "the moved inputs are not write-watched: moved large upload reuse and refresh not tested\n";
+        }
+        snapshotRecorder.Sync();
+    }
+    recorder.Activate();
+    std::cout << "Moved large upload tests passed\n";
+}
+
 void drawInputReuseTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     using Use = Recorder::SnapshotUse;
@@ -15816,6 +15913,10 @@ int main(int argc, char** argv) {
             std::cout << "Draw snapshot cap tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--moved-large-uploads-only") {
+            movedLargeUploadTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-epoch-only") {
             drawSnapshotEpochTests(device);
             return 0;
@@ -15874,6 +15975,7 @@ int main(int argc, char** argv) {
         containingSnapshotTests(device);
         unwrittenSnapshotTests(device);
         drawSnapshotUploadTests(device, recorder);
+        movedLargeUploadTests(device, recorder);
         drawInputReuseTests(device, recorder);
         drawInputInPlaceTests(device, recorder);
         RunResidentPresentTests(device.GetContext());

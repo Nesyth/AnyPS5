@@ -276,6 +276,14 @@ public:
     std::optional<std::vector<MovedBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof) const;
     static std::size_t MaxDrawSnapshotBytes();
     static std::size_t DrawUploadLimit();
+    struct MovedSnapshotCounts {
+        std::uint64_t cached = 0;
+        std::uint64_t reused = 0;
+        std::uint64_t cachedBytes = 0;
+        std::uint64_t uploaded = 0;
+        std::uint64_t uploadedBytes = 0;
+    };
+    static MovedSnapshotCounts TakeMovedSnapshotCounts();
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
