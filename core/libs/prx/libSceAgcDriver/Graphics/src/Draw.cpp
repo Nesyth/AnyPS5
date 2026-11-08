@@ -3569,7 +3569,7 @@ bool fillMultisampleAttachments(const Context& context, const State& state, Prep
         binding.proxied = memo.proxied[index];
         targetViews.push_back(memo.views[index]);
     }
-    if (state.depth && memo.depthActive != nullptr && ClaimDepthTargetMemory(*state.depth)) {
+    if (state.depth && ClaimDepthTargetMemory(*state.depth)) {
         noteAttachments(AttachmentEvent::Depth);
         targetViews.push_back(DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state)));
         return true;
