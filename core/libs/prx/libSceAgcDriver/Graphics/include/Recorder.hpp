@@ -631,7 +631,6 @@ private:
         std::unordered_set<const void*> keptOwners;
         const void* lastKeptOwner = nullptr;
         std::unordered_set<const void*> keptOnce;
-        const void* lastKeptOwner = nullptr;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
