@@ -462,6 +462,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
         }
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
+        bool speculativeMiss = false;
         if (DrawFinisher::Busy()) {
             bool shapeMatters = false;
             if (DrawFinisher::Overlap() && drawDataHits()) {
@@ -470,14 +471,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 shapeMatters = !drawCache.contains(drawKey) && (shape == drawShapes.end() || !drawCache.contains(shape->second));
             }
             const bool drain = !DrawFinisher::Overlap() || (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpReplay) && DrawFinisher::Get().PendingKey(drawKey, shapeMatters ? shapeKey : 0));
-            if (drain) DrawFinisher::Get().Drain();
-            if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Lookup, drain);
+            speculativeMiss = drain && DrawFinisher::Overlap() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SpeculativeLookup);
+            if (drain && !speculativeMiss) DrawFinisher::Get().Drain();
+            if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Lookup, drain && !speculativeMiss);
         }
         std::unique_lock cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
         if (profile) drawEntryCounters.keyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - keyStart).count();
-        const auto found = drawCache.find(drawKey);
+        const auto found = speculativeMiss ? drawCache.end() : drawCache.find(drawKey);
         if (found != drawCache.end()) {
             entry = found->second;
             decode = entry->decode;

@@ -51,6 +51,7 @@ enum class RuntimeSwitch : std::size_t {
     SpinHandoff,
     BesideSampleDumps,
     DeepQueues,
+    SpeculativeLookup,
     Count,
 };
 
