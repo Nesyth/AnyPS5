@@ -275,17 +275,17 @@ AbSchedule::Step AbSchedule::AtPresent(std::uint64_t present, double seconds) {
         settled = false;
         phase = 0;
         phaseStart = seconds;
-        return {Event::Begin, 0, false};
+        return {Event::Begin, 0, config.firstB};
     }
     if (seconds - phaseStart >= config.phaseSeconds) {
         ++phase;
         settled = false;
         phaseStart = seconds;
-        return {Event::Begin, phase, (phase & 1u) != 0};
+        return {Event::Begin, phase, ((phase & 1u) != 0) != config.firstB};
     }
     if (!settled && seconds - phaseStart >= config.settleSeconds) {
         settled = true;
-        return {Event::Settled, phase, (phase & 1u) != 0};
+        return {Event::Settled, phase, ((phase & 1u) != 0) != config.firstB};
     }
     return {};
 }
@@ -305,7 +305,9 @@ AbState& Ab() {
         const char* start = std::getenv("APS5_AB_START");
         const char* settle = std::getenv("APS5_AB_SETTLE");
         if (ab != nullptr) {
-            created->schedule.emplace(AbSchedule::Parse(ab, start != nullptr ? start : "", settle != nullptr ? settle : ""));
+            auto config = AbSchedule::Parse(ab, start != nullptr ? start : "", settle != nullptr ? settle : "");
+            config.firstB = std::getenv("APS5_AB_FIRST_B") != nullptr;
+            created->schedule.emplace(std::move(config));
             for (std::size_t index = 0; index < SwitchCount; ++index) created->environment[index] = RuntimeSwitches::Set(static_cast<RuntimeSwitch>(index));
         }
         return created;

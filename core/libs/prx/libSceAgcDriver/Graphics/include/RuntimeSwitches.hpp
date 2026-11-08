@@ -98,6 +98,7 @@ public:
         std::uint64_t startPresent = 0;
         std::optional<double> startSeconds;
         std::vector<RuntimeSwitch> switches;
+        bool firstB = false;
     };
 
     enum class Event { None, Begin, Settled };
