@@ -4151,7 +4151,12 @@ struct WriteRecords {
     AgcDriver::Mutex mutex;
     std::unordered_map<std::uint64_t, StorageTexture::WriteRecord> byAddress;
     std::uint64_t serial = 0;
+    std::atomic<std::uint64_t> layouts{1};
 };
+
+bool sameLayout(const StorageTexture::WriteRecord& a, const StorageTexture::WriteRecord& b) {
+    return a.width == b.width && a.height == b.height && a.tileMode == b.tileMode && a.dimension == b.dimension && a.format == b.format;
+}
 
 WriteRecords& LayoutWrites() {
     static WriteRecords records;
@@ -4182,11 +4187,18 @@ std::uint64_t StorageTexture::OccasionalLabelStores() {
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
-    {
-        auto& records = LayoutWrites();
+    const bool lean = RuntimeSwitches::Set(RuntimeSwitch::LeanRemark);
+    if (auto& records = LayoutWrites(); !lean || layoutRecord != records.layouts.load(std::memory_order_acquire)) {
         std::lock_guard lock(records.mutex);
-        if (records.byAddress.size() >= 65536u) records.byAddress.clear();
-        records.byAddress[descriptor.baseAddress] = {descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format, ++records.serial};
+        if (records.byAddress.size() >= 65536u) {
+            records.byAddress.clear();
+            records.layouts.fetch_add(1, std::memory_order_release);
+        }
+        const WriteRecord layout{descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format, ++records.serial};
+        const auto [entry, inserted] = records.byAddress.try_emplace(descriptor.baseAddress, layout);
+        if (inserted || !sameLayout(entry->second, layout)) records.layouts.fetch_add(1, std::memory_order_release);
+        entry->second = layout;
+        layoutRecord = records.layouts.load(std::memory_order_relaxed);
     }
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     ++writes;
@@ -4242,8 +4254,11 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         layerPending.SetRange(first, count, true);
     }
     const auto pendingSince = GuestMemory::TrackerGeneration();
-    for (std::uint32_t layer = first; layer < first + count; ++layer) {
-        if (!keptForCpu(layer)) layerPendingSince[layer] = pendingSince;
+    if (lean && keptAtUnwatch.empty()) std::fill_n(layerPendingSince.begin() + first, count, pendingSince);
+    else {
+        for (std::uint32_t layer = first; layer < first + count; ++layer) {
+            if (!keptForCpu(layer)) layerPendingSince[layer] = pendingSince;
+        }
     }
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in

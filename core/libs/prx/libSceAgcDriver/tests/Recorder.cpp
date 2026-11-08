@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MapImportGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
@@ -6660,6 +6661,85 @@ void storageRefreshTests(const Device& device, Recorder& recorder, bool watched)
         Require(watched ? memoryHolds({0, 0, 255, 255}, 65536, 0x33) : memoryHolds({255, 0, 0, 255}), "results dead under new clear keys were stored");
     }
     recorder.Sync();
+}
+
+void leanRemarkTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t surfaceBytes = side * side * 4;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, surfaceBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, surfaceBytes);
+#endif
+    Require(block != nullptr, "cannot allocate the lean re-mark block");
+    std::memset(block, 0x55, surfaceBytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, surfaceBytes, true, true, true);
+    }
+    struct Restore {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        bool lean;
+        ~Restore() {
+            RuntimeSwitches::Assign(RuntimeSwitch::LeanRemark, lean);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, surfaceBytes);
+        }
+    } restore{base, block, address, RuntimeSwitches::Set(RuntimeSwitch::LeanRemark)};
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource wide{};
+    wide.baseAddress = address;
+    wide.width = side;
+    wide.height = side;
+    wide.mipCount = 1;
+    wide.tileMode = TextureTileMode::kR64KBX;
+    wide.dimension = TextureDimension::k2D;
+    wide.format = 56;
+    wide.dstSelX = 4;
+    wide.dstSelY = 5;
+    wide.dstSelZ = 6;
+    wide.dstSelW = 7;
+    auto narrow = wide;
+    narrow.width = side / 2;
+    narrow.height = side / 2;
+    const auto recorded = [&](const GuestTextureResource& resource) {
+        const auto record = StorageTexture::LastWrite(address);
+        return record.has_value() && record->width == resource.width && record->height == resource.height && record->tileMode == resource.tileMode && record->dimension == resource.dimension && record->format == resource.format;
+    };
+    const auto settle = [&](const char* what) {
+        Require(StorageTexture::FlushPending(address, surfaceBytes, nullptr, "lean re-mark test"), what);
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    };
+    for (const bool lean : {false, true}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::LeanRemark, lean);
+        auto wideImage = StorageTexture::Create(context, detiler, wide, 0);
+        auto narrowImage = StorageTexture::Create(context, detiler, narrow, 0);
+        recorder.Keep(wideImage);
+        recorder.Keep(narrowImage);
+        wideImage->MarkDirty();
+        Require(recorded(wide), "marking an image pending did not record its layout at its address");
+        wideImage->MarkDirty();
+        Require(recorded(wide), "marking a pending image again lost its layout record");
+        settle("the pending wide image was not flushed");
+        narrowImage->MarkDirty();
+        Require(recorded(narrow), "marking another layout at the same address did not replace the layout record");
+        settle("the pending narrow image was not flushed");
+        wideImage->MarkDirty();
+        Require(recorded(wide), lean ? "with lean re-marks, an image marked after another layout was recorded at its address left the other layout's record" : "an image marked after another layout was recorded at its address left the other layout's record");
+        settle("the pending wide image was not flushed again");
+    }
+    std::cout << "lean re-mark layout records passed\n";
 }
 
 bool addressShadowTests(const Device& device, Recorder& recorder) {
@@ -15581,6 +15661,7 @@ int main(int argc, char** argv) {
         unitShadowTests(device, recorder);
         storageRefreshTests(device, recorder, false);
         storageRefreshTests(device, recorder, true);
+        leanRemarkTests(device, recorder);
         static_cast<void>(writtenBufferOrderTests(device, recorder));
         writeBackPaddingTests(device, recorder, false);
         writeBackPaddingTests(device, recorder, true);

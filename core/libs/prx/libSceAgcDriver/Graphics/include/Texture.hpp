@@ -869,6 +869,7 @@ private:
     std::atomic<bool> writtenOccasionally{false};
     std::uint64_t version = 0;
     std::uint64_t writes = 0;
+    std::uint64_t layoutRecord = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     std::vector<bool> layerOriginal;
     std::map<std::uint64_t, std::uint64_t> keptAtUnwatch;
