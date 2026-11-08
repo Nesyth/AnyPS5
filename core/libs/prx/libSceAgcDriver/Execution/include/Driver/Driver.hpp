@@ -406,6 +406,7 @@ private:
     static std::chrono::steady_clock::time_point& lastEpochBump();
     static std::deque<const std::uint32_t*>& releasedTails();
     void noteReleasedTails(const Submission& submission);
+    FrontMode latchFront(std::uint32_t queue, bool suspend);
     static bool packetEpoch();
     static bool labelTryEachPacket();
     static std::chrono::microseconds labelFlushDeadline();
@@ -459,6 +460,8 @@ private:
 
     alignas(64) std::atomic<int> packetsInFlight{0};
     std::atomic<std::uint64_t> packetsDone{0};
+
+    alignas(64) LeanFront::Latch frontLatch;
 
     std::atomic<std::uint64_t> eventSerial{0};
     alignas(64) std::shared_ptr<ShaderRegistry> shaders = std::make_shared<ShaderRegistry>();

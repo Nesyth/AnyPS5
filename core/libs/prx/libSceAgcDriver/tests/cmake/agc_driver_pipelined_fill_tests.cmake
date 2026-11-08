@@ -1,5 +1,5 @@
 if(BUILD_TESTING)
-    agc_add_draw_pipeline_test(agc_driver_pipelined_fill)
+    agc_add_draw_pipeline_test(agc_driver_pipelined_fill LATE)
 endif()
 
 if(BUILD_TESTING)

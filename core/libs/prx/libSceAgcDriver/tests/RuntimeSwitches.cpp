@@ -53,6 +53,31 @@ void registry() {
     Require(RuntimeSwitches::Set(RuntimeSwitch::NoBarrierBatch), "an assigned switch did not read back set");
     Require(RuntimeSwitches::Generation() == generation + 2, "flipping a switch back did not move the switch generation");
     Require(RuntimeSwitches::Find("APS5_REPLAY_HEAP_STAGE") == RuntimeSwitch::ReplayHeapStage, "APS5_REPLAY_HEAP_STAGE is not a runtime switch");
+    Require(RuntimeSwitches::Find("APS5_LEAN_FRONT") == RuntimeSwitch::LeanFront, "APS5_LEAN_FRONT is not a runtime switch");
+    Require(RuntimeSwitches::Set(RuntimeSwitch::LeanFront), "APS5_LEAN_FRONT set in the environment did not start set");
+}
+
+void snapshot() {
+    const auto taken = RuntimeSwitches::Snapshot();
+    for (std::size_t index = 0; index < static_cast<std::size_t>(RuntimeSwitch::Count); ++index) {
+        const auto id = static_cast<RuntimeSwitch>(index);
+        Require(taken.Set(id) == RuntimeSwitches::Set(id), std::string("a switch copy differs from the switch: ") + RuntimeSwitches::Name(id));
+    }
+    const auto generation = RuntimeSwitches::Generation();
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, false);
+    const auto flipped = RuntimeSwitches::Snapshot();
+    Require(RuntimeSwitches::Generation() == generation + 1, "flipping APS5_LEAN_FRONT did not move the switch generation");
+    Require(taken.Set(RuntimeSwitch::LeanFront) && !flipped.Set(RuntimeSwitch::LeanFront) && !(taken == flipped), "a switch copy taken after a flip does not show it");
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+    Require(RuntimeSwitches::Snapshot() == taken, "a switch copy taken after flipping back differs from the first one");
+    AgcDriver::Graphics::SwitchSnapshot built;
+    built.Assign(RuntimeSwitch::LeanFront, true);
+    built.Assign(RuntimeSwitch::NoBarrierBatch, true);
+    built.Assign(RuntimeSwitch::NoBarrierBatch, false);
+    for (std::size_t index = 0; index < static_cast<std::size_t>(RuntimeSwitch::Count); ++index) {
+        const auto id = static_cast<RuntimeSwitch>(index);
+        Require(built.Set(id) == (id == RuntimeSwitch::LeanFront), std::string("a built switch copy has the wrong bit for ") + RuntimeSwitches::Name(id));
+    }
 }
 
 void parse() {
@@ -61,6 +86,8 @@ void parse() {
     Require(config.switches.size() == 1 && config.switches[0] == RuntimeSwitch::NoBarrierBatch, "the switch list was not parsed");
     const auto bySeconds = AbSchedule::Parse("60:APS5_NO_BARRIER_BATCH", "90s", "");
     Require(bySeconds.startSeconds == 90.0 && bySeconds.settleSeconds == 2 && bySeconds.startPresent == 0, "a start in seconds was not parsed");
+    const auto lean = AbSchedule::Parse("30:APS5_LEAN_FRONT", "", "");
+    Require(lean.switches.size() == 1 && lean.switches[0] == RuntimeSwitch::LeanFront, "APS5_AB does not accept APS5_LEAN_FRONT");
     Require(Refusal("60:APS5_FULL_BARRIERS").find("APS5_FULL_BARRIERS cannot change while the title runs; switches the A/B can change: APS5_NO_BARRIER_BATCH") != std::string::npos, "a startup-only variable was not refused with the list of switches");
     Require(Refusal("60:APS5_NO_BARRIER_BATCH+APS5_NO_BARRIER_BATCH").find("listed twice") != std::string::npos, "a duplicate switch was not refused");
     Require(Refusal("60:+APS5_NO_BARRIER_BATCH").find("empty switch name") != std::string::npos && Refusal("60:APS5_NO_BARRIER_BATCH+").find("empty switch name") != std::string::npos, "an empty switch name was not refused");
@@ -145,6 +172,7 @@ int main(int argc, char** argv) {
         SetEnvironment("APS5_AB_START", "3");
         SetEnvironment("APS5_AB_SETTLE", nullptr);
         registry();
+        snapshot();
         parse();
         schedule();
         glue();

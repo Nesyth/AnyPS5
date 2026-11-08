@@ -413,6 +413,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
     PerformanceTimer timing("Driver.Rewind");
     static const bool ring = ReadSubmissionRingSettings();
     if (ring) PrepareSubmissionRing(stalled.queue);
+    const auto front = latchFront(stalled.queue, false);
     std::atomic_ref<std::uint32_t> control(*const_cast<std::uint32_t*>(stalled.rewindTail - 1));
     if ((control.load(std::memory_order_acquire) & Pm4::RewindValid) == 0) {
         noteWaitBlocked(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1), true);
@@ -433,6 +434,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
     }
     Submission tail{};
     tail.queue = stalled.queue;
+    tail.front = front;
     if (APS5_ENABLE_TIMING_LOG) tail.receivedAt = std::chrono::steady_clock::now();
     auto& released = releasedTails();
     if (!released.empty() && released.front() == stalled.rewindTail - 1) {

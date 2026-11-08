@@ -242,6 +242,9 @@ void Driver::execute(const Submission& submission) {
         }
     } flipHold{*this, submission.queue, submission.holdsFlip, submission.holdsFlip};
     const bool pipelined = submission.queue == 0 && DrawPipeline::Depth() != 0;
+    const auto front = submission.front != FrontMode::Unlatched ? submission.front : latchFront(submission.queue, submission.suspend);
+    const LeanFront::SegmentNesting nesting(submission.queue == 0 ? &frontLatch : nullptr);
+    const auto switchSet = [&](Graphics::RuntimeSwitch id) { return front == FrontMode::Lean ? LeanFront::SwitchSet(frontLatch, id) : Graphics::RuntimeSwitches::Set(id); };
     static const bool orderedWaits = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
     DrawPipeline::Active() = pipelined;
     struct PipelineDrain {
@@ -350,7 +353,7 @@ void Driver::execute(const Submission& submission) {
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
-        if (submission.queue == 0 && Pm4::DrawOpcode(opcode) && !Pm4::IndirectDrawOpcode(opcode) && !predicated && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpKeepDraws) && deferredLabels().labels.empty() && xpDropsDraw()) {
+        if (submission.queue == 0 && Pm4::DrawOpcode(opcode) && !Pm4::IndirectDrawOpcode(opcode) && !predicated && switchSet(Graphics::RuntimeSwitch::XpKeepDraws) && deferredLabels().labels.empty() && xpDropsDraw()) {
             recent.Record(cursor);
             cursor = nextCursor;
             continue;
@@ -358,7 +361,7 @@ void Driver::execute(const Submission& submission) {
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
             const bool queuesLabel = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && labelPacketQueues(packet, opcode);
             const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);
-            const bool queuesSampleDump = pipelined && !predicated && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::BesideSampleDumps) && sampleDumpQueues(packet, opcode, submission.queue);
+            const bool queuesSampleDump = pipelined && !predicated && switchSet(Graphics::RuntimeSwitch::BesideSampleDumps) && sampleDumpQueues(packet, opcode, submission.queue);
             const bool beside = DrawFinisher::Overlap() && opcode != 0x15 && (queuesLabel || heldLabelWait || queuesSampleDump || keepsDrawPipeline(packet, header, opcode));
             if (!beside) DrawFinisher::Get().Drain();
             if (DrawFinisher::Overlap()) {
@@ -639,7 +642,7 @@ void Driver::execute(const Submission& submission) {
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
                     if (const auto localDevice = device.Load()) localDevice->SealPassWriteOnly();
                 };
-                const bool streamSeal = pipelined && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpStreamSegments);
+                const bool streamSeal = pipelined && switchSet(Graphics::RuntimeSwitch::XpStreamSegments);
                 if (streamSeal && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
                     DrawFinisher::Pending held;
                     held.unknown = false;
@@ -694,7 +697,7 @@ void Driver::execute(const Submission& submission) {
         cursor = nextCursor;
     }
 
-    const bool streamEnd = submission.queue == 0 && pipelined && orderedCompletion && !submission.progress && submission.rewindTail != nullptr && deferredLabels().labels.empty() && (std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0 && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpStreamSegments);
+    const bool streamEnd = submission.queue == 0 && pipelined && orderedCompletion && !submission.progress && submission.rewindTail != nullptr && deferredLabels().labels.empty() && (std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0 && switchSet(Graphics::RuntimeSwitch::XpStreamSegments);
     if (submission.queue == 0 && !streamEnd) DrawFinisher::Get().Drain();
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");

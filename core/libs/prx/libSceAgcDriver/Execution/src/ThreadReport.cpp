@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanFront.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/HeapReplay.hpp"
 #include <algorithm>
 #include <array>
@@ -110,6 +111,7 @@ void Phase() {
         print(at, windowStart.exchange(at, std::memory_order_relaxed), " to the A/B phase event");
     }
     Graphics::ReportHeapReplay(true);
+    DriverDetail::LeanFront::Report(true);
 }
 
 bool OnQueue0Worker() {

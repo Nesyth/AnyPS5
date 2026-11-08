@@ -6,9 +6,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanFront.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libc/include/FailureReport.hpp"
@@ -1918,6 +1920,101 @@ void testRewindTailTrace() {
     check(busy <= 150.0, "the queue worker's busy share counts nested REWIND tails more than once");
 }
 
+void testFrontLatch() {
+    namespace LeanFront = AgcDriver::DriverDetail::LeanFront;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    using AgcDriver::DriverDetail::FrontMode;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    const bool lean = RuntimeSwitches::Set(RuntimeSwitch::LeanFront);
+    const bool keep = RuntimeSwitches::Set(RuntimeSwitch::XpKeepDraws);
+    LeanFront::Latch latch;
+    check(LeanFront::Take(latch, false) == FrontMode::Today && latch.mode == FrontMode::Today && latch.verifyEvery == 0 && !latch.checkSwitches, "a segment off the pipelined queue-0 path was latched lean");
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+    check(LeanFront::Take(latch, true) == FrontMode::Lean && latch.Lean() && latch.generation == RuntimeSwitches::Generation(), "a segment with APS5_LEAN_FRONT set was not latched lean");
+    check(latch.switches == RuntimeSwitches::Snapshot(), "the segment latch did not copy the runtime switches");
+    check(latch.verifyEvery == LeanFront::VerifyEvery(), "a lean segment does not carry APS5_VERIFY_LEAN_FRONT");
+    std::uint64_t stamp = 0;
+    check(latch.Renew(stamp) && stamp == latch.generation && !latch.Renew(stamp), "a lean cache stamp does not follow the switch generation");
+    RuntimeSwitches::Assign(RuntimeSwitch::XpKeepDraws, !keep);
+    latch.checkSwitches = false;
+    check(LeanFront::SwitchSet(latch, RuntimeSwitch::XpKeepDraws) == keep, "a lean segment did not read a switch from its copy");
+    const auto moved = LeanFront::AllowedCount(LeanFront::Allowed::SwitchesMoved);
+    const auto checkedReads = LeanFront::Checked(LeanFront::Item::SwitchRead);
+    const auto differences = LeanFront::Differences(LeanFront::Field::SwitchValues);
+    latch.checkSwitches = true;
+    check(LeanFront::SwitchSet(latch, RuntimeSwitch::XpKeepDraws) == !keep, "a checked switch read did not use today's value");
+    check(LeanFront::AllowedCount(LeanFront::Allowed::SwitchesMoved) == moved + 1 && LeanFront::Differences(LeanFront::Field::SwitchValues) == differences, "a switch flipped inside a segment was not counted as by design");
+    RuntimeSwitches::Assign(RuntimeSwitch::XpKeepDraws, keep);
+    check(LeanFront::Take(latch, true) == FrontMode::Lean, "a second lean latch did not stay lean");
+    latch.checkSwitches = true;
+    latch.switches.Assign(RuntimeSwitch::XpKeepDraws, !keep);
+    check(LeanFront::SwitchSet(latch, RuntimeSwitch::XpKeepDraws) == keep, "a checked switch read with a wrong copy did not use today's value");
+    check(LeanFront::Differences(LeanFront::Field::SwitchValues) == differences + 1 && LeanFront::Checked(LeanFront::Item::SwitchRead) == checkedReads + 2, "a switch copy that differs at the same generation was not counted as a difference");
+    LeanFront::Latch sampled;
+    sampled.verifyEvery = 2;
+    check(!LeanFront::Due(sampled, LeanFront::Item::Draw) && LeanFront::Due(sampled, LeanFront::Item::Draw) && !LeanFront::Due(sampled, LeanFront::Item::Packet) && LeanFront::Due(sampled, LeanFront::Item::Packet), "verify items are not sampled every N-th per kind");
+    sampled.verifyEvery = 0;
+    check(!LeanFront::Due(sampled, LeanFront::Item::Draw) && !LeanFront::Due(sampled, LeanFront::Item::Draw), "a verify item was due with the verify off");
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, lean);
+}
+
+void testRewindFrontFlips() {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    namespace LeanFront = AgcDriver::DriverDetail::LeanFront;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    if (DrawPipeline::Depth() == 0) throw std::runtime_error("the REWIND front flip test needs the pipelined draw path");
+    testFrontLatch();
+    alignas(8) static std::uint32_t started = 0;
+    static auto warm = joinPackets({writeWord(started, 1)});
+    submitWords(warm);
+    AgcDriverWaitIdle_nid_postfix();
+    check(std::atomic_ref<std::uint32_t>(started).load() == 1, "the queue worker did not start");
+    const bool startedLean = RuntimeSwitches::Set(RuntimeSwitch::LeanFront);
+    constexpr std::size_t Tails = 8;
+    alignas(8) static std::array<std::uint32_t, Tails> gates{};
+    alignas(8) static std::array<std::uint32_t, Tails> ran{};
+    alignas(8) static std::uint32_t done = 0;
+    static std::vector<std::uint32_t> words;
+    words.clear();
+    for (std::size_t index = 0; index < Tails; ++index) {
+        const auto rewind = makePacket(0x59, {0x80000000u});
+        const auto wait = makePacket(0x3c, {0x13, low(&gates[index]), high(&gates[index]), 1, 0xffffffffu, 0x19});
+        const auto write = writeWord(ran[index], static_cast<std::uint32_t>(index + 1));
+        for (const auto* packet : {&rewind, &wait, &write}) words.insert(words.end(), packet->begin(), packet->end());
+    }
+    const auto last = writeWord(done, 1);
+    words.insert(words.end(), last.begin(), last.end());
+    const auto latched = [] { return LeanFront::Total(LeanFront::Counter::LeanSegments) + LeanFront::Total(LeanFront::Counter::TodaySegments); };
+    const auto latchedBase = latched();
+    const auto leanBase = LeanFront::Total(LeanFront::Counter::LeanSegments);
+    const auto changesBase = LeanFront::Total(LeanFront::Counter::ModeChanges);
+    const auto differencesBase = LeanFront::Differences();
+    submitWords(words);
+    bool lean = startedLean;
+    for (std::size_t index = 0; index < Tails; ++index) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (latched() < latchedBase + index + 2 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        check(latched() == latchedBase + index + 2, ("the queue worker did not latch the segment that waits on gate " + std::to_string(index) + " exactly once").c_str());
+        check(std::atomic_ref<std::uint32_t>(ran[index]).load() == 0, "a REWIND tail ran past its gate");
+        lean = !lean;
+        RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, lean);
+        std::atomic_ref<std::uint32_t>(gates[index]).store(1);
+    }
+    AgcDriverWaitIdle_nid_postfix();
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, startedLean);
+    for (std::size_t index = 0; index < Tails; ++index) {
+        check(std::atomic_ref<std::uint32_t>(ran[index]).load() == index + 1, ("REWIND tail " + std::to_string(index) + " did not run once").c_str());
+    }
+    check(std::atomic_ref<std::uint32_t>(done).load() == 1, "the last REWIND tail did not run");
+    check(latched() == latchedBase + Tails + 1, "a REWIND segment was latched twice or not at all");
+    const auto leanSegments = LeanFront::Total(LeanFront::Counter::LeanSegments) - leanBase;
+    check(leanSegments == (startedLean ? 5u : 4u), ("the segments ran lean " + std::to_string(leanSegments) + " times instead of following the switch at each segment start").c_str());
+    check(LeanFront::Total(LeanFront::Counter::ModeChanges) - changesBase == Tails - 1, "a switch flipped while the worker waited inside a segment did not take effect at the next segment");
+    check(LeanFront::Differences() == differencesBase, "the lean front verify found differences over the flipped REWIND chain");
+    std::printf("REWIND chain of %zu tails ran with the lean front switch flipped at every gate: %llu lean segments\n", Tails, static_cast<unsigned long long>(leanSegments));
+}
+
 struct RenderingGateState {
     std::mutex mutex;
     std::condition_variable changed;
@@ -2180,7 +2277,7 @@ int main(int argc, char** argv) {
         const std::pair<const char*, void (*)()> ringModes[]{
             {"ring", testSubmissionRing}, {"ring-empty", testEmptySubmissionRing}, {"ring-disabled", testDisabledSubmissionRing},
             {"ring-invalid", testInvalidSubmissionRing}, {"ring-report", testSubmissionRingFailureReport}, {"stall-watchdog", testStallWatchdog},
-            {"stall-watchdog-invalid", testInvalidStallWatchdog}, {"stall-watchdog-rewind", testStallWatchdogRewind}, {"stall-watchdog-order", testStallWatchdogOrder}, {"rewind-trace", testRewindTailTrace}};
+            {"stall-watchdog-invalid", testInvalidStallWatchdog}, {"stall-watchdog-rewind", testStallWatchdogRewind}, {"stall-watchdog-order", testStallWatchdogOrder}, {"rewind-trace", testRewindTailTrace}, {"rewind-flip", testRewindFrontFlips}};
         if (argc == 2 && std::string(argv[1]) == "ring-report-heap") {
 #ifdef _WIN32
             testSubmissionRingFailureReportHeap();

@@ -406,6 +406,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketTiming.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Presentation.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/LeanFront.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/QueueWorker.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/Submission.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/SubmissionRing.cpp
@@ -761,12 +762,35 @@ function(agc_add_env_test agcTestName agcTestTarget)
     endif()
 endfunction()
 
+set(agcLateStackEnvironment
+        APS5_ASYNC_SUBMIT=1 APS5_SECOND_FINISHER=1 APS5_PRECISE_LOOKUP_DRAIN=1 APS5_LOCKLESS_HAZARDS=1 APS5_SPIN_HANDOFF=1
+        APS5_DEEP_QUEUES=1 APS5_SPECULATIVE_LOOKUP=1 APS5_HOST_LARGE_CACHE=1 APS5_PIPELINED_GPU_INDIRECT=1
+        APS5_SKIP_HTILE_KEY_PRESYNC=1 APS5_ARM_FLIP_RESET=1 APS5_ARM_SPANS=1 APS5_ARM_WIDE=1
+        APS5_INPUT_SCRATCH=1 APS5_CARRY_VALIDATION=1 APS5_SINGLE_INDEX_CHECK=1 APS5_OWN_DRAW_SETS=1 APS5_GUARD_RANGE_MEMO=1
+        APS5_MOVED_LARGE_UPLOADS=1 APS5_UNLOCKED_SNAPSHOT_RECHECK=1 APS5_KEEP_BYTES_ONCE=1 APS5_MSAA_PASS_MEMO=1
+        APS5_GPU_SINGLE_KEYS=1 APS5_LEAN_REMARK=1 APS5_KEEP_FAST_PATH=1 APS5_LAZY_PASS_READS=1
+        APS5_RECYCLE_COMMAND_BUFFERS=1 APS5_PUSH_MEMCPY=1 APS5_RESIDENT_FIRST_COLLECT=1 APS5_SORTED_HOST_REGIONS=1
+        APS5_HOST_PREFETCH=1)
+set(agcLeanFrontEnvironment APS5_LEAN_FRONT=1 APS5_VERIFY_LEAN_FRONT=2)
+set(agcLeanFrontDifference "\\[lean-front-verify\\] [-a-z ]+ differs:")
+
 function(agc_add_draw_pipeline_test agcTestName)
+    set(agcPipelineEnvironment ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1)
     agc_add_env_test(${agcTestName}_draw_pipeline ${agcTestName}_tests
-            ENV ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1)
+            ENV ${agcPipelineEnvironment})
     if(NOT "PIPELINE_ONLY" IN_LIST ARGN)
         agc_add_env_test(${agcTestName}_no_draw_pipeline ${agcTestName}_tests
                 ENV ANYPS5_NO_SHADER_CACHE=1 APS5_NO_DRAW_PIPELINE=1)
+    endif()
+    agc_add_env_test(${agcTestName}_lean_front ${agcTestName}_tests
+            ENV ${agcPipelineEnvironment} ${agcLeanFrontEnvironment})
+    set_tests_properties(${agcTestName}_lean_front PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference}")
+    if("LATE" IN_LIST ARGN)
+        agc_add_env_test(${agcTestName}_late ${agcTestName}_tests
+                ENV ${agcPipelineEnvironment} ${agcLateStackEnvironment})
+        agc_add_env_test(${agcTestName}_lean_front_late ${agcTestName}_tests
+                ENV ${agcPipelineEnvironment} ${agcLateStackEnvironment} ${agcLeanFrontEnvironment})
+        set_tests_properties(${agcTestName}_lean_front_late PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference}")
     endif()
 endfunction()
 

@@ -83,7 +83,9 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_SKIP_HTILE_KEY_PRESYNC",
     "APS5_XP_KEEP_DRAWS",
     "APS5_XP_STREAM_SEGMENTS",
+    "APS5_LEAN_FRONT",
 };
+static_assert(SwitchNames.back() != nullptr, "every runtime switch needs a name");
 
 struct SwitchValues {
     std::array<std::atomic<bool>, SwitchCount> set{};
@@ -166,6 +168,7 @@ struct SwitchValues {
             std::getenv("APS5_SKIP_HTILE_KEY_PRESYNC") != nullptr,
             std::getenv("APS5_XP_KEEP_DRAWS") != nullptr,
             std::getenv("APS5_XP_STREAM_SEGMENTS") != nullptr,
+            std::getenv("APS5_LEAN_FRONT") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }
@@ -215,6 +218,15 @@ void Assign(RuntimeSwitch id, bool set) {
 
 std::uint64_t Generation() {
     return Values().generation.load(std::memory_order_acquire);
+}
+
+SwitchSnapshot Snapshot() {
+    auto& values = Values();
+    SwitchSnapshot snapshot;
+    for (std::size_t index = 0; index < SwitchCount; ++index) {
+        if (values.set[index].load(std::memory_order_relaxed)) snapshot.Assign(static_cast<RuntimeSwitch>(index), true);
+    }
+    return snapshot;
 }
 
 std::optional<RuntimeSwitch> Find(std::string_view name) {

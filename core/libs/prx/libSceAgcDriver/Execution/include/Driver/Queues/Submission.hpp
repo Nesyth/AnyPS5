@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionProgress.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanFront.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -33,6 +34,7 @@ struct Submission {
     bool suspend = false;
     bool waitFree = false;
     bool holdsFlip = false;
+    FrontMode front = FrontMode::Unlatched;
 
     std::uint64_t received = 0;
     std::vector<std::uint64_t> labelWrites;
