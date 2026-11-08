@@ -325,6 +325,10 @@ public:
         }
     }
 
+    void SetResidentFirst(bool on) {
+        residentFirstFlag().store(on, std::memory_order_relaxed);
+    }
+
     // A serial bumped whenever a remembered clean range is dropped (a write fault, an unmap, a host write or an
     // alias invalidation), and whether every range in pairs (begin, end, ...) lies inside remembered clean ranges.
     static std::uint64_t CleanForgetSerial() {
@@ -714,7 +718,9 @@ public:
                 }
             }
         } else if (clear && !collectable(address, end)) return false;
-        auto position = views.lower_bound(address & ~(pageBytes - 1));
+        const bool residentFirst = residentFirstFlag().load(std::memory_order_relaxed);
+        const bool verify = residentFirst && verifyResidentFirst();
+        auto position = residentFirst ? views.begin() : views.lower_bound(address & ~(pageBytes - 1));
         std::uintptr_t cleanStart = 0;
         std::uintptr_t cleanEnd = 0;
         const auto flushClean = [&] {
@@ -731,13 +737,19 @@ public:
                 }
             }
             const auto base = cursor & ~(pageBytes - 1);
-            const auto found = viewAt(base, position);
-            if (found != views.end() && found->second.resident) {
+            auto run = residentFirst && !nearView(base, position) ? residentRunAt(cursor) : residentRuns.end();
+            const auto found = run == residentRuns.end() ? viewAt(base, position) : views.end();
+            if (verify) {
+                const auto expected = views.find(base);
+                const bool resident = run != residentRuns.end() || (found != views.end() && found->second.resident);
+                if ((expected != views.end() && expected->second.resident) != resident || (run == residentRuns.end() && expected != found)) residentFirstMismatch(cursor);
+            }
+            if (run != residentRuns.end() || (found != views.end() && found->second.resident)) {
                 flushClean();
                 if (!watchResident) return false;
                 const auto available = capacity - *count;
                 if (available == 0) return true;
-                const auto run = std::prev(residentRuns.upper_bound(cursor));
+                if (run == residentRuns.end()) run = std::prev(residentRuns.upper_bound(cursor));
                 const auto stop = std::min({end, run->second.end, (cursor & ~std::uintptr_t{4095}) + available * 4096, nextClean == cleanRanges.end() ? end : nextClean->first});
                 collectResident(run->first, run->second, cursor, stop, pages, count, clear, collection);
                 if (*count == capacity) return true;
@@ -966,6 +978,11 @@ private:
         return verify;
     }
 
+    static bool verifyResidentFirst() {
+        static const bool verify = std::getenv("APS5_VERIFY_RESIDENT_FIRST") != nullptr;
+        return verify;
+    }
+
     // Resident arming (on unless APS5_NO_ARM_RESIDENT): a clearing collect write-protects a settled, write-watched resident
     // span of a run of at least 256 KiB that no guest store has reached since it was last armed, and
     // remembers it clean, so later collects skip GetWriteWatch there. The first guest store into it faults
@@ -994,6 +1011,11 @@ private:
     static std::atomic<bool>& armWideFlag() {
         static std::atomic<bool> wide{false};
         return wide;
+    }
+
+    static std::atomic<bool>& residentFirstFlag() {
+        static std::atomic<bool> residentFirst{false};
+        return residentFirst;
     }
 
     // Clearing collects of resident runs: [0] all, [1] not watched, [2] fresh pages, [3] written after arming,
@@ -1126,6 +1148,12 @@ private:
     [[noreturn]] static void staleProof(std::uintptr_t address, std::uintptr_t end) {
         char text[192];
         std::snprintf(text, sizeof(text), "a private collect of guest writes succeeded over 0x%llx+0x%llx, which is no longer committed private memory (APS5_VERIFY_DIRECT_COLLECT)", static_cast<unsigned long long>(address), static_cast<unsigned long long>(end - address));
+        throw std::runtime_error(text);
+    }
+
+    [[noreturn]] static void residentFirstMismatch(std::uintptr_t address) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "a resident-first collect classified guest memory at 0x%llx unlike its view (APS5_VERIFY_RESIDENT_FIRST)", static_cast<unsigned long long>(address));
         throw std::runtime_error(text);
     }
 
@@ -1415,6 +1443,13 @@ private:
         if (next == residentIndex.begin()) return residentRuns.end();
         const auto& [first, run] = *std::prev(next);
         return first.first == key && offset - first.second < run->second.end - run->first ? run : residentRuns.end();
+    }
+
+    std::map<std::uintptr_t, Run>::iterator residentRunAt(std::uintptr_t address) {
+        const auto next = residentRuns.upper_bound(address);
+        if (next == residentRuns.begin()) return residentRuns.end();
+        const auto run = std::prev(next);
+        return address < run->second.end ? run : residentRuns.end();
     }
 
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::map<std::uintptr_t, Run>::iterator>::iterator indexEntry(std::map<std::uintptr_t, Run>::iterator run) {
@@ -1802,6 +1837,10 @@ private:
             if (position != views.end() && position->first < base) position = views.lower_bound(base);
         }
         return position != views.end() && position->first == base ? position : views.end();
+    }
+
+    bool nearView(std::uintptr_t base, Views::iterator position) {
+        return position == views.end() || position->first >= base || ++position == views.end() || position->first >= base;
     }
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::shared_ptr<Physical>> physical;
     std::map<std::uintptr_t, Run> residentRuns;

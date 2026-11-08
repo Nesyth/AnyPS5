@@ -842,6 +842,10 @@ void GuestArenaDisarmResident_nid_no_patch() {
     WindowsMappings::Get().DisarmResident();
 }
 
+void GuestArenaSetResidentFirst_nid_no_patch(bool on) {
+    WindowsMappings::Get().SetResidentFirst(on);
+}
+
 std::uint64_t GuestArenaCleanForgetSerial_nid_no_patch() {
     return WindowsMappings::CleanForgetSerial();
 }

@@ -1,11 +1,14 @@
 #define NOMINMAX
 #include "prx/libc/include/WindowsMappings.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <iostream>
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 using Mappings = GuestArena::WindowsMappings;
@@ -914,6 +917,92 @@ void CheckDisarmResident() {
     VirtualFree(reserved, 0, MEM_RELEASE);
     CloseHandle(section);
 }
+
+std::vector<std::uint64_t> ResidentFirstTrace(bool residentFirst) {
+    auto& mappings = Mappings::Get();
+    constexpr std::size_t Chunk = 0x200000;
+    constexpr std::size_t View = 16384;
+    constexpr std::size_t Shared = 4 * View;
+    constexpr std::size_t Large = 16 * View;
+    constexpr std::size_t ResidentAt = Shared;
+    constexpr std::size_t PrivateAt = ResidentAt + Large;
+    constexpr std::size_t SmallAt = PrivateAt + Shared;
+    constexpr std::size_t TailAt = SmallAt + View;
+    constexpr std::size_t Span = TailAt + Shared;
+    constexpr std::array<std::size_t, 4> sizes{Shared, Large, View, Shared};
+    constexpr std::array<std::size_t, 4> offsets{0, ResidentAt, SmallAt, TailAt};
+    std::array<HANDLE, 4> sections{};
+    for (std::size_t index = 0; index < sections.size(); ++index) sections[index] = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, static_cast<DWORD>(sizes[index]), nullptr);
+    auto* reserved = static_cast<unsigned char*>(mappings.Reserve(nullptr, 2 * Chunk));
+    Require(reserved && std::all_of(sections.begin(), sections.end(), [](HANDLE section) { return section != nullptr; }), "cannot allocate resident-first test memory");
+    auto* base = reinterpret_cast<unsigned char*>((reinterpret_cast<std::uintptr_t>(reserved) + Chunk - 1) & ~(Chunk - 1));
+    const auto address = reinterpret_cast<std::uintptr_t>(base);
+    for (const auto section : sections) mappings.ForgetSection(section);
+    mappings.Map(base, Shared, sections[0], 0, PAGE_READWRITE);
+    mappings.Map(base + ResidentAt, Large, sections[1], 0, PAGE_READWRITE, true, true);
+    mappings.Commit(base + PrivateAt, Shared, PAGE_READWRITE, Shared, true);
+    mappings.Map(base + SmallAt, View, sections[2], 0, PAGE_READWRITE, true, true);
+    mappings.Map(base + TailAt, Shared, sections[3], 0, PAGE_READWRITE);
+    mappings.SetResidentFirst(residentFirst);
+    std::vector<std::uint64_t> trace;
+    const auto collect = [&](std::size_t from, std::size_t to, std::size_t capacity, bool clear, Collection collection) {
+        std::array<void*, Span / Small> pages{};
+        for (auto cursor = address + from; cursor < address + to;) {
+            std::size_t count = capacity;
+            const bool complete = mappings.Collect(cursor, address + to - cursor, pages.data(), &count, clear, collection);
+            trace.push_back(complete ? count : ~std::uint64_t{0});
+            for (std::size_t i = 0; i < count; ++i) trace.push_back(reinterpret_cast<std::uintptr_t>(pages[i]) - address);
+            if (!complete || count < capacity) break;
+            cursor = reinterpret_cast<std::uintptr_t>(pages[count - 1]) + Small;
+        }
+    };
+    const auto protections = [&] {
+        for (std::size_t offset = 0; offset < Span; offset += Small) {
+            MEMORY_BASIC_INFORMATION info{};
+            Require(VirtualQuery(base + offset, &info, sizeof(info)) == sizeof(info), "resident-first protection query failed");
+            trace.push_back(info.Protect);
+        }
+    };
+    const auto store = [&](std::size_t offset, unsigned char value) {
+        const auto before = faults.load();
+        static_cast<volatile unsigned char*>(base)[offset] = value;
+        trace.push_back(faults.load() - before);
+    };
+    collect(0, Span, Span / Small, true, Collection::Armed);
+    collect(Small, Span - Small, Span / Small, true, Collection::Fresh);
+    collect(0, Span, Span / Small, true, Collection::All);
+    protections();
+    collect(0, Span, Span / Small, true, Collection::All);
+    protections();
+    collect(ResidentAt + 5 * Small + 9, Span, Span / Small, false, Collection::All);
+    store(View + 8, 1);
+    store(ResidentAt + 10 * Small, 2);
+    store(PrivateAt + 2 * Small, 3);
+    store(SmallAt + 8, 4);
+    store(Span - Small + 8, 5);
+    collect(0, Span, 3, true, Collection::All);
+    protections();
+    store(ResidentAt + 3 * Small, 6);
+    store(View + 8, 7);
+    collect(ResidentAt + 2 * Small + 100, PrivateAt + Small, 2, false, Collection::All);
+    collect(ResidentAt + 2 * Small + 100, PrivateAt + Small, Span / Small, true, Collection::Armed);
+    collect(0, Span, Span / Small, true, Collection::All);
+    collect(0, Span, Span / Small, true, Collection::All);
+    protections();
+    mappings.SetResidentFirst(false);
+    for (std::size_t index = 0; index < sections.size(); ++index) mappings.Reset(base + offsets[index], sizes[index]);
+    mappings.Reset(base + PrivateAt, Shared);
+    for (const auto section : sections) mappings.ForgetSection(section);
+    VirtualFree(reserved, 2 * Chunk, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+    VirtualFree(reserved, 0, MEM_RELEASE);
+    for (const auto section : sections) CloseHandle(section);
+    return trace;
+}
+
+void CheckResidentFirstCollect() {
+    const auto today = ResidentFirstTrace(false);
+    Require(ResidentFirstTrace(true) == today, "a resident-first collect differed from a collect through the views map");
+}
 }
 
 int main(int argc, char** argv) {
@@ -923,6 +1012,12 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::string(argv[1]) == "--verify-direct") {
             CheckVerifiedPrivateCollect();
             std::cout << "Windows verified private collect tests passed\n";
+            RemoveVectoredExceptionHandler(handler);
+            return 0;
+        }
+        if (argc > 1 && std::string(argv[1]) == "--verify-resident-first") {
+            CheckResidentFirstCollect();
+            std::cout << "Windows verified resident-first collect tests passed\n";
             RemoveVectoredExceptionHandler(handler);
             return 0;
         }
@@ -951,6 +1046,7 @@ int main(int argc, char** argv) {
         CheckPrivateCommitTails();
         CheckCommitResetsEveryPageOfARunView();
         CheckDisarmResident();
+        CheckResidentFirstCollect();
         std::cout << "Windows deferred write-watch tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

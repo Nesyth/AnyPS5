@@ -1793,6 +1793,9 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
         armRuleFlipped = armRuleFlipped || (spansBefore != spansWanted && spansBefore >= 0);
     }
     if (armRuleFlipped && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ArmFlipReset)) GuestArena::GuestArenaDisarmResident_nid_no_patch();
+    static std::atomic<int> residentFirst{-1};
+    const int residentFirstWanted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ResidentFirstCollect) ? 1 : 0;
+    if (residentFirst.load(std::memory_order_relaxed) != residentFirstWanted && residentFirst.exchange(residentFirstWanted, std::memory_order_relaxed) != residentFirstWanted) GuestArena::GuestArenaSetResidentFirst_nid_no_patch(residentFirstWanted != 0);
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
     writeRates[0].fetch_add(1, std::memory_order_relaxed);
     writeRates[1].fetch_add(stop - first, std::memory_order_relaxed);
