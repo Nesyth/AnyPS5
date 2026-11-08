@@ -1779,10 +1779,20 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     if (rearmQuiet.load(std::memory_order_relaxed) != rearmWanted && rearmQuiet.exchange(rearmWanted, std::memory_order_relaxed) != rearmWanted) GuestArena::GuestArenaSetRearmQuiet_nid_no_patch(rearmWanted != 0);
     static std::atomic<int> armWide{-1};
     const int wideWanted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ArmWide) ? 1 : 0;
-    if (armWide.load(std::memory_order_relaxed) != wideWanted && armWide.exchange(wideWanted, std::memory_order_relaxed) != wideWanted) GuestArena::GuestArenaSetArmWide_nid_no_patch(wideWanted != 0);
+    bool armRuleFlipped = false;
+    if (armWide.load(std::memory_order_relaxed) != wideWanted) {
+        const int wideBefore = armWide.exchange(wideWanted, std::memory_order_relaxed);
+        if (wideBefore != wideWanted) GuestArena::GuestArenaSetArmWide_nid_no_patch(wideWanted != 0);
+        armRuleFlipped = wideBefore != wideWanted && wideBefore >= 0;
+    }
     static std::atomic<int> armSpans{-1};
     const int spansWanted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ArmSpans) ? 1 : 0;
-    if (armSpans.load(std::memory_order_relaxed) != spansWanted && armSpans.exchange(spansWanted, std::memory_order_relaxed) != spansWanted) GuestArena::GuestArenaSetArmSpans_nid_no_patch(spansWanted != 0);
+    if (armSpans.load(std::memory_order_relaxed) != spansWanted) {
+        const int spansBefore = armSpans.exchange(spansWanted, std::memory_order_relaxed);
+        if (spansBefore != spansWanted) GuestArena::GuestArenaSetArmSpans_nid_no_patch(spansWanted != 0);
+        armRuleFlipped = armRuleFlipped || (spansBefore != spansWanted && spansBefore >= 0);
+    }
+    if (armRuleFlipped && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ArmFlipReset)) GuestArena::GuestArenaDisarmResident_nid_no_patch();
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
     writeRates[0].fetch_add(1, std::memory_order_relaxed);
     writeRates[1].fetch_add(stop - first, std::memory_order_relaxed);

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -34,6 +35,8 @@
 namespace {
 
 using namespace AgcDriver::GuestMemory;
+using AgcDriver::Graphics::RuntimeSwitch;
+namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
 
 constexpr std::size_t Block = 65536;
 #ifdef _WIN32
@@ -45,6 +48,7 @@ constexpr wchar_t RewatchedSharedMode[] = L"--rewatched-direct-shared";
 constexpr wchar_t ImportAliasSharedMode[] = L"--import-alias-shared";
 constexpr wchar_t SharedGenerationsMode[] = L"--compared-shared-generations";
 constexpr wchar_t CpuWritePinMode[] = L"--cpu-write-pin";
+constexpr wchar_t ArmFlipResetMode[] = L"--arm-flip-reset";
 #endif
 
 void Require(bool condition, const std::string& message) {
@@ -1234,6 +1238,52 @@ void CheckResidentDirectMappingReuse() {
     std::cout << "resident direct remap failure: completed private span watched, original mapping error retained\n";
 }
 
+void CheckArmFlipReset() {
+    constexpr std::size_t chunk = 0x200000;
+    constexpr std::size_t bytes = 4 * Block;
+    auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, chunk));
+    Require(memory != nullptr, "cannot reserve the arm flip reset fixture");
+    struct Cleanup {
+        std::uint8_t* memory;
+        void* other = nullptr;
+        HANDLE section = nullptr;
+        ~Cleanup() {
+            GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+            if (other != nullptr) GuestArena::GuestArenaRelease_nid_postfix(other, Block);
+            if (section == nullptr) return;
+            GuestArena::GuestArenaForgetSection_nid_postfix(section);
+            CloseHandle(section);
+        }
+    } cleanup{memory};
+    cleanup.other = AllocateWatched(Block);
+    cleanup.section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    Require(cleanup.section != nullptr, "cannot create the arm flip reset backing");
+    GuestArena::GuestArenaMapDirect_nid_postfix(memory, bytes, cleanup.section, 0, PAGE_READWRITE);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto other = reinterpret_cast<std::uint64_t>(cleanup.other);
+    const auto armed = [&] {
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(memory, &info, sizeof(info)) == sizeof(info) && info.Type == MEM_PRIVATE, "the arm flip reset fixture is not resident");
+        return info.Protect == PAGE_READONLY;
+    };
+    for (const bool reset : {false, true}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::ArmFlipReset, reset);
+        RuntimeSwitches::Assign(RuntimeSwitch::ArmSpans, false);
+        CollectWritesUncached(other, Block);
+        CollectWritesUncached(base, bytes);
+        CollectWritesUncached(base, bytes);
+        Require(armed(), "collects under the default arming rule did not arm the resident fixture");
+        RuntimeSwitches::Assign(RuntimeSwitch::ArmSpans, true);
+        CollectWritesUncached(other, Block);
+        Require(armed() != reset, reset ? "an arming rule flip with APS5_ARM_FLIP_RESET left the resident fixture armed" : "an arming rule flip without APS5_ARM_FLIP_RESET disarmed the resident fixture");
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::ArmSpans, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::ArmFlipReset, false);
+    CollectWritesUncached(other, Block);
+    std::cout << "arm flip reset: an arming rule flip disarms resident runs only with APS5_ARM_FLIP_RESET\n";
+}
+
 void CheckUntrackedHint() {
     constexpr std::size_t bytes = 4 * Block;
     auto* memory = static_cast<volatile std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block));
@@ -2366,6 +2416,10 @@ int main(int argc, char** argv) {
         }
         if (std::wstring_view(GetCommandLineW()).ends_with(ResidentRemapMode)) {
             CheckResidentDirectMappingReuse();
+            return 0;
+        }
+        if (std::wstring_view(GetCommandLineW()).ends_with(ArmFlipResetMode)) {
+            CheckArmFlipReset();
             return 0;
         }
         if (std::wstring_view(GetCommandLineW()).ends_with(RewatchImportPagesMode)) {

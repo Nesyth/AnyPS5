@@ -838,6 +838,10 @@ void GuestArenaSetArmSpans_nid_no_patch(bool on) {
     WindowsMappings::Get().SetArmSpans(on);
 }
 
+void GuestArenaDisarmResident_nid_no_patch() {
+    WindowsMappings::Get().DisarmResident();
+}
+
 std::uint64_t GuestArenaCleanForgetSerial_nid_no_patch() {
     return WindowsMappings::CleanForgetSerial();
 }

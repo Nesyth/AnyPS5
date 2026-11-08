@@ -854,6 +854,66 @@ void CheckCommitResetsEveryPageOfARunView() {
     mappings.ForgetSection(section);
     CloseHandle(section);
 }
+
+void CheckDisarmResident() {
+    auto& mappings = Mappings::Get();
+    constexpr std::size_t Chunk = 0x200000;
+    constexpr std::size_t Large = 0x40000;
+    constexpr std::size_t Last = Large / Small - 1;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, Large, nullptr);
+    auto* reserved = static_cast<unsigned char*>(mappings.Reserve(nullptr, 2 * Chunk));
+    Require(section && reserved, "cannot allocate disarm test memory");
+    auto* run = reinterpret_cast<unsigned char*>((reinterpret_cast<std::uintptr_t>(reserved) + Chunk - 1) & ~(Chunk - 1));
+    const auto address = reinterpret_cast<std::uintptr_t>(run);
+    const auto collect = [&] {
+        std::array<void*, Large / Small> pages{};
+        std::size_t count = pages.size();
+        Require(mappings.Collect(address, Large, pages.data(), &count, true), "disarm test collection failed");
+        std::set<std::size_t> result;
+        for (std::size_t i = 0; i < count; ++i) result.insert((reinterpret_cast<std::uintptr_t>(pages[i]) - address) / Small);
+        return result;
+    };
+    const auto protection = [&](std::size_t page) {
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(run + page * Small, &info, sizeof(info)) == sizeof(info), "disarm test protection query failed");
+        return info.Protect;
+    };
+    const auto faulted = [&](std::size_t page, unsigned char value) {
+        const auto before = faults.load();
+        static_cast<volatile unsigned char*>(run)[page * Small] = value;
+        return faults.load() != before;
+    };
+    mappings.SetArmResident(true);
+    mappings.ForgetSection(section);
+    mappings.Map(run, Large, section, 0, PAGE_READWRITE, true, true);
+    Require(collect() == Pages(0, Large / Small), "a fresh resident run was not reported whole");
+    Require(collect().empty() && protection(0) == PAGE_READONLY && protection(Last) == PAGE_READONLY, "a settled resident run was not armed");
+    mappings.SetArmSpans(true);
+    mappings.SetArmSpans(false);
+    Require(protection(0) == PAGE_READONLY && protection(Last) == PAGE_READONLY, "changing the arming rule without a disarm disarmed the run");
+    mappings.DisarmResident();
+    Require(protection(0) == PAGE_READWRITE && protection(Last) == PAGE_READWRITE, "a disarm left the run armed");
+    Require(!faulted(5, 1), "a store into a disarmed run faulted");
+    Require(collect() == Pages(5, 6), "a store into a disarmed run was not collected");
+    Require(protection(0) == PAGE_READONLY, "a disarmed run was not armed again under the default rule");
+    mappings.SetArmSpans(true);
+    mappings.DisarmResident();
+    Require(protection(0) == PAGE_READWRITE, "a disarm before a spans phase left the run armed");
+    Require(collect().empty() && protection(0) == PAGE_READONLY && protection(Last) == PAGE_READONLY, "the spans rule did not arm the disarmed run");
+    Require(faulted(4, 2), "a store into a run armed by spans did not fault");
+    Require(protection(0) == PAGE_READONLY && protection(4) == PAGE_READWRITE && protection(8) == PAGE_READONLY, "a spans fault did not resume only its view");
+    Require(collect() == Pages(4, 5), "a store under spans was not collected");
+    mappings.SetArmSpans(false);
+    mappings.DisarmResident();
+    Require(protection(0) == PAGE_READWRITE && protection(Last) == PAGE_READWRITE, "a disarm after a spans phase left the run armed");
+    Require(collect().empty() && collect().empty() && protection(0) == PAGE_READWRITE, "a run written under spans was armed again under the default rule");
+    Require(!faulted(0, 3) && collect() == Pages(0, 1), "a store after a spans phase was not collected");
+    mappings.Reset(run, Large);
+    mappings.ForgetSection(section);
+    VirtualFree(reserved, 2 * Chunk, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+    VirtualFree(reserved, 0, MEM_RELEASE);
+    CloseHandle(section);
+}
 }
 
 int main(int argc, char** argv) {
@@ -890,6 +950,7 @@ int main(int argc, char** argv) {
         CheckPrivateCommitEdgeLayouts();
         CheckPrivateCommitTails();
         CheckCommitResetsEveryPageOfARunView();
+        CheckDisarmResident();
         std::cout << "Windows deferred write-watch tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

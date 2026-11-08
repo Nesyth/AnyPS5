@@ -310,6 +310,21 @@ public:
         armSpansFlag().store(on, std::memory_order_relaxed);
     }
 
+    void DisarmResident() {
+        std::lock_guard lock(mutex);
+        const bool spans = armSpansFlag().load(std::memory_order_relaxed);
+        for (auto& [start, run] : residentRuns) {
+            bool armed = false;
+            bool written = false;
+            for (auto it = views.lower_bound(start); it != views.end() && it->first < run.end; ++it) {
+                armed = armed || it->second.armed != 0;
+                written = written || it->second.writtenAfterArming;
+            }
+            if (armed) resumeResidentWrites(start, false);
+            if (written && !spans) run.writeObserved = true;
+        }
+    }
+
     // A serial bumped whenever a remembered clean range is dropped (a write fault, an unmap, a host write or an
     // alias invalidation), and whether every range in pairs (begin, end, ...) lies inside remembered clean ranges.
     static std::uint64_t CleanForgetSerial() {
