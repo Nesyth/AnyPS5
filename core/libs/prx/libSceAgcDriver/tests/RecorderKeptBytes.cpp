@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -39,9 +40,19 @@ struct MockDevice {
     bool lostSubmissionPending = false;
     std::uint64_t idleWaits = 0;
     VkResult idleResult = VK_ERROR_DEVICE_LOST;
+    VkResult waitResult = VK_SUCCESS;
+    std::map<VkFence, VkCommandBuffer> submittedCommands;
+    std::set<VkCommandBuffer> pendingCommands;
 };
 
 MockDevice mock;
+
+void retireCommands(VkFence fence) {
+    const auto found = mock.submittedCommands.find(fence);
+    if (found == mock.submittedCommands.end()) return;
+    mock.pendingCommands.erase(found->second);
+    mock.submittedCommands.erase(found);
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateCommandBuffers(VkDevice, const VkCommandBufferAllocateInfo*, VkCommandBuffer* commands) {
     *commands = reinterpret_cast<VkCommandBuffer>(mock.next++);
@@ -66,12 +77,18 @@ VKAPI_ATTR void VKAPI_CALL mockDestroyFence(VkDevice, VkFence fence, const VkAll
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockGetFenceStatus(VkDevice, VkFence fence) {
-    return mock.signaled.at(fence) ? VK_SUCCESS : VK_NOT_READY;
+    if (!mock.signaled.at(fence)) return VK_NOT_READY;
+    retireCommands(fence);
+    return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockWaitForFences(VkDevice, std::uint32_t count, const VkFence* fences, VkBool32, std::uint64_t) {
-    for (std::uint32_t i = 0; i < count; ++i) mock.signaled.at(fences[i]) = true;
     ++mock.fenceWaits;
+    if (mock.waitResult != VK_SUCCESS) return mock.waitResult;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        mock.signaled.at(fences[i]) = true;
+        retireCommands(fences[i]);
+    }
     return VK_SUCCESS;
 }
 
@@ -81,7 +98,8 @@ VKAPI_ATTR VkResult VKAPI_CALL mockResetFences(VkDevice, std::uint32_t count, co
     return VK_SUCCESS;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL mockBeginCommandBuffer(VkCommandBuffer, const VkCommandBufferBeginInfo*) {
+VKAPI_ATTR VkResult VKAPI_CALL mockBeginCommandBuffer(VkCommandBuffer commands, const VkCommandBufferBeginInfo*) {
+    Expect(mock.pendingCommands.count(commands) == 0, "a command buffer was begun while its batch was still pending");
     return VK_SUCCESS;
 }
 
@@ -89,10 +107,17 @@ VKAPI_ATTR VkResult VKAPI_CALL mockEndCommandBuffer(VkCommandBuffer) {
     return mock.endResult;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence) {
+VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
     ++mock.submits;
     if (mock.submitResult == VK_ERROR_DEVICE_LOST) mock.lostSubmissionPending = true;
-    return mock.submitResult;
+    if (mock.submitResult != VK_SUCCESS) return mock.submitResult;
+    for (std::uint32_t submit = 0; submit < count; ++submit) {
+        for (std::uint32_t index = 0; index < submits[submit].commandBufferCount; ++index) {
+            mock.pendingCommands.insert(submits[submit].pCommandBuffers[index]);
+            mock.submittedCommands[fence] = submits[submit].pCommandBuffers[index];
+        }
+    }
+    return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockDeviceWaitIdle(VkDevice) {
@@ -299,6 +324,61 @@ void BatchGenerationAfterFailedSubmission() {
     RuntimeSwitches::Assign(RuntimeSwitch::KeepFastPath, false);
 }
 
+void RecycledCommandBuffers(bool recycle) {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    RuntimeSwitches::Assign(RuntimeSwitch::RecycleCommandBuffers, recycle);
+    const std::string mode = recycle ? " with recycled command buffers" : " without recycled command buffers";
+    {
+        Recorder recorder(mockContext());
+        for (int batch = 0; batch < 4; ++batch) {
+            recorder.Keep(std::make_shared<int>(batch));
+            recorder.Sync();
+        }
+        Expect(mock.allocatedCommands == (recycle ? 1u : 4u) && mock.freedCommands == (recycle ? 0u : 4u), "four synced batches allocated " + std::to_string(mock.allocatedCommands) + " and freed " + std::to_string(mock.freedCommands) + " command buffers" + mode);
+        recorder.Keep(std::make_shared<int>(4));
+        recorder.Submit();
+        recorder.Keep(std::make_shared<int>(5));
+        Expect(mock.allocatedCommands == (recycle ? 2u : 6u), "a batch opened beside one in flight brought the command buffers allocated to " + std::to_string(mock.allocatedCommands) + mode);
+        recorder.Submit();
+        for (auto& [fence, signaled] : mock.signaled) signaled = true;
+        Expect(recorder.Reap(), "reaped batches stayed in flight" + mode);
+        recorder.Keep(std::make_shared<int>(6));
+        recorder.Sync();
+        Expect(mock.allocatedCommands == (recycle ? 2u : 7u), "a batch opened after a reap brought the command buffers allocated to " + std::to_string(mock.allocatedCommands) + mode);
+        RuntimeSwitches::Assign(RuntimeSwitch::RecycleCommandBuffers, !recycle);
+        recorder.Keep(std::make_shared<int>(7));
+        recorder.Sync();
+        Expect(mock.allocatedCommands == (recycle ? 3u : 8u) && mock.freedCommands == (recycle ? 3u : 7u), "a batch after the switch flipped brought the command buffers allocated to " + std::to_string(mock.allocatedCommands) + " and freed to " + std::to_string(mock.freedCommands) + mode);
+    }
+    Expect(mock.allocatedCommands == mock.freedCommands, "the recorder leaked " + std::to_string(mock.allocatedCommands - mock.freedCommands) + " command buffers at teardown" + mode);
+    RuntimeSwitches::Assign(RuntimeSwitch::RecycleCommandBuffers, false);
+}
+
+void FailedWaitFreesCommandBuffer() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    RuntimeSwitches::Assign(RuntimeSwitch::RecycleCommandBuffers, true);
+    {
+        Recorder recorder(mockContext());
+        recorder.Keep(std::make_shared<int>(0));
+        mock.waitResult = VK_ERROR_DEVICE_LOST;
+        bool failed = false;
+        try {
+            recorder.Sync();
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        mock.waitResult = VK_SUCCESS;
+        Expect(failed && mock.freedCommands == 1, "a batch whose fence wait failed did not free its command buffer");
+        recorder.Keep(std::make_shared<int>(1));
+        Expect(mock.allocatedCommands == 2, "the command buffer of a batch whose fence wait failed was reused");
+        recorder.Sync();
+    }
+    Expect(mock.allocatedCommands == mock.freedCommands, "the recorder leaked command buffers after a failed fence wait");
+    RuntimeSwitches::Assign(RuntimeSwitch::RecycleCommandBuffers, false);
+}
+
 void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleResult = VK_ERROR_DEVICE_LOST) {
     mock = MockDevice{};
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
@@ -373,12 +453,19 @@ int main() {
         KeepFastPathCountsAsBefore(false);
         KeepFastPathCountsAsBefore(true);
         BatchGenerationAfterFailedSubmission();
-        FailedSubmission(VK_ERROR_OUT_OF_HOST_MEMORY, VK_SUCCESS);
-        FailedSubmission(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_SUCCESS);
-        FailedSubmission(VK_SUCCESS, VK_ERROR_OUT_OF_HOST_MEMORY);
-        FailedSubmission(VK_SUCCESS, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-        FailedSubmission(VK_SUCCESS, VK_ERROR_DEVICE_LOST);
-        FailedSubmission(VK_SUCCESS, VK_ERROR_DEVICE_LOST, VK_SUCCESS);
+        RecycledCommandBuffers(false);
+        RecycledCommandBuffers(true);
+        FailedWaitFreesCommandBuffer();
+        for (const bool recycle : {false, true}) {
+            RuntimeSwitches::Assign(RuntimeSwitch::RecycleCommandBuffers, recycle);
+            FailedSubmission(VK_ERROR_OUT_OF_HOST_MEMORY, VK_SUCCESS);
+            FailedSubmission(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_SUCCESS);
+            FailedSubmission(VK_SUCCESS, VK_ERROR_OUT_OF_HOST_MEMORY);
+            FailedSubmission(VK_SUCCESS, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+            FailedSubmission(VK_SUCCESS, VK_ERROR_DEVICE_LOST);
+            FailedSubmission(VK_SUCCESS, VK_ERROR_DEVICE_LOST, VK_SUCCESS);
+        }
+        RuntimeSwitches::Assign(RuntimeSwitch::RecycleCommandBuffers, false);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

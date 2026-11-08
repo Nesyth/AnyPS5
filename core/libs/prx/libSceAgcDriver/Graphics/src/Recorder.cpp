@@ -550,6 +550,7 @@ std::atomic<std::uint64_t> completionStoresSkipped{0};
 std::atomic<std::uint64_t> completionStoresRun{0};
 std::atomic<std::uint64_t> commandBuffersFreed{0};
 std::atomic<std::uint64_t> fencesKept{0};
+constexpr std::size_t SpareCommandBuffers = 16;
 // Write-backs noted over a tracked label dword (NoteWrittenBack): a CPU store over a GPU label.
 std::atomic<std::uint64_t> writeBacksOverLabels{0};
 // Completion labels that entered the pending count at a write-back (see NoteWrittenBack).
@@ -1299,6 +1300,8 @@ Recorder::~Recorder() {
     if (dispatchArgumentLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, dispatchArgumentLayout, nullptr);
     for (const auto fence : spare) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     spare.clear();
+    if (!spareCommands.empty()) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, static_cast<std::uint32_t>(spareCommands.size()), spareCommands.data());
+    spareCommands.clear();
     for (const auto pool : sparePools) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, pool, nullptr);
     sparePools.clear();
     // Sync() above waited for every batch, so no submission still signals the timeline.
@@ -1820,11 +1823,16 @@ void Recorder::ensureOpen() {
         ++passGeneration;
         auto batch = std::make_unique<Batch>();
         try {
-            VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-            allocation.commandPool = context.pool;
-            allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            allocation.commandBufferCount = 1;
-            Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &batch->commands), "vkAllocateCommandBuffers recorder");
+            if (!spareCommands.empty() && RuntimeSwitches::Set(RuntimeSwitch::RecycleCommandBuffers)) {
+                batch->commands = spareCommands.back();
+                spareCommands.pop_back();
+            } else {
+                VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                allocation.commandPool = context.pool;
+                allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                allocation.commandBufferCount = 1;
+                Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &batch->commands), "vkAllocateCommandBuffers recorder");
+            }
             if (!spare.empty()) {
                 batch->fence = spare.back();
                 spare.pop_back();
@@ -4721,7 +4729,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     // The batch's label entries leave the table (a later label to the same dword already replaced
     // its entry and belongs to another batch). Correctness never depended on this removal.
     removeLabels(*batch);
-    release(*batch);
+    release(*batch, true);
 }
 
 void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
@@ -4752,7 +4760,7 @@ void Recorder::removeLabels(Batch& batch) {
     batch.wideLabels.clear();
 }
 
-void Recorder::release(Batch& batch) noexcept {
+void Recorder::release(Batch& batch, bool retired) noexcept {
     if (batch.queries != VK_NULL_HANDLE) {
         if (!GpuTimingEnabled() && sparePools.size() < 64) {
             try {
@@ -4772,6 +4780,19 @@ void Recorder::release(Batch& batch) noexcept {
     batch.segments = VK_NULL_HANDLE;
     batch.segmentPool.reset();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool recycle = RuntimeSwitches::Set(RuntimeSwitch::RecycleCommandBuffers);
+    if (!recycle && !spareCommands.empty()) {
+        context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, static_cast<std::uint32_t>(spareCommands.size()), spareCommands.data());
+        if (profile) commandBuffersFreed.fetch_add(spareCommands.size(), std::memory_order_relaxed);
+        spareCommands.clear();
+    }
+    if (batch.commands != VK_NULL_HANDLE && retired && recycle && spareCommands.size() < SpareCommandBuffers) {
+        try {
+            spareCommands.push_back(batch.commands);
+            batch.commands = VK_NULL_HANDLE;
+        } catch (const std::bad_alloc&) {
+        }
+    }
     if (batch.commands != VK_NULL_HANDLE) {
         context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &batch.commands);
         if (profile) commandBuffersFreed.fetch_add(1, std::memory_order_relaxed);
