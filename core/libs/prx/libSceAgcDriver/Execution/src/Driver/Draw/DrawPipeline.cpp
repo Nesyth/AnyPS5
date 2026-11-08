@@ -622,6 +622,10 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     enqueue({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw});
 }
 
+void DrawPipeline::EnqueueQuiet(Commit commit) {
+    enqueue({std::move(commit), {}, 0, {}, {}, false, false, true});
+}
+
 void DrawPipeline::EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes) {
     const auto end = address + bytes.size();
     enqueue({std::move(commit), {{address, end}}, address, std::move(bytes), {}, false, true});
@@ -744,6 +748,7 @@ void DrawPipeline::run() {
         Commit* commit = nullptr;
         bool isDraw = false;
         bool rangedItem = false;
+        bool quietItem = false;
         std::vector<Range> itemRanges;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
@@ -754,6 +759,7 @@ void DrawPipeline::run() {
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
+            quietItem = items.front().quiet;
             rangedItem = !isDraw && GuestMemory::RangeProofs();
             if (rangedItem) {
                 itemRanges = items.front().writes;
@@ -774,7 +780,8 @@ void DrawPipeline::run() {
         }
         try {
             if (commit != nullptr) (*commit)();
-            if (rangedItem) {
+            if (quietItem) {
+            } else if (rangedItem) {
                 for (const auto& [begin, end] : itemRanges) GuestMemory::BreakProofs(GuestMemory::ProofBreak::NonDrawItem, begin, end);
             } else if (!isDraw) {
                 GuestMemory::BreakProofs(GuestMemory::ProofBreak::NonDrawItem);

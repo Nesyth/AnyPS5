@@ -4586,10 +4586,9 @@ struct IdentityOutcome {
 };
 
 struct IdentityEntry {
-    std::array<std::uint64_t, 3> frames{~0ull, ~0ull, ~0ull};
-    std::array<std::uint32_t, 3> counts{};
-    std::array<IdentityOutcome, 4> outcomes{};
     std::uint64_t lastFrame = 0;
+    std::uint64_t seen = 0;
+    IdentityOutcome last;
 };
 
 enum IdentityMiss : std::size_t { IdentityMissNotRecorded, IdentityMissPipeline, IdentityMissResources, IdentityMissFramebuffer, IdentityMissTargets, IdentityMissInputs, IdentityMissBuild, IdentityMissWalk, IdentityMissCount };
@@ -4625,7 +4624,7 @@ void reportIdentityCensus(IdentityCensusState& census, std::uint64_t present) {
         std::snprintf(text, sizeof(text), "%s %s %.1f%%", i == 0 ? "" : ",", IdentityMissNames[i], 100.0 * static_cast<double>(census.misses[i]) / draws);
         misses += text;
     }
-    std::fprintf(stderr, "[identity] %.1f s, %llu presents: %llu draws (%.0f per present), %llu recipe draws, %llu without a content key; matched in N-1 %.1f%%, only in N-2 %.1f%%, new %.1f%%; exact %.1f%% of draws; matched but not exact, by first difference (of all draws):%s; %zu identities held\n", seconds, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(census.draws), presents == 0 ? 0.0 : static_cast<double>(census.draws) / static_cast<double>(presents), static_cast<unsigned long long>(census.recipeDraws), static_cast<unsigned long long>(census.keyless), 100.0 * static_cast<double>(census.matchedPrevious) / draws, 100.0 * static_cast<double>(census.matchedOlder) / draws, 100.0 * static_cast<double>(census.draws - census.matchedPrevious - census.matchedOlder) / draws, 100.0 * static_cast<double>(census.exact) / draws, misses.c_str(), census.entries.size());
+    std::fprintf(stderr, "[identity] %.1f s, %llu presents: %llu draws (%.0f per present), %llu recipe draws, %llu without a content key; seen in this or the previous present %.1f%%, two presents back %.1f%%, new %.1f%%; exact %.1f%% of draws; matched but not exact, by first difference (of all draws):%s; %zu identities held\n", seconds, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(census.draws), presents == 0 ? 0.0 : static_cast<double>(census.draws) / static_cast<double>(presents), static_cast<unsigned long long>(census.recipeDraws), static_cast<unsigned long long>(census.keyless), 100.0 * static_cast<double>(census.matchedPrevious) / draws, 100.0 * static_cast<double>(census.matchedOlder) / draws, 100.0 * static_cast<double>(census.draws - census.matchedPrevious - census.matchedOlder) / draws, 100.0 * static_cast<double>(census.exact) / draws, misses.c_str(), census.entries.size());
     census.lastReport = now;
     census.reportPresent = present;
     census.draws = census.recipeDraws = census.keyless = census.matchedPrevious = census.matchedOlder = census.exact = 0;
@@ -4638,11 +4637,13 @@ void noteRecipeIdentity() {
     ++census.recipeDraws;
 }
 
-void noteIdentity(const PreparedDraw& prepared, const Pm4::DrawParameters& draw) {
+void noteIdentity(const PreparedDraw& prepared, const State& state, const Pm4::DrawParameters& draw) {
     std::uint64_t id = mixIdentity(0xcbf29ce484222325ull, prepared.shape);
     if (prepared.contentKey != nullptr) {
         for (const auto word : *prepared.contentKey) id = mixIdentity(id, word);
     }
+    for (const auto& color : state.colors) id = mixIdentity(mixIdentity(id, color.address), static_cast<std::uint64_t>(color.format));
+    if (state.depth) id = mixIdentity(mixIdentity(id, state.depth->address), state.depth->stencilAddress);
     id = mixIdentity(id, draw.indexAddress);
     id = mixIdentity(id, draw.indexCount);
     id = mixIdentity(id, draw.instanceCount);
@@ -4661,21 +4662,12 @@ void noteIdentity(const PreparedDraw& prepared, const Pm4::DrawParameters& draw)
     ++census.draws;
     if (prepared.contentKey == nullptr) ++census.keyless;
     auto& entry = census.entries[id];
-    const auto slot = present % 3;
-    if (entry.frames[slot] != present) {
-        entry.frames[slot] = present;
-        entry.counts[slot] = 0;
-    }
-    const auto occurrence = entry.counts[slot]++;
+    const auto age = present - std::min(present, entry.lastFrame);
+    const bool previous = entry.seen != 0 && age <= 1;
+    const bool older = entry.seen != 0 && age == 2;
+    ++entry.seen;
     entry.lastFrame = present;
-    const auto seenIn = [&](std::uint64_t back) {
-        if (present < back) return false;
-        const auto frame = present - back;
-        return entry.frames[frame % 3] == frame && entry.counts[frame % 3] > occurrence;
-    };
-    const bool previous = seenIn(1);
-    const bool older = !previous && seenIn(2);
-    auto& last = entry.outcomes[std::min<std::size_t>(occurrence, entry.outcomes.size() - 1)];
+    auto& last = entry.last;
     if (previous) ++census.matchedPrevious;
     if (older) ++census.matchedOlder;
     if (previous || older) {
@@ -4811,7 +4803,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         throw;
     }
     keepHeldSpace(prepared);
-    if (IdentityCensus()) noteIdentity(prepared, draw);
+    if (IdentityCensus()) noteIdentity(prepared, state, draw);
 }
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {

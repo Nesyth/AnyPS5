@@ -76,6 +76,7 @@ public:
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
     void EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes);
+    void EnqueueQuiet(Commit commit);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
     void ReleaseRetired();
@@ -108,6 +109,7 @@ private:
         std::vector<Range> reads;
         bool draw = false;
         bool store = false;
+        bool quiet = false;
     };
     DrawPipeline() = default;
     void enqueue(Item item);

@@ -28,6 +28,23 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
+void noteXpStream(bool seal) {
+    static std::atomic<std::uint64_t> ends{0}, seals{0};
+    static std::atomic<std::int64_t> lastReport{0};
+    static std::uint64_t endsReported = 0, sealsReported = 0;
+    (seal ? seals : ends).fetch_add(1, std::memory_order_relaxed);
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        lastReport.store(now, std::memory_order_relaxed);
+    } else if (now - last >= 10000 && lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        const auto endsNow = ends.load(std::memory_order_relaxed), sealsNow = seals.load(std::memory_order_relaxed);
+        AgcDriver::ProfilePrint_nid_no_patch("[xp-stream-segments] %.1f s: %llu released segment ends and %llu write-only seals queued without a drain, a submit or a proof break\n", static_cast<double>(now - last) / 1000.0, static_cast<unsigned long long>(endsNow - endsReported), static_cast<unsigned long long>(sealsNow - sealsReported));
+        endsReported = endsNow;
+        sealsReported = sealsNow;
+    }
+}
+
 bool xpDropsDraw() {
     static const std::uint64_t keepOneIn = [] {
         const char* text = std::getenv("APS5_XP_KEEP_DRAWS_N");
@@ -622,8 +639,20 @@ void Driver::execute(const Submission& submission) {
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
                     if (const auto localDevice = device.Load()) localDevice->SealPassWriteOnly();
                 };
-                if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Enqueue(seal, {});
-                else seal();
+                const bool streamSeal = pipelined && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpStreamSegments);
+                if (streamSeal && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
+                    DrawFinisher::Pending held;
+                    held.unknown = false;
+                    DrawFinisher::Get().Enqueue([seal] { DrawPipeline::Queue0().EnqueueQuiet(seal); }, std::move(held));
+                    noteXpStream(true);
+                } else if (streamSeal && DrawPipeline::Queue0().Busy()) {
+                    DrawPipeline::Queue0().EnqueueQuiet(seal);
+                    noteXpStream(true);
+                } else if (pipelined && DrawPipeline::Queue0().Busy()) {
+                    DrawPipeline::Queue0().Enqueue(seal, {});
+                } else {
+                    seal();
+                }
             }
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {
@@ -665,10 +694,32 @@ void Driver::execute(const Submission& submission) {
         cursor = nextCursor;
     }
 
-    if (submission.queue == 0) DrawFinisher::Get().Drain();
+    const bool streamEnd = submission.queue == 0 && pipelined && orderedCompletion && !submission.progress && submission.rewindTail != nullptr && deferredLabels().labels.empty() && (std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0 && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpStreamSegments);
+    if (submission.queue == 0 && !streamEnd) DrawFinisher::Get().Drain();
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
+    if (streamEnd) {
+        const bool holdsFlip = std::exchange(flipHold.working, false);
+        auto enqueue = [this, holdsFlip] {
+            DrawPipeline::Queue0().EnqueueQuiet([this, holdsFlip] {
+                if (holdsFlip) finishFlipWork(submitFlipWork(0));
+                else submitDueAfterCommit(device.Load().get());
+                wakeQueueZeroForCompletions();
+            });
+        };
+        if (DrawFinisher::Overlap() && DrawFinisher::Busy()) {
+            DrawFinisher::Pending held;
+            held.unknown = false;
+            DrawFinisher::Get().Enqueue(std::move(enqueue), std::move(held));
+        } else {
+            enqueue();
+        }
+        noteXpStream(false);
+        endTiming.Finish();
+        executeRewindTail(submission);
+        return;
+    }
     if (pipelined && orderedCompletion && deferredLabels().labels.empty()) {
         if (submission.rewindTail == nullptr) {
             flipHold.working = false;
