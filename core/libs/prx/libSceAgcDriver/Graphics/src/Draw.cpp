@@ -1639,8 +1639,52 @@ struct DrawInputs {
     std::uint32_t meshLayerStride = 0;
     std::vector<std::uint32_t> restartTable;
     std::uint32_t expandedIndexCount = 0;
+    bool recycled = false;
     const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
 };
+
+struct DrawInputSpare {
+    std::vector<VkBuffer> vertexHandles;
+    std::vector<VkDeviceSize> vertexOffsets;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
+};
+
+struct DrawInputScratch {
+    std::vector<VertexFetch> fetches;
+    std::vector<std::size_t> fetchValid;
+    std::vector<std::size_t> fetchOf;
+    std::vector<std::shared_ptr<Buffer>> zeroed;
+    std::vector<std::size_t> soloFetches;
+    std::vector<std::uint8_t> isSolo;
+    std::vector<VertexFetch> plannedFetches;
+    std::vector<std::size_t> plannedOf;
+    VertexCopyPlan plan;
+    std::vector<std::size_t> order;
+    std::vector<VkBuffer> rangeHandles;
+    std::vector<VkDeviceSize> rangeOffsets;
+    std::vector<VkBuffer> soloHandles;
+    bool busy = false;
+};
+
+void takeSpareInputs(DrawInputs& inputs) {
+    auto& spare = HostThreadLocal<DrawInputSpare, DrawInputSpare>();
+    inputs.vertexHandles = std::move(spare.vertexHandles);
+    inputs.vertexOffsets = std::move(spare.vertexOffsets);
+    inputs.inPlaceReads = std::move(spare.inPlaceReads);
+    inputs.vertexHandles.clear();
+    inputs.vertexOffsets.clear();
+    inputs.inPlaceReads.clear();
+    inputs.recycled = true;
+}
+
+void returnSpareInputs(DrawInputs& inputs) {
+    if (!inputs.recycled) return;
+    auto& spare = HostThreadLocal<DrawInputSpare, DrawInputSpare>();
+    spare.vertexHandles = std::move(inputs.vertexHandles);
+    spare.vertexOffsets = std::move(inputs.vertexOffsets);
+    spare.inPlaceReads = std::move(inputs.inPlaceReads);
+    inputs.recycled = false;
+}
 
 bool StripPatches(const State& state, std::span<const CompiledShader> shaders) {
     return state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP && BarycentricPatches(state, shaders);
@@ -1738,6 +1782,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     timer.phase(PhaseValidate);
     timing.Mark("validate");
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
+    const bool scratchInputs = RuntimeSwitches::Set(RuntimeSwitch::InputScratch);
+    if (scratchInputs && recipe == nullptr) takeSpareInputs(inputs);
     if (state.quadList || StripPatches(state, shaders)) {
         Require(!draw.indirect, state.quadList ? "indirect quad-list draw is unsupported" : "an indirect triangle strip through emulated barycentric patches is unsupported");
         Require(state.quadList || !draw.indexed || !state.primitiveRestart, "an indexed triangle strip with primitive restart through emulated barycentric patches is unsupported");
@@ -1900,6 +1946,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (import != nullptr) {
             inputs.indexHandle = import->buffer;
             inputs.indexOffset = HostImportOffset(*import, draw.indexAddress);
+            if (scratchInputs) inputs.inPlaceReads.reserve(1u + DrawVertexAttributes(shaders.front()).size());
             inputs.inPlaceReads.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
         } else {
             inputs.indices = std::move(copy.buffer);
@@ -1923,12 +1970,30 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - inputs.maxIndex, "indexed draw vertex range overflow");
         inputs.maxIndex += draw.firstVertex;
     }
-    std::vector<VertexFetch> fetches;
-    std::vector<std::size_t> fetchValid;
+    auto* shared = scratchInputs ? &HostThreadLocal<DrawInputScratch, DrawInputScratch>() : nullptr;
+    const bool reuse = shared != nullptr && !shared->busy;
+    std::optional<DrawInputScratch> own;
+    auto& scratch = reuse ? *shared : own.emplace();
+    const struct ScratchHold {
+        DrawInputScratch* scratch;
+        ~ScratchHold() {
+            if (scratch == nullptr) return;
+            scratch->zeroed.clear();
+            scratch->busy = false;
+        }
+    } scratchHold{reuse ? shared : nullptr};
+    scratch.busy = reuse;
+    auto& fetches = scratch.fetches;
+    auto& fetchValid = scratch.fetchValid;
+    fetches.clear();
+    fetchValid.clear();
     fetches.reserve(attributes.size());
     fetchValid.reserve(attributes.size());
-    std::vector<std::size_t> fetchOf(attributes.size(), 0);
-    std::vector<std::shared_ptr<Buffer>> zeroed(attributes.size());
+    auto& fetchOf = scratch.fetchOf;
+    fetchOf.assign(attributes.size(), 0);
+    auto& zeroed = scratch.zeroed;
+    zeroed.clear();
+    zeroed.resize(attributes.size());
     const auto& layout = inputs.VertexLayout();
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         const auto& attribute = attributes[i];
@@ -1952,40 +2017,48 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto recordBytes = static_cast<std::uint64_t>(fields[2]) * stride;
         fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
     }
-    const auto soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
-    std::vector<bool> isSolo(fetches.size(), false);
-    for (const auto f : soloFetches) isSolo[f] = true;
-    std::vector<VertexFetch> plannedFetches;
+    auto& soloFetches = scratch.soloFetches;
+    SoloZeroPaddedFetchIndicesInto(fetches, fetchValid, soloFetches);
+    auto& isSolo = scratch.isSolo;
+    isSolo.assign(fetches.size(), 0);
+    for (const auto f : soloFetches) isSolo[f] = 1;
+    auto& plannedFetches = scratch.plannedFetches;
+    plannedFetches.clear();
     plannedFetches.reserve(fetches.size());
-    std::vector<std::size_t> plannedOf(fetches.size(), 0);
+    auto& plannedOf = scratch.plannedOf;
+    plannedOf.assign(fetches.size(), 0);
     for (std::size_t f = 0; f < fetches.size(); ++f) {
-        if (isSolo[f]) continue;
+        if (isSolo[f] != 0) continue;
         plannedOf[f] = plannedFetches.size();
         plannedFetches.push_back(fetches[f]);
     }
-    const auto plan = PlanVertexCopies(plannedFetches);
-    std::vector<VkBuffer> rangeHandles;
-    std::vector<VkDeviceSize> rangeOffsets;
-    rangeHandles.reserve(plan.copies.size());
-    rangeOffsets.reserve(plan.copies.size());
+    if (reuse) PlanVertexCopiesInto(plannedFetches, scratch.plan, scratch.order);
+    else scratch.plan = PlanVertexCopies(plannedFetches);
+    const auto& plan = scratch.plan;
+    auto& rangeHandles = scratch.rangeHandles;
+    auto& rangeOffsets = scratch.rangeOffsets;
+    rangeHandles.assign(plan.copies.size(), VK_NULL_HANDLE);
+    rangeOffsets.assign(plan.copies.size(), 0);
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
         const auto [begin, end] = plan.copies[range];
         const auto bytes = static_cast<std::size_t>(end - begin);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
         RequireNoMultisampleTarget(begin, bytes, "a vertex buffer read");
         if (const auto* import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite)) {
-            rangeHandles.push_back(import->buffer);
-            rangeOffsets.push_back(HostImportOffset(*import, begin));
+            rangeHandles[range] = import->buffer;
+            rangeOffsets[range] = HostImportOffset(*import, begin);
+            if (scratchInputs) inputs.inPlaceReads.reserve(inputs.inPlaceReads.size() + plan.copies.size() - range);
             inputs.inPlaceReads.emplace_back(begin, end);
             continue;
         }
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
-        rangeHandles.push_back(copy.buffer->Handle());
-        rangeOffsets.push_back(0);
+        rangeHandles[range] = copy.buffer->Handle();
+        rangeOffsets[range] = 0;
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
-    std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
+    auto& soloHandles = scratch.soloHandles;
+    soloHandles.assign(fetches.size(), VK_NULL_HANDLE);
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
@@ -2001,7 +2074,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             continue;
         }
         const auto f = fetchOf[i];
-        if (isSolo[f]) {
+        if (isSolo[f] != 0) {
             inputs.vertexHandles.push_back(soloHandles[f]);
             inputs.vertexOffsets[i] = 0;
             continue;
@@ -4501,6 +4574,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PreparedDraw prepared(profile);
+    const struct SpareInputs {
+        PreparedDraw& prepared;
+        ~SpareInputs() { returnSpareInputs(prepared.inputs); }
+    } spareInputs{prepared};
     prepared.recipeOut = recipeOut;
     prepared.trace = trace;
     prepared.shape = shape;

@@ -347,19 +347,13 @@ struct VertexCopyPlan {
     std::vector<std::uint32_t> alignments;
 };
 
-inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
-    VertexCopyPlan plan;
-    plan.copyOf.assign(fetches.size(), 0);
-    plan.offsets.assign(fetches.size(), 0);
-    std::vector<std::size_t> order(fetches.size());
-    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
-        const auto& x = fetches[a];
-        const auto& y = fetches[b];
-        if (x.stride != y.stride) return x.stride < y.stride;
-        if (x.fetchIndex != y.fetchIndex) return x.fetchIndex < y.fetchIndex;
-        return x.begin < y.begin;
-    });
+inline bool VertexCopyOrder(const VertexFetch& x, const VertexFetch& y) {
+    if (x.stride != y.stride) return x.stride < y.stride;
+    if (x.fetchIndex != y.fetchIndex) return x.fetchIndex < y.fetchIndex;
+    return x.begin < y.begin;
+}
+
+inline void PlanOrderedVertexCopies(std::span<const VertexFetch> fetches, std::span<const std::size_t> order, VertexCopyPlan& plan) {
     std::size_t lead = fetches.size();
     for (const auto i : order) {
         const auto& fetch = fetches[i];
@@ -376,7 +370,38 @@ inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
         plan.copyOf[i] = plan.copies.size() - 1;
         plan.offsets[i] = fetch.begin - copy.first;
     }
+}
+
+inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
+    VertexCopyPlan plan;
+    plan.copyOf.assign(fetches.size(), 0);
+    plan.offsets.assign(fetches.size(), 0);
+    std::vector<std::size_t> order(fetches.size());
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return VertexCopyOrder(fetches[a], fetches[b]); });
+    PlanOrderedVertexCopies(fetches, order, plan);
     return plan;
+}
+
+inline void PlanVertexCopiesInto(std::span<const VertexFetch> fetches, VertexCopyPlan& plan, std::vector<std::size_t>& order) {
+    constexpr std::size_t InsertionSortFetches = 16;
+    plan.copies.clear();
+    plan.alignments.clear();
+    plan.copyOf.assign(fetches.size(), 0);
+    plan.offsets.assign(fetches.size(), 0);
+    order.resize(fetches.size());
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    if (order.size() > InsertionSortFetches) {
+        std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return VertexCopyOrder(fetches[a], fetches[b]); });
+    } else {
+        for (std::size_t i = 1; i < order.size(); ++i) {
+            const auto moved = order[i];
+            auto at = i;
+            for (; at != 0 && VertexCopyOrder(fetches[moved], fetches[order[at - 1]]); --at) order[at] = order[at - 1];
+            order[at] = moved;
+        }
+    }
+    PlanOrderedVertexCopies(fetches, order, plan);
 }
 
 inline std::optional<std::uint32_t> ZeroFetchVertex(std::span<const ShaderRecompiler::VertexAttribute> attributes) {
@@ -501,12 +526,17 @@ inline std::vector<std::uint32_t> MeshRestartTable(std::span<const std::byte> in
     return starts;
 }
 
-inline std::vector<std::size_t> SoloZeroPaddedFetchIndices(const std::vector<VertexFetch>& fetches, const std::vector<std::size_t>& fetchValid) {
+inline void SoloZeroPaddedFetchIndicesInto(std::span<const VertexFetch> fetches, std::span<const std::size_t> fetchValid, std::vector<std::size_t>& solo) {
     Require(fetchValid.size() == fetches.size(), "fetch validity does not match the fetch count");
-    std::vector<std::size_t> solo;
+    solo.clear();
     for (std::size_t i = 0; i < fetches.size(); ++i) {
         if (fetchValid[i] < fetches[i].end - fetches[i].begin) solo.push_back(i);
     }
+}
+
+inline std::vector<std::size_t> SoloZeroPaddedFetchIndices(const std::vector<VertexFetch>& fetches, const std::vector<std::size_t>& fetchValid) {
+    std::vector<std::size_t> solo;
+    SoloZeroPaddedFetchIndicesInto(fetches, fetchValid, solo);
     return solo;
 }
 

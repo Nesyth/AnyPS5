@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
@@ -182,9 +183,12 @@ int main() {
             {3u, 16u, true, "OOB_SELECT 3, selectors W Z 1 0", Wzyx},
             {3u, 8u, false, "OOB_SELECT 3, partly fits, selectors W Z 1 0", Wzyx},
         }};
-        for (const auto& value : cases) {
-            Draw(*device, value);
-            Check(value);
+        for (const bool scratch : {false, true, false, true}) {
+            AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::InputScratch, scratch);
+            for (const auto& value : cases) {
+                Draw(*device, value);
+                Check(value);
+            }
         }
         DescriptorDiagnostics(*device);
         std::puts("zero-stride vertex fetch tests passed");

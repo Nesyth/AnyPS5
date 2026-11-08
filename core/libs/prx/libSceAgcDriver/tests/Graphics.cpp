@@ -12431,6 +12431,32 @@ void vertexCopyTests() {
         const std::array<VertexFetch, 1> empty{{{0x4000, 0x4000, 16, 0, 4}}};
         expectFailure([&] { PlanVertexCopies(empty); }, "empty vertex fetch");
     }
+    {
+        using AgcDriver::Graphics::PlanVertexCopiesInto;
+        using AgcDriver::Graphics::VertexCopyPlan;
+        std::mt19937 random(5381);
+        VertexCopyPlan reused;
+        std::vector<std::size_t> order;
+        for (unsigned round = 0; round < 4000; ++round) {
+            std::vector<VertexFetch> fetches(random() % 40u);
+            for (auto& fetch : fetches) {
+                constexpr std::array<std::uint32_t, 4> strides{0, 16, 24, 32};
+                fetch.stride = strides[random() % strides.size()];
+                fetch.fetchIndex = random() % 2u;
+                fetch.begin = 0x10000u + (random() % 12u) * 2u;
+                fetch.end = fetch.begin + 2u + random() % 64u;
+                fetch.alignment = 1u << (random() % 3u);
+            }
+            const auto expected = PlanVertexCopies(fetches);
+            PlanVertexCopiesInto(fetches, reused, order);
+            Require(reused.copies == expected.copies && reused.copyOf == expected.copyOf && reused.offsets == expected.offsets && reused.alignments == expected.alignments, "a vertex copy plan made in reused storage differs from a fresh one (" + std::to_string(fetches.size()) + " fetches)");
+        }
+        const std::array<VertexFetch, 1> empty{{{0x4000, 0x4000, 16, 0, 4}}};
+        expectFailure([&] { PlanVertexCopiesInto(empty, reused, order); }, "empty vertex fetch");
+        const std::array<VertexFetch, 2> pair{{{0x5000, 0x5100, 16, 0, 4}, {0x5004, 0x5104, 16, 0, 4}}};
+        PlanVertexCopiesInto(pair, reused, order);
+        Require(reused.copies.size() == 1 && reused.copyOf == std::vector<std::size_t>{0, 0} && reused.offsets == std::vector<std::uint64_t>{0, 4}, "a failed plan left its reused storage stale");
+    }
 }
 
 void vertexZeroFillTests() {
@@ -12493,6 +12519,12 @@ void vertexZeroFillMergeTests() {
     Require(SoloZeroPaddedFetchIndices(fetches, {88u, 80u}).empty(), "fully valid fetches share the straight copy");
     const auto solo = SoloZeroPaddedFetchIndices(fetches, {88u, 72u});
     Require(solo.size() == 1 && solo[0] == 1, "a fetch past the records is copied alone");
+    std::vector<std::size_t> reused{7u, 8u, 9u};
+    AgcDriver::Graphics::SoloZeroPaddedFetchIndicesInto(fetches, std::vector<std::size_t>{88u, 72u}, reused);
+    Require(reused == solo, "solo fetches found in reused storage differ from a fresh search");
+    AgcDriver::Graphics::SoloZeroPaddedFetchIndicesInto(fetches, std::vector<std::size_t>{88u, 80u}, reused);
+    Require(reused.empty(), "solo fetches found in reused storage kept a stale fetch");
+    expectFailure([&] { AgcDriver::Graphics::SoloZeroPaddedFetchIndicesInto(fetches, std::vector<std::size_t>{88u}, reused); }, "fetch validity does not match");
 }
 
 void parallelCompareTests() {
