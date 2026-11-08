@@ -53,6 +53,7 @@ enum class RuntimeSwitch : std::size_t {
     DeepQueues,
     SpeculativeLookup,
     HostLargeCache,
+    PipelinedGpuIndirect,
     Count,
 };
 

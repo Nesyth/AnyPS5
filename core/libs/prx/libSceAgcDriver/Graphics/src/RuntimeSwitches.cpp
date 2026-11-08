@@ -59,6 +59,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_DEEP_QUEUES",
     "APS5_SPECULATIVE_LOOKUP",
     "APS5_HOST_LARGE_CACHE",
+    "APS5_PIPELINED_GPU_INDIRECT",
 };
 
 struct SwitchValues {
@@ -118,6 +119,7 @@ struct SwitchValues {
             std::getenv("APS5_DEEP_QUEUES") != nullptr,
             std::getenv("APS5_SPECULATIVE_LOOKUP") != nullptr,
             std::getenv("APS5_HOST_LARGE_CACHE") != nullptr,
+            std::getenv("APS5_PIPELINED_GPU_INDIRECT") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }
