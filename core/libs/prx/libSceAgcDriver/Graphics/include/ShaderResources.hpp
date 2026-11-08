@@ -33,6 +33,7 @@ namespace AgcDriver::Graphics {
 
 
 class Recorder;
+class OwnDrawSets;
 struct ShaderResourcesTestAccess;
 
 void FlushCachedTextures(VkDevice device);
@@ -229,6 +230,8 @@ public:
         bool addressOffsets = false;
         std::array<std::uint32_t, 2u * ShaderRecompiler::RuntimeAbi::StageCount> heapOffsets{};
         std::vector<VkDescriptorBufferInfo> addressOverrides;
+        std::shared_ptr<OwnDrawSets> ownSets;
+        std::array<bool, 2> owned{};
         ~DrawBindings();
     };
     void RefreshMovedAddresses(DrawBindings& rewritten) const;
@@ -835,6 +838,9 @@ private:
     mutable std::atomic<std::uint64_t> depthGuardsClear{std::numeric_limits<std::uint64_t>::max()};
     mutable std::atomic<std::uint64_t> multisampleGuardsClear{std::numeric_limits<std::uint64_t>::max()};
     void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
+    void writeOwnDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
+    std::shared_ptr<OwnDrawSets> makeOwnDrawSets() const;
+    mutable std::shared_ptr<OwnDrawSets> ownDrawSets;
     void writeAddressedOverlay(DrawBindings& result, std::span<const std::size_t> selected) const;
     std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;

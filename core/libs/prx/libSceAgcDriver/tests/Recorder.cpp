@@ -4953,6 +4953,92 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+void ownDrawSetTests(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    DescriptorUpdates updates(context);
+    const bool ownBefore = RuntimeSwitches::Set(RuntimeSwitch::OwnDrawSets);
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding data{};
+        data.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        data.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+        data.binding = 2;
+        data.count = 1;
+        data.guestDescriptor = {1, 2, 3, 4};
+        program.bindings.push_back(data);
+        data.binding = 7;
+        program.bindings.push_back(data);
+        ShaderRecompiler::DescriptorBinding sampler{};
+        sampler.kind = ShaderRecompiler::DescriptorKind::Sampler;
+        sampler.role = ShaderRecompiler::DescriptorRole::GuestSamplers;
+        sampler.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers);
+        sampler.count = 2;
+        sampler.guestDescriptor.resize(8);
+        sampler.samplerDepthCompare = {false, false};
+        program.bindings.push_back(sampler);
+        const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        ShaderResources resources(context, shader);
+        Require(updates.calls.size() == 1, "building resources did not write one descriptor set");
+        const auto original = updates.calls.front();
+        Require(original.buffers.size() == 2 && original.images.size() == 2, "own draw set test lacks mixed bindings");
+        const auto use = [&](const ShaderResources& used, std::uint32_t word, const std::function<void()>& during) {
+            const std::array<std::uint32_t, 4> words{5, 6, 7, word};
+            const ShaderResources::MovedBuffer moved{0, 0, 16, words};
+            const auto calls = updates.calls.size();
+            Recorder snapshots(context);
+            snapshots.Activate();
+            auto draw = used.PrepareDrawBindings(snapshots, std::span(&moved, 1));
+            Require(draw != nullptr && draw->snapshots.size() == 1 && updates.calls.size() == calls + 1 && updates.copies == 0, "a draw with moved shader data did not write its set in one update");
+            const auto& snapshot = draw->snapshots.front();
+            Require(std::memcmp(snapshot.Bytes().data(), words.data(), sizeof(words)) == 0, "the draw snapshot does not hold the moved words");
+            const auto& actual = updates.calls.back();
+            Require(actual.buffers.size() == original.buffers.size(), "a draw set update left buffer descriptors unwritten");
+            for (const auto& [key, before] : original.buffers) {
+                const auto after = actual.buffers.at(key);
+                const bool replaced = key.first == 2u;
+                const auto expected = replaced ? snapshot.buffer->Handle() : before.buffer;
+                const auto expectedOffset = replaced ? snapshot.offset : before.offset;
+                Require(after.buffer == expected && after.offset == expectedOffset && after.range == before.range, "a draw set update replaced the wrong buffer or changed its range");
+            }
+            const bool images = !actual.images.empty();
+            if (images) {
+                Require(actual.images.size() == original.images.size(), "a draw set update wrote only part of its image descriptors");
+                for (const auto& [key, before] : original.images) {
+                    const auto after = actual.images.at(key);
+                    Require(after.sampler == before.sampler && after.imageView == before.imageView && after.imageLayout == before.imageLayout, "a draw set update changed an image descriptor");
+                }
+            }
+            const auto set = draw->allocation.set;
+            if (during) during();
+            draw.reset();
+            return std::pair{set, images};
+        };
+        for (const bool own : {false, true, false, true}) {
+            RuntimeSwitches::Assign(RuntimeSwitch::OwnDrawSets, own);
+            const auto first = use(resources, 8, {});
+            const auto second = use(resources, 9, {});
+            Require(first.second, own ? "the first draw after the switch came on did not write its set in full" : "a draw with the switch off did not write its set in full");
+            if (own) Require(second.first == first.first && !second.second, "a draw of a template that already wrote its set took another set or wrote its image descriptors again");
+            else Require(second.second, "a draw with the switch off did not write its set in full");
+        }
+        recorder.Activate();
+        auto doomed = std::make_unique<ShaderResources>(context, shader);
+        const auto kept = use(*doomed, 10, {});
+        const auto outlived = use(*doomed, 11, [&] { doomed.reset(); });
+        Require(kept.second && outlived.first == kept.first && !outlived.second, "a second draw of a template did not reuse the set it wrote");
+        recorder.Activate();
+        ShaderResources fresh(context, shader);
+        const auto allocated = cache.Counters().sets;
+        const auto recycled = use(fresh, 12, {});
+        Require(recycled.second && cache.Counters().sets == allocated, "a set whose draw outlived its template was not recycled");
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::OwnDrawSets, ownBefore);
+    recorder.Activate();
+    std::cout << "Own draw set tests passed\n";
+}
+
 void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
     namespace Abi = ShaderRecompiler::ImageTableAbi;
     using ShaderRecompiler::DescriptorKind;
@@ -15696,6 +15782,10 @@ int main(int argc, char** argv) {
             fmaskDecompressMsaaTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--own-draw-sets-only") {
+            ownDrawSetTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-descriptors-only") {
             drawDescriptorWriteTests(device, recorder);
             drawSnapshotTableSetTests(device, recorder);
@@ -15776,6 +15866,7 @@ int main(int argc, char** argv) {
         misalignedRegionTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
         drawDescriptorWriteTests(device, recorder);
+        ownDrawSetTests(device, recorder);
         drawSnapshotTableSetTests(device, recorder);
         imageTableFirstLayerRevalidateTests(device, recorder);
         drawSnapshotCapTests(device, recorder);
