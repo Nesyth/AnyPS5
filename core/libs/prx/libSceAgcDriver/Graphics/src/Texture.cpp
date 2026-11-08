@@ -4198,7 +4198,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         const auto [entry, inserted] = records.byAddress.try_emplace(descriptor.baseAddress, layout);
         if (inserted || !sameLayout(entry->second, layout)) records.layouts.fetch_add(1, std::memory_order_release);
         entry->second = layout;
-        layoutRecord = records.layouts.load(std::memory_order_relaxed);
+        layoutRecord = records.byAddress.size() >= 65536u ? 0u : records.layouts.load(std::memory_order_relaxed);
     }
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     ++writes;
