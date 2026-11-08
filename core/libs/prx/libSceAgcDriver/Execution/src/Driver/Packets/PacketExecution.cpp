@@ -28,6 +28,31 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
+bool xpDropsDraw() {
+    static const std::uint64_t keepOneIn = [] {
+        const char* text = std::getenv("APS5_XP_KEEP_DRAWS_N");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    static std::atomic<std::uint64_t> seen{0}, dropped{0};
+    static std::atomic<std::int64_t> lastReport{0};
+    static std::uint64_t seenReported = 0, droppedReported = 0;
+    const auto ordinal = seen.fetch_add(1, std::memory_order_relaxed);
+    const bool drop = keepOneIn == 0 || ordinal % keepOneIn != 0;
+    if (drop) dropped.fetch_add(1, std::memory_order_relaxed);
+    if ((ordinal & 1023u) == 0) {
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = lastReport.load(std::memory_order_relaxed);
+        if (last == 0) {
+            lastReport.store(now, std::memory_order_relaxed);
+        } else if (now - last >= 10000 && lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+            const auto seenNow = seen.load(std::memory_order_relaxed), droppedNow = dropped.load(std::memory_order_relaxed);
+            AgcDriver::ProfilePrint_nid_no_patch("[xp-keep-draws] %.1f s: %llu direct draws reached the check, %llu dropped (keep one in %llu)\n", static_cast<double>(now - last) / 1000.0, static_cast<unsigned long long>(seenNow - seenReported), static_cast<unsigned long long>(droppedNow - droppedReported), static_cast<unsigned long long>(keepOneIn));
+            seenReported = seenNow;
+            droppedReported = droppedNow;
+        }
+    }
+    return drop;
+}
 
 struct RingOrder {
     std::uint32_t queue = 0xffffffffu;
@@ -308,6 +333,11 @@ void Driver::execute(const Submission& submission) {
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+        if (submission.queue == 0 && Pm4::DrawOpcode(opcode) && !Pm4::IndirectDrawOpcode(opcode) && !predicated && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpKeepDraws) && deferredLabels().labels.empty() && xpDropsDraw()) {
+            recent.Record(cursor);
+            cursor = nextCursor;
+            continue;
+        }
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
             const bool queuesLabel = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && labelPacketQueues(packet, opcode);
             const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);

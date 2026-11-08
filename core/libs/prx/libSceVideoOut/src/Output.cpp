@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -129,6 +130,7 @@ int APS5_VABI sceVideoOutSetFlipRate(int handle, int rate) try {
     if (rate < 0 || rate > 2) return VIDEO_OUT_ERROR_INVALID_VALUE;
     std::lock_guard lock(cfg->mutex);
     cfg->Check();
+    if (cfg->flipRate != rate) std::fprintf(stderr, "[videoout] flip rate %d (was %d)\n", rate, cfg->flipRate);
     cfg->flipRate = rate;
     return 0;
 } catch (const ProcessShutdown&) {

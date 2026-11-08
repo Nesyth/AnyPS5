@@ -4572,6 +4572,133 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     APS5_LOG_CHARS_OUT_DEBUG("Draw finished");
 }
 
+bool IdentityCensus() {
+    static const bool census = std::getenv("APS5_XP_IDENTITY_CENSUS") != nullptr;
+    return census;
+}
+
+struct IdentityOutcome {
+    const void* pipeline = nullptr;
+    const void* resources = nullptr;
+    const void* framebuffer = nullptr;
+    std::uint64_t targets = 0;
+    std::uint64_t inputs = 0;
+};
+
+struct IdentityEntry {
+    std::array<std::uint64_t, 3> frames{~0ull, ~0ull, ~0ull};
+    std::array<std::uint32_t, 3> counts{};
+    std::array<IdentityOutcome, 4> outcomes{};
+    std::uint64_t lastFrame = 0;
+};
+
+enum IdentityMiss : std::size_t { IdentityMissNotRecorded, IdentityMissPipeline, IdentityMissResources, IdentityMissFramebuffer, IdentityMissTargets, IdentityMissInputs, IdentityMissBuild, IdentityMissWalk, IdentityMissCount };
+constexpr std::array<const char*, IdentityMissCount> IdentityMissNames{"not recorded", "pipeline", "resources", "framebuffer", "targets", "inputs", "build", "target walk"};
+
+struct IdentityCensusState {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, IdentityEntry> entries;
+    std::uint64_t draws = 0, recipeDraws = 0, keyless = 0, matchedPrevious = 0, matchedOlder = 0, exact = 0;
+    std::array<std::uint64_t, IdentityMissCount> misses{};
+    std::uint64_t reportPresent = 0, prunePresent = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+IdentityCensusState& identityCensus() {
+    static IdentityCensusState state;
+    return state;
+}
+
+std::uint64_t mixIdentity(std::uint64_t hash, std::uint64_t value) {
+    return (hash ^ value) * 0x100000001b3ull;
+}
+
+void reportIdentityCensus(IdentityCensusState& census, std::uint64_t present) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - census.lastReport < std::chrono::seconds(10)) return;
+    const double seconds = std::chrono::duration<double>(now - census.lastReport).count();
+    const auto presents = present - census.reportPresent;
+    const double draws = static_cast<double>(std::max<std::uint64_t>(census.draws, 1));
+    std::string misses;
+    for (std::size_t i = 0; i < IdentityMissCount; ++i) {
+        char text[64];
+        std::snprintf(text, sizeof(text), "%s %s %.1f%%", i == 0 ? "" : ",", IdentityMissNames[i], 100.0 * static_cast<double>(census.misses[i]) / draws);
+        misses += text;
+    }
+    std::fprintf(stderr, "[identity] %.1f s, %llu presents: %llu draws (%.0f per present), %llu recipe draws, %llu without a content key; matched in N-1 %.1f%%, only in N-2 %.1f%%, new %.1f%%; exact %.1f%% of draws; matched but not exact, by first difference (of all draws):%s; %zu identities held\n", seconds, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(census.draws), presents == 0 ? 0.0 : static_cast<double>(census.draws) / static_cast<double>(presents), static_cast<unsigned long long>(census.recipeDraws), static_cast<unsigned long long>(census.keyless), 100.0 * static_cast<double>(census.matchedPrevious) / draws, 100.0 * static_cast<double>(census.matchedOlder) / draws, 100.0 * static_cast<double>(census.draws - census.matchedPrevious - census.matchedOlder) / draws, 100.0 * static_cast<double>(census.exact) / draws, misses.c_str(), census.entries.size());
+    census.lastReport = now;
+    census.reportPresent = present;
+    census.draws = census.recipeDraws = census.keyless = census.matchedPrevious = census.matchedOlder = census.exact = 0;
+    census.misses = {};
+}
+
+void noteRecipeIdentity() {
+    auto& census = identityCensus();
+    std::lock_guard lock(census.mutex);
+    ++census.recipeDraws;
+}
+
+void noteIdentity(const PreparedDraw& prepared, const Pm4::DrawParameters& draw) {
+    std::uint64_t id = mixIdentity(0xcbf29ce484222325ull, prepared.shape);
+    if (prepared.contentKey != nullptr) {
+        for (const auto word : *prepared.contentKey) id = mixIdentity(id, word);
+    }
+    id = mixIdentity(id, draw.indexAddress);
+    id = mixIdentity(id, draw.indexCount);
+    id = mixIdentity(id, draw.instanceCount);
+    id = mixIdentity(id, draw.firstVertex);
+    id = mixIdentity(id, draw.firstInstance);
+    id = mixIdentity(id, draw.indexSize | (static_cast<std::uint64_t>(draw.indexed) << 32u));
+    IdentityOutcome outcome{prepared.pipeline.get(), prepared.resolved.resources.get(), prepared.framebuffer.get(), 0, 0};
+    for (const auto view : prepared.targetViews) outcome.targets = mixIdentity(outcome.targets, reinterpret_cast<std::uint64_t>(view));
+    outcome.inputs = mixIdentity(mixIdentity(0, reinterpret_cast<std::uint64_t>(prepared.inputs.indexHandle)), prepared.inputs.indexOffset);
+    for (std::size_t i = 0; i < prepared.inputs.vertexHandles.size(); ++i) outcome.inputs = mixIdentity(mixIdentity(outcome.inputs, reinterpret_cast<std::uint64_t>(prepared.inputs.vertexHandles[i])), i < prepared.inputs.vertexOffsets.size() ? prepared.inputs.vertexOffsets[i] : 0);
+    const bool build = prepared.outcome.kind == KindBuild || prepared.outcome.kind == KindBda;
+    const bool walk = prepared.outcome.pagesWalked != 0 || prepared.outcome.slowLookups != 0;
+    const auto present = Recorder::Presents();
+    auto& census = identityCensus();
+    std::lock_guard lock(census.mutex);
+    ++census.draws;
+    if (prepared.contentKey == nullptr) ++census.keyless;
+    auto& entry = census.entries[id];
+    const auto slot = present % 3;
+    if (entry.frames[slot] != present) {
+        entry.frames[slot] = present;
+        entry.counts[slot] = 0;
+    }
+    const auto occurrence = entry.counts[slot]++;
+    entry.lastFrame = present;
+    const auto seenIn = [&](std::uint64_t back) {
+        if (present < back) return false;
+        const auto frame = present - back;
+        return entry.frames[frame % 3] == frame && entry.counts[frame % 3] > occurrence;
+    };
+    const bool previous = seenIn(1);
+    const bool older = !previous && seenIn(2);
+    auto& last = entry.outcomes[std::min<std::size_t>(occurrence, entry.outcomes.size() - 1)];
+    if (previous) ++census.matchedPrevious;
+    if (older) ++census.matchedOlder;
+    if (previous || older) {
+        std::optional<IdentityMiss> miss;
+        if (!prepared.outcome.recorded) miss = IdentityMissNotRecorded;
+        else if (outcome.pipeline != last.pipeline) miss = IdentityMissPipeline;
+        else if (outcome.resources != last.resources) miss = IdentityMissResources;
+        else if (outcome.framebuffer != last.framebuffer) miss = IdentityMissFramebuffer;
+        else if (outcome.targets != last.targets) miss = IdentityMissTargets;
+        else if (outcome.inputs != last.inputs) miss = IdentityMissInputs;
+        else if (build) miss = IdentityMissBuild;
+        else if (walk) miss = IdentityMissWalk;
+        if (miss) ++census.misses[*miss];
+        else ++census.exact;
+    }
+    last = outcome;
+    if (present >= census.prunePresent + 32) {
+        census.prunePresent = present;
+        std::erase_if(census.entries, [&](const auto& item) { return item.second.lastFrame + 3 < present; });
+    }
+    reportIdentityCensus(census, present);
+}
+
 }
 
 constexpr std::uint64_t MaxCapturedTriangles = 1ull << 20u;
@@ -4684,6 +4811,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         throw;
     }
     keepHeldSpace(prepared);
+    if (IdentityCensus()) noteIdentity(prepared, draw);
 }
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {
@@ -4696,6 +4824,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     DrawRecipeOutcome result;
     DrawOutcome outcome;
     outcome.kind = KindRecipeHit;
+    if (IdentityCensus()) noteRecipeIdentity();
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     double ownWaitedMs = 0;
     const auto miss = [&](DrawRecipeMiss reason) {

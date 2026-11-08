@@ -595,12 +595,13 @@ void VideoOutDriver::pollHostHdr() {
 }
 
 void VideoOutDriver::vblankEnd(std::uint64_t tick) {
+    static const bool everyTick = std::getenv("APS5_XP_VBLANK_119") != nullptr;
     std::lock_guard lock(mutex);
     for (const auto& cfg : contexts) {
         if (!cfg) continue;
         std::lock_guard cfgLock(cfg->mutex);
         if (!cfg->opened || cfg->failure) continue;
-        if (cfg->outputMode != VIDEO_OUT_OUTPUT_MODE_119_88HZ && tick % 2 != 0) continue;
+        if (cfg->outputMode != VIDEO_OUT_OUTPUT_MODE_119_88HZ && !everyTick && tick % 2 != 0) continue;
         require(cfg->vblankStatus.count != std::numeric_limits<uint64_t>::max(), "vblank counter overflow");
         ++cfg->preVblankStatus.count;
         cfg->preVblankStatus.processTime = sceKernelGetProcessTime();
@@ -635,7 +636,8 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         require(req.cfg->lastFlipVblank <= std::numeric_limits<uint64_t>::max() - interval, "flip interval overflow");
         const auto target = req.cfg->lastFlipVblank + interval;
         timing.Mark("validate");
-        req.cfg->vblankCond.wait(lock, req.cfg->shutdownToken, [&] { return req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; });
+        static const bool freeFlips = std::getenv("APS5_XP_FREE_FLIPS") != nullptr;
+        req.cfg->vblankCond.wait(lock, req.cfg->shutdownToken, [&] { return freeFlips || req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; });
         timing.Mark("vblank_wait");
         req.cfg->CheckAlive();
         if (req.cfg->Closed()) {

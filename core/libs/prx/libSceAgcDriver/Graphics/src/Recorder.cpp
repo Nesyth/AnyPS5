@@ -199,6 +199,7 @@ constexpr std::uint32_t SegmentFoldCapacity = 1024;
 constexpr std::uint32_t DumpFoldCapacity = 1024;
 constexpr std::uint32_t SampleDumpBytes = 15 * 16 + 8;
 constexpr VkDeviceSize DumpListOffset = 16 + 8 * SegmentFoldCapacity;
+constexpr std::uint64_t XpVisibleSamples = 65536;
 constexpr std::uint32_t SampleDumpPushBytes = 40;
 std::atomic<std::uint64_t> dumpsQueued{0}, dumpsQueuedInPass{0}, dumpsAtOnce{0}, segmentsClosed{0}, dumpFolds{0};
 
@@ -2404,8 +2405,8 @@ std::uint64_t Recorder::SamplesTotal() {
     std::uint64_t total = 0;
     std::memcpy(&total, sampleCounter->Bytes().data(), sizeof(total));
     for (const auto& segment : pendingSamples) {
-        std::uint64_t samples = 0;
-        Check(context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, segment.handle, segment.slot, 1, sizeof(samples), &samples, sizeof(samples), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT), "vkGetQueryPoolResults occlusion");
+        std::uint64_t samples = XpVisibleSamples;
+        if (segment.handle != VK_NULL_HANDLE) Check(context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, segment.handle, segment.slot, 1, sizeof(samples), &samples, sizeof(samples), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT), "vkGetQueryPoolResults occlusion");
         total += samples;
     }
     pendingSamples.clear();
@@ -2653,11 +2654,20 @@ void Recorder::copySegments(VkCommandBuffer commands, std::uint32_t count) {
     const auto copy = function(cmdCopyQueryPoolResults, "vkCmdCopyQueryPoolResults");
     for (std::uint32_t i = 0; i < count;) {
         const auto& first = pendingSamples[i];
+        if (first.handle == VK_NULL_HANDLE) {
+            recordXpVisibleSegment(commands, i);
+            ++i;
+            continue;
+        }
         std::uint32_t run = 1;
         while (i + run < count && pendingSamples[i + run].handle == first.handle && pendingSamples[i + run].slot == first.slot + run) ++run;
         copy(commands, first.handle, first.slot, run, sampleCounter->Handle(), 16 + 8 * static_cast<VkDeviceSize>(i), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
         i += run;
     }
+}
+
+void Recorder::recordXpVisibleSegment(VkCommandBuffer commands, std::uint32_t index) {
+    function(cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, sampleCounter->Handle(), 16 + 8 * static_cast<VkDeviceSize>(index), sizeof(XpVisibleSamples), &XpVisibleSamples);
 }
 
 void Recorder::retireSegments(std::uint32_t count) {
@@ -2750,6 +2760,10 @@ void Recorder::foldSamples(Batch& batch, VkDeviceAddress target) {
         if (done != 0) recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         for (std::uint32_t i = 0; i < count; ++i) {
             const auto& segment = pendingSamples[done + i];
+            if (segment.handle == VK_NULL_HANDLE) {
+                recordXpVisibleSegment(commands, i);
+                continue;
+            }
             copy(commands, segment.handle, segment.slot, 1, sampleCounter->Handle(), 16 + 8 * i, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
             if (segment.pool != nullptr) batch.kept.push_back(segment.pool);
         }
@@ -2787,10 +2801,12 @@ bool Recorder::DumpSamples(VkDeviceAddress target, std::uint64_t address) {
     if (target == 0 || !gpuSampleCounter()) return false;
     countingSamples = true;
     flushDeferredDispatch();
+    const bool xpVisible = RuntimeSwitches::Set(RuntimeSwitch::XpKeepDraws);
     if (segmentMode()) {
         ensureOpen();
-        if (address != 0 && LabelRunsPerBatch() && pendingSamples.size() < SegmentFoldCapacity && open->queuedDumps < DumpFoldCapacity) {
+        if (address != 0 && LabelRunsPerBatch() && pendingSamples.size() + (xpVisible ? 1u : 0u) < SegmentFoldCapacity && open->queuedDumps < DumpFoldCapacity) {
             if (open->segmentActive) endSegment(*open);
+            if (xpVisible) pendingSamples.push_back({nullptr, VK_NULL_HANDLE, 0});
             if (open->renderPass.open) dumpsQueuedInPass.fetch_add(1, std::memory_order_relaxed);
             if (open->run.queued.empty()) storeRuns.fetch_add(1, std::memory_order_relaxed);
             auto& queued = open->run.queued.emplace_back();
@@ -2803,12 +2819,14 @@ bool Recorder::DumpSamples(VkDeviceAddress target, std::uint64_t address) {
         }
         FlushStores();
         Commands();
+        if (xpVisible) pendingSamples.push_back({nullptr, VK_NULL_HANDLE, 0});
         foldSamples(*open, target);
         dumpsAtOnce.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     Commands();
     endSamples(*open);
+    if (xpVisible) pendingSamples.push_back({nullptr, VK_NULL_HANDLE, 0});
     foldSamples(*open, target);
     if (open->samplePool != nullptr) open->kept.push_back(std::move(open->samplePool));
     open->samplePool.reset();

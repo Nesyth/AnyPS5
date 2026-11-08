@@ -792,6 +792,7 @@ private:
     void beginSegment(Batch& batch);
     void endSegment(Batch& batch);
     void copySegments(VkCommandBuffer commands, std::uint32_t count);
+    void recordXpVisibleSegment(VkCommandBuffer commands, std::uint32_t index);
     void retireSegments(std::uint32_t count);
     void recordQueuedDumps(VkCommandBuffer commands, std::span<const Batch::StoreRun::Queued> writes);
     void dispatchDumps(VkCommandBuffer commands, std::uint32_t firstDump, std::uint32_t dumps, std::uint32_t firstSegment, std::uint32_t lastSegment);
