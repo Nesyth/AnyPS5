@@ -343,6 +343,30 @@ bool EmptyIndirectSkip() {
 
 struct CpuIndirectProgramsStorage {};
 
+struct IndirectPathMemo {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, bool> cpu;
+};
+
+IndirectPathMemo& indirectPathMemo() {
+    static auto* memo = new IndirectPathMemo();
+    return *memo;
+}
+
+bool knownGpuIndirect(std::uint64_t code) {
+    auto& memo = indirectPathMemo();
+    std::lock_guard lock(memo.mutex);
+    const auto found = memo.cpu.find(code);
+    return found != memo.cpu.end() && !found->second;
+}
+
+void noteIndirectPath(std::uint64_t code, bool cpu) {
+    auto& memo = indirectPathMemo();
+    std::lock_guard lock(memo.mutex);
+    auto& entry = memo.cpu[code];
+    entry = entry || cpu;
+}
+
 std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
     return HostThreadLocal<std::unordered_map<std::uint64_t, bool>, CpuIndirectProgramsStorage>();
 }
@@ -789,7 +813,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.dumpTarget = dumpTarget;
     tail.dumpSlot1 = dumpSlot1;
     tail.packetOffset = packetOffset;
-    const bool handOff = pipelined && !drawParameters.indirect && !profile && !lockedPrepare && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawDataHits() && deferredLabels().labels.empty() && DrawFinisher::Enabled();
+    const bool indirectHandOff = drawParameters.indirect && pipelinedIndirect && !programs.empty() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::HandoffGpuIndirect) && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelinedGpuIndirect) && knownGpuIndirect(programs.front().binary.codeAddress);
+    const bool handOff = pipelined && (!drawParameters.indirect || indirectHandOff) && !profile && !lockedPrepare && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawDataHits() && deferredLabels().labels.empty() && DrawFinisher::Enabled();
     if (handOff) {
         tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         tail.submissionSerial = submission.serial;
@@ -1082,6 +1107,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             if (i == 0 && drawParameters.indirect) {
                 indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect, stageCaptures[0].heapWords.get());
                 if (EmptyIndirectSkip()) CpuIndirectPrograms()[programs.front().binary.codeAddress] = indirectCpu.has_value();
+                noteIndirectPath(programs.front().binary.codeAddress, indirectCpu.has_value());
             } else if (i == 0) {
                 fold(result, drawParameters);
             }
@@ -1248,7 +1274,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     snapshot();
     timing.Mark("post_compile_prepare");
     const auto lockForDraw = [&] {
-        require(tail.queue != nullptr, "the draw finisher reached a draw it cannot commit through the pipeline");
+        require(tail.queue != nullptr || (drawParameters.indirect && DrawFinisher::OnFinisherThread()), "the draw finisher reached a draw it cannot commit through the pipeline");
         if (gpuLock.owns_lock()) return;
         phaseTiming.Phase(DrawRowVectors);
         if (DrawFinisher::OnFinisherThread()) DrawFinisher::Get().AwaitTurn();
@@ -1383,6 +1409,12 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                     const RecaptureScope recapture;
                     return draw(*tail.queue, tail.packet, submission, tail.packetOffset, rejected);
                 }
+                if (tail.queue == nullptr && capturedMemoryChanged(memory, snapshots)) {
+                    gpuLock.unlock();
+                    const RecaptureScope recapture;
+                    restartFinishedDraw(tail);
+                    return finishDraw(tail, timing);
+                }
             }
             recordedOne = true;
             noteDrawWriters(stages, submission.queue);
@@ -1459,6 +1491,12 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         gpuLock.unlock();
         const RecaptureScope recapture;
         return draw(*tail.queue, tail.packet, submission, tail.packetOffset, rejected);
+    }
+    if (tail.queue == nullptr && capturedMemoryChanged(memory, snapshots)) {
+        gpuLock.unlock();
+        const RecaptureScope recapture;
+        restartFinishedDraw(tail);
+        return finishDraw(tail, timing);
     }
     noteDrawWriters(stages, submission.queue);
     phaseTiming.Phase(DrawRowVectors);
