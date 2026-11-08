@@ -5432,7 +5432,9 @@ void drawSnapshotEpochTests(const Device& device) {
     snapshotContext.descriptorCache = &cache;
     Recorder snapshotRecorder(snapshotContext);
     snapshotRecorder.Activate();
-    {
+    const bool unlockedBefore = RuntimeSwitches::Set(RuntimeSwitch::UnlockedSnapshotRecheck);
+    for (const bool unlocked : {false, true}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::UnlockedSnapshotRecheck, unlocked);
         ShaderResources resources(snapshotContext, compute);
         const auto snapshot = [&] {
             auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
@@ -5452,6 +5454,7 @@ void drawSnapshotEpochTests(const Device& device) {
         Require(snapshot() == changed, "a second draw after the store copied its input again");
         snapshotRecorder.Sync();
     }
+    RuntimeSwitches::Assign(RuntimeSwitch::UnlockedSnapshotRecheck, unlockedBefore);
     std::cout << "draw snapshot reuse within a collect epoch: ok\n";
 }
 

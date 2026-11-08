@@ -7162,7 +7162,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
                     recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
                 }
             }
-            if (GuestMemory::TrackerGeneration() != stamp[0]) stamped = false;
+            const auto current = RuntimeSwitches::Set(RuntimeSwitch::UnlockedSnapshotRecheck) ? GuestMemory::WriteGeneration() : GuestMemory::TrackerGeneration();
+            if (current != stamp[0]) stamped = false;
             else if (!uploaded || stamp[1] != 0) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer, offset);
         }
         selected.push_back(index);
