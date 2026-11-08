@@ -39,6 +39,7 @@ std::atomic<void (*)(std::uintptr_t, std::size_t)> hostReadHook{nullptr};
 #ifdef _WIN32
 std::atomic<std::uint64_t> commitGeneration{1};
 std::atomic<void (*)(std::uintptr_t, std::size_t, std::uint64_t)> privateMappingObserver{nullptr};
+std::atomic<bool> sortedHostRegions{false};
 #endif
 std::atomic<void (*)(std::uintptr_t, std::size_t)> accessObserver{nullptr};
 
@@ -214,6 +215,7 @@ private:
             cursor = regionEnd;
         }
         _hostRegions = _holes;
+        _hostRegionsOrdered = std::all_of(_hostRegions.begin(), _hostRegions.end(), [](const auto& region) { return region.first <= region.second; }) && std::adjacent_find(_hostRegions.begin(), _hostRegions.end(), [](const auto& before, const auto& after) { return after.first < before.second; }) == _hostRegions.end();
         _holes.emplace_back(SystemReservedStart, SystemReservedEnd);
         for (const auto& [holeStart, holeEnd] : _holes) _used.emplace(holeStart, holeEnd);
         _base = ArenaStart;
@@ -400,12 +402,21 @@ private:
     std::uintptr_t _occupiedPrefixEnd = ArenaStart;
     std::uintptr_t _occupiedDefaultPrefixEnd = DefaultAllocationStart;
     bool _writeWatched = false;
+#ifdef _WIN32
+    bool _hostRegionsOrdered = false;
+#endif
 
 public:
     std::uintptr_t Base() const { return _base; }
     std::size_t Size() const { return _end - _base; }
     bool WriteWatched() const { return _writeWatched; }
     bool OverlapsHostRegion(std::uintptr_t start, std::size_t bytes) const {
+#ifdef _WIN32
+        if (_hostRegionsOrdered && sortedHostRegions.load(std::memory_order_relaxed)) {
+            const auto next = std::partition_point(_hostRegions.begin(), _hostRegions.end(), [&](const auto& region) { return region.first < start + bytes; });
+            return next != _hostRegions.begin() && start < std::prev(next)->second;
+        }
+#endif
         for (const auto& [regionStart, regionEnd] : _hostRegions) {
             if (regionStart < start + bytes && start < regionEnd) return true;
         }
@@ -844,6 +855,10 @@ void GuestArenaDisarmResident_nid_no_patch() {
 
 void GuestArenaSetResidentFirst_nid_no_patch(bool on) {
     WindowsMappings::Get().SetResidentFirst(on);
+}
+
+void GuestArenaSetSortedHostRegions_nid_no_patch(bool on) {
+    sortedHostRegions.store(on, std::memory_order_relaxed);
 }
 
 std::uint64_t GuestArenaCleanForgetSerial_nid_no_patch() {

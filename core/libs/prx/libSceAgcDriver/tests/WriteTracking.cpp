@@ -1400,9 +1400,57 @@ void CheckHostHoleInChild(const wchar_t* mode, std::uint64_t hole) {
     Require(reported && exitCode == 0, "the host-hole child failed");
 }
 
-void CheckHostHole() {
+void CheckSortedHostRegions(std::uint64_t hole) {
+    std::uintptr_t arena = 0;
+    std::size_t arenaBytes = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&arena, &arenaBytes);
+    std::vector<std::uint64_t> edges{0, hole, hole + Block, arena, arena + arenaBytes, std::numeric_limits<std::uint64_t>::max()};
+    for (std::uint64_t cursor = arena; cursor < arena + arenaBytes && edges.size() < 65536;) {
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == sizeof(info), "cannot query the arena for host region edges");
+        cursor = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
+        edges.push_back(cursor);
+    }
+    std::size_t overlapping = 0;
+    for (const auto edge : edges) {
+        for (const auto at : {edge - Block, edge - 1, edge, edge + 1}) {
+            for (const std::size_t length : {std::size_t{0}, std::size_t{1}, std::size_t{2}, std::size_t{4096}, Block, 2 * Block}) {
+                GuestArena::GuestArenaSetSortedHostRegions_nid_no_patch(false);
+                const bool scanned = GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(at, length);
+                GuestArena::GuestArenaSetSortedHostRegions_nid_no_patch(true);
+                const bool searched = GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(at, length);
+                Require(scanned == searched, "the sorted host region search disagrees with the scan at " + std::to_string(at) + "+" + std::to_string(length));
+                overlapping += scanned ? 1 : 0;
+            }
+        }
+    }
+    GuestArena::GuestArenaSetSortedHostRegions_nid_no_patch(false);
+    Require(overlapping != 0, "no host region probe overlapped a host region");
+    std::cout << "sorted host regions: " << edges.size() << " edges probed, " << overlapping << " overlapping probes agree with the scan\n";
+}
+
+void CheckNarrowedCollect() {
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(Block));
+    struct Cleanup {
+        void* memory;
+        ~Cleanup() { GuestArena::GuestArenaRelease_nid_postfix(memory, Block); }
+    } cleanup{memory};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    Unwatch(base + 3 * 4096, 4096);
+    Require(Watched(base, 4096) && !Watched(base, Block), "the narrowed collect fixture is not partly watched");
+    for (const bool sorted : {false, true}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::SortedHostRegions, sorted);
+        BumpCollectEpoch();
+        const auto before = CollectWrites(base + 7, 1);
+        memory[7] ^= 1;
+        BumpCollectEpoch();
+        Require(before != 0 && CollectWrites(base + 7, 1) > before && !UnchangedSince(base + 7, 1, before), sorted ? "with APS5_SORTED_HOST_REGIONS a collect beside an unwatched page of its block missed a CPU write" : "a collect beside an unwatched page of its block missed a CPU write");
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::SortedHostRegions, false);
+}
+
+void CheckHostHoleQueries(std::uint64_t hole) {
     constexpr std::size_t bytes = 64;
-    const auto hole = ChildHostHole();
     Require(GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(hole, bytes), "the range reserved before the arena is not an arena host region");
     const auto before = TrackerGeneration();
     Require(!Watched(hole, bytes), "an arena host hole reads as watched");
@@ -1441,6 +1489,17 @@ void CheckHostHole() {
         return true;
     }) && imported, "an import into an arena host hole did not run");
     Require(!Watched(hole, bytes), "an import made an arena host hole watched");
+}
+
+void CheckHostHole() {
+    const auto hole = ChildHostHole();
+    CheckSortedHostRegions(hole);
+    for (const bool sorted : {false, true}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::SortedHostRegions, sorted);
+        GuestArena::GuestArenaSetSortedHostRegions_nid_no_patch(sorted);
+        CheckHostHoleQueries(hole);
+    }
+    CheckNarrowedCollect();
 }
 
 std::uint64_t failedCollectBegin = 0;

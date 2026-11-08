@@ -1796,6 +1796,9 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     static std::atomic<int> residentFirst{-1};
     const int residentFirstWanted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ResidentFirstCollect) ? 1 : 0;
     if (residentFirst.load(std::memory_order_relaxed) != residentFirstWanted && residentFirst.exchange(residentFirstWanted, std::memory_order_relaxed) != residentFirstWanted) GuestArena::GuestArenaSetResidentFirst_nid_no_patch(residentFirstWanted != 0);
+    static std::atomic<int> sortedHostRegions{-1};
+    const int sortedWanted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SortedHostRegions) ? 1 : 0;
+    if (sortedHostRegions.load(std::memory_order_relaxed) != sortedWanted && sortedHostRegions.exchange(sortedWanted, std::memory_order_relaxed) != sortedWanted) GuestArena::GuestArenaSetSortedHostRegions_nid_no_patch(sortedWanted != 0);
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
     writeRates[0].fetch_add(1, std::memory_order_relaxed);
     writeRates[1].fetch_add(stop - first, std::memory_order_relaxed);
@@ -1854,7 +1857,16 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
+#ifdef _WIN32
+    const bool sortedRegions = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SortedHostRegions);
+#else
+    constexpr bool sortedRegions = false;
+#endif
+    const auto widenedFirst = first & ~(WriteBlockBytes - 1);
+    const auto widenedStop = (stop + WriteBlockBytes - 1) & ~(WriteBlockBytes - 1);
+    const auto widens = [&] { return useMemo && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0 && bytes <= WriteBlockBytes && widenedStop > widenedFirst && tracker.covers(widenedFirst, widenedStop - widenedFirst); };
+    const bool widenedCovered = sortedRegions && tracker.watched && widens();
+    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || (!widenedCovered && !tracker.covers(address, bytes))) return 0;
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
@@ -1867,13 +1879,9 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const TimedAccess timed(CounterCollect, bytes);
     const auto requestedFirst = first;
     const auto requestedStop = stop;
-    if (useMemo && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0 && bytes <= WriteBlockBytes) {
-        const auto begin = first & ~(WriteBlockBytes - 1);
-        const auto end = (stop + WriteBlockBytes - 1) & ~(WriteBlockBytes - 1);
-        if (end > begin && tracker.covers(begin, end - begin)) {
-            first = begin;
-            stop = end;
-        }
+    if (sortedRegions ? widenedCovered : widens()) {
+        first = widenedFirst;
+        stop = widenedStop;
     }
     if (!walkWrites(tracker, first, stop, StampKind::Cpu)) {
 #ifdef _WIN32
