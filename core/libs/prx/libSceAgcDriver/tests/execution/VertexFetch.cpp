@@ -1,11 +1,13 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <string>
 
 namespace {
@@ -107,12 +109,27 @@ void Run(AgcDriver::VulkanDevice& device) {
         AgcDriver::Pm4::DrawParameters draw{0u, 3u, 0u, 1u, 0u, false};
         draw.firstVertex = 1u;
         draw.firstInstance = 1u;
+        const auto drawn = [&](const char* what) {
+            for (std::size_t index = 0; index < pixels.size(); index += 4u) {
+                Require(pixels[index] == std::byte{255} && pixels[index + 1u] == std::byte{0} && pixels[index + 2u] == std::byte{0} && pixels[index + 3u] == std::byte{255}, what);
+            }
+        };
+        std::optional<std::uint32_t> outputs;
+        Require(!device.KnownDrawRejection(state, shaders, &outputs), "a draw that never failed its validation was rejected");
+        Require(&value != &cases.front() || !outputs.has_value(), "fragment outputs were found for a draw that was never validated");
         pixels.fill(std::byte{0});
         device.Draw(state, draw, shaders);
         device.WaitIdle();
-        for (std::size_t index = 0; index < pixels.size(); index += 4u) {
-            Require(pixels[index] == std::byte{255} && pixels[index + 1u] == std::byte{0} && pixels[index + 2u] == std::byte{0} && pixels[index + 3u] == std::byte{255}, "runtime vertex fetch produced the wrong triangle");
+        drawn("runtime vertex fetch produced the wrong triangle");
+        Require(!device.KnownDrawRejection(state, shaders, &outputs) && outputs.has_value(), "the fragment outputs of a validated draw were not found for its commit");
+        for (const bool carried : {false, true}) {
+            AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::CarryValidation, carried);
+            pixels.fill(std::byte{0});
+            device.Draw(state, draw, shaders, {}, nullptr, nullptr, 0, nullptr, &*outputs);
+            device.WaitIdle();
+            drawn(carried ? "runtime vertex fetch produced the wrong triangle from the fragment outputs carried to its commit" : "runtime vertex fetch produced the wrong triangle beside carried fragment outputs it was not to use");
         }
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::CarryValidation, false);
     }
 }
 

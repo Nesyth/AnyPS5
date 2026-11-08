@@ -4793,9 +4793,9 @@ VulkanDevice::IndirectDrawSupport VulkanDevice::DrawIndirectSupport() const {
     return {state->drawIndirectFirstInstance, state->multiDrawIndirect, state->drawIndirectCount};
 }
 
-std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
+std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders, std::optional<std::uint32_t>* fragmentOutputs) const {
     std::optional<Graphics::Context> scratch;
-    return Graphics::KnownValidationFailure(contextRef(scratch), shaders, graphics);
+    return Graphics::KnownValidationFailure(contextRef(scratch), shaders, graphics, fragmentOutputs);
 }
 
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
@@ -4845,7 +4845,7 @@ std::vector<std::uint32_t> VulkanDevice::DrawContentKey(const Graphics::State& g
     return Graphics::DrawResourceContentKey(state->context, graphics, draw, shaders);
 }
 
-void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey) {
+void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey, const std::uint32_t* fragmentOutputs) {
     startJournalReplay();
     for (const auto& shader : shaders) {
         require(shader.program != nullptr, "missing compiled shader");
@@ -4856,7 +4856,7 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (traceDraws) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
     const auto context = graphicsContext();
-    Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe, trace, shape, contentKey);
+    Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe, trace, shape, contentKey, fragmentOutputs);
     if (traceDraws) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
 }
 

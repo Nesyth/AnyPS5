@@ -27,7 +27,7 @@ struct DrawTraceContext {
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0, const std::vector<std::uint32_t>* contentKey = nullptr);
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0, const std::vector<std::uint32_t>* contentKey = nullptr, const std::uint32_t* fragmentOutputs = nullptr);
 std::vector<std::uint32_t> DrawResourceContentKey(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
 
 struct PixelFunctionLdsLayouts {
@@ -46,7 +46,7 @@ VkDescriptorSetLayout MeshWindowSetLayout(const Context& context);
 void PrepareMeshWindow(const Context& context);
 void BindMeshWindow(const Context& context, VkCommandBuffer commands, VkPipelineLayout layout);
 void ReleaseMeshWindow(VkDevice device);
-std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
+std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state, std::optional<std::uint32_t>* fragmentOutputs = nullptr);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
 
 struct DrawInputCopy {

@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
@@ -121,27 +122,33 @@ int main() {
         Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
         Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
         PixelConstant[0] = 0.25f;
-        static_cast<void>(DrawFinisher::DrainText());
-        auto commands = Setup();
-        for (std::uint32_t index = 0; index < Labels; ++index) {
-            Append(commands, 0x2d, {3, 2});
-            WriteLabel(commands, index, 0x100u + index);
-            WaitLabel(commands, index, 0x100u + index);
+        for (const bool carried : {false, true}) {
+            AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::CarryValidation, carried);
+            const std::string pass = carried ? " (validation carried to the commit)" : "";
+            LabelMemory.fill(0);
+            ColorMemory.fill(std::byte{0});
+            static_cast<void>(DrawFinisher::DrainText());
+            auto commands = Setup();
+            for (std::uint32_t index = 0; index < Labels; ++index) {
+                Append(commands, 0x2d, {3, 2});
+                WriteLabel(commands, index, 0x100u + index);
+                WaitLabel(commands, index, 0x100u + index);
+            }
+            Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+            Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed" + pass);
+            AgcDriverWaitIdle_nid_postfix();
+            const auto drains = DrawFinisher::DrainText();
+            AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(LabelMemory.data()), sizeof(LabelMemory));
+            AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size());
+            for (std::uint32_t index = 0; index < Labels; ++index) {
+                Require(LabelMemory[index] == 0x100u + index, "label " + std::to_string(index) + " is " + std::to_string(LabelMemory[index]) + " after the draws before it, expected " + std::to_string(0x100u + index) + pass);
+            }
+            unsigned brightest = 0;
+            for (const auto value : ColorMemory) brightest = std::max(brightest, static_cast<unsigned>(std::to_integer<std::uint8_t>(value)));
+            Require(brightest + 2 >= 128 && brightest <= 130, "the draws before the labels wrote " + std::to_string(brightest) + ", expected 128" + pass);
+            if (finisher) Require(drains.find(" 0x37 x") == std::string::npos, "a WRITE_DATA label after a draw handed to the finisher drained the finisher" + pass + ":" + drains);
+            if (finisher) Require(drains.find(" 0x3c x") == std::string::npos, "a WAIT_REG_MEM on a label the finisher holds drained the finisher" + pass + ":" + drains);
         }
-        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
-        Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
-        AgcDriverWaitIdle_nid_postfix();
-        const auto drains = DrawFinisher::DrainText();
-        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(LabelMemory.data()), sizeof(LabelMemory));
-        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size());
-        for (std::uint32_t index = 0; index < Labels; ++index) {
-            Require(LabelMemory[index] == 0x100u + index, "label " + std::to_string(index) + " is " + std::to_string(LabelMemory[index]) + " after the draws before it, expected " + std::to_string(0x100u + index));
-        }
-        unsigned brightest = 0;
-        for (const auto value : ColorMemory) brightest = std::max(brightest, static_cast<unsigned>(std::to_integer<std::uint8_t>(value)));
-        Require(brightest + 2 >= 128 && brightest <= 130, "the draws before the labels wrote " + std::to_string(brightest) + ", expected 128");
-        if (finisher) Require(drains.find(" 0x37 x") == std::string::npos, "a WRITE_DATA label after a draw handed to the finisher drained the finisher:" + drains);
-        if (finisher) Require(drains.find(" 0x3c x") == std::string::npos, "a WAIT_REG_MEM on a label the finisher holds drained the finisher:" + drains);
         AgcDriverShutdown_nid_postfix();
         std::cout << "labels after finisher draws " << (finisher ? "queued through the finisher" : "written in order") << "\n";
         return 0;

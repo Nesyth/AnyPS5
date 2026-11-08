@@ -1145,6 +1145,11 @@ std::map<std::vector<std::uint64_t>, std::string>& validationFailures() {
     return failures;
 }
 
+std::map<std::vector<std::uint64_t>, std::uint32_t>& validationOutputs() {
+    static std::map<std::vector<std::uint64_t>, std::uint32_t> outputs;
+    return outputs;
+}
+
 std::vector<std::uint64_t>& validationKeyScratch() {
     struct KeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, KeyStorage>();
@@ -1157,7 +1162,7 @@ std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const Comp
     hit = false;
     auto& key = validationKeyScratch();
     const bool keyed = ValidationKey(context, shaders, state, key);
-    static std::map<std::vector<std::uint64_t>, std::uint32_t> memo;
+    auto& memo = validationOutputs();
     struct LastOutputs {
         std::vector<std::uint64_t> key;
         std::uint32_t outputs = 0;
@@ -1699,7 +1704,7 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, std::size_t byt
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed.
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, PerformanceTimer& timing, const DrawRecipe* recipe) {
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, PerformanceTimer& timing, const DrawRecipe* recipe, const std::uint32_t* fragmentOutputs = nullptr) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
@@ -1745,6 +1750,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (recipe != nullptr) {
         inputs.fragmentOutputs = recipe->fragmentOutputs;
         inputs.shaderStages = recipe->shaderStages;
+    } else if (fragmentOutputs != nullptr && RuntimeSwitches::Set(RuntimeSwitch::CarryValidation)) {
+        inputs.fragmentOutputs = *fragmentOutputs;
+        inputs.shaderStages = PipelineStages(shaders);
+        outcome.validateMemoized = true;
+        outcome.validateHit = true;
     } else {
         inputs.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit);
         inputs.shaderStages = PipelineStages(shaders);
@@ -3233,12 +3243,16 @@ bool RecordDraws() {
 
 }
 
-std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state) {
+std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state, std::optional<std::uint32_t>* fragmentOutputs) {
     auto& key = validationKeyScratch();
     if (!ValidationKey(context, shaders, state, key)) return std::nullopt;
     std::lock_guard lock(validationMutex());
     const auto& failures = validationFailures();
     if (const auto found = failures.find(key); found != failures.end()) return found->second;
+    if (fragmentOutputs != nullptr) {
+        const auto& outputs = validationOutputs();
+        if (const auto found = outputs.find(key); found != outputs.end()) *fragmentOutputs = found->second;
+    }
     return std::nullopt;
 }
 
@@ -3278,6 +3292,7 @@ struct PreparedDraw {
     const DrawTraceContext* trace = nullptr;
     std::uint64_t shape = 0;
     const std::vector<std::uint32_t>* contentKey = nullptr;
+    const std::uint32_t* fragmentOutputs = nullptr;
     bool passAttachments = false;
     bool attachmentsFromMemo = false;
     std::vector<std::uint32_t> stencilReferences;
@@ -3676,7 +3691,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& ownWaitedMs = prepared.ownWaitedMs;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto& inputs = prepared.inputs;
-    inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, timing, nullptr);
+    inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, timing, nullptr, prepared.fragmentOutputs);
     if (inputs.nothing) return false;
     const auto* args = prepared.args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -4544,7 +4559,7 @@ std::vector<std::uint32_t> DrawResourceContentKey(const Context& context, const 
     return DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey) {
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey, const std::uint32_t* fragmentOutputs) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (state.stages.tessellationGeometry) {
         drawTessellationGeometry(context, state, draw, shaders, snapshots, trace);
@@ -4582,6 +4597,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     prepared.trace = trace;
     prepared.shape = shape;
     prepared.contentKey = contentKey;
+    prepared.fragmentOutputs = fragmentOutputs;
     prepared.passAttachments = PassAttachmentMemoEnabled();
     const struct HeldSpace {
         PreparedDraw& prepared;
