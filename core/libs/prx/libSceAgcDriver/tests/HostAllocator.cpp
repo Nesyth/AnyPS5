@@ -21,6 +21,7 @@
 #ifdef _WIN32
 namespace AgcDriver {
 void SetHostLargeCacheQuery(bool (*query)()) noexcept;
+void SetHostPrefetchQuery(bool (*query)()) noexcept;
 }
 #endif
 
@@ -243,6 +244,7 @@ void RunAll() {
 }
 
 std::atomic<bool> largeCacheOn{false};
+std::atomic<bool> prefetchOn{false};
 
 int main() {
     RunAll();
@@ -254,6 +256,11 @@ int main() {
     LargeBlocksRoundTrip();
     largeCacheOn.store(true, std::memory_order_relaxed);
     LargeBlocksRoundTrip();
+    AgcDriver::SetHostPrefetchQuery(+[] { return prefetchOn.load(std::memory_order_relaxed); });
+    prefetchOn.store(true, std::memory_order_relaxed);
+    RunAll();
+    largeCacheOn.store(false, std::memory_order_relaxed);
+    RunAll();
 #endif
     if (failures != 0) {
         std::fprintf(stderr, "%d host allocator checks failed\n", failures);

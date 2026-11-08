@@ -32,10 +32,20 @@ constexpr std::uint16_t KeptLists = 8;
 constexpr std::uint16_t KeptLargeLists = 2;
 
 std::atomic<bool (*)()> largeCacheQuery{nullptr};
+std::atomic<bool (*)()> prefetchQuery{nullptr};
 
 bool LargeCache() noexcept {
     const auto query = largeCacheQuery.load(std::memory_order_acquire);
     return query != nullptr && query();
+}
+
+bool PrefetchNext() noexcept {
+    const auto query = prefetchQuery.load(std::memory_order_acquire);
+    return query != nullptr && query();
+}
+
+void PrefetchForWrite(const void* block) noexcept {
+    asm volatile("prefetchw %0" : : "m"(*static_cast<const char*>(block)));
 }
 
 std::size_t LargeClassOf(std::size_t bytes) noexcept {
@@ -174,8 +184,10 @@ void* TryAllocate(std::size_t bytes) noexcept {
                 }
             }
             if (void* block = cache->heads[sizeClass]) {
-                cache->heads[sizeClass] = *static_cast<void**>(block);
+                void* next = *static_cast<void**>(block);
+                cache->heads[sizeClass] = next;
                 --cache->counts[sizeClass];
+                if (next != nullptr && PrefetchNext()) PrefetchForWrite(next);
                 return block;
             }
         }
@@ -222,6 +234,10 @@ namespace AgcDriver {
 
 void SetHostLargeCacheQuery(bool (*query)()) noexcept {
     largeCacheQuery.store(query, std::memory_order_release);
+}
+
+void SetHostPrefetchQuery(bool (*query)()) noexcept {
+    prefetchQuery.store(query, std::memory_order_release);
 }
 
 }

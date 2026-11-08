@@ -79,6 +79,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_ARM_FLIP_RESET",
     "APS5_RESIDENT_FIRST_COLLECT",
     "APS5_SORTED_HOST_REGIONS",
+    "APS5_HOST_PREFETCH",
 };
 
 struct SwitchValues {
@@ -158,6 +159,7 @@ struct SwitchValues {
             std::getenv("APS5_ARM_FLIP_RESET") != nullptr,
             std::getenv("APS5_RESIDENT_FIRST_COLLECT") != nullptr,
             std::getenv("APS5_SORTED_HOST_REGIONS") != nullptr,
+            std::getenv("APS5_HOST_PREFETCH") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

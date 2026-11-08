@@ -71,6 +71,7 @@ constexpr unsigned PublishedReadAttempts = 8;
 #ifdef _WIN32
 const bool hostLargeCacheHooked = [] {
     SetHostLargeCacheQuery(+[] { return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::HostLargeCache); });
+    SetHostPrefetchQuery(+[] { return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::HostPrefetch); });
     return true;
 }();
 #endif
