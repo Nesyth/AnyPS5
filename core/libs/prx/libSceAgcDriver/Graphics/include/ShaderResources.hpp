@@ -676,6 +676,13 @@ private:
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;
     std::shared_ptr<ShaderResources> afterRunSelf;
+    struct ReadNote {
+        std::uint64_t batch = 0;
+        std::uint8_t kind = 0;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    };
+    ReadNote readNote;
+    void notePendingReads(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint8_t kind, bool lean);
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
     std::unique_ptr<BdaResources> bda;
     std::vector<BdaResources::SrtGuardFaults> srtGuardFaults;

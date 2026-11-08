@@ -8444,6 +8444,24 @@ void ShaderResources::WriteBack() {
     if (unaligned) std::rethrow_exception(unaligned);
 }
 
+void ShaderResources::notePendingReads(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint8_t kind, bool lean) {
+    const auto readKind = static_cast<Recorder::ReadKind>(kind);
+    if (!lean) {
+        recorder.NotePendingReads(ranges, readKind);
+        return;
+    }
+    const auto batch = recorder.OpenBatchGeneration();
+    if (batch != 0 && readNote.batch == batch && readNote.kind == kind && std::ranges::equal(readNote.ranges, ranges)) return;
+    recorder.NotePendingReads(ranges, readKind);
+    readNote.batch = 0;
+    try {
+        readNote.ranges.assign(ranges.begin(), ranges.end());
+        readNote.kind = kind;
+        readNote.batch = recorder.OpenBatchGeneration();
+    } catch (const std::bad_alloc&) {
+    }
+}
+
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     if (bda != nullptr && recorder.Device() == context.device) bda->NoteUse(recorder.OpenSerial());
     // The ranges this use reads in place through their host imports (read-only and written elements
@@ -8451,9 +8469,15 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // one of them (the copy HLE) must not land before the recorded work read it.
     static const bool readOnlyLeaseSkip = std::getenv("APS5_NO_READ_ONLY_LEASE_SKIP") == nullptr;
     const auto kind = !guestMemory.HoldsLease() ? Recorder::ReadKind::DispatchElement : readOnlyLeaseSkip && usesBda && bdaReadOnly ? Recorder::ReadKind::AddressBasedReadOnly : Recorder::ReadKind::AddressBased;
+    const bool lean = RuntimeSwitches::Set(RuntimeSwitch::KeepFastPath) && !Recorder::FlipReadCheck() && !CaptureTrace::Enabled();
     if (auto split = guestMemory.SplitInPlaceReads()) {
         recorder.NotePendingReadList(std::move(split->space), kind);
-        recorder.NotePendingReads(split->own, kind);
+        notePendingReads(recorder, split->own, static_cast<std::uint8_t>(kind), lean);
+    } else if (lean) {
+        struct InPlaceReadsStorage {};
+        auto& reads = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, InPlaceReadsStorage>();
+        guestMemory.InPlaceReads(reads);
+        notePendingReads(recorder, reads, static_cast<std::uint8_t>(kind), lean);
     } else {
         recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
     }

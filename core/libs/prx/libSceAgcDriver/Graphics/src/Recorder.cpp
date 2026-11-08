@@ -1840,6 +1840,8 @@ void Recorder::ensureOpen() {
             release(*batch);
             throw;
         }
+        static std::atomic<std::uint64_t> generations{0};
+        batch->generation = generations.fetch_add(1, std::memory_order_relaxed) + 1;
         batch->queue = GuestMemory::GpuLockThreadTag();
         if (countingSamples && !segmentMode()) beginSamples(*batch);
         dropStaleHoldKept();
@@ -3118,8 +3120,10 @@ void Recorder::dropStaleHoldKept() {
 
 void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
     if (owner == nullptr || bytes == 0) return;
+    if (open != nullptr && open->lastKeptOwner == owner && RuntimeSwitches::Set(RuntimeSwitch::KeepFastPath)) return;
     ensureOpen();
     if (open->keptOwners.insert(owner).second) open->keptBytes += bytes;
+    open->lastKeptOwner = owner;
 }
 
 void Recorder::KeepOnce(std::shared_ptr<void> object, std::size_t bytes) {

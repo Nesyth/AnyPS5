@@ -108,6 +108,7 @@ public:
     bool Recording() const { return open != nullptr; }
     bool Idle() const { return open == nullptr && inFlight.empty(); }
     std::uint64_t OpenSerial() const { return submissions + 1; }
+    std::uint64_t OpenBatchGeneration() const { return open != nullptr ? open->generation : 0; }
     std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
@@ -623,6 +624,7 @@ private:
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
+        const void* lastKeptOwner = nullptr;
         std::unordered_set<const void*> keptOnce;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
@@ -645,6 +647,7 @@ private:
         std::vector<ReadListNote> readLists;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
+        std::uint64_t generation = 0;
         std::uint64_t traceId = 0;
         bool submitted = false;
         std::atomic<bool> submitStarted{false};

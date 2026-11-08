@@ -2637,15 +2637,23 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         else if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });
         else recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
     }
-    std::vector<bool> storeNow(residents.size(), false);
+    const bool storeMask = residents.size() <= 64 && RuntimeSwitches::Set(RuntimeSwitch::KeepFastPath);
+    std::uint64_t storeBits = 0;
+    std::vector<bool> storeNow(storeMask ? 0 : residents.size(), false);
     for (std::size_t index = 0; index < residents.size(); ++index) {
         if (residents[index] == nullptr) continue;
-        if (residents[index]->Descriptor().tileMode == TextureTileMode::kLinear) storeNow[index] = !residents[index]->MarkDrawn(index < slices.size() ? slices[index].first : 0u, index < slices.size() ? slices[index].second : 0u, scissor) || !residents[index]->Cached();
-        else if (index < slices.size()) residents[index]->MarkSliceDirty(slices[index].first, slices[index].second);
-        else residents[index]->MarkDirty();
+        if (residents[index]->Descriptor().tileMode == TextureTileMode::kLinear) {
+            const bool store = !residents[index]->MarkDrawn(index < slices.size() ? slices[index].first : 0u, index < slices.size() ? slices[index].second : 0u, scissor) || !residents[index]->Cached();
+            if (storeMask) storeBits |= static_cast<std::uint64_t>(store) << index;
+            else storeNow[index] = store;
+        } else if (index < slices.size()) {
+            residents[index]->MarkSliceDirty(slices[index].first, slices[index].second);
+        } else {
+            residents[index]->MarkDirty();
+        }
     }
     for (std::size_t index = 0; index < residents.size(); ++index) {
-        if (storeNow[index]) StorageTexture::FlushPending(residents[index]->Descriptor().baseAddress, static_cast<std::size_t>(residents[index]->GuestBytes()), nullptr, "linear target");
+        if (storeMask ? (storeBits >> index & 1u) != 0 : storeNow[index]) StorageTexture::FlushPending(residents[index]->Descriptor().baseAddress, static_cast<std::size_t>(residents[index]->GuestBytes()), nullptr, "linear target");
     }
 }
 

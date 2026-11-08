@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <array>
@@ -238,6 +239,66 @@ void SharedOwnerCountsOncePerBatch() {
     recorder.Sync();
 }
 
+void KeepFastPathCountsAsBefore(bool fastPath) {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    RuntimeSwitches::Assign(RuntimeSwitch::KeepFastPath, fastPath);
+    const std::string mode = fastPath ? " with the keep fast path" : " without the keep fast path";
+    Recorder recorder(mockContext());
+    auto first = std::make_shared<int>(0);
+    auto second = std::make_shared<int>(1);
+    for (int keep = 0; keep < 3; ++keep) recorder.KeepBytes(first.get(), Budget / 4);
+    Expect(recorder.OpenKeptBytes() == Budget / 4, "three keeps of one owner counted " + std::to_string(recorder.OpenKeptBytes()) + " kept bytes" + mode);
+    recorder.KeepBytes(second.get(), Budget / 4);
+    recorder.KeepBytes(first.get(), Budget / 4);
+    recorder.KeepBytes(first.get(), Budget / 4);
+    recorder.KeepBytes(second.get(), Budget / 4);
+    Expect(recorder.OpenKeptBytes() == Budget / 2, "alternating owners counted " + std::to_string(recorder.OpenKeptBytes()) + " kept bytes, not each owner once" + mode);
+    RuntimeSwitches::Assign(RuntimeSwitch::KeepFastPath, !fastPath);
+    recorder.KeepBytes(second.get(), Budget / 4);
+    recorder.KeepBytes(first.get(), Budget / 4);
+    RuntimeSwitches::Assign(RuntimeSwitch::KeepFastPath, fastPath);
+    recorder.KeepBytes(first.get(), Budget / 4);
+    recorder.KeepBytes(second.get(), Budget / 4);
+    Expect(recorder.OpenKeptBytes() == Budget / 2, "keeps around a switch flip counted " + std::to_string(recorder.OpenKeptBytes()) + " kept bytes, not each owner once" + mode);
+    recorder.Submit();
+    recorder.KeepBytes(second.get(), Budget / 4);
+    Expect(recorder.OpenKeptBytes() == Budget / 4, "the next batch did not count the owner the submitted batch kept last" + mode);
+    recorder.Sync();
+    RuntimeSwitches::Assign(RuntimeSwitch::KeepFastPath, false);
+}
+
+void BatchGenerationAfterFailedSubmission() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    RuntimeSwitches::Assign(RuntimeSwitch::KeepFastPath, true);
+    Recorder recorder(mockContext());
+    Expect(recorder.OpenBatchGeneration() == 0, "a recorder without an open batch reports a batch generation");
+    auto owner = std::make_shared<int>(0);
+    recorder.KeepBytes(owner.get(), Budget / 4);
+    const auto discardedSerial = recorder.OpenSerial();
+    const auto discardedGeneration = recorder.OpenBatchGeneration();
+    Expect(discardedGeneration != 0, "an open batch reports no generation");
+    mock.submitResult = VK_ERROR_OUT_OF_HOST_MEMORY;
+    bool failed = false;
+    try {
+        recorder.Submit();
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    mock.submitResult = VK_SUCCESS;
+    Expect(failed && !recorder.Recording() && recorder.OpenBatchGeneration() == 0, "a failed submission left its batch open");
+    recorder.KeepBytes(owner.get(), Budget / 4);
+    Expect(recorder.OpenSerial() == discardedSerial && recorder.OpenBatchGeneration() > discardedGeneration, "the batch opened after a failed submission did not take the discarded batch's serial and a new generation");
+    Expect(recorder.OpenKeptBytes() == Budget / 4, "the batch opened after a failed submission did not count the owner the discarded batch kept last");
+    recorder.Submit();
+    Expect(recorder.OpenBatchGeneration() == 0, "a submitted batch still reports its generation");
+    recorder.KeepBytes(owner.get(), Budget / 4);
+    Expect(recorder.OpenBatchGeneration() > discardedGeneration + 1, "a batch opened after a submission did not take a new generation");
+    recorder.Sync();
+    RuntimeSwitches::Assign(RuntimeSwitch::KeepFastPath, false);
+}
+
 void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleResult = VK_ERROR_DEVICE_LOST) {
     mock = MockDevice{};
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
@@ -309,6 +370,9 @@ int main() {
         SyncedWithinTwiceTheBudget();
         CountFollowsEveryPath();
         SharedOwnerCountsOncePerBatch();
+        KeepFastPathCountsAsBefore(false);
+        KeepFastPathCountsAsBefore(true);
+        BatchGenerationAfterFailedSubmission();
         FailedSubmission(VK_ERROR_OUT_OF_HOST_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_SUCCESS, VK_ERROR_OUT_OF_HOST_MEMORY);
