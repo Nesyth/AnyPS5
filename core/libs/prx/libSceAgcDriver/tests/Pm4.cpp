@@ -1920,6 +1920,44 @@ void testRewindTailTrace() {
     check(busy <= 150.0, "the queue worker's busy share counts nested REWIND tails more than once");
 }
 
+void awaitWorkerAt(const std::uint32_t& gate, const char* reason) {
+    const auto reached = [&] {
+        std::array<AgcDriver::AwaitedWait, 16> waits{};
+        const auto count = AgcDriverAwaitedWaits_nid_postfix(waits.data(), waits.size());
+        return std::any_of(waits.begin(), waits.begin() + static_cast<std::ptrdiff_t>(count), [&](const AgcDriver::AwaitedWait& wait) { return wait.address == reinterpret_cast<std::uintptr_t>(&gate); });
+    };
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!reached() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    check(reached(), reason);
+}
+
+void testRewindRegisterLists() {
+    alignas(8) static std::array<std::uint32_t, 3> gates{};
+    alignas(8) static std::array<std::uint32_t, 3> copied{};
+    alignas(8) static std::array<std::uint32_t, 2> shared{0x10, 0x100};
+    alignas(8) static std::array<std::uint32_t, 2> late{0x038f038fu, 0x400};
+    const auto wait = [](const std::uint32_t& gate) { return makePacket(0x3c, {0x13, low(&gate), high(&gate), 1, 0xffffffffu, 0x19}); };
+    const auto copy = [](const std::uint32_t& target) { return makePacket(0x40, {0x100, 0xa010, 0, low(&target), high(&target)}); };
+    const auto list = [](const std::array<std::uint32_t, 2>& pairs) { return makePacket(0x9f, {low(pairs.data()), high(pairs.data()), 0x80000000, 1}); };
+    const auto rewind = makePacket(0x59, {0x80000000u});
+    static std::vector<std::uint32_t> words;
+    words = joinPackets({rewind, wait(gates[0]), rewind, list(shared), copy(copied[0]), wait(gates[1]), rewind, list(shared), copy(copied[1]), wait(gates[2]), list(late), copy(copied[2])});
+    submitWords(words);
+    awaitWorkerAt(gates[0], "the queue worker did not reach the first REWIND gate");
+    std::atomic_ref<std::uint32_t>(shared[1]).store(0x200);
+    std::atomic_ref<std::uint32_t>(gates[0]).store(1);
+    awaitWorkerAt(gates[1], "the queue worker did not reach the second REWIND gate");
+    std::atomic_ref<std::uint32_t>(shared[1]).store(0x300);
+    std::atomic_ref<std::uint32_t>(gates[1]).store(1);
+    awaitWorkerAt(gates[2], "the queue worker did not reach the third REWIND gate");
+    std::atomic_ref<std::uint32_t>(late[0]).store(0x10);
+    std::atomic_ref<std::uint32_t>(gates[2]).store(1);
+    AgcDriverWaitIdle_nid_postfix();
+    check(std::atomic_ref<std::uint32_t>(copied[0]).load() == 0x200, "a register list in a released REWIND tail was not read at the start of its segment");
+    check(std::atomic_ref<std::uint32_t>(copied[1]).load() == 0x300, "a register list rewritten between two REWIND segments kept the earlier segment's values");
+    check(std::atomic_ref<std::uint32_t>(copied[2]).load() == 0x400, "a register list invalid at the start of its REWIND segment was not read again where the packet executes");
+}
+
 void testFrontLatch() {
     namespace LeanFront = AgcDriver::DriverDetail::LeanFront;
     namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
@@ -2277,7 +2315,7 @@ int main(int argc, char** argv) {
         const std::pair<const char*, void (*)()> ringModes[]{
             {"ring", testSubmissionRing}, {"ring-empty", testEmptySubmissionRing}, {"ring-disabled", testDisabledSubmissionRing},
             {"ring-invalid", testInvalidSubmissionRing}, {"ring-report", testSubmissionRingFailureReport}, {"stall-watchdog", testStallWatchdog},
-            {"stall-watchdog-invalid", testInvalidStallWatchdog}, {"stall-watchdog-rewind", testStallWatchdogRewind}, {"stall-watchdog-order", testStallWatchdogOrder}, {"rewind-trace", testRewindTailTrace}, {"rewind-flip", testRewindFrontFlips}};
+            {"stall-watchdog-invalid", testInvalidStallWatchdog}, {"stall-watchdog-rewind", testStallWatchdogRewind}, {"stall-watchdog-order", testStallWatchdogOrder}, {"rewind-trace", testRewindTailTrace}, {"rewind-flip", testRewindFrontFlips}, {"rewind-lists", testRewindRegisterLists}};
         if (argc == 2 && std::string(argv[1]) == "ring-report-heap") {
 #ifdef _WIN32
             testSubmissionRingFailureReportHeap();
