@@ -130,8 +130,8 @@ std::uint32_t BlockBytesFor(TextureTileMode tileMode) {
     throw std::runtime_error("AGC graphics: TextureDetiler encountered an unknown tile mode");
 }
 
-std::uint32_t PipelineKey(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image, bool addressed, bool heap) {
-    return (heap ? 1u << 20 : 0u) | (addressed ? 1u << 19 : 0u) | (image ? 1u << 18 : 0u) | (thick ? 1u << 17 : 0u) | (retile ? 1u << 16 : 0u) | (static_cast<std::uint32_t>(tileMode) << 8) | elementBytes;
+std::uint32_t PipelineKey(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image, bool addressed, bool heap, bool singleBlocks) {
+    return (singleBlocks ? 1u << 21 : 0u) | (heap ? 1u << 20 : 0u) | (addressed ? 1u << 19 : 0u) | (image ? 1u << 18 : 0u) | (thick ? 1u << 17 : 0u) | (retile ? 1u << 16 : 0u) | (static_cast<std::uint32_t>(tileMode) << 8) | elementBytes;
 }
 
 }
@@ -232,16 +232,18 @@ VkDeviceAddress TextureDetiler::bufferAddress(VkBuffer buffer) const {
     return BufferDeviceAddress(context, buffer);
 }
 
-VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image, bool addressed, bool heap) {
+VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image, bool addressed, bool heap, bool singleBlocks) {
     Require(std::has_single_bit(elementBytes) && elementBytes <= 16u, "unsupported element size for texture detiling");
-    const auto key = PipelineKey(tileMode, elementBytes, retile, thick, image, addressed, heap);
+    Require(!singleBlocks || !retile, "single-key blocks are only expanded by a detile");
+    const auto key = PipelineKey(tileMode, elementBytes, retile, thick, image, addressed, heap, singleBlocks);
     for (const auto& entry : pipelines) {
         if (entry.first == key) return entry.second;
     }
     // Constants 0-3 select element size, block size, addressing family and direction; 4-19 carry the
     // per-bit XOR equation for the equation family (2); 20-21 override the block extent in elements.
     const bool gcn = IsGcnTiled(tileMode);
-    std::array<std::uint32_t, 26> values{elementBytes, gcn ? 0u : BlockBytesFor(tileMode), tileMode == TextureTileMode::kLinear ? 0u : 1u, retile ? 1u : 0u};
+    std::array<std::uint32_t, 27> values{elementBytes, gcn ? 0u : BlockBytesFor(tileMode), tileMode == TextureTileMode::kLinear ? 0u : 1u, retile ? 1u : 0u};
+    values[26] = singleBlocks ? 1u : 0u;
     if (gcn) {
         Require(!thick || IsGcnThick(tileMode), "PS4 thin tiled surfaces are detiled thin");
         const auto geometry = GcnTiling(tileMode, elementBytes);
@@ -282,7 +284,7 @@ VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elem
         else if (words) shader = CreateShaderModule(context, TEXTURE_DETILE_IMAGE_WORDS_SPV, sizeof(TEXTURE_DETILE_IMAGE_WORDS_SPV), "vkCreateShaderModule detile image words");
         else shader = CreateShaderModule(context, TEXTURE_DETILE_IMAGE_SPV, sizeof(TEXTURE_DETILE_IMAGE_SPV), "vkCreateShaderModule");
     }
-    std::array<VkSpecializationMapEntry, 26> entries{};
+    std::array<VkSpecializationMapEntry, 27> entries{};
     for (std::uint32_t index = 0; index < entries.size(); ++index) entries[index] = {index, index * 4u, 4};
     VkSpecializationInfo specialization{};
     specialization.mapEntryCount = static_cast<std::uint32_t>(entries.size());
@@ -364,14 +366,14 @@ void TextureDetiler::Dispatch(VkCommandBuffer commands, TextureTileMode tileMode
     Require(sourceRange <= context.limits.maxStorageBufferRange && destinationRange <= context.limits.maxStorageBufferRange, "texture detiling buffer range exceeds device limits");
     const auto sourceAddress = bufferAddress(source);
     const auto destinationAddress = sourceAddress != 0 ? bufferAddress(destination) : 0;
-    const auto heapPipeline = sourceAddress != 0 && destinationAddress != 0 && HeapPassesActive(context) ? pipeline(MipTileMode(tileMode, layout), elementBytes, retile, thickPipeline, false, false, true) : VK_NULL_HANDLE;
+    const auto heapPipeline = sourceAddress != 0 && destinationAddress != 0 && HeapPassesActive(context) ? pipeline(MipTileMode(tileMode, layout), elementBytes, retile, thickPipeline, false, false, true, window.singleBlocks) : VK_NULL_HANDLE;
     const bool heap = heapPipeline != VK_NULL_HANDLE;
     const bool addressed = !heap && sourceAddress != 0 && destinationAddress != 0;
     if (heap) {
         BindlessHeap::For(context).BindDescriptorHeaps(commands);
         context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, heapPipeline);
     } else if (addressed) {
-        context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline(MipTileMode(tileMode, layout), elementBytes, retile, thickPipeline, false, true));
+        context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline(MipTileMode(tileMode, layout), elementBytes, retile, thickPipeline, false, true, false, window.singleBlocks));
     } else {
         const auto set = allocateSet();
         const VkDescriptorBufferInfo sourceInfo{source, sourceDescriptorOffset, sourceRange};
@@ -390,7 +392,7 @@ void TextureDetiler::Dispatch(VkCommandBuffer commands, TextureTileMode tileMode
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[1].pBufferInfo = &destinationInfo;
         context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-        context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline(MipTileMode(tileMode, layout), elementBytes, retile, thickPipeline));
+        context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline(MipTileMode(tileMode, layout), elementBytes, retile, thickPipeline, false, false, false, window.singleBlocks));
         CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &set, SetBindSite::Detiler);
     }
     Push push{};
@@ -655,7 +657,7 @@ void TextureDetiler::DispatchImage(VkCommandBuffer commands, TextureTileMode til
     push.splitStride = layout.gcnSplitStride;
     std::optional<std::uint32_t> slot;
     const auto tiledAddress = owner != nullptr && DescriptorHeapEnabled() ? bufferAddress(tiled) : 0;
-    const auto heapPipeline = tiledAddress != 0 ? pipeline(MipTileMode(tileMode, layout), elementBytes, retile, false, true, false, true) : VK_NULL_HANDLE;
+    const auto heapPipeline = tiledAddress != 0 ? pipeline(MipTileMode(tileMode, layout), elementBytes, retile, false, true, false, true, window.singleBlocks) : VK_NULL_HANDLE;
     if (heapPipeline != VK_NULL_HANDLE) slot = BindlessHeap::For(context).ViewSlot(DetileHeapKind, owner, view);
     if (slot) {
         auto& bindless = BindlessHeap::For(context);
@@ -665,7 +667,7 @@ void TextureDetiler::DispatchImage(VkCommandBuffer commands, TextureTileMode til
         const VkPushDataInfoEXT data{VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT, nullptr, 0, {&pushed, sizeof(pushed)}};
         context.Function<PFN_vkCmdPushDataEXT>("vkCmdPushDataEXT")(commands, &data);
     } else {
-        const auto target = pipeline(MipTileMode(tileMode, layout), elementBytes, retile, false, true);
+        const auto target = pipeline(MipTileMode(tileMode, layout), elementBytes, retile, false, true, false, false, window.singleBlocks);
         const auto set = allocateSet(true);
         const VkDescriptorBufferInfo bufferInfo{tiled, descriptorOffset, range};
         const VkDescriptorImageInfo imageInfo{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};

@@ -36,6 +36,7 @@ class HeapSlotOwner;
         std::uint32_t rowBegin = 0;
         std::uint32_t rowEnd = 0;
         std::uint32_t pipeBankXor = 0;
+        bool singleBlocks = false;
     };
 
     class TextureDetiler {
@@ -63,7 +64,7 @@ class HeapSlotOwner;
     private:
         VkPipeline multisampleReadbackPipeline(std::uint32_t elementBytes, bool depth, bool heap);
         VkPipeline multisampleUploadPipeline(std::uint32_t elementBytes, bool heap);
-        VkPipeline pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image = false, bool addressed = false, bool heap = false);
+        VkPipeline pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image = false, bool addressed = false, bool heap = false, bool singleBlocks = false);
         VkDeviceAddress bufferAddress(VkBuffer buffer) const;
         void release() noexcept;
         struct DescriptorRing {
