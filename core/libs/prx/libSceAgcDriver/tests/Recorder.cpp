@@ -12607,6 +12607,7 @@ void guardRangeMemoTests(const Device& device, Recorder& recorder) {
     const CompiledShader insideCompute{ShaderRecompiler::ShaderStage::Compute, &insideProgram, 0};
     const CompiledShader outsideCompute{ShaderRecompiler::ShaderStage::Compute, &outsideProgram, 0};
     const ShaderResources::MovedBuffer moved{0, address + 256u, bufferBytes, {}};
+    const ShaderResources::MovedBuffer away{0, address + 14u * piece + 256u, bufferBytes, {}};
     for (const bool memo : {false, true}) {
         RuntimeSwitches::Assign(RuntimeSwitch::GuardRangeMemo, memo);
         std::lock_guard gpu(GpuMutex());
@@ -12623,6 +12624,14 @@ void guardRangeMemoTests(const Device& device, Recorder& recorder) {
                 outside.RequireGuestBuffers();
             }
             refused([&] { static_cast<void>(outside.PrepareDrawBindings(recorder, std::span(&moved, 1))); }, "a moved range a guard overlaps while the own range is clear");
+            std::string awayError;
+            try {
+                static_cast<void>(inside.PrepareDrawBindings(recorder, std::span(&away, 1)));
+            } catch (const std::exception& error) {
+                awayError = error.what();
+            }
+            Require(awayError.find("a shader buffer access") == std::string::npos, "a moved range clear of every guard was refused: " + awayError);
+            refused([&] { inside.RequireGuestBuffers(); }, "an own range a guard overlaps after a draw moved it clear of the guard");
             clearTargets();
             inside.RequireGuestBuffers();
             guard(address + 6u * piece);
