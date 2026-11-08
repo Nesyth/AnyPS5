@@ -442,9 +442,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         runningFinishers.fetch_add(1, std::memory_order_acq_rel);
     }
     if (sleepers == 0) return;
-    bool everySleeperTakes = spinHandoff();
-    for (unsigned index = 1; everySleeperTakes && index <= extra.size(); ++index) everySleeperTakes = !extraRunning[index - 1] || finisherTakes(index);
-    if (everySleeperTakes) wake.notify_one();
+    if (spinHandoff() && sleepers == 1) wake.notify_one();
     else wake.notify_all();
 }
 
@@ -997,7 +995,7 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
 }
 
 bool DrawPipeline::Busy() const {
-    return outstanding.load(std::memory_order_acquire) != 0 || (FinisherProducer::Get() && DrawFinisher::Busy() && DrawFinisher::Overlap());
+    return (FinisherProducer::Get() && DrawFinisher::Busy() && DrawFinisher::Overlap()) || outstanding.load(std::memory_order_acquire) != 0;
 }
 
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
