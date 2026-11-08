@@ -4983,7 +4983,7 @@ void ownDrawSetTests(const Device& device, Recorder& recorder) {
         Require(updates.calls.size() == 1, "building resources did not write one descriptor set");
         const auto original = updates.calls.front();
         Require(original.buffers.size() == 2 && original.images.size() == 2, "own draw set test lacks mixed bindings");
-        const auto use = [&](const ShaderResources& used, std::uint32_t word, const std::function<void()>& during) {
+        const auto use = [&](const ShaderResources& used, const decltype(original)& built, std::uint32_t word, const std::function<void()>& during) {
             const std::array<std::uint32_t, 4> words{5, 6, 7, word};
             const ShaderResources::MovedBuffer moved{0, 0, 16, words};
             const auto calls = updates.calls.size();
@@ -4994,8 +4994,8 @@ void ownDrawSetTests(const Device& device, Recorder& recorder) {
             const auto& snapshot = draw->snapshots.front();
             Require(std::memcmp(snapshot.Bytes().data(), words.data(), sizeof(words)) == 0, "the draw snapshot does not hold the moved words");
             const auto& actual = updates.calls.back();
-            Require(actual.buffers.size() == original.buffers.size(), "a draw set update left buffer descriptors unwritten");
-            for (const auto& [key, before] : original.buffers) {
+            Require(actual.buffers.size() == built.buffers.size(), "a draw set update left buffer descriptors unwritten");
+            for (const auto& [key, before] : built.buffers) {
                 const auto after = actual.buffers.at(key);
                 const bool replaced = key.first == 2u;
                 const auto expected = replaced ? snapshot.buffer->Handle() : before.buffer;
@@ -5004,8 +5004,8 @@ void ownDrawSetTests(const Device& device, Recorder& recorder) {
             }
             const bool images = !actual.images.empty();
             if (images) {
-                Require(actual.images.size() == original.images.size(), "a draw set update wrote only part of its image descriptors");
-                for (const auto& [key, before] : original.images) {
+                Require(actual.images.size() == built.images.size(), "a draw set update wrote only part of its image descriptors");
+                for (const auto& [key, before] : built.images) {
                     const auto after = actual.images.at(key);
                     Require(after.sampler == before.sampler && after.imageView == before.imageView && after.imageLayout == before.imageLayout, "a draw set update changed an image descriptor");
                 }
@@ -5017,21 +5017,27 @@ void ownDrawSetTests(const Device& device, Recorder& recorder) {
         };
         for (const bool own : {false, true, false, true}) {
             RuntimeSwitches::Assign(RuntimeSwitch::OwnDrawSets, own);
-            const auto first = use(resources, 8, {});
-            const auto second = use(resources, 9, {});
+            const auto first = use(resources, original, 8, {});
+            const auto second = use(resources, original, 9, {});
             Require(first.second, own ? "the first draw after the switch came on did not write its set in full" : "a draw with the switch off did not write its set in full");
             if (own) Require(second.first == first.first && !second.second, "a draw of a template that already wrote its set took another set or wrote its image descriptors again");
             else Require(second.second, "a draw with the switch off did not write its set in full");
         }
         recorder.Activate();
+        const auto beforeDoomed = updates.calls.size();
         auto doomed = std::make_unique<ShaderResources>(context, shader);
-        const auto kept = use(*doomed, 10, {});
-        const auto outlived = use(*doomed, 11, [&] { doomed.reset(); });
+        Require(updates.calls.size() == beforeDoomed + 1, "building a second template did not write one descriptor set");
+        const auto doomedBuilt = updates.calls.back();
+        const auto kept = use(*doomed, doomedBuilt, 10, {});
+        const auto outlived = use(*doomed, doomedBuilt, 11, [&] { doomed.reset(); });
         Require(kept.second && outlived.first == kept.first && !outlived.second, "a second draw of a template did not reuse the set it wrote");
         recorder.Activate();
+        const auto beforeFresh = updates.calls.size();
         ShaderResources fresh(context, shader);
+        Require(updates.calls.size() == beforeFresh + 1, "building a third template did not write one descriptor set");
+        const auto freshBuilt = updates.calls.back();
         const auto allocated = cache.Counters().sets;
-        const auto recycled = use(fresh, 12, {});
+        const auto recycled = use(fresh, freshBuilt, 12, {});
         Require(recycled.second && cache.Counters().sets == allocated, "a set whose draw outlived its template was not recycled");
     }
     RuntimeSwitches::Assign(RuntimeSwitch::OwnDrawSets, ownBefore);

@@ -992,6 +992,7 @@ int main() {
 #else
         setenv("APS5_PROFILE_DRAW", "1", 1);
 #endif
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::GpuSingleKeys, false);
         std::optional<GuestBlock> block;
         std::optional<GuestBlock> watched;
         std::optional<GuestBlock> untracked;

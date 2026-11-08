@@ -445,6 +445,7 @@ void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleRe
 
 int main() {
     try {
+        RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, false);
         OpenBatchUnderBudget();
         InFlightWithinTwiceTheBudget();
         SyncedWithinTwiceTheBudget();
