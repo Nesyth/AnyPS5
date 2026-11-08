@@ -3208,6 +3208,14 @@ bool HasResidentDepthGuards_nid_no_patch() {
     return anyDepthGuard().load(std::memory_order_acquire);
 }
 
+std::uint64_t DepthGuardsGeneration_nid_no_patch() {
+    return depthGuardGeneration().load(std::memory_order_acquire);
+}
+
+bool MayOverlapDepthGuards_nid_no_patch(std::uint64_t address, std::size_t bytes) {
+    return bytes != 0u && (address > std::numeric_limits<std::uint64_t>::max() - bytes || mayOverlapDepthGuard(address, bytes));
+}
+
 void RetireUnmappedDepth_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
     if (bytes == 0u) return;
     Require(address <= std::numeric_limits<std::uint64_t>::max() - bytes, "native depth release range overflows");

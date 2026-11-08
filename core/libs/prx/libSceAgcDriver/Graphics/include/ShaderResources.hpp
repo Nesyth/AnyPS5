@@ -832,6 +832,8 @@ private:
     std::vector<FaultDescriptor> faultDescriptors;
     void prepareFaultSlot() const;
     mutable bool bindingsChecked = false;
+    mutable std::atomic<std::uint64_t> depthGuardsClear{std::numeric_limits<std::uint64_t>::max()};
+    mutable std::atomic<std::uint64_t> multisampleGuardsClear{std::numeric_limits<std::uint64_t>::max()};
     void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
     void writeAddressedOverlay(DrawBindings& result, std::span<const std::size_t> selected) const;
     std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);

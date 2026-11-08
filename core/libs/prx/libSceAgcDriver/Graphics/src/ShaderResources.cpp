@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuardSpans.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -7269,15 +7270,43 @@ void ShaderResources::prepareFaultSlot() const {
 }
 
 void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) const {
+    if (!completed || !RuntimeSwitches::Set(RuntimeSwitch::GuardRangeMemo) || RuntimeSwitches::Set(RuntimeSwitch::NoGuardSpans) || VerifyGuardSpans()) {
+        for (std::size_t index = 0; index < allocations.size(); ++index) {
+            const auto& item = allocations[index];
+            if (!item.guest) continue;
+            const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+            const auto address = override != moved.end() ? override->address : item.address;
+            const auto bytes = override != moved.end() ? override->size : item.size;
+            RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
+            RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
+        }
+        return;
+    }
+    const auto depthGeneration = DepthGuardsGeneration_nid_no_patch();
+    const auto multisampleGeneration = MultisampleGuardsGeneration();
+    const bool depthHeld = depthGuardsClear.load(std::memory_order_relaxed) == depthGeneration;
+    const bool multisampleHeld = multisampleGuardsClear.load(std::memory_order_relaxed) == multisampleGeneration;
+    if (moved.empty() && depthHeld && multisampleHeld) return;
+    bool depthClear = moved.empty();
+    bool multisampleClear = moved.empty();
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         if (!item.guest) continue;
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
-        const auto address = override != moved.end() ? override->address : item.address;
-        const auto bytes = override != moved.end() ? override->size : item.size;
-        RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
-        RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
+        const bool own = override == moved.end();
+        const auto address = own ? item.address : override->address;
+        const auto bytes = own ? item.size : override->size;
+        if ((!own || !depthHeld) && MayOverlapDepthGuards_nid_no_patch(address, bytes)) {
+            depthClear = false;
+            RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
+        }
+        if ((!own || !multisampleHeld) && MayOverlapMultisampleGuards(address, bytes)) {
+            multisampleClear = false;
+            RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
+        }
     }
+    if (depthClear && !depthHeld) depthGuardsClear.store(depthGeneration, std::memory_order_relaxed);
+    if (multisampleClear && !multisampleHeld) multisampleGuardsClear.store(multisampleGeneration, std::memory_order_relaxed);
 }
 
 void ShaderResources::BindDescriptorHeaps(VkCommandBuffer commands) const {

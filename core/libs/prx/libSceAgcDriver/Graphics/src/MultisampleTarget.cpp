@@ -1735,6 +1735,14 @@ std::uint64_t MultisampleTargetRangeGeneration() {
     return guardedGeneration().load(std::memory_order_acquire);
 }
 
+std::uint64_t MultisampleGuardsGeneration() {
+    return guardSpansGeneration().load(std::memory_order_acquire);
+}
+
+bool MayOverlapMultisampleGuards(std::uint64_t address, std::size_t bytes) {
+    return bytes != 0 && mayOverlapGuarded(address, bytes);
+}
+
 std::optional<std::vector<ShaderRecompiler::BdaAbi::Range>> ExcludeMultisampleTargetRanges(
     VkDevice device, std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::uint64_t& generation) {
     if (ranges.empty()) {

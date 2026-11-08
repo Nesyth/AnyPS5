@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -12266,6 +12267,142 @@ void repeatStorageGuardTests(const Device& device, Recorder& recorder) {
     std::cout << "Repeated storage surface guard tests passed\n";
 }
 
+void guardRangeMemoTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if ((base.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0 || !device.NullDescriptors()) {
+        std::cout << "4x color targets or nullDescriptor unavailable: guard range memo not tested\n";
+        return;
+    }
+    constexpr std::uint32_t side = 64;
+    constexpr std::size_t piece = 65536u;
+    constexpr std::size_t bytes = 16u * piece;
+    constexpr std::uint32_t bufferBytes = 256u;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the guard range memo block");
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        bool memo;
+        ~Unregister() {
+            RuntimeSwitches::Assign(RuntimeSwitch::GuardRangeMemo, memo);
+            ClearMultisampleTargets(context.device);
+            ClearCachedTextures(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } unregister{base, block, RuntimeSwitches::Set(RuntimeSwitch::GuardRangeMemo)};
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    context.nullDescriptors = true;
+    TextureCache cache(context);
+    context.textureCache = &cache;
+    const auto settle = [&] {
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    };
+    const auto guard = [&](std::uint64_t at) {
+        ColorTarget target{};
+        target.address = at;
+        target.surfaceAddress = at;
+        target.extent = {side, side};
+        target.surfaceExtent = target.extent;
+        target.format = VK_FORMAT_R8G8B8A8_UNORM;
+        target.bytes = piece;
+        target.samples = 4;
+        std::lock_guard gpu(GpuMutex());
+        Require(MultisampleTargetView(context, target) != VK_NULL_HANDLE, "the guarding multisampled target has no view");
+        settle();
+    };
+    const auto clearTargets = [&] {
+        settle();
+        ClearMultisampleTargets(context.device);
+    };
+    const auto refused = [](const std::function<void()>& access, const std::string& what) {
+        std::string message;
+        try {
+            access();
+        } catch (const std::exception& error) {
+            message = error.what();
+        }
+        Require(message.find("a shader buffer access") != std::string::npos && message.find("multisampled color target") != std::string::npos, what + " was not refused: " + message);
+    };
+    const auto program = [](std::uint64_t at) {
+        ShaderRecompiler::RecompileResult result;
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.descriptorSet = 0;
+        binding.binding = 0;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at >> 32u) & 0xffffu, bufferBytes, 0x31000000u};
+        binding.bufferWritten = {false};
+        result.bindings.push_back(binding);
+        return result;
+    };
+    const auto insideProgram = program(address + 256u);
+    const auto outsideProgram = program(address + 14u * piece + 256u);
+    const CompiledShader insideCompute{ShaderRecompiler::ShaderStage::Compute, &insideProgram, 0};
+    const CompiledShader outsideCompute{ShaderRecompiler::ShaderStage::Compute, &outsideProgram, 0};
+    const ShaderResources::MovedBuffer moved{0, address + 256u, bufferBytes, {}};
+    for (const bool memo : {false, true}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::GuardRangeMemo, memo);
+        std::lock_guard gpu(GpuMutex());
+        {
+            ShaderResources inside(context, insideCompute);
+            ShaderResources outside(context, outsideCompute);
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                inside.RequireGuestBuffers();
+                outside.RequireGuestBuffers();
+            }
+            guard(address);
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                refused([&] { inside.RequireGuestBuffers(); }, "an own range a later guard overlaps");
+                outside.RequireGuestBuffers();
+            }
+            refused([&] { static_cast<void>(outside.PrepareDrawBindings(recorder, std::span(&moved, 1))); }, "a moved range a guard overlaps while the own range is clear");
+            clearTargets();
+            inside.RequireGuestBuffers();
+            guard(address + 6u * piece);
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                inside.RequireGuestBuffers();
+                outside.RequireGuestBuffers();
+            }
+            clearTargets();
+            if (memo) {
+                inside.RequireGuestBuffers();
+                RuntimeSwitches::Assign(RuntimeSwitch::GuardRangeMemo, false);
+                guard(address);
+                refused([&] { inside.RequireGuestBuffers(); }, "an own range a guard overlaps with the memo off");
+                RuntimeSwitches::Assign(RuntimeSwitch::GuardRangeMemo, true);
+                refused([&] { inside.RequireGuestBuffers(); }, "an own range a guard made while the memo was off overlaps");
+                clearTargets();
+                inside.RequireGuestBuffers();
+            }
+            settle();
+        }
+    }
+    std::cout << "Guard range memo tests passed\n";
+}
+
 void oneFragmentFmaskGuardTests(const Device& device) {
     const auto& base = device.GetContext();
     if (!device.NullDescriptors()) {
@@ -15549,6 +15686,10 @@ int main(int argc, char** argv) {
             repeatStorageGuardTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--guard-range-memo-only") {
+            guardRangeMemoTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--multisample-only") {
             multisampleGuestAccessTests(device, recorder);
             oneFragmentFmaskGuardTests(device);
@@ -15627,6 +15768,7 @@ int main(int argc, char** argv) {
         depthSurfaceProofTests(device, recorder);
         multisampleGuestAccessTests(device, recorder);
         repeatStorageGuardTests(device, recorder);
+        guardRangeMemoTests(device, recorder);
         oneFragmentFmaskGuardTests(device);
         tiledResolveTests(device, recorder);
         fmaskDecompressMsaaTests(device, recorder);
