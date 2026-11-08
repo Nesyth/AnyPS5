@@ -60,11 +60,12 @@ constexpr std::array<FieldInfo, FieldCount> FieldInfos{{
     {Item::SwitchRead, "values"},
 }};
 
-constexpr std::array<const char*, AllowedKinds> AllowedNames{"deferred reaps", "deferred packet submits", "flush boundary", "early flush checks", "held waits raced", "switches moved in the segment"};
+constexpr std::array<const char*, AllowedKinds> AllowedNames{"deferred reaps", "deferred packet submits", "flush boundary", "early flush checks", "held waits raced", "switches moved in the segment", "lists rewritten inside a collect epoch"};
 
 constexpr std::array<const char*, CounterCount> CounterNames{
     "lean segments", "today's segments", "mode changes", "switch copies", "segments looped", "prepared copies used", "prepared copies missed",
     "list cache hits", "list cache misses", "list cache invalidations", "flush checks skipped", "kick wakes", "kick timeouts", "settles that waited",
+    "prepared copies refused", "late tail epoch hoists", "lean register lists", "list cache admits", "list cache bypasses", "list cache evictions",
 };
 
 static_assert(ItemNames.back() != nullptr && FieldInfos.back().name != nullptr && AllowedNames.back() != nullptr && CounterNames.back() != nullptr, "every lean front item, field, by-design case and counter needs a name");

@@ -45,7 +45,7 @@ enum class Field : std::uint8_t {
     Count,
 };
 
-enum class Allowed : std::uint8_t { DeferredReaps, DeferredPacketSubmits, FlushBoundary, EarlyFlushChecks, HeldWaitsRaced, SwitchesMoved, Count };
+enum class Allowed : std::uint8_t { DeferredReaps, DeferredPacketSubmits, FlushBoundary, EarlyFlushChecks, HeldWaitsRaced, SwitchesMoved, ListsRewrittenInEpoch, Count };
 
 enum class Counter : std::uint8_t {
     LeanSegments,
@@ -62,6 +62,12 @@ enum class Counter : std::uint8_t {
     KickWakes,
     KickTimeouts,
     SettlesWaited,
+    PreparedCopiesRefused,
+    LateTailHoists,
+    LeanLists,
+    ListCacheAdmits,
+    ListCacheBypassed,
+    ListCacheEvictions,
     Count,
 };
 

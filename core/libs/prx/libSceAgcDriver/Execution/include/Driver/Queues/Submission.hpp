@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionProgress.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanFront.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/RegisterLists.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -31,9 +32,11 @@ struct Submission {
     std::map<std::size_t, std::shared_ptr<IRenderingWait>> renderingWaits;
     std::map<std::size_t, std::size_t> conditionalEnds;
     std::map<std::size_t, std::vector<std::uint32_t>> registerLists;
+    RegisterLists lists;
     bool suspend = false;
     bool waitFree = false;
     bool holdsFlip = false;
+    bool leanLists = false;
     FrontMode front = FrontMode::Unlatched;
 
     std::uint64_t received = 0;

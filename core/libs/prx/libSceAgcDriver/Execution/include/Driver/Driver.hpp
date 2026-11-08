@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRIVER_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanTails.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
@@ -168,9 +169,15 @@ private:
     void checkStopping() const;
     std::uint32_t reserveEopFlip(const FlipInfo& info, std::uint32_t token);
     static bool& onWorkerThread();
-    static void copyCommands(Submission& submission, const std::uint32_t* guest, std::size_t words);
-    static bool copySegment(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget);
+    static void copyCommands(Submission& submission, const std::uint32_t* guest, std::size_t words, GuestRanges* sources = nullptr);
+    static bool copySegment(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget, GuestRanges* sources);
     static void readRegisterLists(Submission& submission);
+    void resolveLeanLists(Submission& submission, bool cacheable);
+    void settleListHits(Submission& submission);
+    void verifyLeanLists(const Submission& submission, bool cacheable, std::uint64_t ownWrites);
+    bool keptTailCurrent(const KeptTail& kept, const Submission& stalled) const;
+    void recycleLeanTail(Submission& tail);
+    void prepareLeanTail(const Submission& stalled, Submission& tail, bool popped);
     void waitForFlipRoom(const Submission& submission);
     void holdFlipBehindWorker(const Submission& submission, bool cpuFlip);
     bool awaitsTitle(std::uint64_t awaited) const;
@@ -405,7 +412,8 @@ private:
     static void bumpEpoch(std::uint64_t EpochBumps::*counter);
     static std::chrono::steady_clock::time_point& lastEpochBump();
     static std::deque<const std::uint32_t*>& releasedTails();
-    void noteReleasedTails(const Submission& submission);
+    void noteReleasedTails(const Submission& submission, FrontMode front);
+    void keepReleasedTails(const Submission& submission);
     FrontMode latchFront(std::uint32_t queue, bool suspend);
     static bool packetEpoch();
     static bool labelTryEachPacket();
@@ -462,6 +470,7 @@ private:
     std::atomic<std::uint64_t> packetsDone{0};
 
     alignas(64) LeanFront::Latch frontLatch;
+    LeanTails leanTails;
 
     std::atomic<std::uint64_t> eventSerial{0};
     alignas(64) std::shared_ptr<ShaderRegistry> shaders = std::make_shared<ShaderRegistry>();

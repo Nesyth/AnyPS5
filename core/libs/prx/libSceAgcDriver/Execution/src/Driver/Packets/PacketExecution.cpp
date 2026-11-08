@@ -329,7 +329,7 @@ void Driver::execute(const Submission& submission) {
 
     static const bool epochEach = std::getenv("APS5_SUBMISSION_EPOCH_EACH") != nullptr;
     if (epochEach || submission.enqueuedAt == std::chrono::steady_clock::time_point{} || submission.enqueuedAt > lastEpochBump()) {
-        if (!epochEach) noteReleasedTails(submission);
+        if (!epochEach) noteReleasedTails(submission, front);
         bumpEpoch(&EpochBumps::submissions);
     }
     clearResolvedAhead();
@@ -343,6 +343,7 @@ void Driver::execute(const Submission& submission) {
             if (queue0) DrawFinisher::Get().Settle();
         }
     } settleFinisher{submission.queue == 0};
+    std::size_t listHint = 0;
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
@@ -660,8 +661,9 @@ void Driver::execute(const Submission& submission) {
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {
                 if (Pm4::IndirectRegisterOpcode(opcode)) {
-                    const auto& listed = submission.registerLists.at(cursor);
-                    if (Pm4::IndirectRegistersValid(listed)) {
+                    const auto list = RegisterListAt(submission, cursor, listHint);
+                    const auto listed = list.pairs;
+                    if (list.valid) {
                         Pm4::ExecuteIndirectRegisters(packet, listed, queue);
                     } else {
                         landPendingWaits(submission.queue);

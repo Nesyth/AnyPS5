@@ -108,9 +108,14 @@ std::deque<const std::uint32_t*>& Driver::releasedTails() {
     return HostThreadLocal<std::deque<const std::uint32_t*>, ReleasedTailsStorage>();
 }
 
-void Driver::noteReleasedTails(const Submission& submission) {
+void Driver::noteReleasedTails(const Submission& submission, FrontMode front) {
     auto& released = releasedTails();
     released.clear();
+    if (submission.queue == 0) leanTails.ClearKept();
+    if (front == FrontMode::Lean && submission.queue == 0) {
+        keepReleasedTails(submission);
+        return;
+    }
     struct ScratchStorage {};
     auto& scratch = HostThreadLocal<Submission, ScratchStorage>();
     const std::uint32_t* tail = submission.rewindTail;
@@ -130,16 +135,19 @@ void Driver::noteReleasedTails(const Submission& submission) {
     }
 }
 
-void Driver::copyCommands(Submission& submission, const std::uint32_t* guest, std::size_t words) {
+void Driver::copyCommands(Submission& submission, const std::uint32_t* guest, std::size_t words, GuestRanges* sources) {
     submission.commands.clear();
     submission.conditionalEnds.clear();
     std::size_t budget = std::size_t{1} << 26u;
-    copySegment(submission, guest, words, budget);
+    copySegment(submission, guest, words, budget, sources);
 }
 
-bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget) {
+bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget, GuestRanges* sources) {
     require(words <= budget, "command buffer jumps exceed the copy limit (a jump loop?)");
     budget -= words;
+    const auto read = [&](std::size_t consumed) {
+        if (sources != nullptr && consumed != 0) sources->emplace_back(reinterpret_cast<std::uintptr_t>(guest), consumed * sizeof(std::uint32_t));
+    };
     std::vector<std::pair<std::size_t, std::size_t>> guarded;
     const auto reach = [&](std::size_t cursor, std::size_t next) {
         std::erase_if(guarded, [&](const auto& range) {
@@ -160,6 +168,7 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
         const auto count = (header & 0xc0000000u) == 0xc0000000u ? Pm4::PacketWords(header) : words - cursor;
         if ((header & 0xc0000000u) != 0xc0000000u || count > words - cursor) {
             submission.commands.insert(submission.commands.end(), guest + cursor, guest + words);
+            read(words);
             return false;
         }
         reach(cursor, cursor + count);
@@ -173,8 +182,9 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
             const std::size_t targetWords = guest[cursor + 10] & 0xfffffu;
             if (targetWords != 0) {
                 GuestMemory::CheckRange(target, targetWords * sizeof(std::uint32_t), alignof(std::uint32_t));
-                if (copySegment(submission, target, targetWords, budget)) {
+                if (copySegment(submission, target, targetWords, budget, sources)) {
                     require(guarded.empty(), "a REWIND inside a conditional execution range is not implemented");
+                    read(cursor + count);
                     return true;
                 }
             }
@@ -192,7 +202,7 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
                 require(!chain, "predicated command buffer chains are not implemented");
                 const auto start = submission.commands.size();
                 submission.commands.insert(submission.commands.end(), guest + cursor, guest + cursor + count);
-                require(!copySegment(submission, target, targetWords, budget), "a REWIND inside a predicated command buffer is not implemented");
+                require(!copySegment(submission, target, targetWords, budget, sources), "a REWIND inside a predicated command buffer is not implemented");
                 for (auto inner = start + count; inner < submission.commands.size(); inner += Pm4::PacketWords(submission.commands[inner])) {
                     const auto innerHeader = submission.commands[inner];
                     require(innerHeader != FlipPacketHeader && innerHeader != RenderingWaitPacketHeader, "flips and rendering waits in predicated command buffers are not implemented");
@@ -201,11 +211,15 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
                 cursor += count;
                 continue;
             }
-            if (copySegment(submission, target, targetWords, budget)) {
+            if (copySegment(submission, target, targetWords, budget, sources)) {
                 require(guarded.empty(), "a REWIND inside a conditional execution range is not implemented");
+                read(cursor + count);
                 return true;
             }
-            if (chain) return false;
+            if (chain) {
+                read(cursor + count);
+                return false;
+            }
             cursor += count;
             continue;
         }
@@ -216,11 +230,13 @@ bool Driver::copySegment(Submission& submission, const std::uint32_t* guest, std
             require(guarded.empty(), "a REWIND inside a conditional execution range is not implemented");
             submission.rewindTail = guest + cursor;
             submission.rewindWords = words - cursor;
+            read(cursor);
             return true;
         }
     }
     reach(words, words);
     require(guarded.empty(), "conditional execution range exceeds its command buffer");
+    read(words);
     return false;
 }
 
@@ -395,8 +411,8 @@ std::vector<std::uint64_t> BoundGraphicsPrograms(const Submission& submission) {
         if (!Pm4::FillerPacket(header) && opcode == 0x76 && count > 2 && !Pm4::IsTagMarker(packet)) {
             for (std::size_t index = 2; index < count; ++index) note((packet[1] & ~0x70000000u) + static_cast<std::uint32_t>(index - 2), packet[index]);
         } else if (!Pm4::FillerPacket(header) && opcode == 0x63) {
-            if (const auto found = submission.registerLists.find(cursor); found != submission.registerLists.end()) {
-                for (std::size_t index = 0; index + 1 < found->second.size(); index += 2) note(found->second[index] & ~0x70000000u, found->second[index + 1]);
+            if (const auto found = FindRegisterList(submission, cursor)) {
+                for (std::size_t index = 0; index + 1 < found->pairs.size(); index += 2) note(found->pairs[index] & ~0x70000000u, found->pairs[index + 1]);
             }
         }
         flush();
@@ -437,17 +453,26 @@ void Driver::executeRewindTail(const Submission& stalled) {
     tail.front = front;
     if (APS5_ENABLE_TIMING_LOG) tail.receivedAt = std::chrono::steady_clock::now();
     auto& released = releasedTails();
-    if (!released.empty() && released.front() == stalled.rewindTail - 1) {
+    const bool popped = !released.empty() && released.front() == stalled.rewindTail - 1;
+    if (popped) {
         released.pop_front();
         tail.enqueuedAt = lastEpochBump();
     } else {
         released.clear();
         tail.enqueuedAt = std::chrono::steady_clock::now();
     }
-    copyCommands(tail, stalled.rewindTail, stalled.rewindWords);
-    if (APS5_ENABLE_TIMING_LOG) tail.copiedAt = std::chrono::steady_clock::now();
-    validate(tail, stalled.rewindTail);
-    readRegisterLists(tail);
+    if (front == FrontMode::Lean) {
+        prepareLeanTail(stalled, tail, popped);
+    } else {
+        if (stalled.queue == 0 && leanTails.Kept()) {
+            if (popped && leanTails.Front(stalled.rewindTail - 1) != nullptr) leanTails.Pop();
+            else leanTails.ClearKept();
+        }
+        copyCommands(tail, stalled.rewindTail, stalled.rewindWords);
+        if (APS5_ENABLE_TIMING_LOG) tail.copiedAt = std::chrono::steady_clock::now();
+        validate(tail, stalled.rewindTail);
+        readRegisterLists(tail);
+    }
     if (LibraryPrebuildsWaiting()) PrioritizeLibraryPrebuilds(BoundGraphicsPrograms(tail));
     if (APS5_ENABLE_TIMING_LOG) tail.validatedAt = std::chrono::steady_clock::now();
     waitForFlipRoom(tail);
@@ -473,6 +498,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
     timing.Finish();
     retireLabelTakes(tail.queue, retiredTakes);
     execute(tail);
+    if (front == FrontMode::Lean) recycleLeanTail(tail);
 }
 
 void Driver::SubmitFlip(const FlipInfo& info) {
