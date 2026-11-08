@@ -20,6 +20,22 @@ void GuestRangeSet::Insert(std::uint64_t begin, std::uint64_t end) {
     ranges.erase(first + 1, last);
 }
 
+void GuestRangeSet::Merge(std::vector<std::pair<std::uint64_t, std::uint64_t>>& added) {
+    std::sort(added.begin(), added.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    merged.reserve(ranges.size() + added.size());
+    auto own = ranges.begin();
+    auto other = added.begin();
+    while (own != ranges.end() || other != added.end()) {
+        const auto next = other == added.end() || (own != ranges.end() && own->first < other->first) ? *own++ : *other++;
+        if (next.first >= next.second) continue;
+        if (!merged.empty() && next.first <= merged.back().second) merged.back().second = std::max(merged.back().second, next.second);
+        else merged.push_back(next);
+    }
+    ranges = std::move(merged);
+    added.clear();
+}
+
 bool GuestRangeSet::Overlaps(std::uint64_t begin, std::uint64_t end) const {
     if (begin >= end) return false;
     const auto it = std::upper_bound(ranges.begin(), ranges.end(), begin, [](std::uint64_t value, const auto& range) { return value < range.second; });
@@ -31,18 +47,19 @@ bool PassHazards::overlapsAny(const GuestRangeSet& set, GuestRangeList ranges) c
     return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return set.Overlaps(range.first, range.second); });
 }
 
-PassHazard PassHazards::Check(const PassAccess& access, bool samePass) const {
+PassHazard PassHazards::Check(const PassAccess& access, bool samePass) {
     const auto touchesMemory = [](const PassAccess& use) {
         const auto nonEmpty = [](GuestRangeList ranges) { return std::any_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.first < range.second; }); };
         return use.anyReads || use.anyWrites || nonEmpty(use.reads) || nonEmpty(use.writes) || nonEmpty(use.writeOnly);
     };
-    const bool earlierTouches = anyReads || anyWrites || !reads.Empty() || !writes.Empty() || !writeOnly.Empty();
+    const bool earlierTouches = anyReads || anyWrites || !reads.Empty() || !pendingReads.empty() || !writes.Empty() || !writeOnly.Empty();
     if ((access.anyWrites && earlierTouches) || (anyWrites && touchesMemory(access))) return PassHazard::UnknownWrite;
     const auto nonEmpty = [](GuestRangeList ranges) { return std::any_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.first < range.second; }); };
     const bool writesRanges = nonEmpty(access.writes) || nonEmpty(access.writeOnly);
     if ((access.anyReads && (!writes.Empty() || !writeOnly.Empty())) || (anyReads && writesRanges)) return PassHazard::UnknownRead;
     if (overlapsAny(writes, access.reads) || overlapsAny(writeOnly, access.reads)) return PassHazard::ReadAfterWrite;
     if (overlapsAny(writes, access.writes) || overlapsAny(writeOnly, access.writes) || overlapsAny(writes, access.writeOnly)) return PassHazard::WriteAfterWrite;
+    if (writesRanges && !pendingReads.empty()) reads.Merge(pendingReads);
     if (overlapsAny(reads, access.writes) || overlapsAny(reads, access.writeOnly)) return PassHazard::WriteAfterRead;
     const auto conflicts = [](bool earlier, bool later) { return earlier || later; };
     for (const auto& [image, written] : access.images) {
@@ -58,8 +75,15 @@ PassHazard PassHazards::Check(const PassAccess& access, bool samePass) const {
     return PassHazard::None;
 }
 
-void PassHazards::Add(const PassAccess& access) {
-    for (const auto& [begin, end] : access.reads) reads.Insert(begin, end);
+void PassHazards::Add(const PassAccess& access, bool lazyReads) {
+    if (lazyReads) {
+        for (const auto& range : access.reads) {
+            if (range.first < range.second) pendingReads.push_back(range);
+        }
+        if (pendingReads.size() >= std::max(PendingReadsBound, reads.Size())) reads.Merge(pendingReads);
+    } else {
+        for (const auto& [begin, end] : access.reads) reads.Insert(begin, end);
+    }
     for (const auto& [begin, end] : access.writes) writes.Insert(begin, end);
     for (const auto& [begin, end] : access.writeOnly) writeOnly.Insert(begin, end);
     for (const auto& [image, written] : access.images) {
@@ -85,6 +109,7 @@ void PassHazards::SealWriteOnly() {
 
 void PassHazards::Clear() {
     reads.Clear();
+    pendingReads.clear();
     writes.Clear();
     writeOnly.Clear();
     images.clear();
@@ -93,7 +118,7 @@ void PassHazards::Clear() {
 }
 
 bool PassHazards::Empty() const {
-    return reads.Empty() && writes.Empty() && writeOnly.Empty() && images.empty() && attachments.empty() && !anyReads && !anyWrites;
+    return reads.Empty() && pendingReads.empty() && writes.Empty() && writeOnly.Empty() && images.empty() && attachments.empty() && !anyReads && !anyWrites;
 }
 
 }

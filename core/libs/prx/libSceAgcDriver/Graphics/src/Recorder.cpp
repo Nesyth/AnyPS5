@@ -1717,7 +1717,7 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     pass.open = true;
     pass.key = key;
     pass.fenced = pass.fenced || fenced;
-    open->passHazards.Add(access);
+    open->passHazards.Add(access, RuntimeSwitches::Set(RuntimeSwitch::LazyPassReads));
 }
 
 void Recorder::SealPassWriteOnly() {

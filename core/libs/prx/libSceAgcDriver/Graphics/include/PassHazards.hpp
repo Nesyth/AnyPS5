@@ -48,6 +48,7 @@ constexpr PassBreak PassBreakFor(PassHazard hazard) {
 class GuestRangeSet {
 public:
     void Insert(std::uint64_t begin, std::uint64_t end);
+    void Merge(std::vector<std::pair<std::uint64_t, std::uint64_t>>& added);
     bool Overlaps(std::uint64_t begin, std::uint64_t end) const;
     bool Empty() const { return ranges.empty(); }
     std::size_t Size() const { return ranges.size(); }
@@ -60,8 +61,9 @@ private:
 
 class PassHazards {
 public:
-    PassHazard Check(const PassAccess& access, bool samePass) const;
-    void Add(const PassAccess& access);
+    static constexpr std::size_t PendingReadsBound = 1024;
+    PassHazard Check(const PassAccess& access, bool samePass);
+    void Add(const PassAccess& access, bool lazyReads = false);
     void BeginPass() { ++pass; }
     void SealWriteOnly();
     void Clear();
@@ -75,6 +77,7 @@ private:
     };
     bool overlapsAny(const GuestRangeSet& set, GuestRangeList ranges) const;
     GuestRangeSet reads;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pendingReads;
     GuestRangeSet writes;
     GuestRangeSet writeOnly;
     std::vector<std::pair<VkImage, bool>> images;

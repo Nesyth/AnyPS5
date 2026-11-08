@@ -1,7 +1,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <random>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -11,9 +14,9 @@ namespace {
 
 int failures = 0;
 
-void Expect(bool condition, const char* what) {
+void Expect(bool condition, const std::string& what) {
     if (condition) return;
-    std::fprintf(stderr, "FAIL: %s\n", what);
+    std::fprintf(stderr, "FAIL: %s\n", what.c_str());
     ++failures;
 }
 
@@ -254,13 +257,139 @@ void testWriteOnly() {
     Expect(hazards.Empty(), "cleared write-only stores");
 }
 
+void testRangeSetMerge() {
+    GuestRangeSet set;
+    Ranges added{{0x2000, 0x3000}, {0x1000, 0x2000}, {0x5000, 0x5000}, {0x1800, 0x1900}};
+    set.Merge(added);
+    Expect(added.empty() && set.Size() == 1 && set.Overlaps(0x1000, 0x1001) && set.Overlaps(0x2fff, 0x3000) && !set.Overlaps(0x3000, 0x5001), "a merge joins touching ranges and drops empty ones");
+    added = {{0x4000, 0x4100}, {0x2800, 0x3800}, {0x10, 0x20}};
+    set.Merge(added);
+    Expect(set.Size() == 3 && set.Overlaps(0x37ff, 0x3800) && !set.Overlaps(0x3800, 0x4000) && set.Overlaps(0x10, 0x11), "a merge into a set extends and adds ranges");
+    std::mt19937_64 random(7);
+    for (int round = 0; round < 500; ++round) {
+        GuestRangeSet inserted;
+        GuestRangeSet merged;
+        Ranges pending;
+        const auto count = 1 + random() % 48;
+        for (std::uint64_t index = 0; index < count; ++index) {
+            const std::uint64_t begin = random() % 64 * 0x10;
+            const std::uint64_t end = begin + random() % 6 * 0x10;
+            inserted.Insert(begin, end);
+            pending.emplace_back(begin, end);
+            if (random() % 8 == 0) merged.Merge(pending);
+        }
+        merged.Merge(pending);
+        Expect(pending.empty() && std::ranges::equal(inserted.Ranges(), merged.Ranges()), "merged ranges differ from inserted ones in round " + std::to_string(round));
+    }
+}
+
+void testLazyReads() {
+    PassHazards hazards;
+    hazards.BeginPass();
+    Use reader;
+    reader.reads = {{0x1000, 0x2000}, {0x3000, 0x3000}};
+    hazards.Add(reader.View(), true);
+    Expect(!hazards.Empty(), "pending reads are tracked");
+    Use otherReader;
+    otherReader.reads = {{0x1800, 0x1900}};
+    Expect(hazards.Check(otherReader.View(), true) == PassHazard::None, "a read after pending reads");
+    Use writer;
+    writer.writes = {{0x1800, 0x1900}};
+    Expect(hazards.Check(writer.View(), true) == PassHazard::WriteAfterRead, "a write after a pending read of the same bytes");
+    Use writeOnly;
+    writeOnly.writeOnly = {{0x1f00, 0x2100}};
+    Expect(hazards.Check(writeOnly.View(), true) == PassHazard::WriteAfterRead, "write-only stores after a pending read");
+    Use unknownWriter;
+    unknownWriter.anyWrites = true;
+    hazards.Clear();
+    Expect(hazards.Empty() && hazards.Check(writer.View(), true) == PassHazard::None, "a barrier clears pending reads");
+    Use emptyReader;
+    emptyReader.reads = {{0x1000, 0x1000}};
+    hazards.Add(emptyReader.View(), true);
+    Expect(hazards.Empty() && hazards.Check(unknownWriter.View(), true) == PassHazard::None, "an empty pending read touches nothing");
+    hazards.Add(reader.View(), true);
+    Expect(hazards.Check(unknownWriter.View(), true) == PassHazard::UnknownWrite, "unknown writes after a pending read");
+    hazards.Clear();
+    hazards.Add(reader.View(), true);
+    Use farReader;
+    farReader.reads = {{0x8000, 0x8100}};
+    hazards.Add(farReader.View(), false);
+    Use pendingWriter;
+    pendingWriter.writes = {{0x1100, 0x1200}};
+    Expect(hazards.Check(pendingWriter.View(), true) == PassHazard::WriteAfterRead, "pending reads are consulted after inserts resumed");
+    Use disjoint;
+    disjoint.writes = {{0x2000, 0x2100}, {0x8100, 0x8200}};
+    Expect(hazards.Check(disjoint.View(), true) == PassHazard::None, "writes next to pending and inserted reads");
+    Use farWriter;
+    farWriter.writes = {{0x80f0, 0x8100}};
+    Expect(hazards.Check(farWriter.View(), true) == PassHazard::WriteAfterRead, "inserted reads are kept beside pending ones");
+    hazards.Clear();
+    Use many;
+    for (std::uint64_t index = 0; index <= PassHazards::PendingReadsBound; ++index) many.reads.emplace_back(0x100000 + index * 0x20, 0x100000 + index * 0x20 + 0x10);
+    hazards.Add(many.View(), true);
+    Use between;
+    between.writes = {{0x100010, 0x100020}};
+    Expect(hazards.Check(between.View(), true) == PassHazard::None, "a write between many pending reads");
+    Use last;
+    last.writes = {{0x100000 + PassHazards::PendingReadsBound * 0x20 + 0xf, 0x100000 + PassHazards::PendingReadsBound * 0x20 + 0x10}};
+    Expect(hazards.Check(last.View(), true) == PassHazard::WriteAfterRead, "a write over the last of many pending reads");
+
+    std::mt19937_64 random(11);
+    const auto ranges = [&](std::uint64_t most) {
+        Ranges result;
+        const auto count = random() % (most + 1);
+        for (std::uint64_t index = 0; index < count; ++index) {
+            const std::uint64_t begin = random() % 256 * 0x10;
+            result.emplace_back(begin, begin + random() % 5 * 0x10);
+        }
+        return result;
+    };
+    for (int round = 0; round < 200; ++round) {
+        PassHazards eager;
+        PassHazards lazy;
+        eager.BeginPass();
+        lazy.BeginPass();
+        for (int step = 0; step < 400; ++step) {
+            Use use;
+            use.reads = ranges(6);
+            if (random() % 4 == 0) use.writes = ranges(2);
+            if (random() % 8 == 0) use.writeOnly = ranges(2);
+            use.anyReads = random() % 64 == 0;
+            use.anyWrites = random() % 128 == 0;
+            if (random() % 16 == 0) use.images = {{image(1 + random() % 3), random() % 2 == 0}};
+            if (random() % 16 == 0) use.attachments = {{image(4 + random() % 3), random() % 2 == 0}};
+            const bool samePass = random() % 4 != 0;
+            const auto expected = eager.Check(use.View(), samePass);
+            const auto found = lazy.Check(use.View(), samePass);
+            Expect(expected == found, "lazy reads changed a check in round " + std::to_string(round) + " step " + std::to_string(step));
+            const auto action = random() % 32;
+            if (action == 0 || (expected != PassHazard::None && action < 24)) {
+                eager.Clear();
+                lazy.Clear();
+            } else if (action == 1) {
+                eager.SealWriteOnly();
+                lazy.SealWriteOnly();
+            }
+            if (random() % 8 == 0) {
+                eager.BeginPass();
+                lazy.BeginPass();
+            }
+            eager.Add(use.View());
+            lazy.Add(use.View(), random() % 8 != 0);
+            Expect(eager.Empty() == lazy.Empty(), "lazy reads changed emptiness in round " + std::to_string(round) + " step " + std::to_string(step));
+        }
+    }
+}
+
 int main() {
     testRangeSet();
+    testRangeSetMerge();
     testRanges();
     testUnknown();
     testImages();
     testAttachments();
     testWriteOnly();
+    testLazyReads();
     if (failures != 0) {
         std::fprintf(stderr, "%d pass hazard checks failed\n", failures);
         return 1;
