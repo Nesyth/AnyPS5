@@ -1542,15 +1542,18 @@ void CheckMultisamplePassMemo() {
         state.cullMode = VK_CULL_MODE_NONE;
         state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         state.samples = samples;
-        AgcDriver::GuestMemory::BumpCollectEpoch();
-        device->Draw(state, draw, shaders);
-        device->Draw(state, draw, shaders);
-        Require(DepthSurfaceAt(depth.address), "a pass of depth-tested multisampled draws left no resident native depth surface");
-        std::array<std::byte, 1> probe{};
-        AgcDriver::GuestMemory::Read(depth.address + depthBytes - 1u, probe);
-        Require(!DepthSurfaceAt(depth.address), "a guest read inside a pass left a native depth surface only depth-tested resident");
-        device->Draw(state, draw, shaders);
-        Require(DepthSurfaceAt(depth.address), memo ? "the multisample pass memo served a draw with the view of a native depth surface a guest read retired" : "a draw after a guest read left no resident native depth surface");
+        {
+            std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex());
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            device->Draw(state, draw, shaders);
+            device->Draw(state, draw, shaders);
+            Require(DepthSurfaceAt(depth.address), "a pass of depth-tested multisampled draws left no resident native depth surface");
+            std::array<std::byte, 1> probe{};
+            AgcDriver::GuestMemory::Read(depth.address + depthBytes - 1u, probe);
+            Require(!DepthSurfaceAt(depth.address), "a guest read inside a pass left a native depth surface only depth-tested resident");
+            device->Draw(state, draw, shaders);
+            Require(DepthSurfaceAt(depth.address), memo ? "the multisample pass memo served a draw with the view of a native depth surface a guest read retired" : "a draw after a guest read left no resident native depth surface");
+        }
         const auto view = DepthSurfaceView(context, depth, false);
         const auto active = DepthSurfaceActive(context, depth, view);
         Require(active != nullptr && active->load(), "a resident native depth surface has no active flag for its own view");
