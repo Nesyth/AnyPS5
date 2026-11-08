@@ -74,6 +74,7 @@ enum class RuntimeSwitch : std::size_t {
     ResidentFirstCollect,
     SortedHostRegions,
     HostPrefetch,
+    SkipHtileKeyPresync,
     Count,
 };
 

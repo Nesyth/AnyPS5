@@ -4966,6 +4966,7 @@ struct PresyncCounters {
     std::atomic<std::uint64_t> waitedUs{0};
     std::atomic<std::uint64_t> keyChecks{0};
     std::atomic<std::uint64_t> keyWaits{0};
+    std::atomic<std::uint64_t> htileKeysSkipped{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -5539,11 +5540,18 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::vector<WaitedKeyRange> waitedKeys;
     auto& counters = Presyncs();
+    const bool skipHtile = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SkipHtileKeyPresync);
+    const auto htileKeys = [&](const Graphics::PresyncSurface& surface) {
+        if (!skipHtile || !surface.dccKeys || Graphics::DepthHtileOverlapping_nid_no_patch(surface.address, surface.bytes) == 0) return false;
+        counters.htileKeysSkipped.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    };
     bool overlaps = false;
     for (const auto& surface : surfaces) {
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         if (surface.dccKeys) counters.keyChecks.fetch_add(1, std::memory_order_relaxed);
-        overlaps = overlaps || (surface.dccKeys ? Graphics::DccKeyWritersPending(surface.address, bytes) : Graphics::Recorder::SnapshotWriteOverlaps(surface.address, bytes));
+        const bool pending = surface.dccKeys ? Graphics::DccKeyWritersPending(surface.address, bytes) : Graphics::Recorder::SnapshotWriteOverlaps(surface.address, bytes);
+        overlaps = overlaps || (pending && !htileKeys(surface));
     }
     std::uint64_t serial = 0;
     bool texelsPending = false;
@@ -5556,6 +5564,7 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
             for (const auto& surface : surfaces) {
                 const auto bytes = static_cast<std::size_t>(surface.bytes);
                 if (surface.dccKeys && !Graphics::DccKeyWriterNeedsSync(surface.address, bytes)) continue;
+                if (skipHtile && surface.dccKeys && Graphics::DepthHtileOverlapping_nid_no_patch(surface.address, surface.bytes) != 0) continue;
                 const auto info = state->recorder->DescribePendingWrite(surface.address, bytes);
                 if (!info.has_value()) continue;
                 if (surface.dccKeys && Graphics::Recorder::KeyWriterCensus()) {
@@ -5582,7 +5591,7 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
         auto last = counters.lastReport.load();
         if (nowMs - last >= 10000 && counters.lastReport.compare_exchange_strong(last, nowMs)) {
             const auto keyWaitCounts = Graphics::KeyWaitCounts();
-            AgcDriver::ProfilePrint_nid_no_patch("[presync] %llu dispatches checked, %llu pre-syncs waited %.0f ms (cumulative); key ranges %llu checked, %llu pre-syncs that only the keys required; WaitForKeyWriters %llu calls: %llu without a pending writer, %llu known keys, %llu fills leaving uncompressed, %llu synced\n", static_cast<unsigned long long>(counters.checked.load()), static_cast<unsigned long long>(counters.presyncs.load()), counters.waitedUs.load() / 1000.0, static_cast<unsigned long long>(counters.keyChecks.load()), static_cast<unsigned long long>(counters.keyWaits.load()), static_cast<unsigned long long>(keyWaitCounts.calls), static_cast<unsigned long long>(keyWaitCounts.noPending), static_cast<unsigned long long>(keyWaitCounts.known), static_cast<unsigned long long>(keyWaitCounts.fillsUncompressed), static_cast<unsigned long long>(keyWaitCounts.synced));
+            AgcDriver::ProfilePrint_nid_no_patch("[presync] %llu dispatches checked, %llu pre-syncs waited %.0f ms (cumulative); key ranges %llu checked, %llu HTILE key ranges with pending writers skipped, %llu pre-syncs that only the keys required; WaitForKeyWriters %llu calls: %llu without a pending writer, %llu known keys, %llu fills leaving uncompressed, %llu synced\n", static_cast<unsigned long long>(counters.checked.load()), static_cast<unsigned long long>(counters.presyncs.load()), counters.waitedUs.load() / 1000.0, static_cast<unsigned long long>(counters.keyChecks.load()), static_cast<unsigned long long>(counters.htileKeysSkipped.load()), static_cast<unsigned long long>(counters.keyWaits.load()), static_cast<unsigned long long>(keyWaitCounts.calls), static_cast<unsigned long long>(keyWaitCounts.noPending), static_cast<unsigned long long>(keyWaitCounts.known), static_cast<unsigned long long>(keyWaitCounts.fillsUncompressed), static_cast<unsigned long long>(keyWaitCounts.synced));
         }
     }
     return serial;
