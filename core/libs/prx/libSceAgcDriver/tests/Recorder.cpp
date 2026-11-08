@@ -5844,6 +5844,64 @@ void drawSnapshotUploadTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+void keepSnapshotBytesTests(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    {
+        Recorder kept(context);
+        kept.Activate();
+        const std::array<int, 3> owners{};
+        kept.KeepSnapshotBytes(&owners[0], 100);
+        kept.KeepSnapshotBytes(&owners[0], 100);
+        Require(kept.OpenKeptBytes() == 100, "a repeated snapshot keep of one owner counted its bytes twice");
+        kept.KeepSnapshotBytes(&owners[1], 50);
+        kept.KeepSnapshotBytes(&owners[0], 100);
+        kept.KeepBytes(&owners[1], 50);
+        Require(kept.OpenKeptBytes() == 150, "keeping owners again in one batch counted their bytes again");
+        kept.KeepSnapshotBytes(&owners[2], 0);
+        kept.KeepSnapshotBytes(nullptr, 10);
+        kept.KeepSnapshotBytes(&owners[2], 30);
+        Require(kept.OpenKeptBytes() == 180, "an owner first kept without bytes was not counted once it had bytes");
+        kept.Submit();
+        kept.KeepSnapshotBytes(&owners[2], 30);
+        Require(kept.OpenKeptBytes() == 30, "a new batch did not count an owner the previous batch kept last");
+        kept.Sync();
+    }
+    const bool onceBefore = RuntimeSwitches::Set(RuntimeSwitch::KeepBytesOnce);
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding data{};
+        data.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        data.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+        data.binding = 2;
+        data.count = 1;
+        data.guestDescriptor = {1, 2, 3, 4};
+        program.bindings.push_back(data);
+        data.binding = 7;
+        program.bindings.push_back(data);
+        const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        ShaderResources resources(context, shader);
+        const std::array<std::uint32_t, 4> words{5, 6, 7, 8};
+        const std::array<ShaderResources::MovedBuffer, 2> moved{{{0, 0, 16, words}, {1, 0, 16, words}}};
+        for (const bool once : {false, true, false}) {
+            RuntimeSwitches::Assign(RuntimeSwitch::KeepBytesOnce, once);
+            Recorder snapshots(context);
+            snapshots.Activate();
+            const auto draw = resources.PrepareDrawBindings(snapshots, moved);
+            Require(draw != nullptr && draw->snapshots.size() == 2 && draw->snapshots[0].buffer == draw->snapshots[1].buffer, "moved shader data of one draw did not share the upload chunk");
+            const auto chunk = draw->snapshots[0].buffer->Bytes().size();
+            Require(snapshots.OpenKeptBytes() == chunk, "the upload chunk two snapshots share was not counted once");
+            const auto again = resources.PrepareDrawBindings(snapshots, moved);
+            Require(again != nullptr && again->snapshots[0].buffer == draw->snapshots[0].buffer && snapshots.OpenKeptBytes() == chunk, "a second draw counted the upload chunk of the open batch again");
+            snapshots.Sync();
+        }
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::KeepBytesOnce, onceBefore);
+    recorder.Activate();
+    std::cout << "Snapshot byte keep tests passed\n";
+}
+
 void movedLargeUploadTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     constexpr std::size_t movedBytes = 16384;
@@ -15920,6 +15978,10 @@ int main(int argc, char** argv) {
             movedLargeUploadTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--keep-snapshot-bytes-only") {
+            keepSnapshotBytesTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-epoch-only") {
             drawSnapshotEpochTests(device);
             return 0;
@@ -15979,6 +16041,7 @@ int main(int argc, char** argv) {
         unwrittenSnapshotTests(device);
         drawSnapshotUploadTests(device, recorder);
         movedLargeUploadTests(device, recorder);
+        keepSnapshotBytesTests(device, recorder);
         drawInputReuseTests(device, recorder);
         drawInputInPlaceTests(device, recorder);
         RunResidentPresentTests(device.GetContext());

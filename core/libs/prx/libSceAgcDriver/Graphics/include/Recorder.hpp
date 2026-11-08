@@ -115,6 +115,11 @@ public:
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepThroughHold(std::shared_ptr<void> object);
     void KeepBytes(const void* owner, std::size_t bytes);
+    void KeepSnapshotBytes(const void* owner, std::size_t bytes) {
+        if (owner != nullptr && open != nullptr && open->lastKeptOwner == owner) return;
+        KeepBytes(owner, bytes);
+        if (owner != nullptr && bytes != 0) open->lastKeptOwner = owner;
+    }
     void KeepOnce(std::shared_ptr<void> object, std::size_t bytes);
     enum class UploadScratch : std::uint8_t { Tiled = 0, Linear, Count };
     std::shared_ptr<DeviceBuffer> UploadScratchBuffer(UploadScratch kind, std::size_t bytes);
@@ -626,6 +631,7 @@ private:
         std::unordered_set<const void*> keptOwners;
         const void* lastKeptOwner = nullptr;
         std::unordered_set<const void*> keptOnce;
+        const void* lastKeptOwner = nullptr;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;

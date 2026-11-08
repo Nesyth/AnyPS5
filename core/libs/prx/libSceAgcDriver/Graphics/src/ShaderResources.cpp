@@ -7052,6 +7052,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::finishDrawBindin
         return result;
     }
     recorder.Keep(result);
+    if (RuntimeSwitches::Set(RuntimeSwitch::KeepBytesOnce)) {
+        for (const auto& snapshot : result->snapshots) recorder.KeepSnapshotBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+        return result;
+    }
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;
 }
