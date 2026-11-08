@@ -111,26 +111,51 @@ inline VkShaderStageFlags PushConstantStages(std::span<const CompiledShader> sha
     return result;
 }
 
-inline std::array<std::byte, PipelinePushConstantBytes> AssemblePushConstants(std::span<const CompiledShader> shaders) {
+inline void RequirePushConstantRange(const CompiledShader& shader) {
+    const auto& bytes = shader.program->pushConstants;
+    Require(bytes.size() % 4 == 0 && shader.pushConstantOffset % 4 == 0, "shader push constant range is not DWORD aligned");
+    Require(shader.pushConstantOffset < PipelinePushConstantBytes && bytes.size() <= PipelinePushConstantBytes - shader.pushConstantOffset, "shader push constant range lies outside the pipeline push constant block");
+    Require(bytes.size() <= PipelinePushSlotBytes - shader.pushConstantOffset % PipelinePushSlotBytes, "shader push constant range crosses a push constant slot");
+}
+
+inline void PlaceHeapPushWords(std::array<std::byte, PipelinePushConstantBytes>& result, const CompiledShader& shader) {
+    if (shader.heap == nullptr) return;
+    for (const auto& [dword, value] : shader.heap->pushWords) {
+        if ((static_cast<std::size_t>(dword) + 1) * sizeof(std::uint32_t) <= shader.program->pushConstants.size()) std::memcpy(result.data() + shader.pushConstantOffset + static_cast<std::size_t>(dword) * sizeof(std::uint32_t), &value, sizeof(value));
+    }
+}
+
+inline std::array<std::byte, PipelinePushConstantBytes> AssemblePushConstants(std::span<const CompiledShader> shaders, bool copied = false) {
+    static_assert(PipelinePushConstantBytes / sizeof(std::uint32_t) == 64 && PipelinePushSlotBytes / sizeof(std::uint32_t) < 64);
     std::array<std::byte, PipelinePushConstantBytes> result{};
+    if (copied) {
+        std::uint64_t occupied = 0;
+        for (const auto& shader : shaders) {
+            Require(shader.program != nullptr, "missing compiled shader");
+            const auto& bytes = shader.program->pushConstants;
+            if (bytes.empty()) continue;
+            RequirePushConstantRange(shader);
+            const auto dwords = ((std::uint64_t{1} << bytes.size() / sizeof(std::uint32_t)) - 1) << shader.pushConstantOffset / sizeof(std::uint32_t);
+            Require((occupied & dwords) == 0, "shader push constant ranges of different stages overlap");
+            occupied |= dwords;
+            std::memcpy(result.data() + shader.pushConstantOffset, bytes.data(), bytes.size());
+            PlaceHeapPushWords(result, shader);
+        }
+        return result;
+    }
     std::array<bool, PipelinePushConstantBytes> occupied{};
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
         const auto& bytes = shader.program->pushConstants;
         if (bytes.empty()) continue;
-        Require(bytes.size() % 4 == 0 && shader.pushConstantOffset % 4 == 0, "shader push constant range is not DWORD aligned");
-        Require(shader.pushConstantOffset < PipelinePushConstantBytes && bytes.size() <= PipelinePushConstantBytes - shader.pushConstantOffset, "shader push constant range lies outside the pipeline push constant block");
-        Require(bytes.size() <= PipelinePushSlotBytes - shader.pushConstantOffset % PipelinePushSlotBytes, "shader push constant range crosses a push constant slot");
+        RequirePushConstantRange(shader);
         for (std::size_t i = 0; i < bytes.size(); ++i) {
             const auto position = shader.pushConstantOffset + i;
             Require(!occupied[position], "shader push constant ranges of different stages overlap");
             occupied[position] = true;
             result[position] = bytes[i];
         }
-        if (shader.heap == nullptr) continue;
-        for (const auto& [dword, value] : shader.heap->pushWords) {
-            if ((static_cast<std::size_t>(dword) + 1) * sizeof(std::uint32_t) <= bytes.size()) std::memcpy(result.data() + shader.pushConstantOffset + static_cast<std::size_t>(dword) * sizeof(std::uint32_t), &value, sizeof(value));
-        }
+        PlaceHeapPushWords(result, shader);
     }
     return result;
 }

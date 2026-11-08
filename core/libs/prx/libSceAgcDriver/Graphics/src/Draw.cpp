@@ -2709,7 +2709,7 @@ void patchDepthRemapPush(std::array<std::byte, PipelinePushConstantBytes>& block
 
 void recordStencilReplay(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, std::span<const std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> replay, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes = nullptr, VkShaderStageFlags stages = 0, const ShaderResources::DrawBindings* drawBindings = nullptr) {
     State selected = state;
-    auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
+    auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders, RuntimeSwitches::Set(RuntimeSwitch::PushMemcpy));
     if (bytes == nullptr) {
         resources.PatchPushConstants(block);
         stages = PushConstantStages(shaders);
@@ -2750,7 +2750,7 @@ void recordStencilReplay(const Context& context, VkCommandBuffer commands, const
 }
 
 void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false, std::uint32_t meshLayerStride = 0, const ShaderResources::DrawBindings* drawBindings = nullptr) {
-    auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
+    auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders, RuntimeSwitches::Set(RuntimeSwitch::PushMemcpy));
     if (bytes == nullptr) {
         resources.PatchPushConstants(block);
         stages = PushConstantStages(shaders);
