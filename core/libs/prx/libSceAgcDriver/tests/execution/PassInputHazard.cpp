@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -217,20 +218,23 @@ int main() {
         const auto writer = Compile(*device, Triangles().data(), StoreCode, indices + 1);
         constexpr std::size_t all = std::size_t{Width} * Height * 4u;
         const std::array<std::pair<const float*, const float*>, 3> depths{{{nullptr, nullptr}, {FirstDepth.data(), nullptr}, {FirstDepth.data(), SecondDepth.data()}}};
-        for (const auto& [readDepth, writeDepth] : depths) {
-            const Block read(TargetLayout.Bytes());
-            const Block written(TargetLayout.Bytes());
-            std::memcpy(indices, triangle.data(), sizeof(triangle));
-            const auto variant = std::string(readDepth == nullptr ? "without depth" : writeDepth == nullptr ? "with depth on the reader" : "with a depth target each");
-            Draw(*device, reader, read, readDepth, indices);
-            if (device->DrawInputsInPlace()) Require(WriterFenced(inputs.Address(), sizeof(triangle)), "pass input hazard " + variant + ": a pass writing the indices an open pass reads in place took no barrier");
-            Draw(*device, reader, read, readDepth, indices);
-            Draw(*device, writer, written, writeDepth, nullptr);
-            Require(Covered(*device, read) == all, "pass input hazard " + variant + ": the draw reading its indices in place did not cover its target, a later pass overwrote them first");
-            Require(Covered(*device, written) == all, "pass input hazard " + variant + ": the storing draw did not cover its target");
-            std::array<std::uint32_t, 3> stored{};
-            AgcDriver::GuestMemory::Read(inputs.Address(), std::as_writable_bytes(std::span(stored)), 4);
-            Require(stored == std::array<std::uint32_t, 3>{0u, 0u, 2u}, "pass input hazard " + variant + ": the storing draw's write did not reach the indices");
+        for (const bool singleCheck : {false, true}) {
+            AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::SingleIndexCheck, singleCheck);
+            for (const auto& [readDepth, writeDepth] : depths) {
+                const Block read(TargetLayout.Bytes());
+                const Block written(TargetLayout.Bytes());
+                std::memcpy(indices, triangle.data(), sizeof(triangle));
+                const auto variant = std::string(readDepth == nullptr ? "without depth" : writeDepth == nullptr ? "with depth on the reader" : "with a depth target each") + (singleCheck ? ", index range checked once" : "");
+                Draw(*device, reader, read, readDepth, indices);
+                if (device->DrawInputsInPlace()) Require(WriterFenced(inputs.Address(), sizeof(triangle)), "pass input hazard " + variant + ": a pass writing the indices an open pass reads in place took no barrier");
+                Draw(*device, reader, read, readDepth, indices);
+                Draw(*device, writer, written, writeDepth, nullptr);
+                Require(Covered(*device, read) == all, "pass input hazard " + variant + ": the draw reading its indices in place did not cover its target, a later pass overwrote them first");
+                Require(Covered(*device, written) == all, "pass input hazard " + variant + ": the storing draw did not cover its target");
+                std::array<std::uint32_t, 3> stored{};
+                AgcDriver::GuestMemory::Read(inputs.Address(), std::as_writable_bytes(std::span(stored)), 4);
+                Require(stored == std::array<std::uint32_t, 3>{0u, 0u, 2u}, "pass input hazard " + variant + ": the storing draw's write did not reach the indices");
+            }
         }
         std::puts("pass input hazard tests passed");
         return 0;
