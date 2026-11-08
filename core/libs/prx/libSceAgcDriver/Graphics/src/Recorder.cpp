@@ -3340,6 +3340,42 @@ void Recorder::OnComplete(std::function<void()> action) {
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
 }
 
+namespace {
+
+thread_local std::uint64_t currentWriterTag = 0;
+constexpr std::size_t WriterRingSize = std::size_t{1} << 16u;
+
+struct WriterSlot {
+    std::uint64_t note = 0;
+    std::uint64_t tag = 0;
+};
+
+WriterSlot writerRing[WriterRingSize];
+
+void noteWriterOf(std::uint64_t note) {
+    if (Recorder::KeyWriterCensus()) writerRing[note % WriterRingSize] = {note, currentWriterTag};
+}
+
+}
+
+Recorder::WriterScope::WriterScope(std::uint64_t tag) noexcept : previous(currentWriterTag) {
+    currentWriterTag = tag;
+}
+
+Recorder::WriterScope::~WriterScope() {
+    currentWriterTag = previous;
+}
+
+bool Recorder::KeyWriterCensus() {
+    static const bool census = std::getenv("APS5_KEY_WRITER_CENSUS") != nullptr;
+    return census;
+}
+
+std::uint64_t Recorder::WriterOfNote(std::uint64_t note) {
+    const auto& slot = writerRing[note % WriterRingSize];
+    return slot.note == note ? slot.tag : ~std::uint64_t{0};
+}
+
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
@@ -3347,6 +3383,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
+    noteWriterOf(writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, end)) published = nullptr;
     open->writeValues.push_back(static_cast<std::int16_t>(value));
     open->writeWords.push_back(word);
@@ -3376,6 +3413,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // moves as well, so a poller re-consults the label table for a completion label.
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
+    noteWriterOf(writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, address + bytes)) published = nullptr;
     batch.writeValues.push_back(-1);
     batch.writeWords.push_back(-1);

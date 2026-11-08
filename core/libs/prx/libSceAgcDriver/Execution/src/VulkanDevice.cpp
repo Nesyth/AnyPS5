@@ -3030,6 +3030,7 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     if (!recorder.QueuesSampleDumps()) recorder.FlushStoresOverlapping(address, bytes);
     recorder.FlushKeyStoresOverlapping(address, bytes);
     if (!recorder.DumpSamples(import->address + (address - import->base), address)) return false;
+    const Graphics::Recorder::WriterScope writerScope{Graphics::Recorder::WriterTag(5)};
     recorder.NotePendingWrite(address, bytes);
     GuestMemory::MarkWritten(address, bytes);
     return true;
@@ -3223,6 +3224,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     recorder.EndGpuTiming(timing, bytes);
     recorder.MarkCovered(filledAccess);
     phase(recordMs);
+    const Graphics::Recorder::WriterScope writerScope{Graphics::Recorder::WriterTag(4)};
     if (uniform) recorder.NotePendingWordFill(address, bytes, pattern[0]);
     else recorder.NotePendingWrite(address, bytes);
     const auto generation = GuestMemory::MarkWritten(address, bytes);
@@ -3446,6 +3448,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     }
     if (AliasCopy(context, destination, source, bytes)) {
         noteWriter({}, 0);
+        const Graphics::Recorder::WriterScope writerScope{Graphics::Recorder::WriterTag(3)};
         recorder.NotePendingWrite(destination, bytes);
         Graphics::StorageTexture::FlushPending(destination, bytes, nullptr, "buffer copy destination", Graphics::PublishScope::Whole);
         outcome.path = 3;
@@ -3502,6 +3505,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     recorder.MarkCovered(copiedAccess);
     recorder.NotePendingRead(source, bytes, Graphics::Recorder::ReadKind::CopySource);
     GuestMemory::MarkWritten(destination, bytes);
+    const Graphics::Recorder::WriterScope writerScope{Graphics::Recorder::WriterTag(3)};
     recorder.NotePendingWrite(destination, bytes);
     // The destination's bytes after the transfer are the source's now when nothing recorded,
     // pending or still to land can change the source before the transfer reads it (a CPU store
@@ -5435,8 +5439,105 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
     return RecipeOutcome::Recorded;
 }
 
+namespace {
+
+struct KeyWriterRow {
+    std::uint64_t tag;
+    std::uint32_t keyByte;
+    bool uniform;
+    bool operator==(const KeyWriterRow&) const = default;
+};
+
+struct KeyWriterRowHash {
+    std::size_t operator()(const KeyWriterRow& row) const noexcept {
+        return std::hash<std::uint64_t>{}(row.tag * 0x9e3779b97f4a7c15ull ^ (static_cast<std::uint64_t>(row.keyByte) << 1u) ^ (row.uniform ? 1u : 0u));
+    }
+};
+
+struct KeyWriterTotals {
+    std::uint64_t waits = 0;
+    std::uint64_t writeBytes = 0;
+    std::uint64_t keyBytes = 0;
+};
+
+struct KeyWriterCensus {
+    std::mutex mutex;
+    std::unordered_map<KeyWriterRow, KeyWriterTotals, KeyWriterRowHash> rows;
+    std::uint64_t waits = 0;
+    std::uint64_t surfaces = 0;
+    std::int64_t lastReport = 0;
+};
+
+KeyWriterCensus& keyWriterCensus() {
+    static auto* census = new KeyWriterCensus();
+    return *census;
+}
+
+const char* writerSiteName(std::uint64_t site) {
+    switch (site) {
+        case 0: return "untagged";
+        case 1: return "dispatch";
+        case 2: return "cmask clear";
+        case 3: return "copy";
+        case 4: return "fill";
+        case 5: return "sample dump";
+        case 6: return "texture store";
+        case 7: return "unit shadow";
+        case 8: return "htile clear";
+        default: return "unknown note";
+    }
+}
+
+struct WaitedKeyRange {
+    std::uint64_t address;
+    std::uint64_t bytes;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writers;
+};
+
+void reportKeyWriters(std::vector<WaitedKeyRange>& waited) {
+    auto& census = keyWriterCensus();
+    std::vector<std::byte> keys;
+    for (auto& range : waited) {
+        keys.resize(static_cast<std::size_t>(std::min<std::uint64_t>(range.bytes, 65536)));
+        GuestMemory::ReadCommitted(range.address, keys);
+        std::array<std::uint32_t, 256> counts{};
+        for (const auto key : keys) ++counts[static_cast<std::uint8_t>(key)];
+        const auto top = static_cast<std::uint32_t>(std::max_element(counts.begin(), counts.end()) - counts.begin());
+        const bool uniform = counts[top] == keys.size();
+        std::lock_guard lock(census.mutex);
+        ++census.surfaces;
+        if (range.writers.empty()) range.writers.push_back({~std::uint64_t{0}, 0});
+        for (const auto& [tag, bytes] : range.writers) {
+            auto& row = census.rows[KeyWriterRow{tag, top, uniform}];
+            ++row.waits;
+            row.writeBytes += bytes;
+            row.keyBytes += range.bytes;
+        }
+    }
+    std::lock_guard lock(census.mutex);
+    ++census.waits;
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (census.lastReport == 0) census.lastReport = nowMs;
+    if (nowMs - census.lastReport < 10000) return;
+    census.lastReport = nowMs;
+    std::vector<std::pair<KeyWriterRow, KeyWriterTotals>> sorted(census.rows.begin(), census.rows.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) { return left.second.waits > right.second.waits; });
+    std::string text;
+    for (std::size_t index = 0; index < sorted.size() && index < 12; ++index) {
+        const auto& [row, totals] = sorted[index];
+        char item[256];
+        const auto site = row.tag == ~std::uint64_t{0} ? 255u : row.tag >> 56u;
+        std::snprintf(item, sizeof(item), "; %s 0x%llx: %llu (writes %.1f KiB, keys %.1f KiB on average), keys after the wait %s 0x%02x", writerSiteName(site), static_cast<unsigned long long>(row.tag == ~std::uint64_t{0} ? 0 : row.tag & ((std::uint64_t{1} << 56u) - 1u)), static_cast<unsigned long long>(totals.waits), totals.writeBytes / 1024.0 / static_cast<double>(totals.waits), totals.keyBytes / 1024.0 / static_cast<double>(totals.waits), row.uniform ? "all" : "mostly", row.keyByte);
+        text += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[key-writers] %llu pre-sync waits over %llu key ranges (cumulative)%s\n", static_cast<unsigned long long>(census.waits), static_cast<unsigned long long>(census.surfaces), text.c_str());
+}
+
+}
+
 std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> surfaces) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::vector<WaitedKeyRange> waitedKeys;
     auto& counters = Presyncs();
     bool overlaps = false;
     for (const auto& surface : surfaces) {
@@ -5457,6 +5558,10 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
                 if (surface.dccKeys && !Graphics::DccKeyWriterNeedsSync(surface.address, bytes)) continue;
                 const auto info = state->recorder->DescribePendingWrite(surface.address, bytes);
                 if (!info.has_value()) continue;
+                if (surface.dccKeys && Graphics::Recorder::KeyWriterCensus()) {
+                    auto& range = waitedKeys.emplace_back(WaitedKeyRange{surface.address, surface.bytes, {}});
+                    for (const auto& write : state->recorder->PendingWritesOver(surface.address, bytes)) range.writers.push_back({Graphics::Recorder::WriterOfNote(write.note), write.end - write.begin});
+                }
                 open = open || info->open;
                 serial = std::max(serial, info->serial);
                 texelsPending = texelsPending || !surface.dccKeys;
@@ -5467,6 +5572,7 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
     if (serial != 0) {
         const auto waitStart = std::chrono::steady_clock::now();
         WaitRecorded(serial);
+        if (!waitedKeys.empty()) reportKeyWriters(waitedKeys);
         counters.presyncs.fetch_add(1, std::memory_order_relaxed);
         if (!texelsPending) counters.keyWaits.fetch_add(1, std::memory_order_relaxed);
         counters.waitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - waitStart).count()), std::memory_order_relaxed);
@@ -5957,6 +6063,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     Graphics::NoteHtileWriter_nid_no_patch(record.htileClear.has_value() ? "recognised HTILE clear dispatch" : "dispatch", record.programAddress, resources.GpuWrites());
     if (record.htileClear.has_value()) {
         Graphics::QueueHtileDepthClear(record.htileClear->first, record.htileClear->second);
+        const Graphics::Recorder::WriterScope writerScope{Graphics::Recorder::WriterTag(8)};
         recorder.NotePendingWrite(record.htileClear->first, record.htileClear->second);
     }
     recordStep(PhaseRecordMarks);
@@ -6121,6 +6228,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, const std::vector<ShaderRecompiler::RegisteredImageView>* registeredImageViews) {
+    const Graphics::Recorder::WriterScope writerScope{Graphics::Recorder::WriterTag(1, programAddress)};
     startJournalReplay();
     for (const auto& binding : shader.bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
@@ -6473,6 +6581,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
 }
 
 RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify, bool refreshByWords, const std::array<std::uint32_t, 3>& threadGroup) {
+    const Graphics::Recorder::WriterScope writerScope{Graphics::Recorder::WriterTag(1, programAddress)};
     state->recorder->BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     PerformanceTimer timing("Vulkan.DispatchRecipe");

@@ -4002,6 +4002,7 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
         recorder->MarkCovered(storedAccess);
         // Only the pieces written into the import are stores a CPU reader must wait for; the
         // shadowed ones reach it through a publish, which notes its own.
+        const Recorder::WriterScope writerScope{Recorder::WriterTag(6)};
         if (!imported.empty()) recorder->NotePendingWrites(imported);
     }
     partialWriteBacks.fetch_add(1, std::memory_order_relaxed);
@@ -4503,6 +4504,7 @@ std::uint64_t StorageTexture::storeDrawnRect(const DrawnArea& area, std::span<co
     }
     recorder->EndGpuTiming(timing, storedBytes);
     recorder->MarkShaderReadsCovered();
+    const Recorder::WriterScope writerScope{Recorder::WriterTag(6)};
     recorder->NotePendingWrite(hullBegin, hullBytes);
     noteStore(recorder->LastWriteNote(hullBegin, hullBytes));
     return storedBytes;
@@ -6997,6 +6999,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         } else {
             recorder->EndGpuTiming(timing, storedBytes);
             recorder->MarkShaderReadsCovered();
+            const Recorder::WriterScope writerScope{Recorder::WriterTag(6)};
             recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
             if (drawn.drawn) noteStore(recorder->LastWriteNote(firstStored, static_cast<std::size_t>(lastStored - firstStored)));
             else if (OwnStoreNotesEnabled()) noteOwnStore(recorder, recorder->LastWriteNote(firstStored, static_cast<std::size_t>(lastStored - firstStored)));

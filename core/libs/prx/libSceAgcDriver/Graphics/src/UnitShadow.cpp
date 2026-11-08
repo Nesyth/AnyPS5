@@ -268,6 +268,7 @@ bool recordCopiesOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& 
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
     Recorder::CountBarriers(Recorder::CommandClass::ShadowPublish);
     recorder->EndGpuTiming(timing, bytes);
+    const Recorder::WriterScope writerScope{Recorder::WriterTag(7)};
     recorder->NotePendingWrites(ranges);
     recorder->OnComplete([host, pieces = std::move(pieces), checked] {
         host->Invalidate();
@@ -325,6 +326,7 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     recorder->MarkCovered(publishedAccess);
     for (const auto& entry : copies) recorder->Keep(entry.slab);
     // CPU readers reach the import's bytes only after the hook's SyncThrough waits by this note.
+    const Recorder::WriterScope writerScope{Recorder::WriterTag(7)};
     recorder->NotePendingWrites(ranges);
 }
 

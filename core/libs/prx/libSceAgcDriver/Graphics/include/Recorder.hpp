@@ -166,6 +166,16 @@ public:
         std::int64_t word = -1;
     };
     std::vector<PendingWrite> PendingWritesOver(std::uint64_t address, std::size_t bytes) const;
+    struct WriterScope {
+        explicit WriterScope(std::uint64_t tag) noexcept;
+        ~WriterScope();
+        WriterScope(const WriterScope&) = delete;
+        WriterScope& operator=(const WriterScope&) = delete;
+        std::uint64_t previous;
+    };
+    static constexpr std::uint64_t WriterTag(std::uint64_t site, std::uint64_t program = 0) { return (site << 56u) | (program & ((std::uint64_t{1} << 56u) - 1u)); }
+    static bool KeyWriterCensus();
+    static std::uint64_t WriterOfNote(std::uint64_t note);
     void PendingWriteRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const;
     // Batch read tracking: the guest ranges the recorded work reads IN PLACE through a host import
     // and the GPU has not executed yet (a V# element bound in place, a region the GPU copies out of
