@@ -3496,12 +3496,15 @@ struct AttachmentMemo {
     std::vector<std::uint64_t> versions;
     std::vector<bool> gpuTiling;
     std::vector<bool> proxied;
+    std::vector<bool> multisampled;
     std::vector<VkImageView> views;
     std::optional<DepthTarget> depth;
     bool depthWrite = false;
     bool stencilTest = false;
     bool stencilWritten = false;
     VkImageView depthView = VK_NULL_HANDLE;
+    bool multisample = false;
+    std::shared_ptr<const std::atomic<bool>> depthActive;
 };
 
 struct AttachmentMemoStorage {};
@@ -3519,6 +3522,12 @@ bool VerifyPassAttachments() {
     return verify;
 }
 
+bool CheckedPassAttachments() {
+    if (!VerifyPassAttachments()) return false;
+    const auto& memo = attachmentMemo();
+    return memo.valid && memo.depthActive != nullptr && RuntimeSwitches::Set(RuntimeSwitch::MsaaPassMemo);
+}
+
 enum class AttachmentEvent : std::size_t { Hit, NoMemo, Pass, Serials, Targets, Images, Depth, Stored, Ineligible, Verified, Mismatch, MultisampleDepth, MultisampleColor, Count };
 
 void noteAttachments(AttachmentEvent event) {
@@ -3534,10 +3543,48 @@ void noteAttachments(AttachmentEvent event) {
     AgcDriver::ProfilePrint_nid_no_patch("[pass-attachments] 10 s: %llu hits; misses: %llu no memo, %llu pass, %llu serials, %llu targets, %llu images, %llu depth; %llu stored, %llu ineligible (%llu multisample depth, %llu multisampled colour); verify %llu checked, %llu differed\n", taken[0], taken[1], taken[2], taken[3], taken[4], taken[5], taken[6], taken[7], taken[8], taken[11], taken[12], taken[9], taken[10]);
 }
 
+void checkMultisampleDepth(const Context& context, const State& state) {
+    const auto& memo = attachmentMemo();
+    const bool same = RecheckDepthSurfaceView(context, *state.depth, state.stencilTest) == memo.depthView;
+    noteAttachments(same ? AttachmentEvent::Verified : AttachmentEvent::Mismatch);
+    if (!same) {
+        static std::atomic<int> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[pass-attachments] verify: the memo's multisample depth view differs from its surface's, or the surface had a clear to apply (target 0x%llx, depth 0x%llx)\n", static_cast<unsigned long long>(state.hasColorTarget ? state.color.address : 0), static_cast<unsigned long long>(state.depth->address));
+    }
+}
+
+bool fillMultisampleAttachments(const Context& context, const State& state, PreparedDraw& prepared) {
+    const auto& memo = attachmentMemo();
+    auto& targets = prepared.targets;
+    auto& targetViews = prepared.targetViews;
+    for (std::size_t index = 0; index < state.colors.size(); ++index) {
+        auto& binding = targets[index];
+        binding.color = state.colors[index];
+        binding.gpuTiling = memo.gpuTiling[index];
+        if (memo.multisampled[index]) {
+            binding.multisampled = true;
+            targetViews.push_back(MultisampleTargetView(context, binding.color, binding.multisampleOwner, &binding.multisampleImage));
+            continue;
+        }
+        binding.proxied = memo.proxied[index];
+        targetViews.push_back(memo.views[index]);
+    }
+    if (state.depth && memo.depthActive != nullptr && ClaimDepthTargetMemory(*state.depth)) {
+        noteAttachments(AttachmentEvent::Depth);
+        targetViews.push_back(DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state)));
+        return true;
+    }
+    noteAttachments(AttachmentEvent::Hit);
+    if (!state.depth) return true;
+    targetViews.push_back(memo.depthView);
+    if (memo.depthActive != nullptr && VerifyPassAttachments()) checkMultisampleDepth(context, state);
+    return true;
+}
+
 bool memoAttachments(const Context& context, const State& state, PreparedDraw& prepared, bool fill) {
     const auto& memo = attachmentMemo();
     const auto miss = [](AttachmentEvent why) { noteAttachments(why); return false; };
-    if (!memo.valid || memo.device != context.device) return miss(AttachmentEvent::NoMemo);
+    if (!memo.valid || memo.device != context.device || (memo.multisample && !RuntimeSwitches::Set(RuntimeSwitch::MsaaPassMemo))) return miss(AttachmentEvent::NoMemo);
     const auto* recorder = Recorder::Active();
     if (recorder == nullptr || recorder->Id() != memo.recorder || !recorder->RenderPassOpen() || recorder->RenderPassGeneration() != memo.generation) return miss(AttachmentEvent::Pass);
     if (GuestMemory::CollectEpoch() != memo.epoch || GuestMemory::ProofSerial() != memo.proof || StorageTexture::PendingSerial() != memo.pending) return miss(AttachmentEvent::Serials);
@@ -3547,10 +3594,11 @@ bool memoAttachments(const Context& context, const State& state, PreparedDraw& p
     }
     if (state.depth.has_value() != memo.depth.has_value()) return miss(AttachmentEvent::Depth);
     if (state.depth) {
-        if (!sameDepthTarget(*state.depth, *memo.depth) || state.depthWrite != memo.depthWrite || state.stencilTest != memo.stencilTest || writesStencilTarget(state) != memo.stencilWritten || DepthSurfacesSerial() != memo.depthSerial || DepthSurfacesReleased() != memo.depthReleased) return miss(AttachmentEvent::Depth);
+        if (!sameDepthTarget(*state.depth, *memo.depth) || state.depthWrite != memo.depthWrite || state.stencilTest != memo.stencilTest || writesStencilTarget(state) != memo.stencilWritten || DepthSurfacesSerial() != memo.depthSerial || DepthSurfacesReleased() != memo.depthReleased || (memo.depthActive != nullptr && !memo.depthActive->load(std::memory_order_acquire))) return miss(AttachmentEvent::Depth);
     }
     auto& targets = prepared.targets;
     for (std::size_t index = 0; index < memo.residents.size(); ++index) {
+        if (memo.multisampled[index]) continue;
         auto resident = memo.residents[index].lock();
         if (resident == nullptr || resident->Version() != memo.versions[index] || !StorageImageCached(context, resident.get()) || !StorageImageServesKeys(*resident, SurfaceForTarget(state.colors[index]).dccAddress)) {
             for (std::size_t filled = 0; filled < index; ++filled) targets[filled].resident.reset();
@@ -3559,6 +3607,7 @@ bool memoAttachments(const Context& context, const State& state, PreparedDraw& p
         if (fill) targets[index].resident = std::move(resident);
     }
     if (!fill) return true;
+    if (memo.multisample) return fillMultisampleAttachments(context, state, prepared);
     noteAttachments(AttachmentEvent::Hit);
     auto& targetViews = prepared.targetViews;
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
@@ -3575,7 +3624,7 @@ bool memoAttachments(const Context& context, const State& state, PreparedDraw& p
 void checkAttachments(const State& state, const PreparedDraw& prepared) {
     const auto& memo = attachmentMemo();
     bool same = prepared.targetViews.size() == memo.views.size() + (memo.depth ? 1u : 0u);
-    for (std::size_t index = 0; same && index < memo.views.size(); ++index) same = prepared.targets[index].resident == memo.residents[index].lock() && prepared.targetViews[index] == memo.views[index];
+    for (std::size_t index = 0; same && index < memo.views.size(); ++index) same = memo.multisampled[index] || (prepared.targets[index].resident == memo.residents[index].lock() && prepared.targetViews[index] == memo.views[index]);
     if (same && state.depth) same = prepared.targetViews.back() == memo.depthView;
     noteAttachments(same ? AttachmentEvent::Verified : AttachmentEvent::Mismatch);
     if (!same) {
@@ -3588,8 +3637,13 @@ void rememberAttachments(const Context& context, const State& state, const Prepa
     auto& memo = attachmentMemo();
     const auto* recorder = prepared.recorder;
     const auto epoch = GuestMemory::CollectEpoch();
-    const bool eligible = epoch != 0 && recorder != nullptr && recorder->RenderPassOpen() && prepared.dumpLimit == 0 && (!state.depth || state.depth->samples == 1u) && prepared.targetViews.size() == prepared.targets.size() + (state.depth ? 1u : 0u) && std::ranges::all_of(prepared.targets, [](const TargetBinding& binding) { return !binding.multisampled && binding.resident != nullptr && binding.target == nullptr && binding.stagedTemporary == nullptr && binding.dump == nullptr && !binding.color.staged && binding.color.partialWriteMask == 0; });
-    if (!eligible) {
+    const bool multisamplePasses = RuntimeSwitches::Set(RuntimeSwitch::MsaaPassMemo);
+    const bool multisampledDepth = state.depth && state.depth->samples != 1u;
+    const bool multisampledColors = multisamplePasses && std::ranges::all_of(prepared.targets, [](const TargetBinding& binding) { return binding.multisampled && binding.multisampleOwner != nullptr && binding.resident == nullptr && binding.target == nullptr && binding.stagedTemporary == nullptr && binding.dump == nullptr && !binding.color.staged && binding.color.partialWriteMask == 0; });
+    const bool eligible = epoch != 0 && recorder != nullptr && recorder->RenderPassOpen() && prepared.dumpLimit == 0 && (!multisampledDepth || multisamplePasses) && prepared.targetViews.size() == prepared.targets.size() + (state.depth ? 1u : 0u) && (multisampledColors || std::ranges::all_of(prepared.targets, [](const TargetBinding& binding) { return !binding.multisampled && binding.resident != nullptr && binding.target == nullptr && binding.stagedTemporary == nullptr && binding.dump == nullptr && !binding.color.staged && binding.color.partialWriteMask == 0; }));
+    std::shared_ptr<const std::atomic<bool>> depthActive;
+    if (eligible && multisampledDepth) depthActive = prepared.attachmentsFromMemo && memo.valid && memo.depthActive != nullptr && memo.depthView == prepared.targetViews.back() ? memo.depthActive : DepthSurfaceActive(context, *state.depth, prepared.targetViews.back());
+    if (!eligible || (multisampledDepth && depthActive == nullptr)) {
         memo.valid = false;
         noteAttachments(AttachmentEvent::Ineligible);
         if (state.depth && state.depth->samples != 1u) noteAttachments(AttachmentEvent::MultisampleDepth);
@@ -3610,15 +3664,19 @@ void rememberAttachments(const Context& context, const State& state, const Prepa
     memo.versions.clear();
     memo.gpuTiling.clear();
     memo.proxied.clear();
+    memo.multisampled.clear();
     memo.views.clear();
     for (std::size_t index = 0; index < prepared.targets.size(); ++index) {
         const auto& binding = prepared.targets[index];
         memo.residents.emplace_back(binding.resident);
-        memo.versions.push_back(binding.resident->Version());
+        memo.versions.push_back(binding.multisampled ? 0u : binding.resident->Version());
         memo.gpuTiling.push_back(binding.gpuTiling);
         memo.proxied.push_back(binding.proxied);
+        memo.multisampled.push_back(binding.multisampled);
         memo.views.push_back(prepared.targetViews[index]);
     }
+    memo.multisample = multisampledDepth || std::ranges::any_of(prepared.targets, [](const TargetBinding& binding) { return binding.multisampled; });
+    memo.depthActive = depthActive;
     memo.depth = state.depth;
     memo.depthWrite = state.depthWrite;
     memo.stencilTest = state.stencilTest;
@@ -3707,8 +3765,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& targets = prepared.targets;
     targets.resize(state.colors.size());
     auto& targetViews = prepared.targetViews;
-    const bool verifyAttachments = prepared.passAttachments && VerifyPassAttachments() && memoAttachments(context, state, prepared, false);
-    prepared.attachmentsFromMemo = prepared.passAttachments && !VerifyPassAttachments() && memoAttachments(context, state, prepared, true);
+    const bool checkedAttachments = prepared.passAttachments && CheckedPassAttachments();
+    const bool verifyAttachments = prepared.passAttachments && VerifyPassAttachments() && !checkedAttachments && memoAttachments(context, state, prepared, false);
+    prepared.attachmentsFromMemo = prepared.passAttachments && (!VerifyPassAttachments() || checkedAttachments) && memoAttachments(context, state, prepared, true);
     for (std::size_t index = 0; !prepared.attachmentsFromMemo && index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];

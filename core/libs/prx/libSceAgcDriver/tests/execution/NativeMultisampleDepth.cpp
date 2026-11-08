@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -1493,6 +1494,86 @@ void CheckDrawFeedback() {
     Require(probe[0] == guestByte(depthBytes - 1u), "a guest read after a depth-test-only draw did not return its guest bytes");
     Require(!DepthSurfaceAt(tested.address), "a guest read left a native depth surface only depth-tested resident");
     std::puts("Native depth feedback refused through the draw resource path; a written surface refused and a depth-tested one retired on guest read");
+}
+
+void CheckMultisamplePassMemo() {
+    const auto device = OpenVulkanTestDevice();
+    Require(device != nullptr, "the multisample pass memo requires Vulkan");
+    const auto context = device->graphicsContext();
+    constexpr VkExtent2D extent{5u, 3u};
+    constexpr std::uint32_t samples = 4u;
+    const auto depthBytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, 4u, samples));
+    struct Cleanup {
+        AgcDriver::VulkanDevice& device;
+        bool memo;
+        ~Cleanup() {
+            RuntimeSwitches::Assign(RuntimeSwitch::MsaaPassMemo, memo);
+            device.WaitIdle();
+            ClearCachedTextures(device.Device());
+            ClearDepthSurfaces(device.Device());
+            ClearMultisampleTargets(device.Device());
+        }
+    } cleanup{*device, RuntimeSwitches::Set(RuntimeSwitch::MsaaPassMemo)};
+    ShaderRecompiler::RecompileResult vertex, pixel;
+    vertex.spirv = DepthVertexShader();
+    vertex.variantId = 1u;
+    pixel.spirv = DepthFeedbackFragmentShader(ShaderRecompiler::RuntimeAbi::FirstImageBinding, false);
+    pixel.variantId = 2u;
+    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0u}, {ShaderRecompiler::ShaderStage::Fragment, &pixel, PixelPushOffset(0u, device->Target())}}};
+    const AgcDriver::Pm4::DrawParameters draw{0u, 3u, 0u, 1u, 0u, false};
+    for (const bool memo : {false, true}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::MsaaPassMemo, memo);
+        TargetMemory memory(depthBytes), metadata(65536u), colorMemory(65536u);
+        std::memset(metadata.Data(), 0, 65536u);
+        DepthTarget depth{memory.Address(), 0u, extent, VK_FORMAT_D32_SFLOAT, 0.0f, 0u, metadata.Address(), false, samples};
+        depth.depthSwizzle = 24u;
+        depth.iterate256 = depth.htilePipeAligned = true;
+        State state{};
+        state.stages = {ShaderPath::Vertex, 0u, 32u, 32u, std::nullopt, std::nullopt};
+        state.depth = depth;
+        state.depthTest = true;
+        state.depthWrite = false;
+        state.depthCompare = VK_COMPARE_OP_ALWAYS;
+        state.renderExtent = extent;
+        state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        state.viewport = {0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.0f, 1.0f};
+        state.negativeOneToOne = false;
+        state.scissor = {{0, 0}, extent};
+        state.cullMode = VK_CULL_MODE_NONE;
+        state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        state.samples = samples;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        device->Draw(state, draw, shaders);
+        device->Draw(state, draw, shaders);
+        Require(DepthSurfaceAt(depth.address), "a pass of depth-tested multisampled draws left no resident native depth surface");
+        std::array<std::byte, 1> probe{};
+        AgcDriver::GuestMemory::Read(depth.address + depthBytes - 1u, probe);
+        Require(!DepthSurfaceAt(depth.address), "a guest read inside a pass left a native depth surface only depth-tested resident");
+        device->Draw(state, draw, shaders);
+        Require(DepthSurfaceAt(depth.address), memo ? "the multisample pass memo served a draw with the view of a native depth surface a guest read retired" : "a draw after a guest read left no resident native depth surface");
+        const auto view = DepthSurfaceView(context, depth, false);
+        const auto active = DepthSurfaceActive(context, depth, view);
+        Require(active != nullptr && active->load(), "a resident native depth surface has no active flag for its own view");
+        Require(DepthSurfaceActive(context, depth, VK_NULL_HANDLE) == nullptr, "a native depth surface gave its active flag for another view");
+        Require(RecheckDepthSurfaceView(context, depth, false) == view, "the recheck of a settled native depth surface returned another view");
+        ColorTarget color{};
+        color.address = color.surfaceAddress = colorMemory.Address();
+        color.extent = color.surfaceExtent = extent;
+        color.format = VK_FORMAT_R8_UNORM;
+        color.elementBytes = 1u;
+        color.tileMode = ColorTileMode::RenderTarget;
+        color.samples = samples;
+        color.bytes = static_cast<std::size_t>(extent.width) * extent.height;
+        Require(MultisampleTargetView(context, color) != VK_NULL_HANDLE, "the multisample pass memo fixture has no colour target");
+        auto overlapped = depth;
+        overlapped.address = colorMemory.Address();
+        overlapped.htileAddress = 0u;
+        Require(ClaimDepthTargetMemory(overlapped), "a multisampled colour target over a depth target's planes was not reported");
+        device->WaitIdle();
+        ClearDepthSurfaces(device->Device());
+        ClearMultisampleTargets(device->Device());
+    }
+    std::puts("Native depth pass memo: a guest read inside a multisampled pass retires its depth surface and the next draw takes a new one with the memo off and on");
 }
 
 void CheckDepthAttachmentAlias() {
@@ -3398,6 +3479,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         CheckDrawFeedback();
+        if (argc == 1) CheckMultisamplePassMemo();
         if (argc == 1) CheckDepthAttachmentAlias();
         if (argc == 1) CheckStorageAliasRetirement();
         std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex());

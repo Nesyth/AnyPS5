@@ -3277,11 +3277,39 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     return DepthSurfaceViewWithStencilWriteIntent(context, target, depthWritten, stencilTested, true);
 }
 
-VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, bool stencilWritten) {
+bool ClaimDepthTargetMemory(const DepthTarget& target) {
     const auto planeBytes = [&](std::uint32_t bytesPerTexel) { return target.samples == 1u ? DepthSliceBytes(target.extent, bytesPerTexel) : MultisampledDepthBytes_nid_no_patch(target.extent, bytesPerTexel, target.samples); };
-    ClaimMultisampleTargetMemory(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u));
-    if (target.stencilAddress != 0u) ClaimMultisampleTargetMemory(target.stencilAddress, planeBytes(1u));
-    if (target.htileAddress != 0u) ClaimMultisampleTargetMemory(target.htileAddress, HtileMetadataBytes(target.extent));
+    bool overlapped = ClaimMultisampleTargetMemory(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u));
+    if (target.stencilAddress != 0u) overlapped = ClaimMultisampleTargetMemory(target.stencilAddress, planeBytes(1u)) || overlapped;
+    if (target.htileAddress != 0u) overlapped = ClaimMultisampleTargetMemory(target.htileAddress, HtileMetadataBytes(target.extent)) || overlapped;
+    return overlapped;
+}
+
+std::shared_ptr<const std::atomic<bool>> DepthSurfaceActive(const Context& context, const DepthTarget& target, VkImageView view) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (surface->active->load(std::memory_order_acquire) && surface->context.device == context.device && sameSurface(surface->target, target)) return surface->view == view ? surface->active : nullptr;
+    }
+    return nullptr;
+}
+
+VkImageView RecheckDepthSurfaceView(const Context& context, const DepthTarget& target, bool stencilTested) {
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    settlePendingHtileClear(context, target.address);
+    std::lock_guard lock(surfacesMutex());
+    const bool cleared = target.htileAddress != 0u && std::ranges::any_of(clearedHtiles(), [&](const auto& entry) { return HtileFillCovers(target.htileAddress, target.extent, entry.first, entry.second); });
+    for (const auto& surface : surfaces()) {
+        if (!surface->active->load(std::memory_order_acquire) || surface->context.device != context.device || !sameSurface(surface->target, target)) continue;
+        const bool settled = !cleared && surface->pendingClear == 0u && surface->clearGeneration == 0u && surface->stencilClearGeneration == 0u;
+        surface->ApplyFastClear();
+        if (stencilTested && surface->samplingActive) surface->RequireStencilProven();
+        return settled ? surface->view : VK_NULL_HANDLE;
+    }
+    return VK_NULL_HANDLE;
+}
+
+VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, bool stencilWritten) {
+    ClaimDepthTargetMemory(target);
     const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     settlePendingHtileClear(context, target.address);

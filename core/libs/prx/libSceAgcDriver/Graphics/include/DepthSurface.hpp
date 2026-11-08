@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -19,6 +20,9 @@ class StorageTexture;
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten = true, bool stencilTested = false);
 VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, bool stencilWritten);
+bool ClaimDepthTargetMemory(const DepthTarget& target);
+std::shared_ptr<const std::atomic<bool>> DepthSurfaceActive(const Context& context, const DepthTarget& target, VkImageView view);
+VkImageView RecheckDepthSurfaceView(const Context& context, const DepthTarget& target, bool stencilTested);
 SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTarget& target);
 DepthSampleLocations DepthSurfaceSampleLocations(const Context& context, const DepthTarget& target);
 enum class DepthPlaneScope { Overlapped, Whole };

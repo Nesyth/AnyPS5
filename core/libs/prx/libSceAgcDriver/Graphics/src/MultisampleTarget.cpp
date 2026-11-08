@@ -1033,10 +1033,14 @@ void retireUnmapped(std::uintptr_t address, std::size_t bytes) {
     anyGuarded().store(!guarded().empty(), std::memory_order_release);
 }
 
-void claimOverlapping(std::uint64_t address, std::uint64_t bytes, const TargetUse* claimant) {
+bool claimOverlapping(std::uint64_t address, std::uint64_t bytes, const TargetUse* claimant) {
+    bool overlapped = false;
     for (const auto& range : guarded()) {
-        if (!range.fmask && range.use.get() != claimant && address < range.address + range.bytes && range.address < address + bytes) range.use->claimed.store(true, std::memory_order_release);
+        if (address >= range.address + range.bytes || range.address >= address + bytes) continue;
+        overlapped = true;
+        if (!range.fmask && range.use.get() != claimant) range.use->claimed.store(true, std::memory_order_release);
     }
+    return overlapped;
 }
 
 void stampUse(TargetUse& use, std::uint64_t address, std::uint64_t bytes) {
@@ -1702,10 +1706,10 @@ void ClearMultisampleTargets(VkDevice device) {
     UpdateResidentImageUnmapObserver_nid_no_patch();
 }
 
-void ClaimMultisampleTargetMemory(std::uint64_t address, std::uint64_t bytes) {
-    if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire) || !mayOverlapGuarded(address, bytes)) return;
+bool ClaimMultisampleTargetMemory(std::uint64_t address, std::uint64_t bytes) {
+    if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire) || !mayOverlapGuarded(address, bytes)) return false;
     std::shared_lock lock(guardedMutex());
-    claimOverlapping(address, bytes, nullptr);
+    return claimOverlapping(address, bytes, nullptr);
 }
 
 void GuardOneFragmentFmask(const Context& context, const ColorTarget& target) {
