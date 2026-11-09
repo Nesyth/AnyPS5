@@ -77,6 +77,7 @@ enum class RuntimeSwitch : std::size_t {
     SkipHtileKeyPresync,
     XpKeepDraws,
     XpStreamSegments,
+    DeferredEncode,
     Count,
 };
 

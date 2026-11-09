@@ -27,6 +27,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/DispatchArguments_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/QueueSubmitter.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommandEncoder.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -552,6 +553,8 @@ std::atomic<std::uint64_t> completionStoresRun{0};
 std::atomic<std::uint64_t> commandBuffersFreed{0};
 std::atomic<std::uint64_t> fencesKept{0};
 constexpr std::size_t SpareCommandBuffers = 16;
+constexpr std::size_t SpareStreams = 64;
+constexpr std::size_t SpareStreamBytes = std::size_t{16} << 20u;
 // Write-backs noted over a tracked label dword (NoteWrittenBack): a CPU store over a GPU label.
 std::atomic<std::uint64_t> writeBacksOverLabels{0};
 // Completion labels that entered the pending count at a write-back (see NoteWrittenBack).
@@ -1305,6 +1308,8 @@ Recorder::~Recorder() {
     spareCommands.clear();
     for (const auto pool : sparePools) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, pool, nullptr);
     sparePools.clear();
+    stopEncoders();
+    spareStreams.clear();
     // Sync() above waited for every batch, so no submission still signals the timeline.
     if (timeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, timeline, nullptr);
     timeline = VK_NULL_HANDLE;
@@ -1823,8 +1828,12 @@ void Recorder::ensureOpen() {
     if (open == nullptr) {
         ++passGeneration;
         auto batch = std::make_unique<Batch>();
+        const bool deferred = RuntimeSwitches::Set(RuntimeSwitch::DeferredEncode) && QueueSubmitter::Enabled();
         try {
-            if (!spareCommands.empty() && RuntimeSwitches::Set(RuntimeSwitch::RecycleCommandBuffers)) {
+            if (deferred) {
+                batch->stream = takeStream();
+                batch->commands = batch->stream->Handle();
+            } else if (!spareCommands.empty() && RuntimeSwitches::Set(RuntimeSwitch::RecycleCommandBuffers)) {
                 batch->commands = spareCommands.back();
                 spareCommands.pop_back();
             } else {
@@ -1841,10 +1850,12 @@ void Recorder::ensureOpen() {
                 VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
                 Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &info, nullptr, &batch->fence), "vkCreateFence recorder");
             }
-            VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-            begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             NoteCommandBufferBegun(batch->commands);
-            Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(batch->commands, &begin), "vkBeginCommandBuffer recorder");
+            if (!deferred) {
+                VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(batch->commands, &begin), "vkBeginCommandBuffer recorder");
+            }
         } catch (...) {
             release(*batch);
             throw;
@@ -4116,7 +4127,13 @@ void Recorder::Submit() {
             if (batch != nullptr && !batch->submitted) recorder.discard(std::move(batch));
         }
     } discardUnsubmitted{*this, batch};
-    Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
+    const bool async = QueueSubmitter::Enabled();
+    if (batch->stream != nullptr) {
+        batch->stream->Close();
+        if (!async || CommandEncoders::Inline()) encodeInline(*batch);
+    } else {
+        Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
+    }
     if (injectedSubmitFailures.load(std::memory_order_relaxed) != 0 && injectedSubmitFailures.fetch_sub(1, std::memory_order_relaxed) != 0) throw std::runtime_error("vkQueueSubmit recorder: injected failure");
     VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submission.commandBufferCount = 1;
@@ -4150,12 +4167,19 @@ void Recorder::Submit() {
     }
     if (hold != VK_NULL_HANDLE || timeline != VK_NULL_HANDLE) submission.pNext = &timelineInfo;
     DestroyDeferredAtIdle(context);
+    auto* const batchEncoders = batch->stream != nullptr ? &commandEncoders() : nullptr;
     const auto submitStart = std::chrono::steady_clock::now();
     batch->submitStarted.store(true, std::memory_order_release);
-    if (QueueSubmitter::Enabled()) {
+    if (async) {
         auto* submitter = QueueSubmitter::Existing(context.queue);
         if (submitter == nullptr) submitter = &QueueSubmitter::For(context.device, context.queue, function(queueSubmit, "vkQueueSubmit"), reinterpret_cast<PFN_vkDeviceWaitIdle>(context.deviceProc(context.device, "vkDeviceWaitIdle")));
-        submitter->Enqueue({batch->commands, batch->fence, hold, holdValue, timeline, serial});
+        if (batchEncoders != nullptr) {
+            batch->encode = std::make_shared<EncodeTicket>(std::move(batch->stream), batch->traceId);
+            submitter->Enqueue({VK_NULL_HANDLE, batch->fence, hold, holdValue, timeline, serial, batch->encode});
+            batchEncoders->Encode(batch->encode);
+        } else {
+            submitter->Enqueue({batch->commands, batch->fence, hold, holdValue, timeline, serial});
+        }
     } else {
         VkResult result;
         {
@@ -4797,6 +4821,16 @@ void Recorder::release(Batch& batch, bool retired) noexcept {
     batch.endedSamples.clear();
     batch.segments = VK_NULL_HANDLE;
     batch.segmentPool.reset();
+    if (batch.encode != nullptr) {
+        auto& ticket = *batch.encode;
+        if (!batch.submitted || (retired && ticket.Finished())) {
+            if (retired && encoders != nullptr) encoders->Recycle(ticket.Encoder(), ticket.Commands());
+            recycleStream(ticket.TakeStream());
+        }
+        batch.encode.reset();
+    }
+    recycleStream(std::move(batch.stream));
+    if (CommandStream::IsHandle(batch.commands)) batch.commands = VK_NULL_HANDLE;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const bool recycle = RuntimeSwitches::Set(RuntimeSwitch::RecycleCommandBuffers);
     if (!recycle && !spareCommands.empty()) {
@@ -4827,6 +4861,66 @@ void Recorder::release(Batch& batch, bool retired) noexcept {
     }
     if (batch.fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, batch.fence, nullptr);
     batch.fence = VK_NULL_HANDLE;
+}
+
+std::unique_ptr<CommandStream> Recorder::takeStream() {
+    if (spareStreams.empty()) return std::make_unique<CommandStream>();
+    auto stream = std::move(spareStreams.back());
+    spareStreams.pop_back();
+    spareStreamBytes -= stream->ReservedBytes();
+    stream->Reset();
+    return stream;
+}
+
+void Recorder::recycleStream(std::unique_ptr<CommandStream> stream) noexcept {
+    if (stream == nullptr) return;
+    stream->Reset();
+    stream->Close();
+    const auto bytes = stream->ReservedBytes();
+    if (spareStreams.size() >= SpareStreams || spareStreamBytes + bytes > SpareStreamBytes) return;
+    try {
+        spareStreams.push_back(std::move(stream));
+        spareStreamBytes += bytes;
+    } catch (const std::bad_alloc&) {
+    }
+}
+
+void Recorder::encodeInline(Batch& batch) {
+    const auto start = std::chrono::steady_clock::now();
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    if (!spareCommands.empty() && RuntimeSwitches::Set(RuntimeSwitch::RecycleCommandBuffers)) {
+        commands = spareCommands.back();
+        spareCommands.pop_back();
+    } else {
+        VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocation.commandPool = context.pool;
+        allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocation.commandBufferCount = 1;
+        Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &commands), "vkAllocateCommandBuffers recorder");
+    }
+    batch.commands = commands;
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer recorder");
+    batch.stream->Replay(commands);
+    Check(function(endCommandBuffer, "vkEndCommandBuffer")(commands), "vkEndCommandBuffer recorder");
+    CommandEncoders::CountInline(*batch.stream, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+    recycleStream(std::move(batch.stream));
+}
+
+CommandEncoders& Recorder::commandEncoders() {
+    if (encoders == nullptr) encoders = std::make_unique<CommandEncoders>(context, CommandEncoders::Count());
+    return *encoders;
+}
+
+void Recorder::stopEncoders() noexcept {
+    if (encoders == nullptr) return;
+    try {
+        if (auto* submitter = QueueSubmitter::Existing(context.queue); submitter != nullptr) submitter->Drain();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
+    }
+    encoders.reset();
 }
 
 }
