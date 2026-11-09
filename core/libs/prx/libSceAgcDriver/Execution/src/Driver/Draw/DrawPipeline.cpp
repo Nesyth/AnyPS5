@@ -833,7 +833,10 @@ void DrawFinisher::run(unsigned index) {
             --sleepers;
             if (leanReady()) continue;
             slot = untaken();
-            if (slot == nullptr) break;
+            if (slot == nullptr) {
+                if (closing) break;
+                continue;
+            }
             slot->taken = true;
             untakenJobs.fetch_sub(1, std::memory_order_relaxed);
             failed = failure != nullptr;
