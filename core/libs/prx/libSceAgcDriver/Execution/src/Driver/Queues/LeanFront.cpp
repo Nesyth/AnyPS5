@@ -61,14 +61,16 @@ constexpr std::array<FieldInfo, FieldCount> FieldInfos{{
     {Item::SwitchRead, "values"},
 }};
 
-constexpr std::array<const char*, AllowedKinds> AllowedNames{"deferred reaps", "deferred packet submits", "flush boundary", "early flush checks", "held waits raced", "switches moved in the segment", "lists rewritten inside a collect epoch", "overlap verdicts moved between checks"};
+constexpr std::array<const char*, AllowedKinds> AllowedNames{"deferred reaps", "deferred packet submits", "flush boundary", "early flush checks", "held waits raced", "switches moved in the segment", "lists rewritten inside a collect epoch", "overlap verdicts moved between checks", "held writes known from the shape where today's are unknown"};
 
 constexpr std::array<const char*, CounterCount> CounterNames{
     "lean segments", "today's segments", "mode changes", "switch copies", "segments looped", "prepared copies used", "prepared copies missed",
     "list cache hits", "list cache misses", "list cache invalidations", "flush checks skipped", "kick wakes", "kick timeouts", "settles that waited",
     "prepared copies refused", "late tail epoch hoists", "lean register lists", "list cache admits", "list cache bypasses", "list cache evictions",
     "rewind waits", "tails released without a kick", "kicks with no waiter", "idle polls woken by a submission", "flush checks called", "packet tables built",
-    "segment slots created", "segment slots held past their segment",
+    "segment slots created", "segment slots held past their segment", "lean draws", "draws on today's path", "indirect draws on today's path",
+    "shape records built", "shape records restamped", "shape records evicted", "shapes refused", "finisher ring room waits",
+    "finisher waits for earlier jobs", "finisher same-key waits", "finisher store switches", "lean draws that ran the precheck",
 };
 
 static_assert(ItemNames.back() != nullptr && FieldInfos.back().name != nullptr && AllowedNames.back() != nullptr && CounterNames.back() != nullptr, "every lean front item, field, by-design case and counter needs a name");

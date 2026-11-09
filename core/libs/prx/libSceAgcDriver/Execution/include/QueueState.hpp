@@ -113,6 +113,16 @@ public:
             }
         }
     }
+    std::uint64_t CopyRange(std::uint32_t first, std::uint32_t count, std::uint32_t* out) const {
+        std::uint64_t bits = 0;
+        for (std::uint32_t index = 0; index < count && index < 64; ++index) {
+            const auto offset = first + index;
+            const bool held = contains(offset);
+            out[index] = held ? values[offset] : 0u;
+            bits |= static_cast<std::uint64_t>(held) << index;
+        }
+        return bits;
+    }
     std::size_t size() const { return entries; }
     bool empty() const { return entries == 0; }
     void clear() {

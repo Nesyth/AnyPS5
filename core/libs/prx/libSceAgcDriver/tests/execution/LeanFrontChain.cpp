@@ -167,6 +167,9 @@ int main() {
             const auto leanBase = LeanFront::Total(LeanFront::Counter::LeanSegments);
             const auto todayBase = LeanFront::Total(LeanFront::Counter::TodaySegments);
             const auto differencesBase = LeanFront::Differences();
+            const auto leanDrawsBase = LeanFront::Total(LeanFront::Counter::LeanDraws);
+            const auto checkedDrawsBase = LeanFront::Checked(LeanFront::Item::Draw);
+            const auto recordsBase = LeanFront::Total(LeanFront::Counter::ShapeRecordsBuilt);
             static std::vector<std::uint32_t> commands;
             commands = Chain();
             Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
@@ -188,6 +191,16 @@ int main() {
             const std::uint64_t expected = latched ? Segments + 1 : 0;
             Require(leanSegments == (lean ? expected : 0) && todaySegments == (lean ? 0 : expected), "the REWIND chain ran " + std::to_string(leanSegments) + " lean and " + std::to_string(todaySegments) + " of today's segments, expected " + std::to_string(expected) + " of one kind" + arm);
             Require(LeanFront::Differences() == differencesBase, "the lean front verify found differences in the REWIND chain" + arm);
+            const auto leanDraws = LeanFront::Total(LeanFront::Counter::LeanDraws) - leanDrawsBase;
+            const auto checkedDraws = LeanFront::Checked(LeanFront::Item::Draw) - checkedDrawsBase;
+            const auto records = LeanFront::Total(LeanFront::Counter::ShapeRecordsBuilt) - recordsBase;
+            if (!lean || !latched || !finisher) {
+                Require(leanDraws == 0 && checkedDraws == 0, "draws took the lean draw path outside lean segments" + arm);
+            } else {
+                Require(leanDraws + checkedDraws == Segments, "the lean front sent " + std::to_string(leanDraws) + " draws to the finisher ring and checked " + std::to_string(checkedDraws) + ", expected all " + std::to_string(Segments) + " draws of the REWIND segments" + arm);
+                Require(LeanFront::VerifyEvery() == 0 || checkedDraws != 0, "the lean front verify checked no draw of the REWIND chain" + arm);
+                Require(records >= 1 && records <= 2, "the REWIND segments' draws of one shape built " + std::to_string(records) + " shape records" + arm);
+            }
             if (finisher) {
                 for (const char* opcode : {" 0x37 x", " 0x3c x", " 0x59 x", " 0x9f x", " 0x63 x", " 0x64 x"}) Require(drains.find(opcode) == std::string::npos, std::string("a packet inside a released REWIND segment drained the finisher:") + opcode + arm + drains);
             }

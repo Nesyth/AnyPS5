@@ -55,9 +55,13 @@ namespace {
 struct FinisherThreadSlot {};
 struct FinisherProducerSlot {};
 struct FinisherSeqSlot {};
+struct FinisherAheadSlot {};
 using FinisherThread = HostThreadSlot<bool, FinisherThreadSlot>;
 using FinisherProducer = HostThreadSlot<bool, FinisherProducerSlot>;
 using FinisherSeq = HostThreadSlot<std::uint64_t, FinisherSeqSlot>;
+using FinisherAhead = HostThreadSlot<bool, FinisherAheadSlot>;
+
+enum LeanSlotState : std::uint8_t { LeanFree, LeanReady, LeanDone };
 
 bool finisherTakes(unsigned index) {
     if (index == 0) return true;
@@ -220,6 +224,32 @@ PublishedKeys::Answer PublishedKeys::Find(std::uint64_t key, std::uint64_t shape
     return Answer::Unsure;
 }
 
+PublishedKeys::Answer PublishedKeys::FindBefore(std::uint64_t key, std::uint64_t shape, bool insertsOnly, std::uint64_t before) const {
+    for (unsigned attempt = 0; attempt < PublishedReadAttempts; ++attempt) {
+        const auto version = seq.load(std::memory_order_acquire);
+        if ((version & 1u) != 0) {
+            SpinPause();
+            continue;
+        }
+        const auto first = head.load(std::memory_order_relaxed);
+        const auto last = std::min(tail.load(std::memory_order_relaxed), before);
+        const bool fits = first > last || last - first <= Capacity;
+        bool hit = false;
+        for (auto number = first; fits && number < last && !hit; ++number) {
+            const auto slot = static_cast<std::size_t>(number % Capacity) * 3;
+            const auto heldKey = slots[slot].load(std::memory_order_relaxed);
+            const auto heldShape = slots[slot + 1].load(std::memory_order_relaxed);
+            const bool heldInserts = slots[slot + 2].load(std::memory_order_relaxed) != 0;
+            hit = (heldKey == key || (shape != 0 && heldShape == shape)) && (heldInserts || !insertsOnly);
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (seq.load(std::memory_order_relaxed) != version) continue;
+        if (!fits) return Answer::Unsure;
+        return hit ? Answer::Hit : Answer::Clear;
+    }
+    return Answer::Unsure;
+}
+
 DrawFinisher& DrawFinisher::Get() {
     static DrawFinisher* finisher = new DrawFinisher();
     return *finisher;
@@ -250,11 +280,27 @@ bool DrawFinisher::Overlap() {
 }
 
 bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
-    if (!Busy() || !FinisherProducer::Get()) return false;
+    if (!Busy()) return false;
+    if (!FinisherProducer::Get()) {
+        const Range range{begin, end};
+        return aheadWait({&range, 1});
+    }
+    const bool ring = ringMode.load(std::memory_order_acquire);
+    if (ring) retireLean();
     if (lockless()) {
         const Range range{begin, end};
         const auto answer = published.Overlaps({&range, 1});
         if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Hit;
+    }
+    if (ring) {
+        for (auto seq = frontSeq.load(std::memory_order_acquire); seq < nextSeq; ++seq) {
+            const auto& held = leanSlot(seq).pending;
+            if (held.unknown) return true;
+            for (const auto& [first, last] : held.writes) {
+                if (begin < last && first < end) return true;
+            }
+        }
+        return false;
     }
     const auto lock = lockFor(mutex);
     for (const auto& held : pending) {
@@ -267,30 +313,62 @@ bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
 }
 
 DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value) {
-    if (!Busy() || !FinisherProducer::Get()) return LabelLookup::NotHeld;
+    if (!Busy()) return LabelLookup::NotHeld;
     const auto end = address + bytes;
+    if (!FinisherProducer::Get()) {
+        const Range range{address, end};
+        aheadWait({&range, 1});
+        return LabelLookup::NotHeld;
+    }
+    const bool ring = ringMode.load(std::memory_order_acquire);
+    if (ring) retireLean();
     if (lockless()) {
         const Range range{address, end};
         if (published.Overlaps({&range, 1}) == PublishedRanges::Answer::Clear) return LabelLookup::NotHeld;
     }
+    const auto lookup = [&](const Pending& held) -> std::optional<LabelLookup> {
+        if (held.unknown) return LabelLookup::Unknown;
+        const bool overlaps = std::any_of(held.writes.begin(), held.writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
+        if (!overlaps) return std::nullopt;
+        if (held.labelBytes.empty() || address < held.labelAddress || end > held.labelAddress + held.labelBytes.size()) return LabelLookup::Unknown;
+        value = 0;
+        std::memcpy(&value, held.labelBytes.data() + (address - held.labelAddress), bytes);
+        return LabelLookup::Value;
+    };
+    if (ring) {
+        const auto front = frontSeq.load(std::memory_order_acquire);
+        for (auto seq = nextSeq; seq-- > front;) {
+            if (const auto answer = lookup(leanSlot(seq).pending)) return *answer;
+        }
+        return LabelLookup::NotHeld;
+    }
     const auto lock = lockFor(mutex);
     for (auto held = pending.rbegin(); held != pending.rend(); ++held) {
-        if (held->unknown) return LabelLookup::Unknown;
-        const bool overlaps = std::any_of(held->writes.begin(), held->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
-        if (!overlaps) continue;
-        if (held->labelBytes.empty() || address < held->labelAddress || end > held->labelAddress + held->labelBytes.size()) return LabelLookup::Unknown;
-        value = 0;
-        std::memcpy(&value, held->labelBytes.data() + (address - held->labelAddress), bytes);
-        return LabelLookup::Value;
+        if (const auto answer = lookup(*held)) return *answer;
     }
     return LabelLookup::NotHeld;
 }
 
 bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
-    if (!Busy() || !FinisherProducer::Get()) return false;
+    if (!Busy()) return false;
+    if (!FinisherProducer::Get()) return aheadWait(ranges);
+    const bool ring = ringMode.load(std::memory_order_acquire);
+    if (ring) retireLean();
     if (lockless()) {
         const auto answer = published.Overlaps(ranges);
         if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Hit;
+    }
+    if (ring) {
+        for (auto seq = frontSeq.load(std::memory_order_acquire); seq < nextSeq; ++seq) {
+            const auto& held = leanSlot(seq).pending;
+            if (held.unknown) return true;
+            for (const auto& [first, last] : held.writes) {
+                for (const auto& [begin, end] : ranges) {
+                    if (begin < last && first < end) return true;
+                }
+            }
+        }
+        return false;
     }
     const auto lock = lockFor(mutex);
     for (const auto& held : pending) {
@@ -307,12 +385,52 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
 bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
     if (!Busy() || !FinisherProducer::Get()) return false;
     const bool precise = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PreciseLookupDrain);
+    const bool ring = ringMode.load(std::memory_order_acquire);
+    if (ring) retireLean();
     if (lockless()) {
         const auto answer = keys.Find(key, shape, precise);
         if (answer != PublishedKeys::Answer::Unsure) return answer == PublishedKeys::Answer::Hit;
     }
+    const auto matches = [&](const Pending& held) { return (held.key == key || (shape != 0 && held.shape == shape)) && (held.inserts || !precise); };
+    if (ring) {
+        for (auto seq = frontSeq.load(std::memory_order_acquire); seq < nextSeq; ++seq) {
+            if (matches(leanSlot(seq).pending)) return true;
+        }
+        return false;
+    }
     const auto lock = lockFor(mutex);
-    return std::any_of(pending.begin(), pending.end(), [&](const Pending& held) { return (held.key == key || (shape != 0 && held.shape == shape)) && (held.inserts || !precise); });
+    return std::any_of(pending.begin(), pending.end(), matches);
+}
+
+PublishedKeys::Answer DrawFinisher::KeyBefore(std::uint64_t key, std::uint64_t shape, bool insertsOnly) const {
+    const auto seq = FinisherSeq::Get();
+    if (seq == 0 || frontSeq.load(std::memory_order_acquire) >= seq) return PublishedKeys::Answer::Clear;
+    return keys.FindBefore(key, shape, insertsOnly, seq);
+}
+
+bool DrawFinisher::AheadBusy() const {
+    const auto seq = FinisherSeq::Get();
+    return seq != 0 && frontSeq.load(std::memory_order_acquire) < seq;
+}
+
+bool DrawFinisher::AheadOfTurn() {
+    return FinisherAhead::Get() && Get().AheadBusy();
+}
+
+DrawFinisher::AheadScope::AheadScope() : previous(FinisherAhead::Get()) {
+    FinisherAhead::Set(true);
+}
+
+DrawFinisher::AheadScope::~AheadScope() {
+    FinisherAhead::Set(previous);
+}
+
+bool DrawFinisher::aheadWait(std::span<const Range> ranges) {
+    if (!FinisherAhead::Get() || !AheadBusy()) return false;
+    if (published.Overlaps(ranges) == PublishedRanges::Answer::Clear) return false;
+    LeanFront::Add(LeanFront::Counter::AheadWaits);
+    AwaitTurn();
+    return false;
 }
 
 namespace {
@@ -371,6 +489,16 @@ void DrawFinisher::AwaitTurn() {
     if (seq == 0) return;
     if (frontSeq.load(std::memory_order_acquire) == seq) return;
     if (spinHandoff() && SpinUntil(HandoffSpinWindow(), [&] { return frontSeq.load(std::memory_order_acquire) == seq; })) return;
+    if (ringMode.load(std::memory_order_acquire)) {
+        frontWaiters.fetch_add(1, std::memory_order_seq_cst);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        {
+            auto lock = lockFor(mutex);
+            turnWake.wait(lock, [&] { return closing || frontSeq.load(std::memory_order_seq_cst) == seq; });
+        }
+        frontWaiters.fetch_sub(1, std::memory_order_relaxed);
+        return;
+    }
     auto lock = lockFor(mutex);
     ++turnSleepers;
     turnWake.wait(lock, [&] { return closing || jobs.empty() || jobs.front().seq == seq; });
@@ -398,6 +526,21 @@ void DrawFinisher::Enqueue(Job job) {
 
 void DrawFinisher::Enqueue(Job job, Pending held) {
     FinisherProducer::Set(true);
+    if (ringMode.load(std::memory_order_acquire)) {
+        retireLean();
+        rethrowLeanFailure();
+        if (closed.load(std::memory_order_acquire)) {
+            job();
+            return;
+        }
+        awaitLeanRoom();
+        auto& slot = leanSlot(nextSeq);
+        slot.runner = nullptr;
+        slot.closure = std::move(job);
+        slot.pending = std::move(held);
+        publishLean(slot);
+        return;
+    }
     const std::size_t depth = deepQueues() ? PublishedKeys::Capacity : 16;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
@@ -431,6 +574,13 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     keys.Push(jobs.back().seq, held.key, held.shape, held.inserts);
     pending.push_back(std::move(held));
     outstanding.fetch_add(1, std::memory_order_release);
+    startFinishers();
+    if (sleepers == 0) return;
+    if (spinHandoff() && sleepers == 1) wake.notify_one();
+    else wake.notify_all();
+}
+
+void DrawFinisher::startFinishers() {
     if (!running) {
         running = true;
         thread = std::thread([this] {
@@ -440,6 +590,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
             run(0);
         });
         runningFinishers.fetch_add(1, std::memory_order_acq_rel);
+        started.fetch_or(1u, std::memory_order_release);
     }
     for (unsigned index = 1; index <= extra.size(); ++index) {
         if (extraRunning[index - 1] || !finisherTakes(index)) continue;
@@ -451,10 +602,195 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
             run(index);
         });
         runningFinishers.fetch_add(1, std::memory_order_acq_rel);
+        started.fetch_or(1u << index, std::memory_order_release);
     }
-    if (sleepers == 0) return;
+}
+
+void DrawFinisher::Adopt(bool ring) {
+    if (ringMode.load(std::memory_order_relaxed) == ring) return;
+    if (outstanding.load(std::memory_order_acquire) != 0) return;
+    const auto lock = lockFor(mutex);
+    if (outstanding.load(std::memory_order_acquire) != 0 || !jobs.empty() || closing || failure != nullptr) return;
+    if (ringMode.load(std::memory_order_relaxed)) retireLean();
+    if (ring) {
+        if (lean == nullptr) lean = std::make_unique<std::array<LeanSlot, LeanSlots>>();
+        leanTake.store(nextSeq, std::memory_order_seq_cst);
+        leanTail.store(nextSeq, std::memory_order_seq_cst);
+        leanRetired = nextSeq;
+    }
+    frontSeq.store(nextSeq, std::memory_order_release);
+    leanFailed.store(false, std::memory_order_release);
+    ringMode.store(ring, std::memory_order_release);
+    LeanFront::Add(LeanFront::Counter::StoreSwitches);
+}
+
+void DrawFinisher::retireLean() {
+    const auto front = frontSeq.load(std::memory_order_acquire);
+    if (leanRetired >= front) return;
+    bool republish = false;
+    for (; leanRetired < front; ++leanRetired) republish = countPending(leanSlot(leanRetired).pending, false) || republish;
+    if (republish) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
+    keys.Retire(front);
+}
+
+void DrawFinisher::rethrowLeanFailure() {
+    if (!leanFailed.load(std::memory_order_acquire)) return;
+    std::exception_ptr error;
+    {
+        const auto lock = lockFor(mutex);
+        error = std::exchange(failure, nullptr);
+        leanFailed.store(false, std::memory_order_release);
+    }
+    if (error != nullptr) std::rethrow_exception(error);
+}
+
+void DrawFinisher::awaitLeanRoom() {
+    const std::uint64_t depth = deepQueues() ? PublishedKeys::Capacity : 16;
+    const auto full = [&] { return nextSeq - frontSeq.load(std::memory_order_seq_cst) >= depth && !closed.load(std::memory_order_acquire); };
+    if (!full()) return;
+    if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
+    const auto roomStart = ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
+    std::optional<ThreadReport::WorkerStateScope> room;
+    if (roomStart != ThreadReport::Clock::time_point{} && ThreadReport::OnQueue0Worker()) room.emplace(ThreadReport::WorkerState::RoomFinisher);
+    LeanFront::AddOnWorker(LeanFront::Counter::RingRoomWaits);
+    if (!spinHandoff() || !SpinUntil(HandoffSpinWindow(), [&] { return !full(); })) {
+        frontWaiters.fetch_add(1, std::memory_order_seq_cst);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        {
+            auto lock = lockFor(mutex);
+            idle.wait(lock, [&] { return !full(); });
+        }
+        frontWaiters.fetch_sub(1, std::memory_order_relaxed);
+    }
+    room.reset();
+    if (roomStart != ThreadReport::Clock::time_point{}) {
+        const bool worker = ThreadReport::OnQueue0Worker();
+        ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherRoomWaits : ThreadReport::Count::OtherRoomWaits, 1);
+        ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherRoomNs : ThreadReport::Count::OtherRoomNs, ThreadReport::Nanoseconds(roomStart, ThreadReport::Clock::now()));
+    }
+    retireLean();
+}
+
+void DrawFinisher::awaitLeanIdle() {
+    if (outstanding.load(std::memory_order_seq_cst) == 0) return;
+    frontWaiters.fetch_add(1, std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    {
+        auto lock = lockFor(mutex);
+        idle.wait(lock, [&] { return outstanding.load(std::memory_order_seq_cst) == 0; });
+    }
+    frontWaiters.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void DrawFinisher::publishLean(LeanSlot& slot) {
+    const auto seq = nextSeq;
+    if (countPending(slot.pending, true)) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
+    keys.Push(seq, slot.pending.key, slot.pending.shape, slot.pending.inserts);
+    slot.seq.store(seq, std::memory_order_relaxed);
+    slot.state.store(LeanReady, std::memory_order_relaxed);
+    outstanding.fetch_add(1, std::memory_order_acq_rel);
+    nextSeq = seq + 1;
+    issued.store(nextSeq, std::memory_order_relaxed);
+    leanTail.store(nextSeq, std::memory_order_seq_cst);
+    const unsigned wanted = 1u | (finisherTakes(1) ? 2u : 0u) | (finisherTakes(2) ? 4u : 0u);
+    if ((started.load(std::memory_order_acquire) & wanted) != wanted) {
+        const auto lock = lockFor(mutex);
+        startFinishers();
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (parked.load(std::memory_order_relaxed) == 0) return;
+    const auto lock = lockFor(mutex);
     if (spinHandoff() && sleepers == 1) wake.notify_one();
     else wake.notify_all();
+}
+
+std::byte* DrawFinisher::ReserveLean() {
+    FinisherProducer::Set(true);
+    retireLean();
+    rethrowLeanFailure();
+    if (closed.load(std::memory_order_acquire)) return nullptr;
+    awaitLeanRoom();
+    if (closed.load(std::memory_order_acquire)) return nullptr;
+    return leanSlot(nextSeq).payload.data();
+}
+
+void DrawFinisher::PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape) {
+    auto& slot = leanSlot(nextSeq);
+    slot.runner = runner;
+    auto& held = slot.pending;
+    held.key = key;
+    held.shape = shape;
+    held.inserts = true;
+    held.unknown = false;
+    held.writes.assign(writes.begin(), writes.end());
+    held.labelAddress = 0;
+    held.labelBytes.clear();
+    publishLean(slot);
+}
+
+bool DrawFinisher::takeLean(unsigned index, std::uint64_t& seq) {
+    for (;;) {
+        auto take = leanTake.load(std::memory_order_acquire);
+        if (take >= leanTail.load(std::memory_order_acquire)) return false;
+        if (!finisherTakes(index) && !closed.load(std::memory_order_acquire)) return false;
+        if (leanTake.compare_exchange_weak(take, take + 1, std::memory_order_acq_rel)) {
+            seq = take;
+            return true;
+        }
+    }
+}
+
+void DrawFinisher::runLean(std::uint64_t seq, std::chrono::steady_clock::time_point& lastEnd) {
+    auto& slot = leanSlot(seq);
+    FinisherSeq::Set(seq);
+    const auto jobStart = ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
+    if (jobStart != ThreadReport::Clock::time_point{}) ThreadReport::FinisherBusy(true, jobStart);
+    std::exception_ptr error;
+    try {
+        if (!leanFailed.load(std::memory_order_acquire)) {
+            if (slot.runner != nullptr) slot.runner(slot.payload.data());
+            else slot.closure();
+        }
+    } catch (...) {
+        error = std::current_exception();
+    }
+    slot.closure = nullptr;
+    FinisherSeq::Set(0);
+    if (jobStart != ThreadReport::Clock::time_point{}) {
+        const auto end = ThreadReport::Clock::now();
+        ThreadReport::FinisherBusy(false, end);
+        ThreadReport::Add(ThreadReport::Count::FinisherJobs, 1);
+        ThreadReport::Add(ThreadReport::Count::FinisherJobNs, ThreadReport::Nanoseconds(jobStart, end));
+        if (lastEnd != ThreadReport::Clock::time_point{}) ThreadReport::Add(ThreadReport::Count::FinisherIdleNs, ThreadReport::Nanoseconds(lastEnd, jobStart));
+        lastEnd = end;
+        ThreadReport::Tick(end);
+    }
+    if (error != nullptr) {
+        const auto lock = lockFor(mutex);
+        if (failure == nullptr) failure = error;
+        leanFailed.store(true, std::memory_order_release);
+    }
+    slot.state.store(LeanDone, std::memory_order_seq_cst);
+    advanceLeanFront();
+}
+
+void DrawFinisher::advanceLeanFront() {
+    bool moved = false;
+    for (;;) {
+        auto front = frontSeq.load(std::memory_order_seq_cst);
+        if (front >= leanTail.load(std::memory_order_seq_cst)) break;
+        const auto& slot = leanSlot(front);
+        if (slot.seq.load(std::memory_order_seq_cst) != front || slot.state.load(std::memory_order_seq_cst) != LeanDone) break;
+        if (!frontSeq.compare_exchange_strong(front, front + 1, std::memory_order_seq_cst)) continue;
+        outstanding.fetch_sub(1, std::memory_order_seq_cst);
+        moved = true;
+    }
+    if (!moved) return;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (frontWaiters.load(std::memory_order_relaxed) == 0) return;
+    const auto lock = lockFor(mutex);
+    idle.notify_all();
+    turnWake.notify_all();
 }
 
 void DrawFinisher::run(unsigned index) {
@@ -462,15 +798,28 @@ void DrawFinisher::run(unsigned index) {
     if (index == 0) StartFinisherSampler();
     ThreadReport::Clock::time_point lastEnd{};
     for (;;) {
+        std::uint64_t leanSeq = 0;
+        if (takeLean(index, leanSeq)) {
+            runLean(leanSeq, lastEnd);
+            continue;
+        }
         Slot* slot = nullptr;
         bool failed = false;
-        if (finisherTakes(index) && spinHandoff()) SpinUntil(HandoffSpinWindow(), [&] { return untakenJobs.load(std::memory_order_acquire) != 0; });
+        if (finisherTakes(index) && spinHandoff()) SpinUntil(HandoffSpinWindow(), [&] { return untakenJobs.load(std::memory_order_acquire) != 0 || leanReady(); });
         else if (finisherTakes(index)) SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
+        if (takeLean(index, leanSeq)) {
+            runLean(leanSeq, lastEnd);
+            continue;
+        }
         {
             auto lock = lockFor(mutex);
             ++sleepers;
-            wake.wait(lock, [&] { return closing || (untaken() != nullptr && finisherTakes(index)); });
+            parked.fetch_add(1, std::memory_order_seq_cst);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            wake.wait(lock, [&] { return closing || ((untaken() != nullptr || leanReady()) && finisherTakes(index)); });
+            parked.fetch_sub(1, std::memory_order_relaxed);
             --sleepers;
+            if (leanReady()) continue;
             slot = untaken();
             if (slot == nullptr) break;
             slot->taken = true;
@@ -519,6 +868,11 @@ void DrawFinisher::run(unsigned index) {
 void DrawFinisher::Settle() {
     if (!Busy() || OnFinisherThread()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher settle under the GPU lock");
+    if (ringMode.load(std::memory_order_acquire)) {
+        awaitLeanIdle();
+        if (FinisherProducer::Get()) retireLean();
+        return;
+    }
     auto lock = lockFor(mutex);
     ++idleWaiters;
     idle.wait(lock, [&] { return jobs.empty(); });
@@ -531,6 +885,17 @@ void DrawFinisher::Drain() {
     const auto drainStart = ThreadReport::Enabled() && Busy() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
     const ThreadReport::WorkerStateScope draining(ThreadReport::WorkerState::DrainFinisher, drainStart != ThreadReport::Clock::time_point{} && ThreadReport::OnQueue0Worker());
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
+    if (ringMode.load(std::memory_order_acquire)) {
+        awaitLeanIdle();
+        if (drainStart != ThreadReport::Clock::time_point{}) {
+            const bool worker = ThreadReport::OnQueue0Worker();
+            ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherDrains : ThreadReport::Count::OtherDrains, 1);
+            ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherDrainNs : ThreadReport::Count::OtherDrainNs, ThreadReport::Nanoseconds(drainStart, ThreadReport::Clock::now()));
+        }
+        if (FinisherProducer::Get()) retireLean();
+        rethrowLeanFailure();
+        return;
+    }
     auto lock = lockFor(mutex);
     if (!jobs.empty()) {
         ++idleWaiters;
@@ -550,12 +915,14 @@ void DrawFinisher::Stop() {
     {
         const auto lock = lockFor(mutex);
         closing = true;
+        closed.store(true, std::memory_order_release);
         finishers[0] = std::move(thread);
         finishers[1] = std::move(extra[0]);
         finishers[2] = std::move(extra[1]);
     }
     wake.notify_all();
     turnWake.notify_all();
+    idle.notify_all();
     for (auto& finisher : finishers) {
         if (!finisher.joinable()) continue;
         if (finisher.get_id() == std::this_thread::get_id()) finisher.detach();
@@ -1014,7 +1381,7 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
 }
 
 bool DrawPipeline::Busy() const {
-    return (FinisherProducer::Get() && DrawFinisher::Busy() && DrawFinisher::Overlap()) || outstanding.load(std::memory_order_acquire) != 0;
+    return (FinisherProducer::Get() && DrawFinisher::Busy() && DrawFinisher::Overlap()) || outstanding.load(std::memory_order_acquire) != 0 || DrawFinisher::AheadOfTurn();
 }
 
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {

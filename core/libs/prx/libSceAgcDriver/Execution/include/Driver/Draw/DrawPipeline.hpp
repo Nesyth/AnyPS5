@@ -10,6 +10,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -43,6 +44,7 @@ public:
     void Push(std::uint64_t seqNumber, std::uint64_t key, std::uint64_t shape, bool inserts);
     void Retire(std::uint64_t frontSeq);
     Answer Find(std::uint64_t key, std::uint64_t shape, bool insertsOnly) const;
+    Answer FindBefore(std::uint64_t key, std::uint64_t shape, bool insertsOnly, std::uint64_t before) const;
 
 private:
     std::atomic<std::uint32_t> seq{0};
@@ -157,6 +159,19 @@ class DrawFinisher {
 public:
     using Job = std::function<void()>;
     using Range = std::pair<std::uint64_t, std::uint64_t>;
+    using LeanRunner = void (*)(const std::byte* payload);
+    static constexpr std::size_t LeanPayloadBytes = 1024;
+    static constexpr std::size_t LeanSlots = 64;
+    class AheadScope {
+    public:
+        AheadScope();
+        ~AheadScope();
+        AheadScope(const AheadScope&) = delete;
+        AheadScope& operator=(const AheadScope&) = delete;
+
+    private:
+        bool previous;
+    };
     struct Pending {
         std::uint64_t key = 0;
         std::uint64_t shape = 0;
@@ -190,6 +205,13 @@ public:
     void Stop();
     void ReleaseRan();
     void AwaitTurn();
+    void Adopt(bool ring);
+    bool RingStore() const { return ringMode.load(std::memory_order_acquire); }
+    std::byte* ReserveLean();
+    void PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape);
+    PublishedKeys::Answer KeyBefore(std::uint64_t key, std::uint64_t shape, bool insertsOnly) const;
+    bool AheadBusy() const;
+    static bool AheadOfTurn();
 
 private:
     struct Slot {
@@ -198,10 +220,30 @@ private:
         bool taken = false;
         bool done = false;
     };
+    struct LeanSlot {
+        std::atomic<std::uint64_t> seq{0};
+        std::atomic<std::uint8_t> state{0};
+        LeanRunner runner = nullptr;
+        Job closure;
+        Pending pending;
+        alignas(16) std::array<std::byte, LeanPayloadBytes> payload{};
+    };
     DrawFinisher() = default;
     void run(unsigned index);
     Slot* untaken();
     bool countPending(const Pending& held, bool added);
+    void startFinishers();
+    LeanSlot& leanSlot(std::uint64_t seq) { return (*lean)[static_cast<std::size_t>(seq % LeanSlots)]; }
+    bool leanReady() const { return leanTake.load(std::memory_order_acquire) < leanTail.load(std::memory_order_acquire); }
+    bool takeLean(unsigned index, std::uint64_t& seq);
+    void runLean(std::uint64_t seq, std::chrono::steady_clock::time_point& lastEnd);
+    void advanceLeanFront();
+    void retireLean();
+    void rethrowLeanFailure();
+    void awaitLeanRoom();
+    void awaitLeanIdle();
+    void publishLean(LeanSlot& slot);
+    bool aheadWait(std::span<const Range> ranges);
     inline static std::atomic<std::size_t> outstanding{0};
     std::atomic<std::size_t> untakenJobs{0};
     std::mutex mutex;
@@ -227,6 +269,16 @@ private:
     std::condition_variable turnWake;
     std::thread thread;
     std::array<std::thread, 2> extra;
+    std::atomic<bool> ringMode{false};
+    std::atomic<bool> closed{false};
+    std::atomic<bool> leanFailed{false};
+    std::atomic<unsigned> started{0};
+    std::atomic<unsigned> parked{0};
+    std::atomic<unsigned> frontWaiters{0};
+    std::atomic<std::uint64_t> leanTake{1};
+    std::atomic<std::uint64_t> leanTail{1};
+    std::uint64_t leanRetired = 1;
+    std::unique_ptr<std::array<LeanSlot, LeanSlots>> lean;
 };
 
 }

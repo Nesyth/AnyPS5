@@ -536,6 +536,7 @@ void Driver::runLeanSegment(const Submission& submission, QueueState& queue, Seg
     }
     clearResolvedAhead();
     gateOpened() = true;
+    prepareLeanDraws();
     if (!slot.table.built) {
         scanSegment(submission, slot.table);
         markOutputs(submission, slot.table);
@@ -909,7 +910,7 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                     };
                     try {
                         std::string rejected;
-                        const auto verdict = draw(queue, packet, submission, cursor, rejected);
+                        const auto verdict = drawLean(queue, packet, submission, cursor, rejected);
                         drawn = verdict == DrawVerdict::Drawn;
                         CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
                         if (verdict == DrawVerdict::Rejected) {
@@ -936,7 +937,7 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                 static_cast<void>(readRegister(queue.context, 0x318));
                 try {
                     std::string rejected;
-                    const auto verdict = draw(queue, packet, submission, cursor, rejected);
+                    const auto verdict = drawLean(queue, packet, submission, cursor, rejected);
                     static_cast<void>(readRegister(queue.context, 0x8e));
                     if (verdict == DrawVerdict::Rejected) throw std::runtime_error(rejected);
                 } catch (const RefusedDraw& refused) {
