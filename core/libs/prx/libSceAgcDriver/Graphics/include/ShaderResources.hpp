@@ -255,8 +255,19 @@ public:
         std::span<const std::uint32_t> words;
     };
     const PushPlan* PushLayouts() const;
-    std::shared_ptr<DrawBindings> PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan) const;
+    std::shared_ptr<DrawBindings> PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut = nullptr) const;
     void PushDrawBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
+    struct BoundBuffer {
+        std::uint32_t set = 0;
+        std::uint32_t binding = 0;
+        std::uint32_t element = 0;
+        VkDescriptorBufferInfo info{};
+        bool snapshot = false;
+        std::uint64_t address = 0;
+        std::size_t bytes = 0;
+        std::uint64_t content = 0;
+    };
+    void DescribeDrawBindings(const DrawBindings* bound, std::span<const std::size_t> selected, const PushPlan* plan, std::vector<BoundBuffer>& out) const;
     bool RecordLean() const;
     struct DrawUse {
         DrawUse() = default;
@@ -270,7 +281,7 @@ public:
     std::shared_ptr<DrawUse> BeginDrawUse(Recorder& recorder) const;
     void CompleteDrawUse(const DrawUse& use) const;
     void BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const;
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr, bool census = false) const;
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr, bool census = false, std::vector<std::size_t>* selectedOut = nullptr) const;
     ReplayReason HeapReplayRefusal(std::span<const CompiledShader> shaders) const;
     void NoteHeapReplayCensus();
     struct HeapReplayProof {
@@ -876,6 +887,7 @@ private:
     void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     void writeOwnDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     mutable std::unique_ptr<PushPlan> pushPlan;
+    void overlayPushedBuffers(const DrawBindings& result, const PushPlan& plan, std::span<VkDescriptorBufferInfo> buffers, std::span<std::size_t> owners = {}) const;
     mutable bool pushPlanBuilt = false;
     std::shared_ptr<OwnDrawSets> makeOwnDrawSets() const;
     mutable std::shared_ptr<OwnDrawSets> ownDrawSets;

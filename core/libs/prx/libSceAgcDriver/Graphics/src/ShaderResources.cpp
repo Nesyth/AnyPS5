@@ -49,6 +49,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -7053,10 +7054,11 @@ ShaderResources::MovedSnapshotCounts ShaderResources::TakeMovedSnapshotCounts() 
     return {tally.cached.exchange(0, std::memory_order_relaxed), tally.reused.exchange(0, std::memory_order_relaxed), tally.cachedBytes.exchange(0, std::memory_order_relaxed), tally.uploaded.exchange(0, std::memory_order_relaxed), tally.uploadedBytes.exchange(0, std::memory_order_relaxed)};
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord, bool census) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord, bool census, std::vector<std::size_t>* selectedOut) const {
     struct SelectedStorage {};
     auto& selected = HostThreadLocal<std::vector<std::size_t>, SelectedStorage>();
     auto result = selectDrawSnapshots(recorder, moved, movedOnly, selected, census);
+    if (selectedOut != nullptr) selectedOut->assign(selected.begin(), selected.end());
     return finishDrawBindings(recorder, std::move(result), selected, faultRecord);
 }
 
@@ -7617,10 +7619,11 @@ const ShaderResources::PushPlan* ShaderResources::PushLayouts() const {
     return pushPlan.get();
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut) const {
     struct SelectedStorage {};
     auto& selected = HostThreadLocal<std::vector<std::size_t>, SelectedStorage>();
     auto result = selectDrawSnapshots(recorder, moved, false, selected, false);
+    if (selectedOut != nullptr) selectedOut->assign(selected.begin(), selected.end());
     if (result == nullptr || selected.empty()) return {};
     const bool pushes = std::ranges::any_of(selected, [&](std::size_t index) { return index < plan.allocationSets.size() && plan.allocationSets[index] == plan.set; });
     if (!pushes) return finishDrawBindings(recorder, std::move(result), selected, nullptr);
@@ -7644,12 +7647,7 @@ void ShaderResources::PushDrawBindings(VkCommandBuffer commands, VkPipelineLayou
     struct PushBuffersStorage {};
     auto& buffers = HostThreadLocal<std::vector<VkDescriptorBufferInfo>, PushBuffersStorage>();
     buffers = descriptorBuffers;
-    for (std::size_t index = 0; index < result.pushSelected.size(); ++index) {
-        const auto allocation = result.pushSelected[index];
-        if (allocation >= plan.slots.size() || index >= result.snapshots.size()) continue;
-        const auto& snapshot = result.snapshots[index];
-        for (const auto slot : plan.slots[allocation]) buffers[slot] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
-    }
+    overlayPushedBuffers(result, plan, buffers);
     struct PushWritesStorage {};
     auto& writes = HostThreadLocal<std::vector<VkWriteDescriptorSet>, PushWritesStorage>();
     writes.clear();
@@ -7659,6 +7657,82 @@ void ShaderResources::PushDrawBindings(VkCommandBuffer commands, VkPipelineLayou
         if (write.pBufferInfo != nullptr) write.pBufferInfo = buffers.data() + (descriptorWrites[index].pBufferInfo - descriptorBuffers.data());
     }
     CmdPushDescriptorSet(context.Resolved(&DeviceFunctions::cmdPushDescriptorSet, "vkCmdPushDescriptorSetKHR"), commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, plan.set == 0 ? 0u : fragmentSet, static_cast<std::uint32_t>(writes.size()), writes.data(), SetBindSite::Draw);
+}
+
+void ShaderResources::overlayPushedBuffers(const DrawBindings& result, const PushPlan& plan, std::span<VkDescriptorBufferInfo> buffers, std::span<std::size_t> owners) const {
+    for (std::size_t index = 0; index < result.pushSelected.size(); ++index) {
+        const auto allocation = result.pushSelected[index];
+        if (allocation >= plan.slots.size() || index >= result.snapshots.size()) continue;
+        const auto& snapshot = result.snapshots[index];
+        for (const auto slot : plan.slots[allocation]) {
+            buffers[slot] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+            if (!owners.empty()) owners[slot] = index;
+        }
+    }
+}
+
+void ShaderResources::DescribeDrawBindings(const DrawBindings* bound, std::span<const std::size_t> selected, const PushPlan* plan, std::vector<BoundBuffer>& out) const {
+    out.clear();
+    constexpr auto none = std::numeric_limits<std::size_t>::max();
+    std::vector<VkDescriptorBufferInfo> buffers = descriptorBuffers;
+    std::vector<std::size_t> owners(buffers.size(), none);
+    const bool pushing = bound != nullptr && bound->pushedSet >= 0 && plan != nullptr;
+    const auto pushedSet = pushing ? bound->pushedSet : -1;
+    const auto chosen = pushing ? std::span<const std::size_t>(bound->pushSelected) : selected;
+    if (pushing) overlayPushedBuffers(*bound, *plan, buffers, owners);
+    const bool rewritten = bound != nullptr && (!pushing || std::ranges::any_of(chosen, [&](std::size_t index) { return index >= plan->allocationSets.size() || plan->allocationSets[index] != static_cast<std::uint8_t>(pushedSet); }));
+    std::vector<std::size_t> snapshotOf(allocations.size(), none);
+    if (rewritten) {
+        for (std::size_t index = 0; index < chosen.size() && index < bound->snapshots.size(); ++index) {
+            if (chosen[index] < snapshotOf.size()) snapshotOf[chosen[index]] = index;
+        }
+    }
+    std::vector<std::uint8_t> writeSets(descriptorWrites.size(), 0xffu);
+    std::size_t next = 0;
+    for (const auto& binding : bindings) {
+        if (binding.heap) continue;
+        const auto set = setOf(binding);
+        const auto original = set == 0 ? _set : fragment.set;
+        while (next < descriptorWrites.size() && descriptorWrites[next].dstBinding == binding.layout.binding && descriptorWrites[next].dstSet == original) {
+            const auto& write = descriptorWrites[next];
+            writeSets[next++] = static_cast<std::uint8_t>(set);
+            if (!rewritten || static_cast<std::int32_t>(set) == pushedSet || binding.allocations.empty() || write.pBufferInfo == nullptr) continue;
+            const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
+            for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+                const auto snapshot = snapshotOf[binding.allocations[element]];
+                if (snapshot == none) continue;
+                const auto& held = bound->snapshots[snapshot];
+                buffers[offset + element] = wholeDwordRange({held.buffer->Handle(), held.offset, held.bytes});
+                owners[offset + element] = snapshot;
+            }
+        }
+    }
+    const auto emit = [&](std::uint32_t set, const VkWriteDescriptorSet& write) {
+        if (write.pBufferInfo == nullptr) return;
+        const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
+        for (std::uint32_t element = 0; element < write.descriptorCount; ++element) {
+            BoundBuffer entry{set, write.dstBinding, write.dstArrayElement + element, buffers[offset + element]};
+            if (const auto owner = owners[offset + element]; owner != none) {
+                const auto& snapshot = bound->snapshots[owner];
+                entry.snapshot = true;
+                entry.address = snapshot.address;
+                entry.bytes = snapshot.bytes;
+                if (snapshot.address == 0) {
+                    std::uint64_t hash = 0xcbf29ce484222325ull;
+                    for (const auto byte : snapshot.Bytes()) hash = (hash ^ std::to_integer<std::uint8_t>(byte)) * 0x100000001b3ull;
+                    entry.content = hash;
+                }
+            }
+            out.push_back(entry);
+        }
+    };
+    for (std::size_t index = 0; index < descriptorWrites.size(); ++index) {
+        if (writeSets[index] != 0xffu && static_cast<std::int32_t>(writeSets[index]) != pushedSet) emit(writeSets[index], descriptorWrites[index]);
+    }
+    if (pushing) {
+        for (const auto index : plan->writes) emit(plan->set, descriptorWrites[index]);
+    }
+    std::ranges::sort(out, [](const BoundBuffer& a, const BoundBuffer& b) { return std::tie(a.set, a.binding, a.element) < std::tie(b.set, b.binding, b.element); });
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {

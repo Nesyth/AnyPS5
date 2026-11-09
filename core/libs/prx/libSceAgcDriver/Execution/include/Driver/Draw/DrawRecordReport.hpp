@@ -40,6 +40,10 @@ enum class Field : std::uint8_t {
     VertexInputs,
     ShaderStages,
     CommitFragmentOutputs,
+    CommitBindings,
+    PassAccess,
+    Keeps,
+    TargetNotes,
     Count,
 };
 

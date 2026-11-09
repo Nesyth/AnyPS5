@@ -563,7 +563,7 @@ void InjectedCommit(Arms& arms) {
     Require(DrawRecords::VerifyEvery() >= 2, "inject commit: the committer verify needs APS5_VERIFY_DRAW_RECORDS of 2 or more, so hits reach the committer");
     DrawRecords::CorruptCommits(true);
     arms.Run("a corrupted committer answer", Alternating(Kind::Constants, 8), DrawsPerSubmission, [&](const Totals& now, const Totals& base) {
-        Require(DrawRecords::Differences(DrawRecords::Field::PassKeys) != 0 && now.Since(base, Counter::CommitDemoted) != 0, "inject commit: the committer verify did not catch a corrupted committer answer" + Describe(now, base));
+        Require(DrawRecords::Differences(DrawRecords::Field::CommitBindings) != 0 && now.Since(base, Counter::CommitDemoted) != 0, "inject commit: the committer verify did not catch a corrupted buffer binding in the committer answer" + Describe(now, base));
         Require(now.Since(base, Counter::CommitBuilt) != 0, "inject commit: today's path did not rebuild the committer half after a demotion" + Describe(now, base));
     });
     DrawRecords::CorruptCommits(false);

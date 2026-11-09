@@ -4191,12 +4191,24 @@ std::uint64_t StorageTexture::OccasionalLabelStores() {
     return occasionalLabelStores.load(std::memory_order_relaxed);
 }
 
-bool StorageTexture::RenoteInPass(std::uint64_t recorder, std::uint64_t pass, std::uint32_t slice, std::uint32_t count) {
+StorageTexture::PassRenote StorageTexture::ProbeRenote(std::uint64_t recorder, std::uint64_t pass, std::uint32_t slice, std::uint32_t count) const {
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     const auto& note = passNote;
-    if (eager || !note.valid || note.recorder != recorder || note.pass != pass || note.version != version || note.slice != slice || note.count != count || !dirty || lent) return false;
-    if (note.layers == 0 || note.first + note.layers > trackedLayers || !layerPending.AllIn(note.first, note.layers)) return false;
-    if (!handedOver.empty() || !handedUnits.empty() || (borrowedUnits.size() == trackedLayers && borrowedUnits.AnyIn(note.first, note.layers))) return false;
+    PassRenote probe{false, note.first, note.layers};
+    if (eager || !note.valid || note.recorder != recorder || note.pass != pass || note.version != version || note.slice != slice || note.count != count || !dirty || lent) return probe;
+    if (note.layers == 0 || note.first + note.layers > trackedLayers || !layerPending.AllIn(note.first, note.layers)) return probe;
+    if (!handedOver.empty() || !handedUnits.empty() || (borrowedUnits.size() == trackedLayers && borrowedUnits.AnyIn(note.first, note.layers))) return probe;
+    probe.renote = true;
+    return probe;
+}
+
+bool StorageTexture::FirstWriteStoresKeys() const {
+    return descriptor.dccAddress != 0 && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle) && !IsDccClear(filledKeys);
+}
+
+bool StorageTexture::RenoteInPass(std::uint64_t recorder, std::uint64_t pass, std::uint32_t slice, std::uint32_t count) {
+    if (!ProbeRenote(recorder, pass, slice, count).renote) return false;
+    const auto& note = passNote;
     ++writes;
     if (const auto flip = flipSerial.load(std::memory_order_relaxed); flip != writtenFlip) {
         writtenOccasionally = flip - writtenFlip > OccasionalWriteFlips;

@@ -351,6 +351,10 @@ constexpr std::array<FieldInfo, FieldCount> FieldInfos{{
     {Item::Commit, "vertex inputs"},
     {Item::Commit, "shader stages"},
     {Item::Commit, "fragment outputs"},
+    {Item::Commit, "bound buffers"},
+    {Item::Commit, "pass access"},
+    {Item::Commit, "batch keeps"},
+    {Item::Commit, "target notes"},
 }};
 
 constexpr std::array<const char*, AllowedKinds> AllowedNames{"fragment outputs known on one side only", "today's draw not queued", "the record's commit fell back", "today's commit built no recipe", "today's commit served another template"};
@@ -1191,6 +1195,34 @@ DrawRecords::Counter CommitMiss(Graphics::DrawRecipeMiss miss) {
     }
 }
 
+bool SameBoundBuffer(const Graphics::ShaderResources::BoundBuffer& a, const Graphics::ShaderResources::BoundBuffer& b) {
+    if (a.set != b.set || a.binding != b.binding || a.element != b.element || a.snapshot != b.snapshot || a.info.range != b.info.range) return false;
+    if (!a.snapshot) return a.info.buffer == b.info.buffer && a.info.offset == b.info.offset;
+    return a.address == b.address && a.bytes == b.bytes && a.content == b.content;
+}
+
+std::string boundText(const Graphics::ShaderResources::BoundBuffer& entry) {
+    const auto at = "set " + std::to_string(entry.set) + " binding " + std::to_string(entry.binding) + "[" + std::to_string(entry.element) + "] range " + std::to_string(entry.info.range);
+    if (!entry.snapshot) return at + " from the template (buffer " + hex(reinterpret_cast<std::uint64_t>(entry.info.buffer)) + " at " + std::to_string(entry.info.offset) + ")";
+    if (entry.address == 0) return at + " from " + std::to_string(entry.bytes) + " data bytes hashing to " + hex(entry.content);
+    return at + " from " + std::to_string(entry.bytes) + " bytes at " + hex(entry.address);
+}
+
+std::string accessText(const DrawRecordAccess& access) {
+    return std::to_string(access.reads.size()) + " reads, " + std::to_string(access.writes.size()) + " writes, " + std::to_string(access.writeOnly.size()) + " write-only ranges, " + std::to_string(access.images.size()) + " storage images" + (access.readsTarget ? ", reading a target" : "");
+}
+
+std::string lookupText(const DrawCommitView& today, const void* recorded) {
+    const std::string which = today.found == recorded ? "the same template" : "the template it found";
+    switch (today.lookup) {
+    case DrawCommitLookup::Absent: return "found no template under the key";
+    case DrawCommitLookup::Invalid: return "failed to revalidate " + which;
+    case DrawCommitLookup::Unmoved: return "refused to move the read-only buffers of " + which;
+    case DrawCommitLookup::Uncacheable: return "found the draw uncacheable";
+    default: return "never looked a template up";
+    }
+}
+
 bool SameVertexInput(const Graphics::VertexInputLayout& a, const Graphics::VertexInputLayout& b) {
     const auto sameBinding = [](const VkVertexInputBindingDescription& x, const VkVertexInputBindingDescription& y) { return x.binding == y.binding && x.stride == y.stride && x.inputRate == y.inputRate; };
     const auto sameAttribute = [](const VkVertexInputAttributeDescription& x, const VkVertexInputAttributeDescription& y) { return x.location == y.location && x.binding == y.binding && x.format == y.format && x.offset == y.offset; };
@@ -1241,11 +1273,18 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     }
     DrawCommitView answer;
     if (verify) static_cast<void>(localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, &answer));
+    if (verify && DrawRecords::CorruptingCommits() && !answer.bindings.empty()) {
+        const auto snapshot = std::ranges::find_if(answer.bindings, [](const Graphics::ShaderResources::BoundBuffer& entry) { return entry.snapshot; });
+        (snapshot != answer.bindings.end() ? *snapshot : answer.bindings.front()).info.range ^= 4u;
+    }
     DrawCommitView today;
     struct ViewScope {
         ~ViewScope() { DrawCommitViewSlot::Set(nullptr); }
     } viewScope;
-    if (verify) DrawCommitViewSlot::Set(&today);
+    if (verify) {
+        today.wantPush = answer.pushed;
+        DrawCommitViewSlot::Set(&today);
+    }
     std::shared_ptr<const DrawRecipe> built;
     const auto& record = *hit.record;
     localDevice->Draw(graphics, hit.parameters, hit.stages, hit.snapshots, &built, tracePtr, shape, record.contentKey.empty() ? nullptr : &record.contentKey, fragmentOutputs ? &*fragmentOutputs : nullptr, true);
@@ -1287,6 +1326,7 @@ bool Driver::verifyRecordCommit(const DrawRecord& record, const DrawCommitView& 
     };
     if (answer.resources != today.resources) {
         if (answer.key != today.key) note(Field::Templates, "the record's template key has " + std::to_string(answer.key.size()) + " words, today's " + std::to_string(today.key.size()) + "; " + firstDifference(answer.key, today.key));
+        else if (today.lookup != DrawCommitLookup::Hit) note(Field::Templates, "the record proved its template current and its moved buffers, but today's lookup " + lookupText(today, answer.resources) + " and built another");
         else DrawRecords::NoteAllowed(DrawRecords::Allowed::CommitTemplateRebuilt);
         return differs;
     }
@@ -1309,6 +1349,37 @@ bool Driver::verifyRecordCommit(const DrawRecord& record, const DrawCommitView& 
     if (!SameVertexInput(answer.vertexInput, today.vertexInput)) note(Field::VertexInputs, "the record's vertex input has " + std::to_string(answer.vertexInput.attributes.size()) + " attributes, today's " + std::to_string(today.vertexInput.attributes.size()));
     if (answer.shaderStages != today.shaderStages || answer.hasDepth != today.hasDepth) note(Field::ShaderStages, "the record's stages " + hex(answer.shaderStages) + ", today's " + hex(today.shaderStages));
     if (answer.fragmentOutputs != today.fragmentOutputs) note(Field::CommitFragmentOutputs, "the record's fragment outputs " + hex(answer.fragmentOutputs) + ", today's " + hex(today.fragmentOutputs));
+    if (answer.pushed) {
+        if (today.pushPipeline == nullptr) note(Field::Pipelines, "the record binds its moved buffers through push descriptors, but today's template has no push layout for this draw");
+        else if (answer.pushPipeline != today.pushPipeline) note(Field::Pipelines, "the record's push pipeline is another object than today's pipeline with the push layout");
+        if (today.pushPipeline != nullptr && answer.pushFramebuffer != today.pushFramebuffer) note(Field::Framebuffers, "the record's push framebuffer is another object than today's push framebuffer");
+    }
+    if (answer.bound && today.bound) {
+        std::size_t index = 0;
+        while (index < answer.bindings.size() && index < today.bindings.size() && SameBoundBuffer(answer.bindings[index], today.bindings[index])) ++index;
+        if (index != answer.bindings.size() || index != today.bindings.size()) {
+            const auto describe = [&](const DrawCommitView& view) { return index < view.bindings.size() ? boundText(view.bindings[index]) : std::string("nothing"); };
+            note(Field::CommitBindings, "the record binds " + std::to_string(answer.bindings.size()) + std::string(answer.pushed ? " pushed" : "") + " buffer descriptors, today's draw " + std::to_string(today.bindings.size()) + "; at " + std::to_string(index) + " the record binds " + describe(answer) + ", today's " + describe(today));
+        }
+    }
+    if (answer.access.has_value() && today.access.has_value()) {
+        const auto& kept = *answer.access;
+        const auto& now = *today.access;
+        if (kept.readsTarget != now.readsTarget || kept.reads != now.reads || kept.writes != now.writes || kept.writeOnly != now.writeOnly || kept.images != now.images) note(Field::PassAccess, "the record's pass access memo holds " + accessText(kept) + ", today's draw derives " + accessText(now));
+    }
+    if (answer.keptOnce) {
+        const auto* boundPipeline = answer.pushed ? today.pushPipeline : today.pipeline;
+        const auto* boundFramebuffer = answer.pushed ? today.pushFramebuffer : today.framebuffer;
+        if (answer.keep.resources != today.resources || answer.keep.pipeline != boundPipeline || answer.keep.framebuffer != boundFramebuffer || answer.keep.targets != today.targets) note(Field::Keeps, "the record keeps its objects once per batch, but the batch holds other objects than today's draw keeps");
+        else if (today.gpuWrites != 0) note(Field::Keeps, "the record skips noting GPU writes behind its per-batch keep, but today's template notes " + std::to_string(today.gpuWrites) + " write ranges");
+    }
+    if (answer.passNotes) {
+        for (std::size_t target = 0; target < today.notes.size(); ++target) {
+            const auto& now = today.notes[target];
+            if (!now.present || now.linear || !now.renote) continue;
+            if (now.storesKeys || now.noteFirst != now.markedFirst || now.noteLayers != now.markedLayers) note(Field::TargetNotes, "target " + std::to_string(target) + ": the record skips its dirty note as already noted in this pass (layers " + std::to_string(now.noteFirst) + "+" + std::to_string(now.noteLayers) + "), but today's note marked layers " + std::to_string(now.markedFirst) + "+" + std::to_string(now.markedLayers) + (now.storesKeys ? " and stored the first write's DCC keys" : ""));
+        }
+    }
     if (DrawRecords::CorruptingCommits() && !differs) note(Field::PassKeys, "a corrupted committer answer");
     return differs;
 }

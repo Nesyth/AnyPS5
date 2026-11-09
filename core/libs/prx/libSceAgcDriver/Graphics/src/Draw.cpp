@@ -45,6 +45,7 @@
 #include <mutex>
 #include <new>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -2229,7 +2230,7 @@ void noteLeanCoverage(const ShaderResources& resources, std::span<const ShaderRe
     std::fprintf(stderr, "[lean-coverage] template hits (10 s): %llu; same template as the previous draw %llu; template already used in the open batch %llu; moved buffers per hit 0: %llu, 1: %llu, 2: %llu, 3+: %llu; moved bytes %llu; moved snapshots up to 64 KiB through the snapshot cache %llu (%llu reused, %llu bytes), copied into the upload chunk %llu (%llu bytes)\n", taken[Hits], taken[BackToBack], taken[SameBatch], taken[Moved0], taken[Moved1], taken[Moved2], taken[Moved3], taken[MovedBytes], static_cast<unsigned long long>(snapshots.cached), static_cast<unsigned long long>(snapshots.reused), static_cast<unsigned long long>(snapshots.cachedBytes), static_cast<unsigned long long>(snapshots.uploaded), static_cast<unsigned long long>(snapshots.uploadedBytes));
 }
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const std::vector<std::uint32_t>* contentKey, ReplayReason replayDraw, bool replayOn) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const std::vector<std::uint32_t>* contentKey, ReplayReason replayDraw, bool replayOn, DrawCommitView* view = nullptr) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -2258,7 +2259,9 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         } else {
             resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         }
+        if (view != nullptr) view->lookup = DrawCommitLookup::Absent;
         if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+            if (view != nullptr) view->found = cached.get();
             const auto releaseSpace = [](ShaderResources* resources) { static_cast<void>(resources->ReleaseSpace()); };
             std::unique_ptr<ShaderResources, decltype(releaseSpace)> heldSpace(nullptr, releaseSpace);
             const bool counted = address == AddressStages::ReadOnly && cached->SpaceReuse();
@@ -2316,17 +2319,21 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
                 if (counted) reuse = AddressDrawReuse::Reused;
+                if (view != nullptr) view->lookup = DrawCommitLookup::Hit;
             } else if (valid || inUse) {
+                if (view != nullptr) view->lookup = valid ? DrawCommitLookup::Unmoved : DrawCommitLookup::Invalid;
                 if (valid && cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 if (valid && counted) reuse = patched ? AddressDrawReuse::PatchedData : AddressDrawReuse::MovedBuffer;
                 countCache(&DrawProfile::cacheMisses);
             } else {
+                if (view != nullptr) view->lookup = DrawCommitLookup::Invalid;
                 if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
             }
         }
     } else {
+        if (view != nullptr) view->lookup = DrawCommitLookup::Uncacheable;
         countCache(&DrawProfile::uncacheable);
     }
     findCost.Stop();
@@ -2600,11 +2607,15 @@ struct RecordKeeping {
     bool passNotes = false;
     std::uint32_t* notesSkipped = nullptr;
     bool* keptOnce = nullptr;
+    DrawCommitView* view = nullptr;
 };
 
+bool keepsOnce(const DrawRecordKeep* keep, const Recorder& recorder, const ShaderResources* resources, const Pipeline* pipeline, const Framebuffer* framebuffer, std::span<const std::shared_ptr<StorageTexture>> targets, bool plain) {
+    return plain && keep != nullptr && keep->recorder == recorder.Id() && keep->batch == recorder.OpenSerial() && keep->resources == resources && keep->pipeline == pipeline && keep->framebuffer == framebuffer && std::ranges::equal(keep->targets, targets, [](const void* kept, const std::shared_ptr<StorageTexture>& target) { return kept == target.get(); });
+}
+
 void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::pair<std::uint32_t, std::uint32_t>> slices, VkRect2D scissor, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, std::shared_ptr<ShaderResources::DrawUse> use, std::shared_ptr<const void>* spaceKeep, const RecordKeeping& keeping = {}) {
-    const auto sameTargets = [&] { return std::ranges::equal(keeping.keep->targets, targets, [](const void* kept, const std::shared_ptr<StorageTexture>& target) { return kept == target.get(); }); };
-    const bool keptOnce = keeping.keep != nullptr && keeping.keep->recorder == recorder.Id() && keeping.keep->batch == recorder.OpenSerial() && keeping.keep->resources == resources.get() && keeping.keep->pipeline == pipeline.get() && keeping.keep->framebuffer == framebuffer.get() && sameTargets() && !checkRecords && !completion && use == nullptr && spaceKeep == nullptr;
+    const bool keptOnce = keepsOnce(keeping.keep, recorder, resources.get(), pipeline.get(), framebuffer.get(), targets, !checkRecords && !completion && use == nullptr && spaceKeep == nullptr);
     std::shared_ptr<Kept> kept;
     if (keptOnce) {
         if (inputs.indices != nullptr || !inputs.vertexBuffers.empty() || scratch != nullptr) {
@@ -2674,21 +2685,33 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     const bool storeMask = residents.size() <= 64 && RuntimeSwitches::Set(RuntimeSwitch::KeepFastPath);
     std::uint64_t storeBits = 0;
     std::vector<bool> storeNow(storeMask ? 0 : residents.size(), false);
+    if (keeping.view != nullptr) keeping.view->notes.assign(residents.size(), DrawCommitNote{});
     for (std::size_t index = 0; index < residents.size(); ++index) {
         if (residents[index] == nullptr) continue;
+        auto* note = keeping.view != nullptr ? &keeping.view->notes[index] : nullptr;
+        if (note != nullptr) note->present = true;
         if (residents[index]->Descriptor().tileMode == TextureTileMode::kLinear) {
+            if (note != nullptr) note->linear = true;
             const bool store = !residents[index]->MarkDrawn(index < slices.size() ? slices[index].first : 0u, index < slices.size() ? slices[index].second : 0u, scissor) || !residents[index]->Cached();
             if (storeMask) storeBits |= static_cast<std::uint64_t>(store) << index;
             else storeNow[index] = store;
         } else {
             const auto slice = index < slices.size() ? slices[index].first : ~0u;
             const auto count = index < slices.size() ? slices[index].second : 0u;
+            if (note != nullptr) {
+                const auto probe = residents[index]->ProbeRenote(recorder.Id(), recorder.RenderPassGeneration(), slice, count);
+                note->renote = probe.renote;
+                note->noteFirst = probe.first;
+                note->noteLayers = probe.layers;
+                note->storesKeys = residents[index]->FirstWriteStoresKeys();
+            }
             if (keeping.passNotes && residents[index]->RenoteInPass(recorder.Id(), recorder.RenderPassGeneration(), slice, count)) {
                 if (keeping.notesSkipped != nullptr) ++*keeping.notesSkipped;
                 continue;
             }
             if (index < slices.size()) residents[index]->MarkSliceDirty(slice, count);
             else residents[index]->MarkDirty();
+            if (note != nullptr) std::tie(note->markedFirst, note->markedLayers) = residents[index]->MarkedLayers();
             if (recorder.RenderPassOpen()) residents[index]->RememberPassNote(recorder.Id(), recorder.RenderPassGeneration(), slice, count);
         }
     }
@@ -2742,6 +2765,7 @@ struct RecordedDraw {
     std::shared_ptr<Pipeline> pushPipeline;
     std::shared_ptr<Framebuffer> pushFramebuffer;
     bool* pushed = nullptr;
+    DrawCommitView* view = nullptr;
 };
 
 // A remapped viewport depth range reads its scale and offset from the draw's push block (the vertex shader's
@@ -2941,6 +2965,10 @@ bool PassAccessMemoVerify() {
     return on;
 }
 
+bool passAccessMatches(const DrawRecordAccess& memo, const Recorder* recorder, const ShaderResources& resources, std::span<const std::shared_ptr<StorageTexture>> targets) {
+    return memo.recorder == recorder && memo.generation == recorder->RenderPassGeneration() && memo.resources == &resources && std::ranges::equal(memo.targets, targets, [](const void* kept, const std::shared_ptr<StorageTexture>& target) { return kept == target.get(); });
+}
+
 void notePassAccessCheck(bool differed) {
     static std::atomic<std::uint64_t> checks{0}, differences{0};
     if (differed) differences.fetch_add(1, std::memory_order_relaxed);
@@ -2970,8 +2998,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const auto passKey = DrawRenderPassKey(context, state, record.targetViews);
     auto& memo = record.access != nullptr ? *record.access : passAccessMemo();
     const bool memoUsable = !resources.HoldsLease() && !resources.UsesAddressTable() && (record.access != nullptr || !RuntimeSwitches::Set(RuntimeSwitch::NoPassAccessMemo));
-    const bool memoMatched = memoUsable && memo.recorder == recorder && memo.generation == recorder->RenderPassGeneration() && memo.resources == &resources && std::ranges::equal(memo.targets, record.targets, [](const void* kept, const std::shared_ptr<StorageTexture>& target) { return kept == target.get(); });
-    const bool memoHit = memoMatched && !PassAccessMemoVerify();
+    const bool memoMatched = memoUsable && passAccessMatches(memo, recorder, resources, record.targets);
+    const bool memoHit = memoMatched && !PassAccessMemoVerify() && record.view == nullptr;
     const bool readsTarget = memoHit ? memo.readsTarget : std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
     // address-based build), or over its GPU-side records, lands before it, as before a dispatch
@@ -3021,7 +3049,13 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     ShaderResources::HeapReplayProof replayProof;
     const bool hitCensus = ReplayCensusEnabled() && outcome.kind == KindTemplateHit && resources.HeapStage();
     const auto* faultRecord = drawUse != nullptr ? drawUse->record.get() : nullptr;
-    const auto drawBindings = record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus);
+    std::vector<std::size_t> viewSelected;
+    auto* selectedOut = record.view != nullptr ? &viewSelected : nullptr;
+    const auto drawBindings = record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, selectedOut) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus, selectedOut);
+    if (record.view != nullptr && faultRecord == nullptr && !record.replay && !resources.HeapStage()) {
+        resources.DescribeDrawBindings(drawBindings.get(), viewSelected, record.push, record.view->bindings);
+        record.view->bound = true;
+    }
     const bool pushing = drawBindings != nullptr && drawBindings->pushedSet >= 0;
     if (pushing) {
         record.pipeline = record.pushPipeline;
@@ -3061,7 +3095,15 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passWriteOnly = writeOnly;
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
-    if (memoMatched && !memoHit) {
+    if (record.view != nullptr && !resources.HoldsLease() && !resources.UsesAddressTable()) {
+        auto& derived = record.view->access.emplace();
+        derived.readsTarget = readsTarget;
+        derived.reads.assign(passReads.begin(), passReads.begin() + static_cast<std::ptrdiff_t>(ownReads));
+        derived.writes.assign(passWrites.begin(), passWrites.end());
+        derived.writeOnly.assign(passWriteOnly.begin(), passWriteOnly.end());
+        derived.images.assign(passImages.begin(), passImages.end());
+    }
+    if (memoMatched && !memoHit && PassAccessMemoVerify()) {
         const bool same = memo.readsTarget == readsTarget && std::ranges::equal(memo.reads, std::span(passReads).first(ownReads)) && std::ranges::equal(memo.writes, passWrites) && std::ranges::equal(memo.writeOnly, passWriteOnly) && std::ranges::equal(memo.images, passImages);
         notePassAccessCheck(!same);
     }
@@ -3379,6 +3421,7 @@ struct PreparedDraw {
     SampleOrderPass reorderPass;
     std::optional<DepthSampleLocations> depthLocations;
     std::shared_ptr<std::shared_ptr<const void>> spaceKeep;
+    DrawCommitView* view = nullptr;
 };
 
 void keepHeldSpace(PreparedDraw& prepared) {
@@ -3952,7 +3995,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& resolved = prepared.resolved;
     const bool replayOn = RuntimeSwitches::Set(RuntimeSwitch::ReplayHeapStage) || RuntimeSwitches::Set(RuntimeSwitch::XpReplay);
     const auto replayDraw = replayOn || ReplayCensusEnabled() ? heapReplayDrawReason(state, draw, shaders, inputs, targets, !stencilReferences.empty(), recordable) : ReplayReason::Count;
-    resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared.contentKey, replayDraw, replayOn);
+    resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared.contentKey, replayDraw, replayOn, prepared.view);
     if (stopAfterResolve.load(std::memory_order_relaxed) != 0) {
         const auto stop = stopAfterResolve.exchange(0, std::memory_order_relaxed);
         if (stop == 1) return false;
@@ -4280,7 +4323,9 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.reorderPass = reorderPass;
         record.depthLocations = depthLocations;
         record.spaceKeep = &prepared.spaceKeep;
-        if (auto* view = DrawCommitViewSlot::Get(); view != nullptr) {
+        if (auto* view = prepared.view; view != nullptr) {
+            record.view = view;
+            record.keeping.view = view;
             view->filled = true;
             view->resources = resources.get();
             view->pipeline = pipeline.get();
@@ -4309,6 +4354,21 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             view->shaderStages = inputs.shaderStages;
             view->hasDepth = state.depth.has_value();
             view->pushed = false;
+            view->pushPipeline = nullptr;
+            view->pushFramebuffer = nullptr;
+            const auto* push = view->wantPush && resources->RecordLean() && stencilReferences.empty() && !UsesMeshWindow(shaders) && !pipeline->DescriptorHeap() ? resources->PushLayouts() : nullptr;
+            if (push != nullptr) {
+                const State& pipelineState = masked.has_value() ? *masked : state;
+                auto pushPipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), push->layouts, shaders, VK_IMAGE_LAYOUT_GENERAL);
+                if (pushPipeline != nullptr) {
+                    auto pushFramebuffer = pushPipeline->AcquireFramebuffer(targetViews, prepared.framebufferOwners, state.renderExtent, state.renderLayers);
+                    view->pushPipeline = pushPipeline.get();
+                    view->pushFramebuffer = pushFramebuffer.get();
+                    view->held.push_back(std::move(pushPipeline));
+                    view->held.push_back(std::move(pushFramebuffer));
+                }
+            }
+            view->gpuWrites = resources->GpuWrites().size();
         }
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, prepared.trace);
         if (prepared.passAttachments) rememberAttachments(context, state, prepared);
@@ -4861,6 +4921,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     prepared.fragmentOutputs = fragmentOutputs;
     prepared.passAttachments = PassAttachmentMemoEnabled();
     prepared.recordRecipe = recordRecipe;
+    prepared.view = DrawCommitViewSlot::Get();
     const struct HeldSpace {
         PreparedDraw& prepared;
         ~HeldSpace() {
@@ -5230,7 +5291,25 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         answer->fragmentOutputs = recipe.fragmentOutputs;
         answer->shaderStages = recipe.shaderStages;
         answer->hasDepth = recipe.hasDepth;
-        answer->pushed = push != nullptr;
+        answer->pushed = false;
+        answer->bound = false;
+        answer->bindings.clear();
+        if (lean) {
+            std::vector<std::size_t> selected;
+            const auto bindings = push != nullptr ? resources->PreparePushedDrawBindings(*recorder, moved, *push, &selected) : resources->PrepareDrawBindings(*recorder, moved, false, nullptr, false, &selected);
+            resources->DescribeDrawBindings(bindings.get(), selected, push, answer->bindings);
+            answer->bound = true;
+            answer->pushed = bindings != nullptr && bindings->pushedSet >= 0;
+        }
+        answer->pushPipeline = answer->pushed ? pushPipeline.get() : nullptr;
+        answer->pushFramebuffer = answer->pushed ? pushFramebuffer.get() : nullptr;
+        answer->access.reset();
+        if (!resources->HoldsLease() && !resources->UsesAddressTable() && !PassAccessMemoVerify() && passAccessMatches(record.access, recorder, *resources, targets)) answer->access = record.access;
+        const Pipeline* boundPipeline = answer->pushed ? pushPipeline.get() : pipeline.get();
+        const Framebuffer* boundFramebuffer = answer->pushed ? pushFramebuffer.get() : framebuffer.get();
+        answer->keptOnce = lean && keepsOnce(&record.keep, *recorder, resources.get(), boundPipeline, boundFramebuffer, targets, !resources->ChecksFaults());
+        answer->keep = record.keep;
+        answer->passNotes = lean;
         record.effects.passHeld = held;
         return result;
     }

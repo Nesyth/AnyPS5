@@ -320,7 +320,15 @@ public:
     void WriteBack();
     // Deferred write-back (APS5_EAGER_WRITEBACK=1 stores at once instead).
     void MarkDirty();
+    struct PassRenote {
+        bool renote = false;
+        std::uint32_t first = 0;
+        std::uint32_t layers = 0;
+    };
+    PassRenote ProbeRenote(std::uint64_t recorder, std::uint64_t pass, std::uint32_t slice, std::uint32_t count) const;
     bool RenoteInPass(std::uint64_t recorder, std::uint64_t pass, std::uint32_t slice, std::uint32_t count);
+    std::pair<std::uint32_t, std::uint32_t> MarkedLayers() const { return {markedFirst, markedLayers}; }
+    bool FirstWriteStoresKeys() const;
     void RememberPassNote(std::uint64_t recorder, std::uint64_t pass, std::uint32_t slice, std::uint32_t count);
     void MarkWholeWritten();
     void MarkUnitsWritten(const std::vector<bool>& units);

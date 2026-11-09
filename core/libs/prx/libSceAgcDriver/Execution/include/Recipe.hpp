@@ -135,11 +135,38 @@ struct DrawRecordAccess {
     std::vector<std::pair<VkImage, bool>> images;
 };
 
+enum class DrawCommitLookup : std::uint8_t { Unknown, Hit, Absent, Invalid, Unmoved, Uncacheable };
+
+struct DrawCommitNote {
+    bool present = false;
+    bool linear = false;
+    bool renote = false;
+    bool storesKeys = false;
+    std::uint32_t noteFirst = 0;
+    std::uint32_t noteLayers = 0;
+    std::uint32_t markedFirst = 0;
+    std::uint32_t markedLayers = 0;
+};
+
 struct DrawCommitView {
     bool filled = false;
     const void* resources = nullptr;
     const void* pipeline = nullptr;
     const void* framebuffer = nullptr;
+    bool wantPush = false;
+    const void* pushPipeline = nullptr;
+    const void* pushFramebuffer = nullptr;
+    DrawCommitLookup lookup = DrawCommitLookup::Unknown;
+    const void* found = nullptr;
+    bool bound = false;
+    std::vector<Graphics::ShaderResources::BoundBuffer> bindings;
+    std::optional<DrawRecordAccess> access;
+    bool keptOnce = false;
+    DrawRecordKeep keep;
+    std::size_t gpuWrites = 0;
+    bool passNotes = false;
+    std::vector<DrawCommitNote> notes;
+    std::vector<std::shared_ptr<const void>> held;
     Graphics::ResourceCache::Key key;
     std::vector<VkImageView> views;
     std::vector<const void*> targets;
