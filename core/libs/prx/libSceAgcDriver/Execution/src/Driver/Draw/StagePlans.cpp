@@ -319,6 +319,12 @@ std::shared_ptr<StagePlanSet> MergeStagePlans(const StagePlanSet* kept, const St
     return set;
 }
 
+bool StagePlanBuildDue(std::uint64_t& buildSeq, std::uint64_t seq, std::uint64_t front) {
+    if (buildSeq != 0 && buildSeq >= front) return false;
+    buildSeq = seq;
+    return true;
+}
+
 namespace StagePlans {
 
 namespace {
@@ -339,10 +345,10 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "no plans", "refused", "generation moved", "user words unreadable", "new layout", "runs unreadable", "new user words", "new low bits", "new run words", "new combination",
     "image views moved", "content differs", "inaccessible", "queued label", "flushing image", "forget serial moved", "publish moved", "pending storage moved", "device images", "moved buffer fields", "vertex layout differs", "memory changed", "fetch error",
     "today's draw", "indirect", "lean front verify", "inline",
-    "builds", "not queued", "generation moved", "shape", "indirect", "stage count", "geometry back end", "capture", "direct stage", "program", "result", "patched programs", "layout",
+    "builds", "not queued", "generation moved", "deferred behind the shape's build in flight", "shape", "indirect", "stage count", "geometry back end", "capture", "direct stage", "program", "result", "patched programs", "layout",
     "builds dropped", "dropped without an answer slot", "dropped as stale", "dropped for a replaced shape", "dropped for a refused shape", "dropped over the byte cap",
     "stage plans added", "stage plans shared", "stage plans replaced", "stage plans evicted", "layouts added", "draw plans added", "draw plans known", "draw plans evicted", "sets swept", "sets cleared", "mode changes", "demotions",
-    "skipped clean", "skipped after a clean re-query", "verified", "verify differed", "first proof", "last proof failed", "not reusable", "storage images", "depth copies", "own writes", "not all clean", "views moved", "serials moved", "a range forgotten", "rewritten since the record", "pending writes", "proved in full with clean proofs off",
+    "skipped clean", "skipped after a clean re-query", "verified", "verify differed", "first proof", "last proof failed", "not reusable", "storage images", "depth copies", "own writes", "not all clean", "views moved", "serials moved", "a range forgotten", "rewritten since the record", "pending writes", "written during the last proof", "proved in full with clean proofs off",
     "held", "first draw", "another pass", "collect epoch moved", "proof serial moved", "pending serial moved", "depth serials moved", "a target changed",
     "checked", "trusted by the ticket",
 };
@@ -434,6 +440,10 @@ void Add(Counter counter, std::uint64_t count) {
 void AddOnWorker(Counter counter, std::uint64_t count) {
     auto& value = counters[static_cast<std::size_t>(counter)].value;
     value.store(value.load(std::memory_order_relaxed) + count, std::memory_order_relaxed);
+}
+
+void AddOnCommitter(Counter counter, std::uint64_t count) {
+    AddOnWorker(counter, count);
 }
 
 void NoteStore(std::size_t shapes, std::size_t stagePlans, std::size_t drawPlans, std::size_t bytes) {
@@ -596,10 +606,13 @@ void Driver::probeStagePlans(LeanDrawJob& job, ShapeRecord& record) {
         StagePlans::AddOnWorker(Counter::MissRefused);
         return;
     }
-    job.recordFlags |= DrawRecordFlags::BuildWanted;
+    job.recordFlags |= DrawRecordFlags::PlanProbed;
+    auto& finisher = DrawFinisher::Get();
+    const auto seq = finisher.Issued();
+    if (StagePlanBuildDue(record.plansBuildSeq, seq, finisher.Front())) job.recordFlags |= DrawRecordFlags::BuildWanted;
     if (record.plans == nullptr) return;
     job.plans = record.plans.get();
-    record.plansSeq = DrawFinisher::Get().Issued();
+    record.plansSeq = seq;
     record.plansPresent = Graphics::Recorder::Presents();
     if (StagePlans::Due(frontLatch)) job.recordFlags |= DrawRecordFlags::VerifyDue;
 }
@@ -676,6 +689,7 @@ std::shared_ptr<DrawRecordHit> Driver::lookupStagePlans(const LeanDrawJob& job, 
 void Driver::finishStagePlanDraw(const LeanDrawJob& job) {
     using StagePlans::Counter;
     const auto& anchor = leanDraws.AnchorAt(job.anchor);
+    const bool probed = (job.recordFlags & DrawRecordFlags::PlanProbed) != 0;
     const bool buildable = (job.recordFlags & DrawRecordFlags::BuildWanted) != 0;
     std::shared_ptr<DrawRecordHit> hit;
     auto miss = Counter::MissNoPlans;
@@ -706,8 +720,9 @@ void Driver::finishStagePlanDraw(const LeanDrawJob& job) {
         if (hit->record->plan->addressed) answer.CaptureSnapshots(hit->snapshots);
         answer.fetched = std::move(hit->fetched);
         if (DrawRecords::CorruptingAnswers()) answer.parameters[3] ^= 1u;
-    } else if (buildable) {
+    } else if (probed) {
         StagePlans::Add(miss);
+        if (!buildable && BuildsOn(miss)) StagePlans::Add(Counter::BuildsDeferred);
     }
     const bool build = hit == nullptr && buildable && BuildsOn(miss);
     if (hit == nullptr && !build) {
@@ -786,7 +801,7 @@ void Driver::installStagePlans(const LeanDrawJob& job, const StagePlanAnswer& an
     const auto front = DrawFinisher::Get().Front();
     const auto dropped = [&](Counter reason) {
         if (answer.demote) return;
-        StagePlans::AddOnWorker(Counter::BuildsDropped);
+        StagePlans::Add(Counter::BuildsDropped);
         StagePlans::AddOnWorker(reason);
     };
     if (job.recordGeneration != lean.stamp || answer.shape == nullptr || answer.generation != lean.stamp) {

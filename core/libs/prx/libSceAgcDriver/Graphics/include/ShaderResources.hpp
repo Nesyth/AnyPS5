@@ -416,7 +416,7 @@ public:
         ProofFailure failure = ProofFailure::None;
         bool audited = false;
     };
-    enum class CleanProof : std::uint8_t { Skipped, Requeried, Verified, Differs, FirstProof, Failed, NotReusable, StorageImages, DepthCopies, OwnWrites, NotClean, Views, Serials, Forgotten, Rewritten, PendingWrites, Count };
+    enum class CleanProof : std::uint8_t { Skipped, Requeried, Verified, Differs, FirstProof, Failed, NotReusable, StorageImages, DepthCopies, OwnWrites, NotClean, Views, Serials, Forgotten, Rewritten, PendingWrites, Unsettled, Count };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr, CleanProof* clean = nullptr);
     struct CleanStamp {
         std::uint64_t forget = 0;
@@ -944,7 +944,7 @@ private:
     bool cleanCurrent(const CleanStamp& stamp, CleanProof& outcome);
     void recordClean(bool proved, const CleanStamp& stamp);
     bool cleanEligible();
-    bool cleanUnchangedSince() const;
+    bool cleanUnchangedSince(std::uint64_t generation) const;
     bool cleanProved = false;
     std::uint8_t cleanEligibility = 0;
     std::uint32_t cleanMisses = 0;

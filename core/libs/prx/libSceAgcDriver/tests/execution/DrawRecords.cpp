@@ -425,6 +425,37 @@ void StagePlanKeys() {
     unread[3] = 0x9999u;
     Plans::StageKeyOf(layout, unread, PlanWords(moved), key);
     Require(Plans::FindStagePlan(stage, built->layout.get(), key) == built.get(), "a user word the stage never reads moved the key");
+    auto valued = PlanStage(first, 0x51);
+    valued.userData.push_back(0x5000u);
+    valued.valueWords = 1u << 4u;
+    valued.vertexWords = 1u << 3u;
+    valued.userDataMask |= (1u << 3u) | (1u << 4u);
+    const auto withValue = Plans::MakeStagePlan(valued);
+    Require(withValue != nullptr && withValue->layout->exactUsers == 2u && withValue->layout->bitUsers == ((1u << 4u) | 1u) && withValue->layout->users == 5u, "a user word patched into a bound buffer did not join the key by its low bits, or a vertex table word joined it");
+    Plans::StagePlanStage valueStage;
+    valueStage.layouts.push_back(withValue->layout);
+    valueStage.plans.push_back(withValue);
+    const auto valueKey = [&](std::uint32_t value, std::uint32_t vertex) {
+        auto users = valued.userData;
+        users[3] = vertex;
+        users[4] = value;
+        Plans::StageKeyOf(*withValue->layout, users, PlanWords(first), key);
+        return Plans::FindStagePlan(valueStage, withValue->layout.get(), key) == withValue.get();
+    };
+    Require(valueKey(0x7340u, 0x1234u), "a moved buffer base in a user word or a moved vertex table pointer gave another key");
+    Require(!valueKey(0x7342u, 0xabcdu) && !valueKey(0u, 0xabcdu), "a user word buffer base with other low bits or none at all kept the key");
+    auto hidden = PlanStage(first, 0x51);
+    hidden.hiddenUserWords = 1;
+    const auto withHidden = Plans::MakeStagePlan(hidden);
+    Require(withHidden != nullptr && withHidden->layout->exactUsers == 3u && withHidden->layout->bitUsers == 0u, "a hidden user word did not join the key as it is");
+}
+
+void StagePlanBuilds() {
+    namespace Plans = AgcDriver::DriverDetail;
+    std::uint64_t pending = 0;
+    Require(Plans::StagePlanBuildDue(pending, 10, 5) && pending == 10, "the first build of a shape was not due");
+    Require(!Plans::StagePlanBuildDue(pending, 11, 5) && !Plans::StagePlanBuildDue(pending, 12, 10) && pending == 10, "a second build was due while the first one's job had not finished");
+    Require(Plans::StagePlanBuildDue(pending, 13, 11) && pending == 13, "a build was not due once the finisher front passed the last build's job");
 }
 
 void StagePlanMerges() {
@@ -768,8 +799,9 @@ int main() {
         Twins();
         StagePlanKeys();
         StagePlanMerges();
+        StagePlanBuilds();
         const auto device = Device();
-        std::cout << "draw record keys, store bounds, eviction, invalidation, variant probes, twins, stage plan keys and stage plan merges passed" << (device == 0 ? "; repeated lean draws hit their identity records and their shape's stage plans" : "; the device part was skipped") << '\n';
+        std::cout << "draw record keys, store bounds, eviction, invalidation, variant probes, twins, stage plan keys, stage plan merges and stage plan build pacing passed" << (device == 0 ? "; repeated lean draws hit their identity records and their shape's stage plans" : "; the device part was skipped") << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

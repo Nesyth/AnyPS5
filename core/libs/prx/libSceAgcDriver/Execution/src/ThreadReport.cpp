@@ -108,7 +108,7 @@ std::uint64_t Peek(Count count) {
 }
 
 void MarkItem(ItemMark mark) {
-    itemMark = mark;
+    if (Enabled()) itemMark = mark;
 }
 
 ItemMark TakeItemMark(std::uint64_t* waitedNs) {

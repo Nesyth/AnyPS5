@@ -108,6 +108,7 @@ StagePlans::Counter StageKeyMiss(const StagePlanStage& stage, const StageLayout*
 const DrawPlan* FindDrawPlan(const StagePlanSet& set, std::span<const StagePlan* const> stages);
 std::shared_ptr<const DrawRecord> AssembleDrawRecord(const DrawRecord& built, std::span<const std::shared_ptr<const StagePlan>> stages);
 std::shared_ptr<StagePlanSet> MergeStagePlans(const StagePlanSet* kept, const StagePlanAnswer& answer, StagePlanMerge& merge);
+bool StagePlanBuildDue(std::uint64_t& buildSeq, std::uint64_t seq, std::uint64_t front);
 
 }
 

@@ -4254,7 +4254,7 @@ const std::vector<std::pair<std::uint64_t, std::uint64_t>>* ShaderResources::ran
 
 namespace {
 
-enum class CleanEvent { Hit, Requeried, Verified, Differs, NoRecord, Views, Serials, Forgotten, Rewritten, PendingWrites, NotReusable, StorageImages, DepthCopies, OwnWrites, NotClean, Count };
+enum class CleanEvent { Hit, Requeried, Verified, Differs, NoRecord, Views, Serials, Forgotten, Rewritten, PendingWrites, NotReusable, StorageImages, DepthCopies, OwnWrites, NotClean, Unsettled, Count };
 
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CleanEvent::Count)>& cleanEvents() {
     static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CleanEvent::Count)> events{};
@@ -4266,7 +4266,7 @@ void noteClean(CleanEvent event) {
     events[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
     static std::atomic<std::uint64_t> calls{0};
     if ((calls.fetch_add(1, std::memory_order_relaxed) & 0x7ffffu) != 0x7ffffu) return;
-    constexpr std::array<const char*, static_cast<std::size_t>(CleanEvent::Count)> names{"hits", "of them re-queried", "verified", "verify differs", "no record", "views moved", "serials moved", "a range forgotten", "rewritten since the record", "pending writes", "not reusable", "storage images", "depth copies", "own writes", "not all clean"};
+    constexpr std::array<const char*, static_cast<std::size_t>(CleanEvent::Count)> names{"hits", "of them re-queried", "verified", "verify differs", "no record", "views moved", "serials moved", "a range forgotten", "rewritten since the record", "pending writes", "not reusable", "storage images", "depth copies", "own writes", "not all clean", "written during the proof"};
     std::string line = "[clean-currency] template proofs (last 524288 events):";
     for (std::size_t index = 0; index < names.size(); ++index) {
         char item[64];
@@ -4316,12 +4316,12 @@ bool ShaderResources::cleanEligible() {
     return true;
 }
 
-bool ShaderResources::cleanUnchangedSince() const {
-    if (cleanAt.generation == 0) return false;
+bool ShaderResources::cleanUnchangedSince(std::uint64_t generation) const {
+    if (generation == 0) return false;
     struct CleanQueriesStorage {};
     auto& queries = HostThreadLocal<std::vector<GuestMemory::UnchangedQuery>, CleanQueriesStorage>();
     queries.clear();
-    for (const auto& [begin, end] : cleanRangeList) queries.push_back({begin, static_cast<std::size_t>(end - begin), cleanAt.generation});
+    for (const auto& [begin, end] : cleanRangeList) queries.push_back({begin, static_cast<std::size_t>(end - begin), generation});
     return queries.empty() || GuestMemory::UnchangedSinceAll(queries);
 }
 
@@ -4343,7 +4343,7 @@ bool ShaderResources::cleanCurrent(const CleanStamp& stamp, CleanProof& outcome)
     const auto* ranges = &cleanRangeList;
     if (stamp.forget != cleanAt.forget) {
         if (!GuestMemory::AllClean(*ranges)) return refuse(CleanEvent::Forgotten, CleanProof::Forgotten);
-        if (!cleanUnchangedSince()) return refuse(CleanEvent::Rewritten, CleanProof::Rewritten);
+        if (!cleanUnchangedSince(cleanAt.generation)) return refuse(CleanEvent::Rewritten, CleanProof::Rewritten);
         cleanAt.forget = stamp.forget;
         noteClean(CleanEvent::Requeried);
         outcome = CleanProof::Requeried;
@@ -4392,6 +4392,11 @@ void ShaderResources::recordClean(bool proved, const CleanStamp& stamp) {
         return;
     }
     cleanMisses = 0;
+    if (!cleanUnchangedSince(stamp.generation)) {
+        noteClean(CleanEvent::Unsettled);
+        cleanRefusal = CleanProof::Unsettled;
+        return;
+    }
     cleanProved = true;
     cleanAt = stamp;
 }

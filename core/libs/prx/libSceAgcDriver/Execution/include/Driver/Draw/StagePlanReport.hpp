@@ -49,6 +49,7 @@ enum class Counter : std::uint8_t {
     Builds,
     BuildsNotQueued,
     BuildsGenerationMoved,
+    BuildsDeferred,
     RefusedShape,
     RefusedIndirect,
     RefusedStages,
@@ -93,6 +94,7 @@ enum class Counter : std::uint8_t {
     ProofForgotten,
     ProofRewritten,
     ProofPendingWrites,
+    ProofUnsettled,
     ProofsFull,
     TargetsHeld,
     TargetsFirst,
@@ -119,6 +121,7 @@ void NoteDifference(DrawRecords::Field field, std::string_view detail);
 void NoteAllowed(DrawRecords::Allowed kind);
 void Add(Counter counter, std::uint64_t count = 1);
 void AddOnWorker(Counter counter, std::uint64_t count = 1);
+void AddOnCommitter(Counter counter, std::uint64_t count = 1);
 void NoteStore(std::size_t shapes, std::size_t stagePlans, std::size_t drawPlans, std::size_t bytes);
 void Report(bool force);
 

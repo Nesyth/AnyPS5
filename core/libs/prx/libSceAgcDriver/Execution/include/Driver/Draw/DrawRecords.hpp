@@ -215,6 +215,7 @@ constexpr std::uint8_t Probed = 2;
 constexpr std::uint8_t BuildWanted = 4;
 constexpr std::uint8_t VerifyDue = 8;
 constexpr std::uint8_t StagePlans = 16;
+constexpr std::uint8_t PlanProbed = 32;
 
 }
 

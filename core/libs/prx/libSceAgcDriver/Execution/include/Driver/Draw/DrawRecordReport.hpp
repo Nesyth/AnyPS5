@@ -140,6 +140,7 @@ void NoteDifference(Field field, std::string_view detail);
 void NoteAllowed(Allowed kind);
 void Add(Counter counter, std::uint64_t count = 1);
 void AddOnWorker(Counter counter, std::uint64_t count = 1);
+void AddOnCommitter(Counter counter, std::uint64_t count = 1);
 void NoteStore(std::size_t identities, std::size_t records, std::size_t bytes);
 void Report(bool force);
 

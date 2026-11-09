@@ -46,6 +46,7 @@ struct ShapeRecord {
     std::shared_ptr<const StagePlanSet> plans;
     std::uint64_t plansSeq = 0;
     std::uint64_t plansPresent = 0;
+    std::uint64_t plansBuildSeq = 0;
 };
 
 struct LeanDrawJob {

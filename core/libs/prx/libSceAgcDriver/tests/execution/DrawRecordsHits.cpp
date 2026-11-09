@@ -892,7 +892,7 @@ void Plans(PlanArms& arms) {
 }
 
 std::uint64_t ProofsRun(const PlanTotals& now, const PlanTotals& base) {
-    return now.Since(base, PlanCounter::ProofFirst, PlanCounter::ProofPendingWrites) + now.Since(base, PlanCounter::ProofsFull);
+    return now.Since(base, PlanCounter::ProofFirst, PlanCounter::ProofUnsettled) + now.Since(base, PlanCounter::ProofsFull);
 }
 
 std::uint64_t ProofsSkipped(const PlanTotals& now, const PlanTotals& base) {
@@ -945,7 +945,11 @@ void Textures(PlanArms& arms) {
         Require(!armed || ProofsSkipped(clean, base) != 0, "textures: no planned draw of a clean texture in armed memory skipped its template proof" + DescribePlans(clean, base));
         Require(ProofsRun(written, clean) != 0, "textures: no planned draw proved its template again after a CPU write into its texture" + DescribePlans(written, clean));
     }
-    if (!AgcDriver::ThreadReport::Enabled()) return;
+    if (!AgcDriver::ThreadReport::Enabled()) {
+        AgcDriver::ThreadReport::MarkItem(AgcDriver::ThreadReport::ItemMark::Planned);
+        Require(AgcDriver::ThreadReport::TakeItemMark() == AgcDriver::ThreadReport::ItemMark::None, "textures: a planned item was marked while the thread report is off");
+        return;
+    }
     using ThreadCount = AgcDriver::ThreadReport::Count;
     Require(AgcDriver::ThreadReport::Peek(ThreadCount::CommitterPlannedDraws) != 0 && AgcDriver::ThreadReport::Peek(ThreadCount::FinisherPlannedJobs) != 0 && AgcDriver::ThreadReport::Peek(ThreadCount::FinisherPlanMisses) != 0, "textures: the thread report counted no planned committer draw, planned finisher job or plan miss");
     AgcDriver::ThreadReport::Phase();

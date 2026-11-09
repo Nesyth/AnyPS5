@@ -592,6 +592,10 @@ void AddOnWorker(Counter counter, std::uint64_t count) {
     value.store(value.load(std::memory_order_relaxed) + count, std::memory_order_relaxed);
 }
 
+void AddOnCommitter(Counter counter, std::uint64_t count) {
+    AddOnWorker(counter, count);
+}
+
 void NoteStore(std::size_t identities, std::size_t records, std::size_t bytes) {
     storeIdentities.store(identities, std::memory_order_relaxed);
     storeRecords.store(records, std::memory_order_relaxed);
@@ -1511,17 +1515,17 @@ std::string lookupText(const DrawCommitView& today, const void* recorded) {
     }
 }
 
-static_assert(static_cast<std::size_t>(StagePlans::Counter::ProofPendingWrites) - static_cast<std::size_t>(StagePlans::Counter::ProofsSkipped) + 1 == static_cast<std::size_t>(Graphics::ShaderResources::CleanProof::Count), "every clean proof outcome needs a stage plan counter");
+static_assert(static_cast<std::size_t>(StagePlans::Counter::ProofUnsettled) - static_cast<std::size_t>(StagePlans::Counter::ProofsSkipped) + 1 == static_cast<std::size_t>(Graphics::ShaderResources::CleanProof::Count), "every clean proof outcome needs a stage plan counter");
 static_assert(static_cast<std::size_t>(StagePlans::Counter::TargetsChanged) - static_cast<std::size_t>(StagePlans::Counter::TargetsHeld) + 1 == static_cast<std::size_t>(DrawRecordHold::Count), "every target hold outcome needs a stage plan counter");
 
 void NotePlannedCommit(const DrawRecordCommit& commit) {
     using StagePlans::Counter;
     const auto& effects = commit.effects;
-    if (effects.hold != DrawRecordHold::Count) StagePlans::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::TargetsHeld) + static_cast<std::size_t>(effects.hold)));
-    if (effects.cleanProof.has_value()) StagePlans::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::ProofsSkipped) + static_cast<std::size_t>(*effects.cleanProof)));
-    else if (effects.proved) StagePlans::Add(Counter::ProofsFull);
-    if (effects.movedChecked != 0) StagePlans::Add(Counter::MovedChecked, effects.movedChecked);
-    if (effects.movedTrusted != 0) StagePlans::Add(Counter::MovedTrusted, effects.movedTrusted);
+    if (effects.hold != DrawRecordHold::Count) StagePlans::AddOnCommitter(static_cast<Counter>(static_cast<std::size_t>(Counter::TargetsHeld) + static_cast<std::size_t>(effects.hold)));
+    if (effects.cleanProof.has_value()) StagePlans::AddOnCommitter(static_cast<Counter>(static_cast<std::size_t>(Counter::ProofsSkipped) + static_cast<std::size_t>(*effects.cleanProof)));
+    else if (effects.proved) StagePlans::AddOnCommitter(Counter::ProofsFull);
+    if (effects.movedChecked != 0) StagePlans::AddOnCommitter(Counter::MovedChecked, effects.movedChecked);
+    if (effects.movedTrusted != 0) StagePlans::AddOnCommitter(Counter::MovedTrusted, effects.movedTrusted);
 }
 
 bool SameVertexInput(const Graphics::VertexInputLayout& a, const Graphics::VertexInputLayout& b) {
@@ -1557,23 +1561,23 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     const auto every = DrawRecords::VerifyEvery();
     const bool verify = commit.recipe != nullptr && every != 0 && ++ordinal % every == 0;
     if (commit.recipe == nullptr) {
-        DrawRecords::Add(Counter::CommitFirst);
+        DrawRecords::AddOnCommitter(Counter::CommitFirst);
     } else if (!verify) {
         const auto outcome = localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr);
         if (hit.planned) NotePlannedCommit(commit);
         if (outcome.recorded) {
             if (hit.planned) ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
             const auto& effects = commit.effects;
-            DrawRecords::Add(Counter::CommitHits);
-            if (effects.pushed) DrawRecords::Add(Counter::CommitPushed);
-            if (effects.unpushed) DrawRecords::Add(Counter::CommitUnpushed);
-            if (effects.passHeld) DrawRecords::Add(Counter::CommitPassHeld);
-            if (effects.keptOnce) DrawRecords::Add(Counter::CommitKeptOnce);
-            if (effects.notesSkipped != 0) DrawRecords::Add(Counter::CommitNotesSkipped, effects.notesSkipped);
-            if (effects.movedTrusted != 0) DrawRecords::Add(Counter::CommitMovedTrusted, effects.movedTrusted);
+            DrawRecords::AddOnCommitter(Counter::CommitHits);
+            if (effects.pushed) DrawRecords::AddOnCommitter(Counter::CommitPushed);
+            if (effects.unpushed) DrawRecords::AddOnCommitter(Counter::CommitUnpushed);
+            if (effects.passHeld) DrawRecords::AddOnCommitter(Counter::CommitPassHeld);
+            if (effects.keptOnce) DrawRecords::AddOnCommitter(Counter::CommitKeptOnce);
+            if (effects.notesSkipped != 0) DrawRecords::AddOnCommitter(Counter::CommitNotesSkipped, effects.notesSkipped);
+            if (effects.movedTrusted != 0) DrawRecords::AddOnCommitter(Counter::CommitMovedTrusted, effects.movedTrusted);
             return;
         }
-        DrawRecords::Add(CommitMiss(outcome.miss));
+        DrawRecords::AddOnCommitter(CommitMiss(outcome.miss));
     }
     if (hit.planned) ThreadReport::MarkItem(ThreadReport::ItemMark::PlanFallback);
     DrawCommitView answer;
@@ -1596,19 +1600,19 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     DrawCommitViewSlot::Set(nullptr);
     bool differs = false;
     if (verify) {
-        DrawRecords::Add(Counter::CommitVerified);
+        DrawRecords::AddOnCommitter(Counter::CommitVerified);
         differs = verifyRecordCommit(record, answer, today);
     }
     if (differs) {
         commit.Adopt(nullptr);
-        DrawRecords::Add(Counter::CommitDemoted);
+        DrawRecords::AddOnCommitter(Counter::CommitDemoted);
         return;
     }
     if (built != nullptr && (!verify || !answer.filled || answer.resources != today.resources)) {
         commit.Adopt(std::move(built));
-        DrawRecords::Add(Counter::CommitBuilt);
+        DrawRecords::AddOnCommitter(Counter::CommitBuilt);
     } else if (!verify) {
-        DrawRecords::Add(Counter::CommitUnbuilt);
+        DrawRecords::AddOnCommitter(Counter::CommitUnbuilt);
     }
 }
 
