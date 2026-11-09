@@ -198,7 +198,8 @@ public:
     static constexpr std::size_t Sets = 2048;
     static constexpr std::size_t Variants = 4;
     static constexpr std::uint64_t KeepPresents = 3;
-    static constexpr std::size_t DefaultByteCap = std::size_t{32} << 20;
+    static constexpr std::size_t DefaultByteCap = std::size_t{256} << 20;
+    static std::size_t ConfiguredByteCap();
 
     struct Entry {
         DrawRecordKey key;
@@ -243,7 +244,7 @@ private:
     std::size_t identities = 0;
     std::size_t records = 0;
     std::size_t bytes = 0;
-    std::size_t byteCap = DefaultByteCap;
+    std::size_t byteCap = ConfiguredByteCap();
     std::uint64_t uses = 0;
     std::uint64_t sweptPresent = ~std::uint64_t{0};
 };

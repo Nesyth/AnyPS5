@@ -212,6 +212,18 @@ DrawRecordStore::Entry& DrawRecordStore::Place(const DrawRecordKey& key, std::ui
     return *victim;
 }
 
+std::size_t DrawRecordStore::ConfiguredByteCap() {
+    static const std::size_t cap = [] {
+        const char* text = std::getenv("APS5_DRAW_RECORD_MIB");
+        if (text == nullptr || text[0] == '\0') return DefaultByteCap;
+        char* end = nullptr;
+        const auto mib = std::strtoull(text, &end, 10);
+        if (end == text || *end != '\0' || mib == 0 || mib > 4096) return DefaultByteCap;
+        return static_cast<std::size_t>(mib) << 20;
+    }();
+    return cap;
+}
+
 DrawRecordStore::Installed DrawRecordStore::Install(const std::shared_ptr<const DrawRecord>& record, std::uint64_t present, std::uint64_t front) {
     auto* entry = locate(record->key, record->probe);
     if (entry == nullptr) return Installed::NoEntry;
@@ -361,9 +373,9 @@ constexpr std::array<const char*, AllowedKinds> AllowedNames{"fragment outputs k
 
 constexpr std::array<const char*, CounterCount> CounterNames{
     "draws", "hits", "input refetches", "hits on today's path", "new identity", "second sighting", "build pending", "shape replaced", "refused",
-    "content differs", "generation moved", "not queued", "keyless", "no fetch plan", "user word moved", "fetch gate", "image views moved", "vertex layout differs", "moved buffer fields", "memory changed", "fetch error",
+    "content differs", "generation moved", "not queued", "keyless", "no fetch plan", "user word moved", "hidden user word moved", "relocated user word misaligned", "value user word zero", "walked user word moved", "user words unreadable", "fetch gate", "image views moved", "vertex layout differs", "moved buffer fields", "memory changed", "fetch error",
     "today's draw", "indirect", "lean front verify", "inline",
-    "records built", "fetch plans built", "fetch plans refused", "builds refused", "records installed", "builds dropped", "identities evicted", "records cleared", "record mode changes", "demotions",
+    "records built", "fetch plans built", "fetch plans refused", "builds refused", "records installed", "builds dropped", "dropped without an answer slot", "dropped as stale", "dropped over the byte cap", "dropped without an identity", "dropped for a refused identity", "identities evicted", "records cleared", "record mode changes", "demotions",
     "recorded", "pushed", "moved without push", "targets held by the pass", "kept once per batch", "target notes skipped", "moved buffers trusted", "committer halves built", "verified on today's path",
     "no committer half", "not recordable", "targets", "template gone", "objects gone", "texture proof", "moved buffers", "no recipe built", "demoted",
 };
@@ -1006,22 +1018,22 @@ DrawRecords::Counter Driver::fetchDrawRecord(const LeanDrawJob& job, const DrawR
         const auto& program = programs[i];
         const auto& compiled = *stage.compiled;
         auto& user = scratch.userData[i];
-        if (!ReadRecordUserWords(program, job.words, user) || user.size() != stage.userData.size()) return Counter::MissUserWord;
+        if (!ReadRecordUserWords(program, job.words, user) || user.size() != stage.userData.size()) return Counter::MissUserWordUnread;
         if (stage.registeredViews != nullptr && !CaptureRegisteredViewsCurrent(*stage.registeredViews)) return Counter::MissImageViews;
         bool relocated = false;
         for (std::size_t index = 0; index < user.size(); ++index) {
             const auto from = stage.userData[index];
             const auto to = user[index];
             if (from == to) continue;
-            if (index < stage.hiddenUserWords || index >= 64u) return Counter::MissUserWord;
+            if (index < stage.hiddenUserWords || index >= 64u) return Counter::MissUserWordHidden;
             const auto bit = std::uint64_t{1} << index;
             if ((stage.relocatableWords & bit) != 0) {
-                if (from == 0 || to == 0 || ((from ^ to) & 3u) != 0) return Counter::MissUserWord;
+                if (from == 0 || to == 0 || ((from ^ to) & 3u) != 0) return Counter::MissUserWordRelocation;
                 relocated = true;
             } else if ((stage.valueWords & bit) != 0) {
-                if (from == 0 || to == 0) return Counter::MissUserWord;
+                if (from == 0 || to == 0) return Counter::MissUserWordValue;
             } else if ((stage.walkedWords & bit) != 0) {
-                return Counter::MissUserWord;
+                return Counter::MissUserWordWalked;
             } else if ((stage.vertexWords & bit) == 0 && (stage.forwardedWords & bit) == 0 && (stage.userDataMask & bit) != 0) {
                 return Counter::MissUserWord;
             }
@@ -1499,7 +1511,10 @@ void Driver::settleDrawRecord(const LeanDrawJob& job, const DrawRecordSink& sink
     answer->built = DrawRecord::Build(answer->key, job.shape->shared_from_this(), job.deviceSerial, job.recordGeneration, Graphics::Recorder::Presents(), sink);
     DrawRecords::Add(Counter::RecordsBuilt);
     DrawRecords::Add(sink.built != nullptr ? Counter::PlansBuilt : Counter::PlansRefused);
-    if (!DrawFinisher::AnswerLean(std::move(answer))) DrawRecords::Add(Counter::BuildsDropped);
+    if (!DrawFinisher::AnswerLean(std::move(answer))) {
+        DrawRecords::Add(Counter::BuildsDropped);
+        DrawRecords::Add(Counter::DroppedUnanswered);
+    }
 }
 
 void Driver::installDrawRecord(const LeanDrawJob& job, const DrawRecordAnswer& answer) {
@@ -1507,7 +1522,10 @@ void Driver::installDrawRecord(const LeanDrawJob& job, const DrawRecordAnswer& a
     auto& lean = leanDraws;
     const auto front = DrawFinisher::Get().Front();
     if (job.recordGeneration != lean.stamp || job.deviceSerial != lean.identitiesSerial) {
-        if (answer.built != nullptr) DrawRecords::Add(Counter::BuildsDropped);
+        if (answer.built != nullptr) {
+            DrawRecords::Add(Counter::BuildsDropped);
+            DrawRecords::Add(Counter::DroppedStale);
+        }
         return;
     }
     if (answer.demote) {
@@ -1516,8 +1534,12 @@ void Driver::installDrawRecord(const LeanDrawJob& job, const DrawRecordAnswer& a
     }
     if (answer.built == nullptr) return;
     const auto installed = lean.identities.Install(answer.built, Graphics::Recorder::Presents(), front);
-    if (installed == DrawRecordStore::Installed::Yes) DrawRecords::AddOnWorker(Counter::RecordsInstalled);
-    else DrawRecords::Add(Counter::BuildsDropped);
+    if (installed == DrawRecordStore::Installed::Yes) {
+        DrawRecords::AddOnWorker(Counter::RecordsInstalled);
+        return;
+    }
+    DrawRecords::Add(Counter::BuildsDropped);
+    DrawRecords::Add(installed == DrawRecordStore::Installed::OverCap ? Counter::DroppedOverCap : installed == DrawRecordStore::Installed::Refused ? Counter::DroppedRefused : Counter::DroppedNoEntry);
 }
 
 void Driver::retireDrawRecord(const std::byte* payload, std::shared_ptr<const void>&& answer) {
