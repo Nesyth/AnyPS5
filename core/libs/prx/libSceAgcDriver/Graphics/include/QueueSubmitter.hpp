@@ -3,14 +3,18 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <vulkan/vulkan.h>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <thread>
 
 namespace AgcDriver::Graphics {
+
+class EncodeTicket;
 
 class QueueSubmitter {
 public:
@@ -21,13 +25,15 @@ public:
         std::uint64_t waitValue = 0;
         VkSemaphore signal = VK_NULL_HANDLE;
         std::uint64_t signalValue = 0;
+        std::shared_ptr<EncodeTicket> encode;
     };
 
     static bool Enabled();
     static QueueSubmitter& For(VkDevice device, VkQueue queue, PFN_vkQueueSubmit submit, PFN_vkDeviceWaitIdle waitIdle);
     static QueueSubmitter* Existing(VkQueue queue);
 
-    void Enqueue(const Job& job);
+    std::uint64_t Enqueue(Job job);
+    void WaitSubmitReturned(std::uint64_t position) const;
     void Drain();
     void RethrowFailure();
     AgcDriver::Mutex& QueueMutex() { return queueMutex; }
@@ -49,6 +55,9 @@ private:
     bool busy = false;
     bool sleeping = false;
     std::uint64_t submitted = 0;
+    std::uint64_t enqueued = 0;
+    std::uint64_t taken = 0;
+    std::atomic<std::uint64_t> returned{0};
     std::exception_ptr failure;
     std::thread thread;
 };

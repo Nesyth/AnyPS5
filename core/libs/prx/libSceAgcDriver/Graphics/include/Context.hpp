@@ -150,6 +150,8 @@ struct DeviceFunctions {
 // Per-thread count of vkGetDeviceProcAddr lookups made through Context::Function (the [vk] line).
 std::uint64_t& DeviceProcLookups();
 
+PFN_vkVoidFunction ResolveDeviceFunction(VkDevice device, PFN_vkGetDeviceProcAddr deviceProc, const char* name, bool descriptorHeap);
+
 class DeviceFunctionCache {
 public:
     PFN_vkVoidFunction Find(const char* name, PFN_vkGetDeviceProcAddr proc) const {
@@ -347,14 +349,7 @@ struct Context {
         if (cache != nullptr) {
             if (const auto cached = cache->Find(name, deviceProc); cached != nullptr) return reinterpret_cast<TFunction>(cached);
         }
-        if (descriptorHeap) {
-            if (const auto hooked = DescriptorHeapObjectFunction(device, deviceProc, name); hooked != nullptr) {
-                if (cache != nullptr) functionCache->Keep(name, deviceProc, hooked);
-                return reinterpret_cast<TFunction>(hooked);
-            }
-        }
-        ++DeviceProcLookups();
-        const auto function = deviceProc(device, name);
+        const auto function = ResolveDeviceFunction(device, deviceProc, name, descriptorHeap);
         if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
         if (cache != nullptr) functionCache->Keep(name, deviceProc, function);
         return reinterpret_cast<TFunction>(function);

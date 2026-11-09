@@ -82,6 +82,7 @@ enum class RuntimeSwitch : std::size_t {
     DrawRecords,
     StagePlans,
     NoPlanCleanProofs,
+    DeferredEncode,
     Count,
 };
 
