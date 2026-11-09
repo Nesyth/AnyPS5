@@ -741,7 +741,7 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
             ++run.gate.calls;
             checkFlush(submission, cursor, run.gate, gateDue, decision, flushInputs);
         } else if (flushDue(run.gate, flushInputs)) {
-            flushInputs.now = std::chrono::steady_clock::now();
+            if (flushInputs.given) flushInputs.now = std::chrono::steady_clock::now();
             flushBetweenPackets(submission.queue, header, labelPacket, flushInputs.given ? &flushInputs : nullptr);
             tagged = NoTag;
             ++run.gate.calls;

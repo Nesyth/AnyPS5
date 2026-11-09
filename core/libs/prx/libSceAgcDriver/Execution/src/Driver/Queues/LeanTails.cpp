@@ -20,6 +20,7 @@ namespace {
 
 constexpr std::size_t SpareLimit = 512;
 constexpr std::size_t SpareWordsLimit = std::size_t{1} << 20u;
+constexpr std::size_t SpareBytesLimit = std::size_t{64} << 20u;
 
 bool listCacheEnabled() {
     static const bool enabled = std::getenv("APS5_LEAN_NO_LIST_CACHE") == nullptr && std::getenv("APS5_SUBMISSION_EPOCH_EACH") == nullptr && !APS5_ENABLE_TIMING_LOG && GuestMemory::WriteWatched();
@@ -28,6 +29,14 @@ bool listCacheEnabled() {
 
 std::uint32_t controlWord(const std::uint32_t* tail) {
     return std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(tail - 1)).load(std::memory_order_relaxed);
+}
+
+std::size_t commandBytes(const std::vector<std::uint32_t>& commands) {
+    return commands.capacity() * sizeof(std::uint32_t);
+}
+
+std::size_t listBytes(const RegisterLists& lists) {
+    return lists.words.capacity() * sizeof(std::uint32_t) + lists.refs.capacity() * sizeof(RegisterListRef);
 }
 
 std::string hex(std::uint64_t value) {
@@ -77,7 +86,7 @@ KeptTail& LeanTails::Keep() {
     if (keptFront == keptEnd) keptFront = keptEnd = 0;
     if (keptEnd == kept.size()) kept.emplace_back();
     auto& slot = kept[keptEnd++];
-    if (slot.copy.commands.capacity() == 0) slot.copy.commands = TakeCommands();
+    if (slot.copy.commands.capacity() == 0 || slot.copy.commands.capacity() > SpareWordsLimit) slot.copy.commands = TakeCommands();
     slot.copy.rewindTail = nullptr;
     slot.copy.rewindWords = 0;
     slot.sources.clear();
@@ -106,12 +115,15 @@ std::vector<std::uint32_t> LeanTails::TakeCommands() {
     if (spareCommands.empty()) return {};
     auto commands = std::move(spareCommands.back());
     spareCommands.pop_back();
+    spareBytes -= commandBytes(commands);
     return commands;
 }
 
 void LeanTails::GiveCommands(std::vector<std::uint32_t>&& commands) {
-    if (commands.capacity() == 0 || commands.capacity() > SpareWordsLimit || spareCommands.size() >= SpareLimit) return;
+    const auto bytes = commandBytes(commands);
+    if (commands.capacity() == 0 || commands.capacity() > SpareWordsLimit || spareCommands.size() >= SpareLimit || spareBytes + bytes > SpareBytesLimit) return;
     commands.clear();
+    spareBytes += bytes;
     spareCommands.push_back(std::move(commands));
 }
 
@@ -119,12 +131,15 @@ RegisterLists LeanTails::TakeLists() {
     if (spareLists.empty()) return {};
     auto lists = std::move(spareLists.back());
     spareLists.pop_back();
+    spareBytes -= listBytes(lists);
     return lists;
 }
 
 void LeanTails::GiveLists(RegisterLists&& lists) {
-    if (lists.words.capacity() > SpareWordsLimit || spareLists.size() >= SpareLimit) return;
+    const auto bytes = listBytes(lists);
+    if (lists.words.capacity() > SpareWordsLimit || spareLists.size() >= SpareLimit || spareBytes + bytes > SpareBytesLimit) return;
     lists.Clear();
+    spareBytes += bytes;
     spareLists.push_back(std::move(lists));
 }
 

@@ -104,6 +104,7 @@ private:
     std::size_t keptEnd = 0;
     std::vector<std::vector<std::uint32_t>> spareCommands;
     std::vector<RegisterLists> spareLists;
+    std::size_t spareBytes = 0;
 };
 
 }
