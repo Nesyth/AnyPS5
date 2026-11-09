@@ -384,6 +384,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawDecode.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawLookup.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPipeline.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRecords.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadReport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPrecheck.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRegisterKey.cpp
@@ -797,6 +798,24 @@ function(agc_add_draw_pipeline_test agcTestName)
                 ENV ${agcPipelineEnvironment} ${agcLateStackEnvironment} ${agcLeanFrontEnvironment})
         set_tests_properties(${agcTestName}_lean_front_late PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference}")
     endif()
+endfunction()
+
+set(agcDrawRecordsDifference "\\[draw-records-verify\\] [-a-z ]+ differs:")
+
+function(agc_add_draw_records_test agcTestName)
+    set(agcPipelineEnvironment ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1)
+    set(agcRecordsEnvironment ${agcPipelineEnvironment} ${agcLeanFrontEnvironment} APS5_DRAW_RECORDS=1)
+    agc_add_env_test(${agcTestName}_records ${agcTestName}_tests
+            ENV ${agcRecordsEnvironment})
+    agc_add_env_test(${agcTestName}_records_verify ${agcTestName}_tests
+            ENV ${agcRecordsEnvironment} APS5_VERIFY_DRAW_RECORDS=1)
+    set(agcRecordsTests ${agcTestName}_records ${agcTestName}_records_verify)
+    if("LATE" IN_LIST ARGN)
+        agc_add_env_test(${agcTestName}_records_late ${agcTestName}_tests
+                ENV ${agcRecordsEnvironment} ${agcLateStackEnvironment} APS5_VERIFY_DRAW_RECORDS=2)
+        list(APPEND agcRecordsTests ${agcTestName}_records_late)
+    endif()
+    set_tests_properties(${agcRecordsTests} PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDrawRecordsDifference}")
 endfunction()
 
 function(agc_add_gpu_heap_test agcTestName)

@@ -160,6 +160,7 @@ public:
     using Job = std::function<void()>;
     using Range = std::pair<std::uint64_t, std::uint64_t>;
     using LeanRunner = void (*)(const std::byte* payload);
+    using LeanRetirer = void (*)(const std::byte* payload, std::shared_ptr<const void>&& answer);
     static constexpr std::size_t LeanPayloadBytes = 1024;
     static constexpr std::size_t LeanSlots = 64;
     class AheadScope {
@@ -208,7 +209,8 @@ public:
     bool Adopt(bool ring);
     bool RingStore() const { return ringMode.load(std::memory_order_acquire); }
     std::byte* ReserveLean();
-    void PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape);
+    void PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape, LeanRetirer retirer = nullptr, bool inserts = true);
+    static bool AnswerLean(std::shared_ptr<const void> answer);
     PublishedKeys::Answer KeyBefore(std::uint64_t key, std::uint64_t shape, bool insertsOnly) const;
     bool AheadBusy() const;
     static bool AheadOfTurn();
@@ -224,6 +226,8 @@ private:
         std::atomic<std::uint64_t> seq{0};
         std::atomic<std::uint8_t> state{0};
         LeanRunner runner = nullptr;
+        LeanRetirer retirer = nullptr;
+        std::shared_ptr<const void> answer;
         Job closure;
         Pending pending;
         alignas(16) std::array<std::byte, LeanPayloadBytes> payload{};

@@ -539,6 +539,8 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         }
         auto& slot = leanSlot(nextSeq);
         slot.runner = nullptr;
+        slot.retirer = nullptr;
+        slot.answer = nullptr;
         slot.closure = std::move(job);
         slot.pending = std::move(held);
         publishLean(slot);
@@ -637,7 +639,12 @@ void DrawFinisher::retireLean() {
     const auto front = frontSeq.load(std::memory_order_acquire);
     if (leanRetired >= front) return;
     bool republish = false;
-    for (; leanRetired < front; ++leanRetired) republish = countPending(leanSlot(leanRetired).pending, false) || republish;
+    for (; leanRetired < front; ++leanRetired) {
+        auto& slot = leanSlot(leanRetired);
+        republish = countPending(slot.pending, false) || republish;
+        if (const auto retirer = std::exchange(slot.retirer, nullptr); retirer != nullptr) retirer(slot.payload.data(), std::move(slot.answer));
+        slot.answer = nullptr;
+    }
     if (republish) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
     keys.Retire(front);
 }
@@ -726,18 +733,30 @@ std::byte* DrawFinisher::ReserveLean() {
     return leanSlot(nextSeq).payload.data();
 }
 
-void DrawFinisher::PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape) {
+void DrawFinisher::PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape, LeanRetirer retirer, bool inserts) {
     auto& slot = leanSlot(nextSeq);
     slot.runner = runner;
+    slot.retirer = retirer;
+    slot.answer = nullptr;
     auto& held = slot.pending;
     held.key = key;
     held.shape = shape;
-    held.inserts = true;
+    held.inserts = inserts;
     held.unknown = false;
     held.writes.assign(writes.begin(), writes.end());
     held.labelAddress = 0;
     held.labelBytes.clear();
     publishLean(slot);
+}
+
+bool DrawFinisher::AnswerLean(std::shared_ptr<const void> answer) {
+    const auto seq = FinisherSeq::Get();
+    auto& finisher = Get();
+    if (seq == 0 || finisher.lean == nullptr || !finisher.ringMode.load(std::memory_order_acquire)) return false;
+    auto& slot = finisher.leanSlot(seq);
+    if (slot.seq.load(std::memory_order_acquire) != seq || slot.retirer == nullptr) return false;
+    slot.answer = std::move(answer);
+    return true;
 }
 
 bool DrawFinisher::takeLean(unsigned index, std::uint64_t& seq) {
@@ -947,8 +966,14 @@ void DrawFinisher::Stop() {
 
 void DrawFinisher::ReleaseRan() {
     std::vector<Job> done;
+    std::vector<std::shared_ptr<const void>> answers;
     const auto lock = lockFor(mutex);
     std::swap(done, ran);
+    if (!closed.load(std::memory_order_acquire) || lean == nullptr) return;
+    for (auto& slot : *lean) {
+        slot.retirer = nullptr;
+        if (slot.answer != nullptr) answers.push_back(std::move(slot.answer));
+    }
 }
 
 DrawPipeline& DrawPipeline::Queue0() {

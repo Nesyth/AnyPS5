@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <semaphore>
 #include <span>
@@ -206,6 +207,85 @@ void AheadWaits() {
     Require(LeanFront::Total(LeanFront::Counter::AheadWaits) == waitsBefore + 1, "the lean job did not count its wait for the earlier job");
 }
 
+std::vector<std::pair<std::uint32_t, std::uint32_t>> answered;
+
+void RunAnswering(const std::byte* payload) {
+    std::uint32_t value = 0;
+    std::memcpy(&value, payload, sizeof(value));
+    if (value % 7 == 0) std::this_thread::sleep_for(std::chrono::microseconds(30));
+    if (value % 3 != 0) Require(DrawFinisher::AnswerLean(std::make_shared<const std::uint32_t>(value * 2)), "a lean job with a retirer could not answer");
+}
+
+void RunSilent(const std::byte* payload) {
+    Require(!DrawFinisher::AnswerLean(std::make_shared<const std::uint32_t>(1)), "a lean job without a retirer took an answer");
+    static_cast<void>(payload);
+}
+
+void RetireAnswer(const std::byte* payload, std::shared_ptr<const void>&& answer) {
+    std::uint32_t value = 0;
+    std::memcpy(&value, payload, sizeof(value));
+    answered.emplace_back(value, answer == nullptr ? 0u : *std::static_pointer_cast<const std::uint32_t>(answer));
+}
+
+void AnswersReachTheRetirer() {
+    auto& finisher = DrawFinisher::Get();
+    answered.clear();
+    constexpr std::uint32_t Jobs = 300;
+    std::uint32_t expected = 0;
+    for (std::uint32_t index = 1; index <= Jobs; ++index) {
+        if (index % 11 == 0) {
+            finisher.Enqueue([] { Require(!DrawFinisher::AnswerLean(std::make_shared<const std::uint32_t>(1)), "a closure job took an answer"); }, DrawFinisher::Pending{0, 0, true, false, {}, 0, {}});
+            continue;
+        }
+        auto* payload = finisher.ReserveLean();
+        Require(payload != nullptr, "the finisher ring refused a job while open");
+        std::memcpy(payload, &index, sizeof(index));
+        if (index % 5 == 0) {
+            finisher.PublishLean(&RunSilent, {}, 0, 0);
+            continue;
+        }
+        finisher.PublishLean(&RunAnswering, {}, 0, 0, &RetireAnswer);
+        ++expected;
+    }
+    finisher.Drain();
+    Require(answered.size() == expected, "the retirer saw " + std::to_string(answered.size()) + " of " + std::to_string(expected) + " answered jobs");
+    for (std::size_t index = 0; index < answered.size(); ++index) {
+        const auto [value, answer] = answered[index];
+        Require(index == 0 || answered[index - 1].first < value, "the retirer saw job " + std::to_string(value) + " out of order");
+        Require(answer == (value % 3 != 0 ? value * 2 : 0u), "job " + std::to_string(value) + " retired with answer " + std::to_string(answer));
+    }
+    Require(!DrawFinisher::AnswerLean(std::make_shared<const std::uint32_t>(1)), "a thread outside the finisher ring took an answer");
+}
+
+std::atomic<bool> keyChecked{false};
+std::atomic<int> insertsOnlyAnswer{-1};
+std::atomic<int> anyAnswer{-1};
+
+void RunKeyCheck(const std::byte*) {
+    auto& finisher = DrawFinisher::Get();
+    insertsOnlyAnswer.store(static_cast<int>(finisher.KeyBefore(91, 0, true)));
+    anyAnswer.store(static_cast<int>(finisher.KeyBefore(91, 0, false)));
+    keyChecked.store(true);
+}
+
+void HitsPublishNoInserts() {
+    auto& finisher = DrawFinisher::Get();
+    std::binary_semaphore release{0};
+    keyChecked.store(false);
+    finisher.Enqueue([&] { release.acquire(); }, DrawFinisher::Pending{0, 0, true, false, {}, 0, {}});
+    Require(finisher.ReserveLean() != nullptr, "the finisher ring refused a job while open");
+    finisher.PublishLean(&RunSilent, {}, 91, 0, nullptr, false);
+    Require(finisher.ReserveLean() != nullptr, "the finisher ring refused a job while open");
+    finisher.PublishLean(&RunKeyCheck, {}, 92, 0);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!keyChecked.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    release.release();
+    finisher.Drain();
+    Require(keyChecked.load(), "the job behind a held one never ran ahead of it");
+    Require(insertsOnlyAnswer.load() == static_cast<int>(PublishedKeys::Answer::Clear), "a job published without inserts was found by a lookup that waits only for inserts");
+    Require(anyAnswer.load() == static_cast<int>(PublishedKeys::Answer::Hit), "a job published without inserts was not found by a lookup of every key");
+}
+
 void StoreSwitches() {
     auto& finisher = DrawFinisher::Get();
     finisher.Drain();
@@ -248,6 +328,12 @@ int main() {
         }
         RuntimeSwitches::Assign(RuntimeSwitch::SecondFinisher, true);
         AheadWaits();
+        HitsPublishNoInserts();
+        for (const bool more : {false, true}) {
+            RuntimeSwitches::Assign(RuntimeSwitch::SecondFinisher, more);
+            RuntimeSwitches::Assign(RuntimeSwitch::ThirdFinisher, more);
+            AnswersReachTheRetirer();
+        }
         RuntimeSwitches::Assign(RuntimeSwitch::SecondFinisher, second);
         RuntimeSwitches::Assign(RuntimeSwitch::ThirdFinisher, third);
         StoreSwitches();

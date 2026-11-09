@@ -79,6 +79,7 @@ enum class RuntimeSwitch : std::size_t {
     XpKeepDraws,
     XpStreamSegments,
     LeanFront,
+    DrawRecords,
     Count,
 };
 

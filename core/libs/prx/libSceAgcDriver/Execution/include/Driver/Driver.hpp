@@ -320,6 +320,10 @@ private:
     static bool leanShapeCurrent(const LeanShape& shape, const QueueState& queue, const ShaderRegistry& registry);
     void finishLeanDraw(const LeanDrawJob& job, const LeanAnchor& anchor);
     static void runLeanDraw(const std::byte* payload);
+    void probeDrawRecord(LeanDrawJob& job, const LeanShape& shape);
+    void settleDrawRecord(const LeanDrawJob& job, const DrawRecordSink& sink);
+    void installDrawRecord(const LeanDrawJob& job, const DrawRecordAnswer& answer);
+    static void retireDrawRecord(const std::byte* payload, std::shared_ptr<const void>&& answer);
     void restartFinishedDraw(DrawTail& tail);
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();

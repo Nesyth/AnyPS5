@@ -199,10 +199,12 @@ void LeanDraws::Clear(std::uint64_t front) {
         Retire(record, front);
         record = ShapeRecord{};
     }
+    identities.Clear(front);
 }
 
 void LeanDraws::Release(std::uint64_t front, std::uint64_t issued) {
     if (!retired.empty()) std::erase_if(retired, [&](const auto& entry) { return entry.second < front; });
+    identities.Release(front);
     while (anchorTail - anchorHead > 1 && anchors[static_cast<std::size_t>((anchorHead + 1) % Anchors)].firstSeq <= front) {
         anchors[static_cast<std::size_t>(anchorHead % Anchors)] = LeanAnchor{};
         ++anchorHead;
@@ -217,6 +219,8 @@ void LeanDraws::ReleaseDevice() {
     for (; anchorHead != anchorTail; ++anchorHead) anchors[static_cast<std::size_t>(anchorHead % Anchors)] = LeanAnchor{};
     device = nullptr;
     deviceStores = ~std::uint64_t{0};
+    identities.Reset();
+    identitiesSerial = 0;
 }
 
 void LeanDraws::Reset() {
@@ -252,6 +256,10 @@ bool Driver::leanDrawDevice() {
     if (stores != lean.deviceStores || lean.device == nullptr) {
         lean.device = device.Load();
         lean.deviceStores = stores;
+        if (lean.device != nullptr && lean.device->Serial() != lean.identitiesSerial) {
+            lean.identities.Clear(DrawFinisher::Get().Front());
+            lean.identitiesSerial = lean.device->Serial();
+        }
     }
     return lean.device != nullptr;
 }
@@ -358,8 +366,15 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
         }
         return drawEntries() && registerKeyEnabled() && !verifyDrawDataHits() && !verifyDrawRecipe() && !verifyDrawEntries() && !traceDrawCache() && !drawRelocationDrain() && DrawFinisher::Enabled() && DrawFinisher::Overlap();
     }();
+    const bool records = frontLatch.records;
+    const auto recordsOff = [&](DrawRecords::Counter reason) {
+        if (!records) return;
+        DrawRecords::AddOnWorker(DrawRecords::Counter::Draws);
+        DrawRecords::AddOnWorker(reason);
+    };
     const auto today = [&](Counter counter) {
         LeanFront::AddOnWorker(counter);
+        recordsOff(counter == Counter::IndirectDrawsOnTodaysPath ? DrawRecords::Counter::OffIndirect : DrawRecords::Counter::OffTodaysDraw);
         return draw(queue, packet, submission, packetOffset, rejected);
     };
     auto& finisher = DrawFinisher::Get();
@@ -395,12 +410,19 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
         job.drawKey = LeanExactKey(shape, job.words);
         job.shapeKey = shape.finalShape;
         job.deviceSerial = record.deviceSerial;
+        job.records = nullptr;
+        job.recordGeneration = 0;
+        job.recordFlags = 0;
+        recordsOff(DrawRecords::Counter::OffLeanVerify);
         return verifyLeanDraw(queue, packet, submission, packetOffset, rejected, record, verdict, parameters, &job);
     }
     if (verdict == LeanVerdict::Live) {
         LeanFront::AddOnWorker(Counter::PrecheckedLeanDraws);
         bool traceIndirect = false;
-        if (const auto prechecked = precheckDraw(queue, submission, packetOffset, packet, parameters, rejected, traceIndirect)) return *prechecked;
+        if (const auto prechecked = precheckDraw(queue, submission, packetOffset, packet, parameters, rejected, traceIndirect)) {
+            if (*prechecked == DrawVerdict::Drawn) recordsOff(DrawRecords::Counter::OffTodaysDraw);
+            return *prechecked;
+        }
     }
     if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpHalfWorkerDraws) && HalfWorkerDrawDropped()) return DrawVerdict::Drawn;
     if (shape.skipped) return DrawVerdict::Drawn;
@@ -420,13 +442,19 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
     job->drawKey = LeanExactKey(shape, job->words);
     job->shapeKey = shape.finalShape;
     job->deviceSerial = record.deviceSerial;
+    job->records = nullptr;
+    job->recordGeneration = 0;
+    job->recordFlags = 0;
     LeanFront::AddOnWorker(Counter::LeanDraws);
     if (local.has_value()) {
+        recordsOff(DrawRecords::Counter::OffInline);
         finishLeanDraw(*local, LeanAnchor{submission.shaders, leanDraws.device, 0});
         return DrawVerdict::Drawn;
     }
+    if (records) probeDrawRecord(*job, shape);
     record.lastSeq = finisher.Issued();
-    finisher.PublishLean(&Driver::runLeanDraw, shape.writes, job->drawKey, job->shapeKey);
+    const bool answered = (job->recordFlags & (DrawRecordFlags::BuildWanted | DrawRecordFlags::VerifyDue)) != 0;
+    finisher.PublishLean(&Driver::runLeanDraw, shape.writes, job->drawKey, job->shapeKey, answered ? &Driver::retireDrawRecord : nullptr);
     return DrawVerdict::Drawn;
 }
 

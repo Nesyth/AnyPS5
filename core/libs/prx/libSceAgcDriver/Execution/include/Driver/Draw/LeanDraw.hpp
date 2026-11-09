@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <array>
@@ -18,7 +19,7 @@ namespace AgcDriver::DriverDetail {
 
 enum class LeanVerdict : std::uint8_t { Unknown, Normal, Nothing, Live, Fallback };
 
-struct LeanShape {
+struct LeanShape : std::enable_shared_from_this<LeanShape> {
     std::shared_ptr<const DrawDecode> decode;
     DrawShaderSet shaderSet;
     std::uint64_t shape = 0;
@@ -53,6 +54,9 @@ struct LeanDrawJob {
     std::uint64_t deviceSerial;
     std::uint32_t queue;
     std::uint32_t opcode;
+    const DrawRecordSet* records;
+    std::uint64_t recordGeneration;
+    std::uint8_t recordFlags;
     Pm4::DrawParameters parameters;
     DrawUserWords words;
 };
@@ -108,6 +112,8 @@ public:
     std::shared_ptr<VulkanDevice> device;
     std::uint64_t deviceStores = ~std::uint64_t{0};
     LeanDrawSink* sink = nullptr;
+    DrawRecordStore identities;
+    std::uint64_t identitiesSerial = 0;
 
 private:
     std::vector<ShapeRecord> records;

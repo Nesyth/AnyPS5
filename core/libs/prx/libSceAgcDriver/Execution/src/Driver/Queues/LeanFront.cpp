@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanFront.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include <atomic>
 #include <chrono>
@@ -124,6 +125,8 @@ FrontMode Take(Latch& latch, bool eligible) {
         latch.mode = FrontMode::Today;
         latch.verifyEvery = 0;
         latch.checkSwitches = false;
+        latch.records = false;
+        latch.recordsVerifyEvery = 0;
         return FrontMode::Today;
     }
     const auto generation = Graphics::RuntimeSwitches::Generation();
@@ -138,8 +141,17 @@ FrontMode Take(Latch& latch, bool eligible) {
     latch.mode = mode;
     latch.verifyEvery = mode == FrontMode::Lean ? VerifyEvery() : 0;
     latch.checkSwitches = Due(latch, Item::SwitchRead);
+    const bool records = mode == FrontMode::Lean && latch.switches.Set(Graphics::RuntimeSwitch::DrawRecords);
+    const std::uint8_t recordsTaken = records ? 2 : 1;
+    if (latch.recordsTaken != 0 && latch.recordsTaken != recordsTaken) DrawRecords::AddOnWorker(DrawRecords::Counter::RecordModeChanges);
+    latch.recordsTaken = recordsTaken;
+    latch.records = records;
+    latch.recordsVerifyEvery = records ? DrawRecords::VerifyEvery() : 0;
     AddOnWorker(mode == FrontMode::Lean ? Counter::LeanSegments : Counter::TodaySegments);
-    if ((++latch.latches & 15u) == 0) Report(false);
+    if ((++latch.latches & 15u) == 0) {
+        Report(false);
+        DrawRecords::Report(false);
+    }
     return mode;
 }
 
