@@ -227,8 +227,8 @@ private:
     static void markOutputs(const Submission& submission, PacketTable& table);
     static void verifyOutputs(const Submission& submission, const PacketTable& table);
     static void verifySegmentTable(const Submission& submission, const PacketTable& table);
-    bool flushDue(FlushGate& gate);
-    static void checkFlush(const Submission& submission, std::size_t cursor, bool gateDue, std::uint32_t decision, std::chrono::steady_clock::time_point before, std::optional<std::chrono::steady_clock::time_point> pending, std::chrono::steady_clock::time_point reapedAt);
+    bool flushDue(FlushGate& gate, FlushSeen* seen = nullptr);
+    static void checkFlush(const Submission& submission, std::size_t cursor, bool gateDue, std::uint32_t decision, std::chrono::steady_clock::time_point before, std::chrono::steady_clock::time_point after, const FlushSeen& seen);
     void releaseSegmentSlot(SegmentSlot& slot);
     void enqueue(Submission submission);
     void noteHeldAtSubmit(Submission& submission, std::size_t cursor);

@@ -865,6 +865,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             sink->held = held;
             sink->reg207 = tail.reg207;
             sink->parameters = tail.drawParameters;
+            sink->decode = decode;
+            sink->dataEntry = dataEntry;
+            sink->device = localDevice.get();
         }
         DrawFinisher::Get().Enqueue([this, tailHolder] {
             auto& job = *tailHolder;
@@ -1021,16 +1024,8 @@ void Driver::finishLeanDraw(const LeanDrawJob& job, const LeanAnchor& anchor) {
             decode = nullptr;
         }
         if (dataEntry != nullptr && !DecodeProgramsCurrent(*dataEntry->decode, *submission.shaders)) dataEntry = nullptr;
-        const auto refreshed = [&](const DrawDecode& from) {
-            auto fresh = std::make_shared<DrawDecode>(from);
-            for (auto& program : fresh->programs) {
-                ReadUserWordsFrom(words, program);
-                if (program.merged) InitializeMergedFrom(words, program, program.mergedPointer, program.mergedPointerRequired);
-            }
-            return fresh;
-        };
-        if (dataEntry != nullptr) decode = refreshed(*dataEntry->decode);
-        if (decode == nullptr) decode = refreshed(*shape.decode);
+        if (dataEntry != nullptr) decode = LeanRefreshedDecode(*dataEntry->decode, words);
+        if (decode == nullptr) decode = LeanRefreshedDecode(*shape.decode, words);
         const auto& graphics = decode->state;
         auto& pixel = tail.pixel;
         pixel = decode->pixel;

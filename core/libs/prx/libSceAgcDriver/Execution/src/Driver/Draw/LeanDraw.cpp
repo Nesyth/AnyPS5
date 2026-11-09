@@ -86,15 +86,15 @@ bool leanQualified(const DrawDecode& decode) {
     return true;
 }
 
-std::shared_ptr<DrawDecode> refreshedDecode(const DrawDecode& from, const DrawUserWords& words) {
+}
+
+std::shared_ptr<DrawDecode> LeanRefreshedDecode(const DrawDecode& from, const DrawUserWords& words) {
     auto refreshed = std::make_shared<DrawDecode>(from);
     for (auto& program : refreshed->programs) {
         ReadUserWordsFrom(words, program);
         if (program.merged) InitializeMergedFrom(words, program, program.mergedPointer, program.mergedPointerRequired);
     }
     return refreshed;
-}
-
 }
 
 std::uint64_t LeanExactKey(const LeanShape& shape, const DrawUserWords& words) {
@@ -470,6 +470,20 @@ DrawVerdict Driver::verifyLeanDraw(QueueState& queue, std::span<const std::uint3
         if (alias != sink.alias) {
             LeanFront::NoteDifference(Field::AliasKeys, at + ": lean alias " + hex(alias) + ", today's " + hex(sink.alias));
             demote = true;
+        } else if (alias != 0) {
+            std::shared_ptr<DrawEntry> todayEntry, leanEntry;
+            std::shared_ptr<const DrawDecode> todayDonor, leanDonor;
+            std::vector<DrawUserPatch> todayPatches, leanPatches;
+            {
+                std::lock_guard cacheLock(drawCacheMutex);
+                relocateDrawEntry(queue, alias, todayEntry, todayDonor, todayPatches);
+                relocateDrawEntry(job->words, alias, leanEntry, leanDonor, leanPatches);
+            }
+            const bool samePatches = std::equal(todayPatches.begin(), todayPatches.end(), leanPatches.begin(), leanPatches.end(), [](const DrawUserPatch& a, const DrawUserPatch& b) { return a.program == b.program && a.index == b.index && a.value == b.value; });
+            if (todayDonor != leanDonor || !samePatches) {
+                LeanFront::NoteDifference(Field::Patches, at + ": relocating alias " + hex(alias) + " with the job's user words gives " + std::to_string(leanPatches.size()) + " patches" + (todayDonor != leanDonor ? " from another donor" : "") + ", with the queue's registers " + std::to_string(todayPatches.size()));
+                demote = true;
+            }
         }
     }
     for (std::uint32_t offset = 0; offset < 0x200u; ++offset) {
@@ -483,7 +497,7 @@ DrawVerdict Driver::verifyLeanDraw(QueueState& queue, std::span<const std::uint3
         }
     }
     try {
-        const auto lean = refreshedDecode(*shape.decode, job->words);
+        const auto lean = LeanRefreshedDecode(*shape.decode, job->words);
         const auto fresh = decodeDraw(queue, submission, leanDraws.device->graphicsContext());
         if (!sameDecode(*lean, *fresh)) {
             LeanFront::NoteDifference(Field::Decodes, at + ": the shape record's decode with the draw's user words differs from a fresh decode (shape " + hex(job->shapeKey) + ")");
@@ -506,6 +520,18 @@ DrawVerdict Driver::verifyLeanDraw(QueueState& queue, std::span<const std::uint3
         if (!sameParameters || sink.held.key != job->drawKey || sink.held.shape != job->shapeKey || sink.reg207 != shape.reg207) {
             LeanFront::NoteDifference(Field::Jobs, at + ": the lean job's " + (!sameParameters ? "draw parameters" : sink.reg207 != shape.reg207 ? "PA_CL_VS_OUT_CNTL" : "held key") + " differ from today's hand-off");
             demote = true;
+        }
+        if (sink.device != leanDraws.device.get()) LeanFront::NoteDifference(Field::Jobs, at + ": the lean job's device differs from the device today's draw used");
+        if (sink.dataEntry != nullptr && sink.decode != nullptr) {
+            try {
+                if (!sameDecode(*LeanRefreshedDecode(*sink.dataEntry->decode, job->words), *sink.decode)) {
+                    LeanFront::NoteDifference(Field::Decodes, at + ": the data entry's decode refreshed with the job's user words differs from today's refresh (shape " + hex(job->shapeKey) + ")");
+                    demote = true;
+                }
+            } catch (const std::exception& error) {
+                LeanFront::NoteDifference(Field::Decodes, at + ": refreshing the data entry's decode with the job's user words failed: " + error.what());
+                demote = true;
+            }
         }
     }
     if (demote) {

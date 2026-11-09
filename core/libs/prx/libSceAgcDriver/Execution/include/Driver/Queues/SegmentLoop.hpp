@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -86,6 +87,12 @@ struct FlushGate {
     std::int64_t reapDue = 0;
     std::uint64_t skipped = 0;
     std::uint64_t calls = 0;
+};
+
+struct FlushSeen {
+    std::optional<std::chrono::steady_clock::time_point> pending;
+    bool completions = false;
+    std::chrono::steady_clock::time_point reap{};
 };
 
 namespace FlushDecision {

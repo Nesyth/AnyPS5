@@ -344,11 +344,12 @@ void Driver::verifySegmentTable(const Submission& submission, const PacketTable&
     if (table.outputs != fresh.outputs) LeanFront::NoteDifference(LeanFront::Field::PacketTable, "serial " + std::to_string(submission.serial) + ": the packet table's output positions differ from a fresh scan");
 }
 
-bool Driver::flushDue(FlushGate& gate) {
+bool Driver::flushDue(FlushGate& gate, FlushSeen* seen) {
     if (gate.everyPacket || !deferredLabels().labels.empty()) return true;
     if (gate.cap != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= gate.cap) return true;
     const auto pending = Graphics::Recorder::PendingLabelSince();
     const bool completions = completionsPending();
+    if (seen != nullptr) *seen = FlushSeen{pending, completions, lastReapTries[0]};
     if (!pending.has_value() && !completions) return false;
     if (pending.has_value() && (!gate.labelArmed || gate.label != *pending)) {
         gate.label = *pending;
@@ -364,7 +365,7 @@ bool Driver::flushDue(FlushGate& gate) {
     return (pending.has_value() && now >= gate.labelDue) || (completions && now >= gate.reapDue);
 }
 
-void Driver::checkFlush(const Submission& submission, std::size_t cursor, bool gateDue, std::uint32_t decision, std::chrono::steady_clock::time_point before, std::optional<std::chrono::steady_clock::time_point> pending, std::chrono::steady_clock::time_point reapedAt) {
+void Driver::checkFlush(const Submission& submission, std::size_t cursor, bool gateDue, std::uint32_t decision, std::chrono::steady_clock::time_point before, std::chrono::steady_clock::time_point after, const FlushSeen& seen) {
     using LeanFront::Allowed;
     using LeanFront::Field;
     const bool acts = (decision & FlushDecision::Acts) != 0;
@@ -374,19 +375,21 @@ void Driver::checkFlush(const Submission& submission, std::size_t cursor, bool g
     }
     if (gateDue) return;
     const auto late = [&](std::chrono::steady_clock::time_point due) { return std::chrono::duration_cast<std::chrono::nanoseconds>(before - due).count(); };
-    const auto detail = [&](const char* what, std::int64_t lateNs) { return where(submission, cursor) + ": today's flush " + what + " where the lean deadline gate skipped the check" + (lateNs >= 0 ? " (" + std::to_string(lateNs) + " ns past the deadline)" : std::string()); };
+    const auto boundary = [&](std::chrono::steady_clock::time_point due) { return after >= due && late(due) <= BoundaryNs; };
+    const auto detail = [&](const char* what, std::int64_t lateNs) { return where(submission, cursor) + ": today's flush " + what + " where the lean deadline gate skipped the check" + (lateNs >= 0 ? " (" + std::to_string(lateNs) + " ns past the deadline at the gate's check)" : std::string()); };
     if ((decision & (FlushDecision::Record | FlushDecision::RecordAtLock)) != 0) {
         LeanFront::NoteDifference(Field::FlushRecords, detail("records queued labels", -1));
     } else if ((decision & FlushDecision::Capped) != 0) {
         LeanFront::NoteDifference(Field::FlushCaps, detail("submits at the batch cap", -1));
     } else if ((decision & FlushDecision::Submit) != 0) {
-        const auto lateNs = pending.has_value() ? late(*pending + labelFlushDeadline()) : -1;
-        if ((decision & FlushDecision::Deadline) != 0 && lateNs >= 0 && lateNs < BoundaryNs) LeanFront::NoteAllowed(Allowed::FlushBoundary);
-        else LeanFront::NoteDifference(Field::FlushSubmits, detail("submits a pending label", lateNs));
+        if (!seen.pending.has_value()) LeanFront::NoteAllowed(Allowed::DeferredPacketSubmits);
+        else if ((decision & FlushDecision::Deadline) != 0 && boundary(*seen.pending + labelFlushDeadline())) LeanFront::NoteAllowed(Allowed::FlushBoundary);
+        else LeanFront::NoteDifference(Field::FlushSubmits, detail("submits a pending label", late(*seen.pending + labelFlushDeadline())));
     } else {
-        const auto lateNs = late(reapedAt + ReapInterval);
-        if (lateNs >= 0 && lateNs < BoundaryNs) LeanFront::NoteAllowed(Allowed::FlushBoundary);
-        else LeanFront::NoteDifference(Field::FlushReaps, detail("reaps completions", lateNs));
+        const auto due = seen.reap + ReapInterval;
+        if (!seen.completions) LeanFront::NoteAllowed(Allowed::DeferredReaps);
+        else if (boundary(due)) LeanFront::NoteAllowed(Allowed::FlushBoundary);
+        else LeanFront::NoteDifference(Field::FlushReaps, detail("reaps completions", late(due)));
     }
 }
 
@@ -730,13 +733,13 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
         const bool labelPacket = opcode == 0x49 || opcode == 0x37;
         if (verifyPacket) {
             const auto before = std::chrono::steady_clock::now();
-            const auto pending = Graphics::Recorder::PendingLabelSince();
-            const auto reapedAt = lastReapTries[0];
-            const bool gateDue = flushDue(run.gate);
+            FlushSeen seen;
+            const bool gateDue = flushDue(run.gate, &seen);
             const auto decision = flushBetweenPackets(submission.queue, header, labelPacket);
+            const auto after = std::chrono::steady_clock::now();
             tagged = NoTag;
             ++run.gate.calls;
-            checkFlush(submission, cursor, gateDue, decision, before, pending, reapedAt);
+            checkFlush(submission, cursor, gateDue, decision, before, after, seen);
         } else if (flushDue(run.gate)) {
             flushBetweenPackets(submission.queue, header, labelPacket);
             tagged = NoTag;

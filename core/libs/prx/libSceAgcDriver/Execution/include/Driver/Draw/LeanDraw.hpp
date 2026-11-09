@@ -80,6 +80,9 @@ struct LeanDrawSink {
     DrawFinisher::Pending held;
     std::uint32_t reg207 = 0;
     Pm4::DrawParameters parameters{};
+    std::shared_ptr<const DrawDecode> decode;
+    std::shared_ptr<DrawEntry> dataEntry;
+    const VulkanDevice* device = nullptr;
 };
 
 class LeanDraws {
@@ -114,6 +117,7 @@ private:
     std::uint64_t anchorTail = 0;
 };
 
+std::shared_ptr<DrawDecode> LeanRefreshedDecode(const DrawDecode& from, const DrawUserWords& words);
 std::uint64_t LeanExactKey(const LeanShape& shape, const DrawUserWords& words);
 std::uint64_t LeanIdentityKey(const LeanShape& shape, const DrawUserWords& words);
 void LeanAliasKey(const LeanShape& shape, const DrawUserWords& words, const DrawRelocation* relocation, std::uint64_t deviceSerial, std::uint64_t& alias);
