@@ -92,7 +92,9 @@ public:
     ShapeRecord& Place(std::uint64_t shape, std::uint64_t deviceSerial, std::uint64_t front);
     void Retire(ShapeRecord& record, std::uint64_t front);
     void Clear(std::uint64_t front);
-    void Release(std::uint64_t front);
+    void Release(std::uint64_t front, std::uint64_t issued);
+    void ReleaseDevice();
+    void Reset();
     std::optional<std::uint64_t> AnchorFor(const std::shared_ptr<const ShaderRegistry>& heldRegistry, const std::shared_ptr<VulkanDevice>& heldDevice, std::uint64_t issued);
     const LeanAnchor& AnchorAt(std::uint64_t index) const { return anchors[static_cast<std::size_t>(index % Anchors)]; }
 

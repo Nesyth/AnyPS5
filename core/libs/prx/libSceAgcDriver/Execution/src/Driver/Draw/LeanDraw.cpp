@@ -201,12 +201,30 @@ void LeanDraws::Clear(std::uint64_t front) {
     }
 }
 
-void LeanDraws::Release(std::uint64_t front) {
+void LeanDraws::Release(std::uint64_t front, std::uint64_t issued) {
     if (!retired.empty()) std::erase_if(retired, [&](const auto& entry) { return entry.second < front; });
     while (anchorTail - anchorHead > 1 && anchors[static_cast<std::size_t>((anchorHead + 1) % Anchors)].firstSeq <= front) {
         anchors[static_cast<std::size_t>(anchorHead % Anchors)] = LeanAnchor{};
         ++anchorHead;
     }
+    if (anchorTail - anchorHead == 1 && front >= issued && anchors[static_cast<std::size_t>(anchorHead % Anchors)].device != device) {
+        anchors[static_cast<std::size_t>(anchorHead % Anchors)] = LeanAnchor{};
+        ++anchorHead;
+    }
+}
+
+void LeanDraws::ReleaseDevice() {
+    for (; anchorHead != anchorTail; ++anchorHead) anchors[static_cast<std::size_t>(anchorHead % Anchors)] = LeanAnchor{};
+    device = nullptr;
+    deviceStores = ~std::uint64_t{0};
+}
+
+void LeanDraws::Reset() {
+    ReleaseDevice();
+    records.clear();
+    retired.clear();
+    registry = nullptr;
+    ++registryEpoch;
 }
 
 std::optional<std::uint64_t> LeanDraws::AnchorFor(const std::shared_ptr<const ShaderRegistry>& heldRegistry, const std::shared_ptr<VulkanDevice>& heldDevice, std::uint64_t issued) {
@@ -224,7 +242,8 @@ void Driver::prepareLeanDraws() {
     finisher.Adopt(true);
     const auto front = finisher.Front();
     if (frontLatch.Renew(leanDraws.stamp)) leanDraws.Clear(front);
-    leanDraws.Release(front);
+    if (leanDraws.device != nullptr && device.Stores() != leanDraws.deviceStores) leanDraws.device = nullptr;
+    leanDraws.Release(front, finisher.Issued());
 }
 
 bool Driver::leanDrawDevice() {

@@ -205,7 +205,7 @@ public:
     void Stop();
     void ReleaseRan();
     void AwaitTurn();
-    void Adopt(bool ring);
+    bool Adopt(bool ring);
     bool RingStore() const { return ringMode.load(std::memory_order_acquire); }
     std::byte* ReserveLean();
     void PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape);

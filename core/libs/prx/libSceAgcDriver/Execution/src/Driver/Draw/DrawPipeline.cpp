@@ -609,11 +609,11 @@ void DrawFinisher::startFinishers() {
     }
 }
 
-void DrawFinisher::Adopt(bool ring) {
-    if (ringMode.load(std::memory_order_relaxed) == ring) return;
-    if (outstanding.load(std::memory_order_acquire) != 0) return;
+bool DrawFinisher::Adopt(bool ring) {
+    if (ringMode.load(std::memory_order_relaxed) == ring) return false;
+    if (outstanding.load(std::memory_order_acquire) != 0) return false;
     const auto lock = lockFor(mutex);
-    if (outstanding.load(std::memory_order_acquire) != 0 || !jobs.empty() || closing || failure != nullptr) return;
+    if (outstanding.load(std::memory_order_acquire) != 0 || !jobs.empty() || closing || failure != nullptr) return false;
     if (ringMode.load(std::memory_order_relaxed)) retireLean();
     if (!pendingWrites.empty() || pendingUnknown != 0) {
         pendingWrites.clear();
@@ -630,6 +630,7 @@ void DrawFinisher::Adopt(bool ring) {
     leanFailed.store(false, std::memory_order_release);
     ringMode.store(ring, std::memory_order_release);
     LeanFront::Add(LeanFront::Counter::StoreSwitches);
+    return true;
 }
 
 void DrawFinisher::retireLean() {

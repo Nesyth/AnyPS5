@@ -334,7 +334,7 @@ void Driver::execute(const Submission& submission) {
     const auto switchSet = [&](Graphics::RuntimeSwitch id) { return front == FrontMode::Lean ? LeanFront::SwitchSet(frontLatch, id) : Graphics::RuntimeSwitches::Set(id); };
     static const bool orderedWaits = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
     DrawPipeline::Active() = pipelined;
-    if (pipelined) DrawFinisher::Get().Adopt(false);
+    if (pipelined && DrawFinisher::Get().Adopt(false)) leanDraws.ReleaseDevice();
     struct PipelineDrain {
         bool pipelined;
         ~PipelineDrain() {
