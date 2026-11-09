@@ -2492,6 +2492,16 @@ std::uint64_t PreparedShaderInvocation::VariantId() const {
     return handle != nullptr && handle->artifact != nullptr ? handle->artifact->artifact.variantId : 0u;
 }
 
+std::optional<std::uint64_t> PreparedShaderInvocation::SharedKey(const ResourceCapture& capture) const {
+    if (capture.source != handle->source) return std::nullopt;
+    const auto& variant = *handle->artifact;
+    struct SharedKeySubstituteStorage {};
+    auto& substitutes = HostThreadLocal<std::vector<BufferSubstitute>, SharedKeySubstituteStorage>();
+    if (bufferSubstitutesEnabled() && variant.substitutes != nullptr) variant.substitutes->LearnedSlots(substitutes);
+    else substitutes.clear();
+    return snapshotHash(request, capture.snapshot, {.masked = true, .perDrawData = false, .descriptors = true}, substitutes);
+}
+
 void CompleteHeapDataWords(const RecompileResult& shared, HeapStageWords& words) {
     const auto count = shared.bindings.size();
     if (!words.bindings.empty() && words.bindings.size() != count) throw std::runtime_error("ShaderRecompiler: a heap stage's per-draw bindings differ in number from its template");
