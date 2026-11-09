@@ -733,7 +733,7 @@ std::byte* DrawFinisher::ReserveLean() {
     return leanSlot(nextSeq).payload.data();
 }
 
-void DrawFinisher::PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape, LeanRetirer retirer, bool inserts) {
+void DrawFinisher::PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape, LeanRetirer retirer) {
     auto& slot = leanSlot(nextSeq);
     slot.runner = runner;
     slot.retirer = retirer;
@@ -741,7 +741,7 @@ void DrawFinisher::PublishLean(LeanRunner runner, std::span<const Range> writes,
     auto& held = slot.pending;
     held.key = key;
     held.shape = shape;
-    held.inserts = inserts;
+    held.inserts = true;
     held.unknown = false;
     held.writes.assign(writes.begin(), writes.end());
     held.labelAddress = 0;

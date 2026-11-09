@@ -219,12 +219,12 @@ void LeanDraws::ReleaseDevice() {
     for (; anchorHead != anchorTail; ++anchorHead) anchors[static_cast<std::size_t>(anchorHead % Anchors)] = LeanAnchor{};
     device = nullptr;
     deviceStores = ~std::uint64_t{0};
-    identities.Reset();
-    identitiesSerial = 0;
 }
 
 void LeanDraws::Reset() {
     ReleaseDevice();
+    identities.Reset();
+    identitiesSerial = 0;
     records.clear();
     retired.clear();
     registry = nullptr;
@@ -454,7 +454,7 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
     if (records) probeDrawRecord(*job, shape);
     record.lastSeq = finisher.Issued();
     const bool answered = (job->recordFlags & (DrawRecordFlags::BuildWanted | DrawRecordFlags::VerifyDue)) != 0;
-    finisher.PublishLean(&Driver::runLeanDraw, shape.writes, job->drawKey, job->shapeKey, answered ? &Driver::retireDrawRecord : nullptr, job->records == nullptr);
+    finisher.PublishLean(&Driver::runLeanDraw, shape.writes, job->drawKey, job->shapeKey, answered ? &Driver::retireDrawRecord : nullptr);
     return DrawVerdict::Drawn;
 }
 

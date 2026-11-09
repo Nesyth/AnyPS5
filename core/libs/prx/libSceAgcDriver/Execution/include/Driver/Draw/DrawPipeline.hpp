@@ -209,7 +209,7 @@ public:
     bool Adopt(bool ring);
     bool RingStore() const { return ringMode.load(std::memory_order_acquire); }
     std::byte* ReserveLean();
-    void PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape, LeanRetirer retirer = nullptr, bool inserts = true);
+    void PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape, LeanRetirer retirer = nullptr);
     static bool AnswerLean(std::shared_ptr<const void> answer);
     PublishedKeys::Answer KeyBefore(std::uint64_t key, std::uint64_t shape, bool insertsOnly) const;
     bool AheadBusy() const;

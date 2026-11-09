@@ -257,35 +257,6 @@ void AnswersReachTheRetirer() {
     Require(!DrawFinisher::AnswerLean(std::make_shared<const std::uint32_t>(1)), "a thread outside the finisher ring took an answer");
 }
 
-std::atomic<bool> keyChecked{false};
-std::atomic<int> insertsOnlyAnswer{-1};
-std::atomic<int> anyAnswer{-1};
-
-void RunKeyCheck(const std::byte*) {
-    auto& finisher = DrawFinisher::Get();
-    insertsOnlyAnswer.store(static_cast<int>(finisher.KeyBefore(91, 0, true)));
-    anyAnswer.store(static_cast<int>(finisher.KeyBefore(91, 0, false)));
-    keyChecked.store(true);
-}
-
-void HitsPublishNoInserts() {
-    auto& finisher = DrawFinisher::Get();
-    std::binary_semaphore release{0};
-    keyChecked.store(false);
-    finisher.Enqueue([&] { release.acquire(); }, DrawFinisher::Pending{0, 0, true, false, {}, 0, {}});
-    Require(finisher.ReserveLean() != nullptr, "the finisher ring refused a job while open");
-    finisher.PublishLean(&RunSilent, {}, 91, 0, nullptr, false);
-    Require(finisher.ReserveLean() != nullptr, "the finisher ring refused a job while open");
-    finisher.PublishLean(&RunKeyCheck, {}, 92, 0);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!keyChecked.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
-    release.release();
-    finisher.Drain();
-    Require(keyChecked.load(), "the job behind a held one never ran ahead of it");
-    Require(insertsOnlyAnswer.load() == static_cast<int>(PublishedKeys::Answer::Clear), "a job published without inserts was found by a lookup that waits only for inserts");
-    Require(anyAnswer.load() == static_cast<int>(PublishedKeys::Answer::Hit), "a job published without inserts was not found by a lookup of every key");
-}
-
 void StoreSwitches() {
     auto& finisher = DrawFinisher::Get();
     finisher.Drain();
@@ -328,7 +299,6 @@ int main() {
         }
         RuntimeSwitches::Assign(RuntimeSwitch::SecondFinisher, true);
         AheadWaits();
-        HitsPublishNoInserts();
         for (const bool more : {false, true}) {
             RuntimeSwitches::Assign(RuntimeSwitch::SecondFinisher, more);
             RuntimeSwitches::Assign(RuntimeSwitch::ThirdFinisher, more);

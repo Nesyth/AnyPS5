@@ -1436,7 +1436,7 @@ void Driver::installDrawRecord(const LeanDrawJob& job, const DrawRecordAnswer& a
     auto& lean = leanDraws;
     const auto front = DrawFinisher::Get().Front();
     if (job.recordGeneration != lean.stamp || job.deviceSerial != lean.identitiesSerial) {
-        if (answer.built != nullptr) DrawRecords::AddOnWorker(Counter::BuildsDropped);
+        if (answer.built != nullptr) DrawRecords::Add(Counter::BuildsDropped);
         return;
     }
     if (answer.demote) {
@@ -1445,7 +1445,8 @@ void Driver::installDrawRecord(const LeanDrawJob& job, const DrawRecordAnswer& a
     }
     if (answer.built == nullptr) return;
     const auto installed = lean.identities.Install(answer.built, Graphics::Recorder::Presents(), front);
-    DrawRecords::AddOnWorker(installed == DrawRecordStore::Installed::Yes ? Counter::RecordsInstalled : Counter::BuildsDropped);
+    if (installed == DrawRecordStore::Installed::Yes) DrawRecords::AddOnWorker(Counter::RecordsInstalled);
+    else DrawRecords::Add(Counter::BuildsDropped);
 }
 
 void Driver::retireDrawRecord(const std::byte* payload, std::shared_ptr<const void>&& answer) {
