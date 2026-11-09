@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Packets/DriverTimed.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -205,26 +206,6 @@ std::optional<std::uint32_t> Driver::releaseInterrupt(std::span<const std::uint3
     const auto context = packet[7] & 0x0fffffffu;
     if ((context & 0x08000000u) != 0) throw std::runtime_error("AGC: a release asks for typed interrupt context " + std::to_string(context) + ", which is not delivered as a graphics end-of-pipe event; not implemented");
     return context;
-}
-
-template <typename TWork>
-void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
-    const ThreadReport::WorkerStateScope state(bucket == &WorkerProfile::dispatchMs ? ThreadReport::WorkerState::Dispatch : ThreadReport::WorkerState::Draw, bucket != &WorkerProfile::waitMs && ThreadReport::OnQueue0Worker());
-    static const bool report = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!report) {
-        work();
-        return;
-    }
-    static thread_local WorkerProfile profile;
-    const auto begin = std::chrono::steady_clock::now();
-    work();
-    const auto end = std::chrono::steady_clock::now();
-    profile.*bucket += std::chrono::duration<double, std::milli>(end - begin).count();
-    if (end - profile.reported > std::chrono::seconds(10)) {
-        profile.reported = end;
-        AgcDriver::ProfilePrint_nid_no_patch( "[gpu] worker at %.0f s: dispatch %.1f s, draw %.1f s, wait %.1f s\n", std::chrono::duration<double>(end - profile.start).count(), profile.dispatchMs / 1000, profile.drawMs / 1000, profile.waitMs / 1000);
-    }
-    if (report && bucket != &WorkerProfile::waitMs) PerformanceCounters::AddDriverNanoseconds(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count()));
 }
 
 template <bool Lean>
