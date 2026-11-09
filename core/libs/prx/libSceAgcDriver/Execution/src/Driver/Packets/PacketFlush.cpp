@@ -8,7 +8,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-std::uint32_t Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket) {
+std::uint32_t Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket, const FlushInputs* inputs) {
     static const bool packetFlush = !LabelBatchSubmit() && std::getenv("APS5_NO_LABEL_PACKET_FLUSH") == nullptr;
     static const bool ownLock = std::getenv("APS5_LABEL_OWN_LOCK") != nullptr;
     static std::atomic<std::uint64_t> packetFlushes{0}, deadlineFlushes{0}, capFlushes{0}, boundaryReaps{0}, overdueLocks{0};
@@ -18,13 +18,13 @@ std::uint32_t Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t hea
     if (queuedTable) noteQueuedLabels(queue);
     const bool selfLocking = !ownLock && PacketLocksItself(header);
     bool submit = false, record = false, needsRecord = false, deferredDue = false, pendingDue = false;
-    const auto pending = Graphics::Recorder::PendingLabelSince();
+    const auto pending = inputs != nullptr ? inputs->pending : Graphics::Recorder::PendingLabelSince();
 
     auto& lastReapTry = lastReapTries[queue == 0 ? 0 : queue - 0x20 + 1];
-    const bool completions = completionsPending();
+    const bool completions = inputs != nullptr ? inputs->completions : completionsPending();
     const bool reapDue = completions && (reapEachPacket() || queue == 0);
 
-    const auto now = queued || pending.has_value() || reapDue ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto now = inputs != nullptr ? inputs->now : (queued || pending.has_value() || reapDue ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{});
 
     bool recordAtLock = false;
     if (queued) {
@@ -43,9 +43,9 @@ std::uint32_t Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t hea
         if (!labelPacket && packetFlush) submit = true;
         if (now - *pending >= labelFlushDeadline()) submit = pendingDue = true;
     }
-    const auto work = Graphics::Recorder::RecordedWorkSinceSubmit();
+    const auto work = inputs != nullptr ? inputs->work : Graphics::Recorder::RecordedWorkSinceSubmit();
     const bool capped = !submit && !record && batchCap() != 0 && work >= batchCap();
-    const bool reap = !submit && !record && !capped && reapDue && (reapEachPacket() || now - lastReapTry >= ReapInterval);
+    const bool reap = !submit && !record && !capped && reapDue && (reapEachPacket() || now - (inputs != nullptr ? inputs->reap : lastReapTry) >= ReapInterval);
     const std::uint32_t decision = (queuedTable ? FlushDecision::Noted : 0u) | (record ? FlushDecision::Record : 0u) | (submit ? FlushDecision::Submit : 0u) | (pendingDue ? FlushDecision::Deadline : 0u)
         | (capped ? FlushDecision::Capped : 0u) | (reap ? FlushDecision::Reap : 0u) | (recordAtLock && (submit || capped || reap) ? FlushDecision::RecordAtLock : 0u);
     if (!submit && !record && !capped && !reap) {

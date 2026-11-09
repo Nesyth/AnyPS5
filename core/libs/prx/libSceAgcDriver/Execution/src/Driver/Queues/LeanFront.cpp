@@ -61,7 +61,7 @@ constexpr std::array<FieldInfo, FieldCount> FieldInfos{{
     {Item::SwitchRead, "values"},
 }};
 
-constexpr std::array<const char*, AllowedKinds> AllowedNames{"deferred reaps", "deferred packet submits", "flush boundary", "early flush checks", "held waits raced", "switches moved in the segment", "lists rewritten inside a collect epoch", "overlap verdicts moved between checks", "held writes known from the shape where today's are unknown"};
+constexpr std::array<const char*, AllowedKinds> AllowedNames{"batch cap moved since the gate's copy", "early flush checks", "held waits raced", "switches moved in the segment", "lists rewritten inside a collect epoch", "overlap verdicts moved between checks", "held writes known from the shape where today's are unknown"};
 
 constexpr std::array<const char*, CounterCount> CounterNames{
     "lean segments", "today's segments", "mode changes", "switch copies", "segments looped", "prepared copies used", "prepared copies missed",

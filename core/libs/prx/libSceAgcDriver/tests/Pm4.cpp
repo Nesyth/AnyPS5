@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanFront.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SegmentLoop.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
@@ -2274,18 +2275,28 @@ void testRewindChainLoop() {
         appendPacket(words, writeWord(ran[index], static_cast<std::uint32_t>(index + 1)));
     }
     appendPacket(words, writeWord(done, 1));
+    constexpr std::size_t Rounds = 2;
     const auto looped = LeanFront::Total(Counter::SegmentsLooped);
     const auto differences = LeanFront::Differences();
-    submitWords(words);
-    AgcDriverWaitIdle_nid_postfix();
-    for (std::size_t index = 0; index < tails; ++index) {
-        check(std::atomic_ref<std::uint32_t>(ran[index]).load() == index + 1, ("REWIND tail " + std::to_string(index) + " of a long released chain did not run once").c_str());
+    const auto slots = LeanFront::Total(Counter::SlotsCreated);
+    for (std::size_t round = 0; round < Rounds; ++round) {
+        for (auto& word : ran) std::atomic_ref<std::uint32_t>(word).store(0);
+        std::atomic_ref<std::uint32_t>(done).store(0);
+        submitWords(words);
+        AgcDriverWaitIdle_nid_postfix();
+        for (std::size_t index = 0; index < tails; ++index) {
+            check(std::atomic_ref<std::uint32_t>(ran[index]).load() == index + 1, ("REWIND tail " + std::to_string(index) + " of a long released chain did not run once").c_str());
+        }
+        check(std::atomic_ref<std::uint32_t>(done).load() == 1, "the last REWIND tail of a long released chain did not run");
     }
-    check(std::atomic_ref<std::uint32_t>(done).load() == 1, "the last REWIND tail of a long released chain did not run");
     check(LeanFront::Differences() == differences, "the lean front verify found differences over a long released REWIND chain");
     const auto loopedNow = LeanFront::Total(Counter::SegmentsLooped) - looped;
-    if (lean) check(loopedNow == tails, ("the lean front ran " + std::to_string(loopedNow) + " of " + std::to_string(tails) + " released REWIND tails in its segment loop instead of all of them").c_str());
-    std::printf("released REWIND chain of %zu tails: %llu segments looped, %llu segment slots created\n", tails, static_cast<unsigned long long>(loopedNow), static_cast<unsigned long long>(LeanFront::Total(Counter::SlotsCreated)));
+    const auto slotsNow = LeanFront::Total(Counter::SlotsCreated) - slots;
+    if (lean) {
+        check(loopedNow == Rounds * tails, ("the lean front ran " + std::to_string(loopedNow) + " of " + std::to_string(Rounds * tails) + " released REWIND tails in its segment loop instead of all of them").c_str());
+        check(slotsNow <= 2, ("the lean segment loop created " + std::to_string(slotsNow) + " segment slots over " + std::to_string(Rounds * tails) + " released REWIND tails instead of reusing two").c_str());
+    }
+    std::printf("released REWIND chain of %zu tails, %zu rounds: %llu segments looped, %llu segment slots created\n", tails, Rounds, static_cast<unsigned long long>(loopedNow), static_cast<unsigned long long>(slotsNow));
 }
 
 void testRewindKick() {
@@ -2329,11 +2340,27 @@ void testRewindKick() {
         static_cast<unsigned long long>(LeanFront::Total(Counter::ReleasesWithoutKick) - plainReleases));
 }
 
+void checkFlushTicks() {
+    using AgcDriver::DriverDetail::FlushTicks;
+    using AgcDriver::DriverDetail::FlushTicksAt;
+    for (const std::int64_t offset : {-1000, -1, 0, 1, 2, 10, 250, 1000}) {
+        for (int repeat = 0; repeat < 64; ++repeat) {
+            const auto at = std::chrono::steady_clock::now() + std::chrono::microseconds(offset);
+            const auto due = FlushTicksAt(at);
+            while (std::chrono::steady_clock::now() < at) {
+            }
+            const auto reached = FlushTicks();
+            check(reached >= due, ("a flush deadline " + std::to_string(offset) + " us ahead was converted to a counter tick " + std::to_string(due - reached) + " ticks after the deadline").c_str());
+        }
+    }
+}
+
 void testRewindLabels() {
     using AgcDriver::DriverDetail::DrawPipeline;
     namespace LeanFront = AgcDriver::DriverDetail::LeanFront;
     using Counter = LeanFront::Counter;
     if (DrawPipeline::Depth() == 0) throw std::runtime_error("the REWIND label test needs the pipelined draw path");
+    checkFlushTicks();
     warmQueueWorker();
     constexpr std::size_t Tails = 64;
     alignas(8) static std::array<std::uint32_t, Tails> labels{};

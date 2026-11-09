@@ -227,8 +227,8 @@ private:
     static void markOutputs(const Submission& submission, PacketTable& table);
     static void verifyOutputs(const Submission& submission, const PacketTable& table);
     static void verifySegmentTable(const Submission& submission, const PacketTable& table);
-    bool flushDue(FlushGate& gate, FlushSeen* seen = nullptr);
-    static void checkFlush(const Submission& submission, std::size_t cursor, bool gateDue, std::uint32_t decision, std::chrono::steady_clock::time_point before, std::chrono::steady_clock::time_point after, const FlushSeen& seen);
+    bool flushDue(FlushGate& gate, FlushInputs& inputs);
+    static void checkFlush(const Submission& submission, std::size_t cursor, const FlushGate& gate, bool gateDue, std::uint32_t decision, const FlushInputs& inputs);
     void releaseSegmentSlot(SegmentSlot& slot);
     void enqueue(Submission submission);
     void noteHeldAtSubmit(Submission& submission, std::size_t cursor);
@@ -487,7 +487,7 @@ private:
     void noteQueuedLabels(std::uint32_t queue);
     void recordQueuedLabelsByTry(std::uint32_t queue, std::atomic<std::uint64_t>& counter);
     static void recordQueuedLabelsFromHook();
-    std::uint32_t flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket);
+    std::uint32_t flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket, const FlushInputs* inputs = nullptr);
     bool preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, std::optional<std::uint32_t> interrupt, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump);
     void dumpSampleCounters(std::uint64_t address);
     template <typename TWork>

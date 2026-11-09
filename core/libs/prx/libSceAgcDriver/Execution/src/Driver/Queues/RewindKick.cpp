@@ -41,8 +41,8 @@ std::int64_t FlushTicksAt(std::chrono::steady_clock::time_point at) {
 #ifdef _WIN32
     const auto frequency = ticksPerSecond();
     if (frequency != 0) {
-        const auto ahead = std::chrono::duration_cast<std::chrono::nanoseconds>(at - std::chrono::steady_clock::now()).count();
         const auto now = FlushTicks();
+        const auto ahead = std::chrono::duration_cast<std::chrono::nanoseconds>(at - std::chrono::steady_clock::now()).count();
         const auto margin = frequency / 1'000'000 > 0 ? frequency / 1'000'000 : std::int64_t{1};
         if (ahead <= 0) return now - margin;
         const auto clamped = ahead < FarAheadNs ? ahead : FarAheadNs;

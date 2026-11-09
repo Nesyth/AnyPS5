@@ -89,10 +89,13 @@ struct FlushGate {
     std::uint64_t calls = 0;
 };
 
-struct FlushSeen {
+struct FlushInputs {
+    bool given = false;
     std::optional<std::chrono::steady_clock::time_point> pending;
     bool completions = false;
+    std::uint64_t work = 0;
     std::chrono::steady_clock::time_point reap{};
+    std::chrono::steady_clock::time_point now{};
 };
 
 namespace FlushDecision {
