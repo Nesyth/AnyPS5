@@ -321,9 +321,9 @@ private:
     void finishLeanDraw(const LeanDrawJob& job, const LeanAnchor& anchor);
     static void runLeanDraw(const std::byte* payload);
     void probeDrawRecord(LeanDrawJob& job, const LeanShape& shape);
-    void settleDrawRecord(const LeanDrawJob& job, const DrawRecordSink& sink, bool hit);
+    void settleDrawRecord(const LeanDrawJob& job, const DrawRecordSink& sink, bool hit, std::size_t checked);
     void finishRecordDraw(const LeanDrawJob& job);
-    std::shared_ptr<DrawRecordHit> fetchDrawRecords(const LeanDrawJob& job);
+    std::shared_ptr<DrawRecordHit> fetchDrawRecords(const LeanDrawJob& job, std::size_t& checked);
     DrawRecords::Counter fetchDrawRecord(const LeanDrawJob& job, const DrawRecord& record, DrawRecordHit& hit);
     void commitRecordDraw(const LeanDrawJob& job, const LeanAnchor& anchor, std::shared_ptr<DrawRecordHit> hit);
     void commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, DrawRecordHit& hit, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape);

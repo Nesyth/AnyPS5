@@ -86,6 +86,7 @@ enum class Counter : std::uint8_t {
     OffLeanVerify,
     OffInline,
     RecordsBuilt,
+    RecordsRebuilt,
     PlansBuilt,
     PlansRefused,
     BuildsRefused,

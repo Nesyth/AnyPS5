@@ -180,6 +180,7 @@ struct DrawRecordSet {
 
 std::vector<DrawRecordProbe> DrawRecordProbes(const DrawRecordPlan& plan, const DrawRecordSet* kept);
 bool DrawRecordProbesHold(std::span<const DrawRecordProbe> probes, std::span<const std::vector<std::uint32_t>> users);
+std::optional<std::size_t> DrawRecordTwin(const DrawRecordSet& set, const DrawRecordHash& content, std::uint64_t generation, std::uint64_t deviceSerial, const std::uint64_t* signature);
 
 struct DrawRecordAnswer {
     std::shared_ptr<const DrawRecord> built;

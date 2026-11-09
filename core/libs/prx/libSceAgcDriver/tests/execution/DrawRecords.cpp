@@ -260,10 +260,38 @@ void Probes() {
     Require(!AgcDriver::DriverDetail::DrawRecordProbesHold(follow, moved), "a probe relative to a user word held with another value at the moved address");
     const auto third = ProbedPlan({21, 22, 23, 24, 25, 26}, {5, 6}, 7);
     const auto many = DrawRecordProbes(*third, &set);
-    Require(many.size() == 2 * AgcDriver::DriverDetail::DrawRecordStore::ProbesPerVariant, "a variant differing in every fixed word got " + std::to_string(many.size()) + " probes against two variants, expected the per-variant limit for each at distinct addresses");
+    Require(many.size() == DrawRecordStore::ProbesPerVariant, "a variant differing from two variants in every fixed word got " + std::to_string(many.size()) + " probes, expected the per-variant limit against the newer one, whose probes tell the older one apart too");
     ProbedMemory = {21, 22, 23, 24, 0, 0, 0, 0, 0, 0, 25, 26, 0, 0, 0, 0};
     Require(AgcDriver::DriverDetail::DrawRecordProbesHold(many, moved), "the probes of a variant failed in its own memory");
+    ProbedMemory = {1, 2, 3, 4, 5, 6, 0, 0, 7, 0, 11, 12, 0, 0, 0, 0};
+    Require(!AgcDriver::DriverDetail::DrawRecordProbesHold(many, moved), "the probes taken against the newer variant held in the memory of the older one they were meant to tell apart");
+    DrawRecordSet pair;
+    pair.records.push_back(ProbedRecord(ProbedPlan({1, 2, 9, 4, 11, 12}, {5, 6}, 7), nullptr));
+    pair.records.push_back(ProbedRecord(ProbedPlan({5, 6, 9, 4, 11, 12}, {5, 6}, 7), nullptr));
+    const auto apart = DrawRecordProbes(*ProbedPlan({5, 6, 9, 4, 11, 40}, {5, 6}, 7), &pair);
+    const auto late = std::find_if(apart.begin(), apart.end(), [](const DrawRecordProbe& probe) { return probe.base < 0 && probe.address == ProbedAt(11) && probe.value == 40; });
+    Require(apart.size() == DrawRecordStore::ProbesPerVariant + 1 && late != apart.end(), "an older variant that the probes against a newer one do not tell apart got no probe of its own: " + std::to_string(apart.size()) + " probes");
+    ProbedMemory = {5, 6, 9, 4, 5, 6, 0, 0, 7, 0, 11, 12, 0, 0, 0, 0};
+    Require(!AgcDriver::DriverDetail::DrawRecordProbesHold(apart, moved), "the probes of a variant held in the memory of an older variant they were meant to tell apart");
+    ProbedMemory[11] = 40;
+    Require(AgcDriver::DriverDetail::DrawRecordProbesHold(apart, moved), "the probes of a variant failed in its own memory");
     Require(!AgcDriver::DriverDetail::DrawRecordProbesHold(std::vector<DrawRecordProbe>{{0, 0, 0, -1}}, moved), "a probe at an unmapped address held");
+}
+
+void Twins() {
+    using AgcDriver::DriverDetail::DrawRecordTwin;
+    const auto key = DrawRecordKey::For(0x51, Parameters(0x100000));
+    auto shape = std::make_shared<LeanShape>();
+    DrawRecordSet set;
+    for (std::uint32_t content = 1; content <= 3; ++content) set.records.push_back(Record(key, shape, content));
+    const auto& last = *set.records.back();
+    const auto signature = last.signature;
+    const auto other = signature + 1;
+    const auto twin = DrawRecordTwin(set, last.content, last.generation, last.deviceSerial, &signature);
+    Require(twin.has_value() && *twin == 2, "the twin of the last variant was not found at its place in the set");
+    Require(!DrawRecordTwin(set, last.content, last.generation, last.deviceSerial, &other).has_value(), "a record of another plan structure was taken for a twin");
+    Require(DrawRecordTwin(set, last.content, last.generation, last.deviceSerial, nullptr) == twin, "a draw without a fetch plan did not find the record of its content");
+    Require(!DrawRecordTwin(set, last.content, last.generation + 1, last.deviceSerial, &signature).has_value() && !DrawRecordTwin(set, last.content, last.generation, last.deviceSerial + 1, &signature).has_value(), "a record of another switch generation or device was taken for a twin");
 }
 
 alignas(256) constexpr std::array<std::uint32_t, 16> VertexCode{
@@ -470,8 +498,9 @@ int main() {
         Eviction();
         Invalidation();
         Probes();
+        Twins();
         const auto device = Device();
-        std::cout << "draw record keys, store bounds, eviction, invalidation and variant probes passed" << (device == 0 ? "; repeated lean draws hit their identity records" : "; the device part was skipped") << '\n';
+        std::cout << "draw record keys, store bounds, eviction, invalidation, variant probes and twins passed" << (device == 0 ? "; repeated lean draws hit their identity records" : "; the device part was skipped") << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
