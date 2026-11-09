@@ -2052,6 +2052,40 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     return hash;
 }
 
+// Under source.mutex: keeps `shared` in `table` under the variant and `key`, or returns the result
+// an entry already holds for them.
+std::shared_ptr<const RecompileResult> insertResultMemo(SourceEntry& source, std::unique_ptr<ResultMemoTable>& table, std::uint64_t at, std::uint64_t variantId, std::uint64_t key, const std::shared_ptr<const RecompileResult>& shared, std::uint64_t bytes, std::shared_ptr<const MemoPatch> recipe, bool count) {
+    auto& counters = resultMemoCounters();
+    if (table == nullptr) {
+        table = std::make_unique<ResultMemoTable>();
+        if (source.memo == nullptr || source.maskedMemo == nullptr) {
+            auto& registry = resultMemoRegistry();
+            std::lock_guard registryLock(registry.mutex);
+            registry.sources.push_back(source.weak_from_this());
+        }
+    }
+    auto* set = memoSet(table, at);
+    auto* victim = set;
+    for (std::size_t way = 0; way < ResultMemoWays; ++way) {
+        auto& entry = set[way];
+        if (entry.result != nullptr && entry.variantId == variantId && entry.hash == key) {
+            entry.used = nextMemoUse();
+            return entry.result;
+        }
+        if (entry.used < victim->used) victim = &entry;
+    }
+    if (victim->result != nullptr) {
+        if (count) counters.evictions.fetch_add(1, std::memory_order_relaxed);
+        counters.heldBytes.fetch_sub(victim->bytes, std::memory_order_relaxed);
+        counters.heldEntries.fetch_sub(1, std::memory_order_relaxed);
+    }
+    const auto held = bytes + (recipe != nullptr ? patchBytes(*recipe) : 0u);
+    *victim = {variantId, key, shared, nextMemoUse(), std::move(recipe), held};
+    counters.heldBytes.fetch_add(held, std::memory_order_relaxed);
+    counters.heldEntries.fetch_add(1, std::memory_order_relaxed);
+    return shared;
+}
+
 // The memo'd result of `source`'s variant for the snapshot (design13 R5): a hit returns the shared
 // object, a miss materializes outside the source mutex and inserts (a concurrent miss's object is
 // as good). `memoHit` reports the hit.
@@ -2113,40 +2147,10 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     if (result->deviceImageTables) result->deviceImagePlan = source.plan;
     std::shared_ptr<const RecompileResult> shared = std::move(result);
     const auto bytes = resultBytes(*shared);
-    const auto insert = [&](std::unique_ptr<ResultMemoTable>& table, std::uint64_t at, std::uint64_t key, std::shared_ptr<const MemoPatch> recipe, bool count) {
-        if (table == nullptr) {
-            table = std::make_unique<ResultMemoTable>();
-            if (source.memo == nullptr || source.maskedMemo == nullptr) {
-                auto& registry = resultMemoRegistry();
-                std::lock_guard registryLock(registry.mutex);
-                registry.sources.push_back(source.weak_from_this());
-            }
-        }
-        auto* set = memoSet(table, at);
-        auto* victim = set;
-        for (std::size_t way = 0; way < ResultMemoWays; ++way) {
-            auto& entry = set[way];
-            if (entry.result != nullptr && entry.variantId == variantId && entry.hash == key) {
-                entry.used = nextMemoUse();
-                return entry.result;
-            }
-            if (entry.used < victim->used) victim = &entry;
-        }
-        if (victim->result != nullptr) {
-            if (count) counters.evictions.fetch_add(1, std::memory_order_relaxed);
-            counters.heldBytes.fetch_sub(victim->bytes, std::memory_order_relaxed);
-            counters.heldEntries.fetch_sub(1, std::memory_order_relaxed);
-        }
-        const auto held = bytes + (recipe != nullptr ? patchBytes(*recipe) : 0u);
-        *victim = {variantId, key, shared, nextMemoUse(), std::move(recipe), held};
-        counters.heldBytes.fetch_add(held, std::memory_order_relaxed);
-        counters.heldEntries.fetch_add(1, std::memory_order_relaxed);
-        return shared;
-    };
     {
         std::lock_guard lock(source.mutex);
-        shared = insert(source.memo, index, hash, nullptr, true);
-        if (patch != nullptr && patch->valid) static_cast<void>(insert(source.maskedMemo, maskedIndex, maskedHash, patch, false));
+        shared = insertResultMemo(source, source.memo, index, variantId, hash, shared, bytes, nullptr, true);
+        if (patch != nullptr && patch->valid) static_cast<void>(insertResultMemo(source, source.maskedMemo, maskedIndex, variantId, maskedHash, shared, bytes, patch, false));
     }
     if (const auto budget = resultMemoBudget(); budget != 0 && counters.heldBytes.load(std::memory_order_relaxed) > budget) trimResultMemo(budget);
     reportResultMemo();
@@ -2500,6 +2504,44 @@ std::optional<std::uint64_t> PreparedShaderInvocation::SharedKey(const ResourceC
     if (bufferSubstitutesEnabled() && variant.substitutes != nullptr) variant.substitutes->LearnedSlots(substitutes);
     else substitutes.clear();
     return snapshotHash(request, capture.snapshot, {.masked = true, .perDrawData = false, .descriptors = true}, substitutes);
+}
+
+SharedStage PreparedShaderInvocation::ShareStage(const ResourceCapture& capture) const {
+    if (capture.source != handle->source) return {};
+    auto& source = *handle->source;
+    const auto& variant = handle->artifact;
+    const auto variantId = variant->artifact.variantId;
+    const auto& snapshot = capture.snapshot;
+    const auto substitutes = bufferSubstitutesEnabled() && variant->substitutes != nullptr ? variant->substitutes->Slots() : std::vector<BufferSubstitute>{};
+    const bool masking = request.useCache && ResultMemo() && MaskedResultMemo();
+    const auto maskedHash = masking ? snapshotHash(request, snapshot, {.masked = true}, substitutes) : 0u;
+    const auto maskedIndex = (variantId * 0x9e3779b97f4a7c15ull) ^ maskedHash;
+    if (masking) {
+        std::lock_guard lock(source.mutex);
+        if (auto* set = memoSet(source.maskedMemo, maskedIndex)) {
+            for (std::size_t way = 0; way < ResultMemoWays; ++way) {
+                auto& entry = set[way];
+                if (entry.result == nullptr || entry.variantId != variantId || entry.hash != maskedHash) continue;
+                entry.used = nextMemoUse();
+                return {entry.result, entry.patch};
+            }
+        }
+    }
+    auto patch = std::make_shared<MemoPatch>();
+    auto result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, false, nullptr, patch.get(), &substitutes));
+    if (!patch->valid) return {};
+    result->cacheHit = true;
+    if (result->deviceImageTables) result->deviceImagePlan = source.plan;
+    std::shared_ptr<const RecompileResult> donor = std::move(result);
+    if (masking) {
+        const auto bytes = resultBytes(*donor);
+        {
+            std::lock_guard lock(source.mutex);
+            static_cast<void>(insertResultMemo(source, source.maskedMemo, maskedIndex, variantId, maskedHash, donor, bytes, patch, false));
+        }
+        if (const auto budget = resultMemoBudget(); budget != 0 && resultMemoCounters().heldBytes.load(std::memory_order_relaxed) > budget) trimResultMemo(budget);
+    }
+    return {std::move(donor), std::move(patch)};
 }
 
 void CompleteHeapDataWords(const RecompileResult& shared, HeapStageWords& words) {
