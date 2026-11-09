@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -341,6 +342,9 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "builds", "not queued", "generation moved", "shape", "indirect", "stage count", "geometry back end", "capture", "direct stage", "program", "result", "patched programs", "layout",
     "builds dropped", "dropped without an answer slot", "dropped as stale", "dropped for a replaced shape", "dropped for a refused shape", "dropped over the byte cap",
     "stage plans added", "stage plans shared", "stage plans replaced", "stage plans evicted", "layouts added", "draw plans added", "draw plans known", "draw plans evicted", "sets swept", "sets cleared", "mode changes", "demotions",
+    "skipped clean", "skipped after a clean re-query", "verified", "verify differed", "first proof", "last proof failed", "not reusable", "storage images", "depth copies", "own writes", "not all clean", "views moved", "serials moved", "a range forgotten", "rewritten since the record", "pending writes", "proved in full with clean proofs off",
+    "held", "first draw", "another pass", "collect epoch moved", "proof serial moved", "pending serial moved", "depth serials moved", "a target changed",
+    "checked", "trusted by the ticket",
 };
 
 constexpr std::array<const char*, AllowedKinds> AllowedNames{"fragment outputs known on one side only", "today's draw not queued", "the record's commit fell back", "today's commit built no recipe", "today's commit served another template"};
@@ -467,12 +471,13 @@ void Report(bool force) {
     const auto draws = at(Counter::Draws);
     if (Printed() && (draws != 0 || at(Counter::ModeChanges) != 0 || at(Counter::SetsCleared) != 0)) {
         const auto hits = at(Counter::Hits);
-        AgcDriver::ProfilePrint_nid_no_patch("[stage-plans] %.1f s: draws %llu, hits %llu (%.1f%%), hits on today's path %llu, input refetches %llu, relocated hits %llu, relocated base and value words %llu, moved buffer bases patched %llu; misses: %s; plans off: %s; builds: %s; store: %s; %llu shapes, %llu stage plans, %llu draw plans, %.1f KiB\n", seconds,
+        AgcDriver::ProfilePrint_nid_no_patch("[stage-plans] %.1f s: draws %llu, hits %llu (%.1f%%), hits on today's path %llu, input refetches %llu, relocated hits %llu, relocated base and value words %llu, moved buffer bases patched %llu; misses: %s; plans off: %s; builds: %s; store: %s; %llu shapes, %llu stage plans, %llu draw plans, %.1f KiB; committer template proofs: %s; committer targets: %s; committer moved buffers: %s\n", seconds,
             static_cast<unsigned long long>(draws), static_cast<unsigned long long>(hits), draws != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(draws) : 0.0,
             static_cast<unsigned long long>(at(Counter::HitsOnTodaysPath)), static_cast<unsigned long long>(at(Counter::InputRefetches)), static_cast<unsigned long long>(at(Counter::HitsRelocated)),
             static_cast<unsigned long long>(at(Counter::HitsBaseValue)), static_cast<unsigned long long>(at(Counter::HitsBuffersPatched)),
             counted(counts, Counter::MissNoPlans, Counter::MissFetchError).c_str(), counted(counts, Counter::OffTodaysDraw, Counter::OffInline).c_str(), counted(counts, Counter::Builds, Counter::DroppedOverCap).c_str(), counted(counts, Counter::StagePlansAdded, Counter::Demotions).c_str(),
-            static_cast<unsigned long long>(storeShapes.load(std::memory_order_relaxed)), static_cast<unsigned long long>(storePlans.load(std::memory_order_relaxed)), static_cast<unsigned long long>(storeDraws.load(std::memory_order_relaxed)), static_cast<double>(storeBytes.load(std::memory_order_relaxed)) / 1024.0);
+            static_cast<unsigned long long>(storeShapes.load(std::memory_order_relaxed)), static_cast<unsigned long long>(storePlans.load(std::memory_order_relaxed)), static_cast<unsigned long long>(storeDraws.load(std::memory_order_relaxed)), static_cast<double>(storeBytes.load(std::memory_order_relaxed)) / 1024.0,
+            counted(counts, Counter::ProofsSkipped, Counter::ProofsFull).c_str(), counted(counts, Counter::TargetsHeld, Counter::TargetsChanged).c_str(), counted(counts, Counter::MovedChecked, Counter::MovedTrusted).c_str());
     }
     if (VerifyEvery() == 0 || (draws == 0 && checksTotal == 0 && differingTotal == 0 && byDesignTotal == 0)) return;
     const auto fields = listed(FieldCount, [&](std::size_t index) { return differing[index]; }, [&](std::size_t index) { return std::string(DrawRecords::FieldName(static_cast<Field>(index))); });
@@ -664,6 +669,7 @@ std::shared_ptr<DrawRecordHit> Driver::lookupStagePlans(const LeanDrawJob& job, 
         return nullptr;
     }
     hit->record = draw->record;
+    hit->planned = true;
     return hit;
 }
 
@@ -682,9 +688,13 @@ void Driver::finishStagePlanDraw(const LeanDrawJob& job) {
         if (hit->buffersPatched) StagePlans::Add(Counter::HitsBuffersPatched);
         if ((job.recordFlags & DrawRecordFlags::VerifyDue) == 0) {
             commitRecordDraw(job, anchor, std::move(hit));
+            ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
             return;
         }
     }
+    struct FallbackMark {
+        ~FallbackMark() { ThreadReport::MarkItem(ThreadReport::ItemMark::PlanFallback); }
+    } fallbackMark;
     DrawRecordView answer;
     if (hit != nullptr) {
         StagePlans::Add(Counter::HitsOnTodaysPath);

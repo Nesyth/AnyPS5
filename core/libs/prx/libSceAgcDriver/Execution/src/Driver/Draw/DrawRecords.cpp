@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/LeanDraw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StagePlanReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -8,6 +9,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
@@ -1509,6 +1511,19 @@ std::string lookupText(const DrawCommitView& today, const void* recorded) {
     }
 }
 
+static_assert(static_cast<std::size_t>(StagePlans::Counter::ProofPendingWrites) - static_cast<std::size_t>(StagePlans::Counter::ProofsSkipped) + 1 == static_cast<std::size_t>(Graphics::ShaderResources::CleanProof::Count), "every clean proof outcome needs a stage plan counter");
+static_assert(static_cast<std::size_t>(StagePlans::Counter::TargetsChanged) - static_cast<std::size_t>(StagePlans::Counter::TargetsHeld) + 1 == static_cast<std::size_t>(DrawRecordHold::Count), "every target hold outcome needs a stage plan counter");
+
+void NotePlannedCommit(const DrawRecordCommit& commit) {
+    using StagePlans::Counter;
+    const auto& effects = commit.effects;
+    if (effects.hold != DrawRecordHold::Count) StagePlans::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::TargetsHeld) + static_cast<std::size_t>(effects.hold)));
+    if (effects.cleanProof.has_value()) StagePlans::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::ProofsSkipped) + static_cast<std::size_t>(*effects.cleanProof)));
+    else if (effects.proved) StagePlans::Add(Counter::ProofsFull);
+    if (effects.movedChecked != 0) StagePlans::Add(Counter::MovedChecked, effects.movedChecked);
+    if (effects.movedTrusted != 0) StagePlans::Add(Counter::MovedTrusted, effects.movedTrusted);
+}
+
 bool SameVertexInput(const Graphics::VertexInputLayout& a, const Graphics::VertexInputLayout& b) {
     const auto sameBinding = [](const VkVertexInputBindingDescription& x, const VkVertexInputBindingDescription& y) { return x.binding == y.binding && x.stride == y.stride && x.inputRate == y.inputRate; };
     const auto sameAttribute = [](const VkVertexInputAttributeDescription& x, const VkVertexInputAttributeDescription& y) { return x.location == y.location && x.binding == y.binding && x.format == y.format && x.offset == y.offset; };
@@ -1537,6 +1552,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     recordLabelsForPacket(localDevice.get(), queue);
     noteDrawWriters(hit.stages, queue);
     auto& commit = *hit.record->commit;
+    commit.cleanProofs = hit.planned && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoPlanCleanProofs);
     static std::uint64_t ordinal = 0;
     const auto every = DrawRecords::VerifyEvery();
     const bool verify = commit.recipe != nullptr && every != 0 && ++ordinal % every == 0;
@@ -1544,7 +1560,9 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         DrawRecords::Add(Counter::CommitFirst);
     } else if (!verify) {
         const auto outcome = localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr);
+        if (hit.planned) NotePlannedCommit(commit);
         if (outcome.recorded) {
+            if (hit.planned) ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
             const auto& effects = commit.effects;
             DrawRecords::Add(Counter::CommitHits);
             if (effects.pushed) DrawRecords::Add(Counter::CommitPushed);
@@ -1557,6 +1575,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         }
         DrawRecords::Add(CommitMiss(outcome.miss));
     }
+    if (hit.planned) ThreadReport::MarkItem(ThreadReport::ItemMark::PlanFallback);
     DrawCommitView answer;
     if (verify) static_cast<void>(localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, &answer));
     if (verify && DrawRecords::CorruptingCommits() && !answer.bindings.empty()) {

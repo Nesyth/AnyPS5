@@ -416,7 +416,8 @@ public:
         ProofFailure failure = ProofFailure::None;
         bool audited = false;
     };
-    bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
+    enum class CleanProof : std::uint8_t { Skipped, Requeried, Verified, Differs, FirstProof, Failed, NotReusable, StorageImages, DepthCopies, OwnWrites, NotClean, Views, Serials, Forgotten, Rewritten, PendingWrites, Count };
+    bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr, CleanProof* clean = nullptr);
     struct CleanStamp {
         std::uint64_t forget = 0;
         std::uint64_t release = 0;
@@ -425,6 +426,7 @@ public:
         std::uint64_t allocations = 0;
         std::uint64_t unwatched = 0;
         std::uint64_t depthSurfaces = 0;
+        std::uint64_t generation = 0;
     };
     bool AsIsCurrent();
     // Objects whose fast proof came from another template's stamp (FastProofStamp), so far.
@@ -434,7 +436,7 @@ public:
     static std::string TakeEpochMissReport();
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
-    bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }
+    bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr, CleanProof* clean = nullptr) { return Revalidate(shaders, report, clean); }
     bool ProveCurrent(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(shader, report); }
     // FNV over the ShaderData/FlattenedSrt words, in binding order: of this object's data buffers
     // as the recorded work will find them (maintained by addDataBuffer and RefreshData), and of a
@@ -939,12 +941,14 @@ private:
     std::uint64_t pendingSerialSeen = 0;
     bool revalidateProof(std::span<const CompiledShader> shaders, ProofReport* report);
     CleanStamp cleanStampNow() const;
-    bool cleanCurrent(const CleanStamp& stamp);
+    bool cleanCurrent(const CleanStamp& stamp, CleanProof& outcome);
     void recordClean(bool proved, const CleanStamp& stamp);
     bool cleanEligible();
+    bool cleanUnchangedSince() const;
     bool cleanProved = false;
     std::uint8_t cleanEligibility = 0;
     std::uint32_t cleanMisses = 0;
+    CleanProof cleanRefusal = CleanProof::FirstProof;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> cleanRangeList;
     CleanStamp cleanAt;
     std::uint64_t provedEpoch = 0;

@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StagePlanReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -31,6 +32,7 @@
 #include <functional>
 #include <initializer_list>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -74,6 +76,13 @@ constexpr std::uint32_t ConstantRecords = 64;
 constexpr std::uint32_t InnerRecords = 16;
 constexpr std::array<std::uint32_t, 4> RawFormats{0x31016facu, 0x31014facu, 0x31015facu, 0x21016facu};
 constexpr std::array<std::uint32_t, 2> SlotFormats{0x01014facu, 0x01015facu};
+constexpr std::size_t TextureBlockBytes = 0x40000;
+constexpr std::array<std::size_t, 2> TextureOffsets{0x0, 0x20000};
+constexpr std::size_t TextureBytes = 1024;
+constexpr std::uint32_t TextureUserWords = 12;
+constexpr std::array<std::array<std::uint8_t, 4>, 2> Texels{{{0x10u, 0x80u, 0xc0u, 0xffu}, {0x33u, 0x66u, 0x99u, 0xffu}}};
+constexpr std::array<std::uint32_t, 4> TextureVertexCounts{3u, 6u, 9u, 12u};
+constexpr std::uint32_t TextureDraws = 3 * DrawsPerSubmission;
 
 alignas(256) constexpr std::array<std::uint32_t, 16> PlainVertex{
     0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
@@ -128,6 +137,8 @@ alignas(256) constexpr std::array<std::uint32_t, 16> RingPixel{
     0xbf810000u, 0xbf810000u,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 12> SamplePixel{0x7e0002f0u, 0x7e0202f0u, 0xf09c0f08u, 0x00400000u, 0xbf8c0000u, 0xf800180fu, 0x03020100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
+
 struct Header {
     Shader shader{};
     ShaderUserData userData{};
@@ -138,6 +149,7 @@ alignas(8) Header ConstantPixelHeader{};
 alignas(8) Header TableVertexHeader{};
 alignas(8) Header ReadPixelHeader{};
 alignas(8) Header RingPixelHeader{};
+alignas(8) Header SamplePixelHeader{};
 
 void Register(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
     header.shader.file_header = 0x34333231u;
@@ -216,6 +228,65 @@ public:
 private:
     std::uint8_t* block = nullptr;
 };
+
+class TextureBlock {
+public:
+    TextureBlock() {
+#ifdef _WIN32
+        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(TextureBlockBytes, 0x200000));
+        Require(block != nullptr, "draw record hits: cannot reserve the texture block");
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(TextureBlockBytes), nullptr);
+        Require(section != nullptr, "draw record hits: cannot create the texture block's backing");
+        GuestArena::GuestArenaMapDirect_nid_postfix(block, TextureBlockBytes, section, 0, PAGE_READWRITE);
+#else
+        constexpr std::uintptr_t alignment = 65536;
+        void* mapped = mmap(nullptr, TextureBlockBytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapped != MAP_FAILED) {
+            const auto begin = reinterpret_cast<std::uintptr_t>(mapped);
+            const auto aligned = (begin + alignment - 1) & ~(alignment - 1);
+            if (aligned != begin) munmap(mapped, aligned - begin);
+            if (aligned + TextureBlockBytes != begin + TextureBlockBytes + alignment) munmap(reinterpret_cast<void*>(aligned + TextureBlockBytes), begin + alignment - aligned);
+            block = reinterpret_cast<std::uint8_t*>(aligned);
+            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, TextureBlockBytes);
+        }
+        Require(block != nullptr, "draw record hits: cannot allocate the texture block");
+#endif
+        std::memset(block, 0, TextureBlockBytes);
+        GuestAllocations::Mutation().Add(block, TextureBlockBytes, true, true, true);
+    }
+
+    TextureBlock(const TextureBlock&) = delete;
+    TextureBlock& operator=(const TextureBlock&) = delete;
+
+    std::uint64_t At(std::size_t offset) const { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(block + offset)); }
+    std::uint8_t* Bytes(std::size_t offset) const { return block + offset; }
+
+    bool Armed(std::size_t offset) const {
+#ifdef _WIN32
+        MEMORY_BASIC_INFORMATION info{};
+        return VirtualQuery(block + offset, &info, sizeof(info)) == sizeof(info) && info.Protect == PAGE_READONLY;
+#else
+        static_cast<void>(offset);
+        return false;
+#endif
+    }
+
+    bool Arm(std::size_t offset) const {
+        AgcDriver::GuestMemory::CollectWritesUncached(At(0), TextureBlockBytes);
+        AgcDriver::GuestMemory::CollectWritesUncached(At(0), TextureBlockBytes);
+        return Armed(offset);
+    }
+
+private:
+    std::uint8_t* block = nullptr;
+#ifdef _WIN32
+    HANDLE section = nullptr;
+#endif
+};
+
+std::array<std::uint32_t, 8> TextureDescriptor(std::uint64_t address) {
+    return {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u};
+}
 
 using RegisterWrites = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
 
@@ -301,17 +372,19 @@ struct Blocks {
     GuestBlock fetch;
     GuestBlock output;
     GuestBlock ring;
+    std::unique_ptr<TextureBlock> texture;
 };
 
 Blocks* Scene = nullptr;
 
-enum class Kind { Constants, Table, Fetch, Ring, Inner, RingInner, Sized, Format, FetchFormat };
+enum class Kind { Constants, Table, Fetch, Ring, Inner, RingInner, Sized, Format, FetchFormat, Texture };
 
 struct State {
     Kind kind = Kind::Table;
     std::uint32_t variant = 0;
     std::uint32_t stride = 16;
     std::uint32_t vertices = 3;
+    std::uint32_t texture = 0;
 };
 
 bool RingKind(Kind kind) {
@@ -361,6 +434,13 @@ void Apply(const State& state) {
     case Kind::FetchFormat:
         WriteWords(blocks.fetch, FetchBufferTableOffset, SlotDescriptor(blocks.fetch.At(CurrentSlotsOffset), SlotFormats[state.variant % SlotFormats.size()]));
         break;
+    case Kind::Texture: {
+        std::array<std::uint8_t, TextureBytes> wanted{};
+        for (std::size_t at = 0; at < wanted.size(); at += Texels[0].size()) std::memcpy(wanted.data() + at, Texels[state.variant % Texels.size()].data(), Texels[0].size());
+        auto* texels = blocks.texture->Bytes(TextureOffsets[state.texture % TextureOffsets.size()]);
+        if (std::memcmp(texels, wanted.data(), wanted.size()) != 0) std::memcpy(texels, wanted.data(), wanted.size());
+        break;
+    }
     default:
         break;
     }
@@ -391,6 +471,13 @@ void Submit(const State& state, std::uint32_t draws) {
         for (std::uint32_t word = 0; word < user.size(); ++word) registers.emplace_back(0x8cu + word, user[word]);
         for (const auto& entry : RegisterWrites{{0x00b, 8u << 1u}, {0x00c, 0}, {0x00d, 0}, {0x00e, static_cast<std::uint32_t>(pointer)}, {0x00f, static_cast<std::uint32_t>(pointer >> 32u)}}) registers.push_back(entry);
         SubmitDraws(reinterpret_cast<std::uintptr_t>(FetchVertex.data()), reinterpret_cast<std::uintptr_t>(ReadPixel.data()), {{0x242, 4}, {0x24a, FetchIndexOffset}}, registers, blocks.target, draws, state.vertices);
+        break;
+    }
+    case Kind::Texture: {
+        const auto image = TextureDescriptor(blocks.texture->At(TextureOffsets[state.texture % TextureOffsets.size()]));
+        RegisterWrites registers{{0x8b, 0}, {0x8c, 0}, {0x00b, TextureUserWords << 1u}};
+        for (std::uint32_t word = 0; word < TextureUserWords; ++word) registers.emplace_back(0x00cu + word, word < image.size() ? image[word] : 0u);
+        SubmitDraws(reinterpret_cast<std::uintptr_t>(PlainVertex.data()), reinterpret_cast<std::uintptr_t>(SamplePixel.data()), {{0x242, 4}, {0x24a, 0}}, registers, blocks.target, draws, state.vertices);
         break;
     }
     default: {
@@ -804,6 +891,66 @@ void Plans(PlanArms& arms) {
     });
 }
 
+std::uint64_t ProofsRun(const PlanTotals& now, const PlanTotals& base) {
+    return now.Since(base, PlanCounter::ProofFirst, PlanCounter::ProofPendingWrites) + now.Since(base, PlanCounter::ProofsFull);
+}
+
+std::uint64_t ProofsSkipped(const PlanTotals& now, const PlanTotals& base) {
+    return now.Since(base, PlanCounter::ProofsSkipped) + now.Since(base, PlanCounter::ProofsRequeried);
+}
+
+void Textures(PlanArms& arms) {
+    auto& blocks = *Scene;
+    if (blocks.texture == nullptr) blocks.texture = std::make_unique<TextureBlock>();
+    const auto counts = TextureVertexCounts.size();
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
+    std::array<std::array<std::vector<std::uint8_t>, TextureVertexCounts.size()>, Texels.size()> today;
+    for (std::uint32_t texel = 0; texel < Texels.size(); ++texel) {
+        for (std::size_t count = 0; count < counts; ++count) today[texel][count] = Render({Kind::Texture, texel, 16, TextureVertexCounts[count], 0}, TextureDraws);
+    }
+    Require(today[0][0] != today[1][0], "textures: the two texel values rendered the same image");
+    Apply({Kind::Texture, 0, 16, 3, 1});
+    const bool armed = blocks.texture->Arm(TextureOffsets[1]);
+#ifdef _WIN32
+    Require(armed, "textures: two collects of the whole resident texture block did not arm it");
+#endif
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, true);
+    const auto base = PlanTotals::Now();
+    for (std::size_t index = 0; index < 2 * counts; ++index) {
+        const auto count = index % counts;
+        Require(Render({Kind::Texture, 0, 16, TextureVertexCounts[count], 1}, TextureDraws) == today[0][count], "textures: submission " + std::to_string(index) + " of planned draws sampling a clean texture rendered differently from today's path" + DescribePlans(PlanTotals::Now(), base));
+    }
+    const auto clean = PlanTotals::Now();
+    std::cout << "stage plans, draws of " << counts << " identities sampling a clean texture in armed memory:" << DescribePlans(clean, base) << '\n';
+    Require(!armed || blocks.texture->Armed(TextureOffsets[1]), "textures: the clean texture's memory was disarmed without a write");
+    Apply({Kind::Texture, 1, 16, 3, 1});
+    Require(!blocks.texture->Armed(TextureOffsets[1]), "textures: a CPU write into armed texture memory left it armed");
+    for (std::size_t count = 0; count < 2; ++count) {
+        Require(Render({Kind::Texture, 1, 16, TextureVertexCounts[count], 1}, TextureDraws) == today[1][count], "textures: planned draws after a CPU write into their texture rendered differently from today's path" + DescribePlans(PlanTotals::Now(), clean));
+    }
+    const auto written = PlanTotals::Now();
+    std::cout << "stage plans, the texture written by the CPU between two submissions:" << DescribePlans(written, clean) << '\n';
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
+    if (!arms.ring) return;
+    Require(written.differences == base.differences, "textures: the stage plan or committer verify found differences" + DescribePlans(written, base));
+    ExpectPlanHits("textures", clean, base, DrawsPerSubmission);
+    Require(clean.Since(base, PlanCounter::DrawPlansAdded) == 1, "textures: draws of " + std::to_string(counts) + " identities did not share one draw plan" + DescribePlans(clean, base));
+    if (StagePlanReport::VerifyEvery() == 1 || DrawRecords::VerifyEvery() == 1) return;
+    Require(clean.Since(base, PlanCounter::TargetsHeld, PlanCounter::TargetsChanged) != 0 && ProofsRun(clean, base) != 0, "textures: the committer half of planned draws neither held its targets nor proved its template" + DescribePlans(clean, base));
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoPlanCleanProofs)) {
+        Require(ProofsSkipped(written, base) == 0 && written.Since(base, PlanCounter::ProofsFull) != 0, "textures: with clean proofs off, a planned draw skipped its template proof or none was proved in full" + DescribePlans(written, base));
+    } else {
+        Require(!armed || ProofsSkipped(clean, base) != 0, "textures: no planned draw of a clean texture in armed memory skipped its template proof" + DescribePlans(clean, base));
+        Require(ProofsRun(written, clean) != 0, "textures: no planned draw proved its template again after a CPU write into its texture" + DescribePlans(written, clean));
+    }
+    if (!AgcDriver::ThreadReport::Enabled()) return;
+    using ThreadCount = AgcDriver::ThreadReport::Count;
+    Require(AgcDriver::ThreadReport::Peek(ThreadCount::CommitterPlannedDraws) != 0 && AgcDriver::ThreadReport::Peek(ThreadCount::FinisherPlannedJobs) != 0 && AgcDriver::ThreadReport::Peek(ThreadCount::FinisherPlanMisses) != 0, "textures: the thread report counted no planned committer draw, planned finisher job or plan miss");
+    AgcDriver::ThreadReport::Phase();
+}
+
 void InjectedPlans(PlanArms& arms) {
     Require(StagePlanReport::VerifyEvery() == 1, "inject plans: the stage plan verify needs APS5_VERIFY_STAGE_PLANS=1");
     DrawRecords::CorruptAnswers(true);
@@ -834,6 +981,7 @@ int main(int argc, char** argv) {
         const bool inject = argc > 1 && std::string_view(argv[1]) == "--inject";
         const bool injectCommit = argc > 1 && std::string_view(argv[1]) == "--inject-commit";
         const bool injectPlans = argc > 1 && std::string_view(argv[1]) == "--inject-plans";
+        const bool texturesOnly = argc > 1 && std::string_view(argv[1]) == "--textures";
         using AgcDriver::DriverDetail::DrawFinisher;
         using AgcDriver::DriverDetail::DrawPipeline;
         const bool leanEnvironment = RuntimeSwitches::Set(RuntimeSwitch::LeanFront);
@@ -848,6 +996,7 @@ int main(int argc, char** argv) {
         Register(TableVertexHeader, TableVertex.data(), sizeof(TableVertex), 2);
         Register(ReadPixelHeader, ReadPixel.data(), sizeof(ReadPixel), 1);
         Register(RingPixelHeader, RingPixel.data(), sizeof(RingPixel), 1);
+        Register(SamplePixelHeader, SamplePixel.data(), sizeof(SamplePixel), 1);
         RegisterFetchVertex();
         Blocks blocks;
         Scene = &blocks;
@@ -856,10 +1005,13 @@ int main(int argc, char** argv) {
             Injected(arms);
         } else if (injectCommit) {
             InjectedCommit(arms);
+        } else if (texturesOnly) {
+            Textures(planArms);
         } else if (injectPlans) {
             InjectedPlans(planArms);
         } else if (plansEnvironment) {
             Plans(planArms);
+            Textures(planArms);
         } else {
             Hits(arms);
             Ring(arms);
@@ -867,6 +1019,7 @@ int main(int argc, char** argv) {
             Misses(arms);
             Fallbacks(arms);
             Plans(planArms);
+            Textures(planArms);
         }
         DrawRecords::Report(true);
         StagePlanReport::Report(true);

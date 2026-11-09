@@ -38,13 +38,29 @@ enum class Count : std::size_t {
     OtherDrainNs,
     OtherRoomWaits,
     OtherRoomNs,
+    CommitterPlannedDraws,
+    CommitterPlannedDrawNs,
+    CommitterPlanFallbacks,
+    CommitterPlanFallbackNs,
+    FinisherPlannedJobs,
+    FinisherPlannedJobNs,
+    FinisherPlannedWaitNs,
+    FinisherPlanMisses,
+    FinisherPlanMissNs,
     Count
 };
 
 using Clock = std::chrono::steady_clock;
 
+enum class ItemMark : std::uint8_t { None, Planned, PlanFallback };
+
 bool Enabled();
 void Add(Count count, std::uint64_t value);
+std::uint64_t Peek(Count count);
+void MarkItem(ItemMark mark);
+ItemMark TakeItemMark(std::uint64_t* waitedNs = nullptr);
+void NoteFinisherJob(ItemMark mark, std::uint64_t ns, std::uint64_t waitedNs);
+void NoteCommitterDraw(ItemMark mark, std::uint64_t ns);
 std::uint64_t Nanoseconds(Clock::time_point from, Clock::time_point to);
 void Tick(Clock::time_point now);
 void Phase();

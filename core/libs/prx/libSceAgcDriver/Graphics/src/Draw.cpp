@@ -5152,15 +5152,25 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     std::vector<std::shared_ptr<StorageTexture>> targets;
     targets.reserve(recipe.targets.size());
     const auto& pass = record.pass;
-    bool held = pass.valid && pass.recorder == recorder->Id() && recorder->RenderPassOpen() && pass.generation == recorder->RenderPassGeneration() && pass.epoch == GuestMemory::CollectEpoch() && pass.proof == GuestMemory::ProofSerial() && pass.pending == StorageTexture::PendingSerial() && pass.versions.size() == recipe.targets.size() && (!recipe.hasDepth || (pass.depthSerial == DepthSurfacesSerial() && pass.depthReleased == DepthSurfacesReleased()));
+    auto hold = DrawRecordHold::Held;
+    if (!pass.valid) hold = DrawRecordHold::First;
+    else if (pass.recorder != recorder->Id() || !recorder->RenderPassOpen() || pass.generation != recorder->RenderPassGeneration()) hold = DrawRecordHold::Pass;
+    else if (pass.epoch != GuestMemory::CollectEpoch()) hold = DrawRecordHold::Epoch;
+    else if (pass.proof != GuestMemory::ProofSerial()) hold = DrawRecordHold::Proof;
+    else if (pass.pending != StorageTexture::PendingSerial()) hold = DrawRecordHold::Pending;
+    else if (pass.versions.size() != recipe.targets.size()) hold = DrawRecordHold::Target;
+    else if (recipe.hasDepth && (pass.depthSerial != DepthSurfacesSerial() || pass.depthReleased != DepthSurfacesReleased())) hold = DrawRecordHold::Depth;
+    bool held = hold == DrawRecordHold::Held;
     for (std::size_t index = 0; held && index < recipe.targets.size(); ++index) {
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr || stored->UploadVersion() != pass.versions[index] || !stored->Cached() || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) {
             held = false;
+            hold = DrawRecordHold::Target;
             break;
         }
         targets.push_back(std::move(stored));
     }
+    record.effects.hold = hold;
     if (!held) {
         targets.clear();
         if (failed(DrawRecipeMiss::TargetGone)) return miss(DrawRecipeMiss::TargetGone);
@@ -5185,7 +5195,16 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         }
     }
     timer.phase(PhasePrepare);
-    if (failed(DrawRecipeMiss::Proof) || !resources->ProveCurrent(shaders, &result.proof)) {
+    const auto proved = [&] {
+        if (failed(DrawRecipeMiss::Proof)) return false;
+        record.effects.proved = true;
+        if (!record.cleanProofs) return resources->ProveCurrent(shaders, &result.proof);
+        ShaderResources::CleanProof clean = ShaderResources::CleanProof::FirstProof;
+        const bool ok = resources->ProveCurrent(shaders, &result.proof, &clean);
+        record.effects.cleanProof = clean;
+        return ok;
+    };
+    if (!proved()) {
         if (recording) {
             SharedResourceCache().Remove(recipe.key, resources.get());
             countCache(&DrawProfile::cacheInvalidated);

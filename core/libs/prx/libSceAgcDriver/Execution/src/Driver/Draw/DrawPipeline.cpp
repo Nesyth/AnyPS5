@@ -775,7 +775,10 @@ void DrawFinisher::runLean(std::uint64_t seq, std::chrono::steady_clock::time_po
     auto& slot = leanSlot(seq);
     FinisherSeq::Set(seq);
     const auto jobStart = ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
-    if (jobStart != ThreadReport::Clock::time_point{}) ThreadReport::FinisherBusy(true, jobStart);
+    if (jobStart != ThreadReport::Clock::time_point{}) {
+        ThreadReport::FinisherBusy(true, jobStart);
+        static_cast<void>(ThreadReport::TakeItemMark());
+    }
     std::exception_ptr error;
     try {
         if (!leanFailed.load(std::memory_order_acquire)) {
@@ -792,6 +795,9 @@ void DrawFinisher::runLean(std::uint64_t seq, std::chrono::steady_clock::time_po
         ThreadReport::FinisherBusy(false, end);
         ThreadReport::Add(ThreadReport::Count::FinisherJobs, 1);
         ThreadReport::Add(ThreadReport::Count::FinisherJobNs, ThreadReport::Nanoseconds(jobStart, end));
+        std::uint64_t waited = 0;
+        const auto mark = ThreadReport::TakeItemMark(&waited);
+        ThreadReport::NoteFinisherJob(mark, ThreadReport::Nanoseconds(jobStart, end), waited);
         if (lastEnd != ThreadReport::Clock::time_point{}) ThreadReport::Add(ThreadReport::Count::FinisherIdleNs, ThreadReport::Nanoseconds(lastEnd, jobStart));
         lastEnd = end;
         ThreadReport::Tick(end);
@@ -862,7 +868,10 @@ void DrawFinisher::run(unsigned index) {
         }
         FinisherSeq::Set(slot->seq);
         const auto jobStart = ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
-        if (jobStart != ThreadReport::Clock::time_point{}) ThreadReport::FinisherBusy(true, jobStart);
+        if (jobStart != ThreadReport::Clock::time_point{}) {
+            ThreadReport::FinisherBusy(true, jobStart);
+            static_cast<void>(ThreadReport::TakeItemMark());
+        }
         std::exception_ptr error;
         try {
             if (!failed) slot->job();
@@ -875,6 +884,9 @@ void DrawFinisher::run(unsigned index) {
             ThreadReport::FinisherBusy(false, end);
             ThreadReport::Add(ThreadReport::Count::FinisherJobs, 1);
             ThreadReport::Add(ThreadReport::Count::FinisherJobNs, ThreadReport::Nanoseconds(jobStart, end));
+            std::uint64_t waited = 0;
+            const auto mark = ThreadReport::TakeItemMark(&waited);
+            ThreadReport::NoteFinisherJob(mark, ThreadReport::Nanoseconds(jobStart, end), waited);
             if (lastEnd != ThreadReport::Clock::time_point{}) ThreadReport::Add(ThreadReport::Count::FinisherIdleNs, ThreadReport::Nanoseconds(lastEnd, jobStart));
             lastEnd = end;
             ThreadReport::Tick(end);
@@ -1208,6 +1220,7 @@ void DrawPipeline::run() {
             const auto end = start + std::chrono::nanoseconds(spent);
             ThreadReport::Add(isDraw ? ThreadReport::Count::CommitterDraws : ThreadReport::Count::CommitterOther, 1);
             ThreadReport::Add(isDraw ? ThreadReport::Count::CommitterDrawNs : ThreadReport::Count::CommitterOtherNs, spent);
+            ThreadReport::NoteCommitterDraw(ThreadReport::TakeItemMark(), spent);
             if (lastEnd != ThreadReport::Clock::time_point{}) {
                 ThreadReport::Add(ThreadReport::Count::CommitterIdleNs, ThreadReport::Nanoseconds(lastEnd, start));
                 ThreadReport::NoteCommitterIdle(idleFrom, idleTo);

@@ -8,7 +8,9 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <cstdio>
 #include <mutex>
+#include <string>
 #include <utility>
 
 namespace AgcDriver::ThreadReport {
@@ -25,6 +27,8 @@ std::array<Counter, static_cast<std::size_t>(Count::Count)> counts{};
 std::atomic<std::int64_t> windowStart{0};
 std::mutex printMutex;
 thread_local bool queue0Worker = false;
+thread_local ItemMark itemMark = ItemMark::None;
+thread_local std::uint64_t itemWaitedNs = 0;
 thread_local Clock::time_point lastSubmissionEnd{};
 constexpr std::size_t StateCount = static_cast<std::size_t>(WorkerState::Count);
 std::array<std::atomic<std::uint64_t>, StateCount> workerStateNs{};
@@ -50,14 +54,22 @@ void print(std::int64_t now, std::int64_t since, const char* why) {
     const double seconds = since == 0 ? 0.0 : static_cast<double>(now - since) / 1e9;
     const auto finisherWaits = value(Count::FinisherRoomNs) + value(Count::FinisherCommitterDrainNs);
     const auto workerWaits = value(Count::WorkerFinisherDrainNs) + value(Count::WorkerCommitterDrainNs) + value(Count::WorkerFinisherRoomNs) + value(Count::WorkerCommitterRoomNs);
+    std::string planned;
+    if (value(Count::CommitterPlannedDraws) + value(Count::CommitterPlanFallbacks) + value(Count::FinisherPlannedJobs) + value(Count::FinisherPlanMisses) != 0) {
+        char text[512];
+        std::snprintf(text, sizeof(text), "; planned path: committer %llu planned draws at %.2f us and %llu planned fallbacks at %.2f us, finisher %llu planned jobs at %.2f us, %.2f us net of their waits, and %llu plan misses at %.2f us",
+            items(Count::CommitterPlannedDraws), per(Count::CommitterPlannedDrawNs, Count::CommitterPlannedDraws), items(Count::CommitterPlanFallbacks), per(Count::CommitterPlanFallbackNs, Count::CommitterPlanFallbacks),
+            items(Count::FinisherPlannedJobs), per(Count::FinisherPlannedJobNs, Count::FinisherPlannedJobs), net(Count::FinisherPlannedJobNs, Count::FinisherPlannedJobs, value(Count::FinisherPlannedWaitNs)), items(Count::FinisherPlanMisses), per(Count::FinisherPlanMissNs, Count::FinisherPlanMisses));
+        planned = text;
+    }
     AgcDriver::ProfilePrint_nid_no_patch(
-        "[threads] %.1f s%s: committer %llu draws at %.2f us and %llu other items at %.2f us, idle %.1f ms (with the retire, the dequeue and the hand-off spin); finisher %llu jobs at %.2f us, %.2f us net of its waits for committer room (%llu, %.1f ms) and its drains of the committer (%llu, %.1f ms), idle %.1f ms; queue-0 worker %llu submissions at %.1f us, %.1f us net of its drains and room waits, idle %.1f ms, %llu draw packets at %.2f us with the waits inside them; worker drains of the finisher %llu (%.1f ms), of the committer %llu (%.1f ms); worker room waits for the finisher %llu (%.1f ms), for the committer %llu (%.1f ms); other threads' drains %llu (%.1f ms) and room waits %llu (%.1f ms)\n",
+        "[threads] %.1f s%s: committer %llu draws at %.2f us and %llu other items at %.2f us, idle %.1f ms (with the retire, the dequeue and the hand-off spin); finisher %llu jobs at %.2f us, %.2f us net of its waits for committer room (%llu, %.1f ms) and its drains of the committer (%llu, %.1f ms), idle %.1f ms; queue-0 worker %llu submissions at %.1f us, %.1f us net of its drains and room waits, idle %.1f ms, %llu draw packets at %.2f us with the waits inside them; worker drains of the finisher %llu (%.1f ms), of the committer %llu (%.1f ms); worker room waits for the finisher %llu (%.1f ms), for the committer %llu (%.1f ms); other threads' drains %llu (%.1f ms) and room waits %llu (%.1f ms)%s\n",
         seconds, why, items(Count::CommitterDraws), per(Count::CommitterDrawNs, Count::CommitterDraws), items(Count::CommitterOther), per(Count::CommitterOtherNs, Count::CommitterOther), ms(Count::CommitterIdleNs),
         items(Count::FinisherJobs), per(Count::FinisherJobNs, Count::FinisherJobs), net(Count::FinisherJobNs, Count::FinisherJobs, finisherWaits), items(Count::FinisherRoomWaits), ms(Count::FinisherRoomNs), items(Count::FinisherCommitterDrains), ms(Count::FinisherCommitterDrainNs), ms(Count::FinisherIdleNs),
         items(Count::WorkerSubmissions), per(Count::WorkerSubmissionNs, Count::WorkerSubmissions), net(Count::WorkerSubmissionNs, Count::WorkerSubmissions, workerWaits), ms(Count::WorkerIdleNs), items(Count::WorkerDrawPackets), per(Count::WorkerDrawPacketNs, Count::WorkerDrawPackets),
         items(Count::WorkerFinisherDrains), ms(Count::WorkerFinisherDrainNs), items(Count::WorkerCommitterDrains), ms(Count::WorkerCommitterDrainNs),
         items(Count::WorkerFinisherRoomWaits), ms(Count::WorkerFinisherRoomNs), items(Count::WorkerCommitterRoomWaits), ms(Count::WorkerCommitterRoomNs),
-        items(Count::OtherDrains), ms(Count::OtherDrainNs), items(Count::OtherRoomWaits), ms(Count::OtherRoomNs));
+        items(Count::OtherDrains), ms(Count::OtherDrainNs), items(Count::OtherRoomWaits), ms(Count::OtherRoomNs), planned.c_str());
     std::array<double, StateCount + 1> idle{};
     for (std::size_t index = 0; index < idle.size(); ++index) idle[index] = static_cast<double>(committerIdleBy[index].value.exchange(0, std::memory_order_relaxed)) / 1e6;
     const auto state = [&](WorkerState which) { return idle[static_cast<std::size_t>(which)]; };
@@ -88,6 +100,42 @@ bool Enabled() {
 
 void Add(Count count, std::uint64_t value) {
     counts[static_cast<std::size_t>(count)].value.fetch_add(value, std::memory_order_relaxed);
+    if (count == Count::FinisherRoomNs || count == Count::FinisherCommitterDrainNs) itemWaitedNs += value;
+}
+
+std::uint64_t Peek(Count count) {
+    return counts[static_cast<std::size_t>(count)].value.load(std::memory_order_relaxed);
+}
+
+void MarkItem(ItemMark mark) {
+    itemMark = mark;
+}
+
+ItemMark TakeItemMark(std::uint64_t* waitedNs) {
+    if (waitedNs != nullptr) *waitedNs = itemWaitedNs;
+    itemWaitedNs = 0;
+    return std::exchange(itemMark, ItemMark::None);
+}
+
+void NoteFinisherJob(ItemMark mark, std::uint64_t ns, std::uint64_t waitedNs) {
+    if (mark == ItemMark::Planned) {
+        Add(Count::FinisherPlannedJobs, 1);
+        Add(Count::FinisherPlannedJobNs, ns);
+        Add(Count::FinisherPlannedWaitNs, std::min(ns, waitedNs));
+    } else if (mark == ItemMark::PlanFallback) {
+        Add(Count::FinisherPlanMisses, 1);
+        Add(Count::FinisherPlanMissNs, ns);
+    }
+}
+
+void NoteCommitterDraw(ItemMark mark, std::uint64_t ns) {
+    if (mark == ItemMark::Planned) {
+        Add(Count::CommitterPlannedDraws, 1);
+        Add(Count::CommitterPlannedDrawNs, ns);
+    } else if (mark == ItemMark::PlanFallback) {
+        Add(Count::CommitterPlanFallbacks, 1);
+        Add(Count::CommitterPlanFallbackNs, ns);
+    }
 }
 
 std::uint64_t Nanoseconds(Clock::time_point from, Clock::time_point to) {

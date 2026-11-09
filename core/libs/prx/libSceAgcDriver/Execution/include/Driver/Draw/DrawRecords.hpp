@@ -205,6 +205,7 @@ struct DrawRecordHit {
     bool baseValueMoved = false;
     bool buffersPatched = false;
     bool relocated = false;
+    bool planned = false;
 };
 
 namespace DrawRecordFlags {

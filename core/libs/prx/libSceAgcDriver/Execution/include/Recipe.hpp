@@ -113,6 +113,8 @@ struct DrawRecordKeep {
     std::vector<const void*> targets;
 };
 
+enum class DrawRecordHold : std::uint8_t { Held, First, Pass, Epoch, Proof, Pending, Depth, Target, Count };
+
 struct DrawRecordEffects {
     bool pushed = false;
     bool unpushed = false;
@@ -121,6 +123,9 @@ struct DrawRecordEffects {
     std::uint32_t notesSkipped = 0;
     std::size_t movedChecked = 0;
     std::size_t movedTrusted = 0;
+    DrawRecordHold hold = DrawRecordHold::Count;
+    bool proved = false;
+    std::optional<Graphics::ShaderResources::CleanProof> cleanProof;
 };
 
 struct DrawRecordAccess {
@@ -199,6 +204,7 @@ struct DrawRecordCommit {
     const void* pushTemplate = nullptr;
     std::uint64_t touchedPresent = ~std::uint64_t{0};
     std::uint64_t builds = 0;
+    bool cleanProofs = false;
 
     void Adopt(std::shared_ptr<const DrawRecipe> built) {
         recipe = std::move(built);
