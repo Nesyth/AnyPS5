@@ -88,6 +88,7 @@ public:
     bool Kept() const { return keptFront != keptEnd; }
     void Pop();
     void ClearKept();
+    void TrimKept();
     std::vector<std::uint32_t> TakeCommands();
     void GiveCommands(std::vector<std::uint32_t>&& commands);
     RegisterLists TakeLists();

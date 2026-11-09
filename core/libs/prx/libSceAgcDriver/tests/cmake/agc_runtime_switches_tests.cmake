@@ -5,9 +5,10 @@ if(BUILD_TESTING)
     configure_windows_unwind(agc_runtime_switches_tests)
     add_test(NAME agc_runtime_switches COMMAND agc_runtime_switches_tests)
     add_test(NAME agc_runtime_switches_refused COMMAND agc_runtime_switches_tests refused)
-    set_tests_properties(agc_runtime_switches agc_runtime_switches_refused PROPERTIES TIMEOUT 20 ENVIRONMENT "APS5_LATE_MS=1;APS5_LEAN_FRONT=1")
+    add_test(NAME agc_runtime_switches_clock COMMAND agc_runtime_switches_tests clock)
+    set_tests_properties(agc_runtime_switches agc_runtime_switches_refused agc_runtime_switches_clock PROPERTIES TIMEOUT 20 ENVIRONMENT "APS5_LATE_MS=1;APS5_LEAN_FRONT=1")
     if(WIN32)
-        set_tests_properties(agc_runtime_switches agc_runtime_switches_refused PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_runtime_switches agc_runtime_switches_refused agc_runtime_switches_clock PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

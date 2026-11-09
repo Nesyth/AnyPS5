@@ -384,7 +384,7 @@ void Driver::checkFlush(const Submission& submission, std::size_t cursor, const 
     if ((decision & (FlushDecision::Record | FlushDecision::RecordAtLock)) != 0) {
         LeanFront::NoteDifference(Field::FlushRecords, detail("records queued labels", -1));
     } else if ((decision & FlushDecision::Capped) != 0) {
-        if (batchCap() != gate.cap) LeanFront::NoteAllowed(Allowed::CapMoved);
+        if (Graphics::RuntimeSwitches::Generation() != gate.capGeneration) LeanFront::NoteAllowed(Allowed::CapMoved);
         else LeanFront::NoteDifference(Field::FlushCaps, detail("submits at the batch cap", -1));
     } else if ((decision & FlushDecision::Submit) != 0) {
         LeanFront::NoteDifference(Field::FlushSubmits, detail("submits a pending label", inputs.pending.has_value() ? late(*inputs.pending + labelFlushDeadline()) : -1));
@@ -549,6 +549,7 @@ void Driver::runLeanSegment(const Submission& submission, QueueState& queue, Seg
         verifySegmentTable(submission, slot.table);
         if (submission.front != FrontMode::Lean) LeanFront::NoteChecked(LeanFront::Item::Segment);
     }
+    run.gate.capGeneration = Graphics::RuntimeSwitches::Generation();
     run.gate.cap = batchCap();
     const auto skipped = run.gate.skipped;
     const auto calls = run.gate.calls;
@@ -741,7 +742,7 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
             ++run.gate.calls;
             checkFlush(submission, cursor, run.gate, gateDue, decision, flushInputs);
         } else if (flushDue(run.gate, flushInputs)) {
-            if (flushInputs.given) flushInputs.now = std::chrono::steady_clock::now();
+            if (flushInputs.given && (flushInputs.pending.has_value() || flushInputs.completions)) flushInputs.now = std::chrono::steady_clock::now();
             flushBetweenPackets(submission.queue, header, labelPacket, flushInputs.given ? &flushInputs : nullptr);
             tagged = NoTag;
             ++run.gate.calls;
@@ -834,15 +835,8 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;
             if (Graphics::AbConfigured()) {
-                static const auto abClock = std::chrono::steady_clock::now();
-                std::vector<std::string> abLines;
-                {
-                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
-                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
-                    abLines = Graphics::AbAtPresent(flipsCounted.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - abClock).count());
-                }
-                for (const auto& line : abLines) AgcDriver::ProfilePrint_nid_no_patch("%s", line.c_str());
-                if (!abLines.empty()) ThreadReport::Phase();
+                abAtFlip();
+                run.gate.capGeneration = Graphics::RuntimeSwitches::Generation();
                 run.gate.cap = batchCap();
             }
             timing.Mark("flip_flush");

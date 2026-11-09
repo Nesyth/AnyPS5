@@ -1,10 +1,12 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 
 using AgcDriver::Graphics::AbSchedule;
 using AgcDriver::Graphics::RuntimeSwitch;
@@ -126,6 +128,17 @@ void schedule() {
     Require(timed.AtPresent(501, 1089.0).event == Event::None, "a start in seconds began early");
     const auto begin = timed.AtPresent(502, 1090.0);
     Require(begin.event == Event::Begin && begin.phase == 0 && !begin.b, "a start in seconds did not begin phase A");
+
+    AbSchedule mixed(AbSchedule::Parse("30:APS5_NO_BARRIER_BATCH", "", ""));
+    Require(mixed.AtPresent(1, 250.0).event == Event::Begin, "a schedule from present 0 did not begin at the first present");
+    Require(mixed.AtPresent(2, 250.0).event == Event::None, "a present at the same time moved the schedule");
+    bool refused = false;
+    try {
+        mixed.AtPresent(3, 30.0);
+    } catch (const std::logic_error&) {
+        refused = true;
+    }
+    Require(refused, "a present timed before the previous present was not refused");
 }
 
 void glue() {
@@ -144,6 +157,44 @@ void glue() {
     lines = AgcDriver::Graphics::AbAtPresent(7, 11.5);
     Require(lines.size() == 1 && lines[0] == "[ab] phase A 2 begins at present 7 (t 11.500 s): APS5_NO_BARRIER_BATCH set\n", "phase A did not come back");
     Require(RuntimeSwitches::Set(RuntimeSwitch::NoBarrierBatch), "phase A did not restore the environment's setting");
+    bool refused = false;
+    try {
+        AgcDriver::Graphics::AbAtPresent(8);
+    } catch (const std::logic_error&) {
+        refused = true;
+    }
+    Require(refused, "a present on the A/B clock after presents timed 11.5 s later was not refused");
+}
+
+int abClock() {
+    SetEnvironment("APS5_NO_BARRIER_BATCH", "1");
+    SetEnvironment("APS5_AB", "1:APS5_NO_BARRIER_BATCH");
+    SetEnvironment("APS5_AB_START", nullptr);
+    SetEnvironment("APS5_AB_SETTLE", "0.5");
+    try {
+        const auto start = std::chrono::steady_clock::now();
+        auto lines = AgcDriver::Graphics::AbAtPresent(1);
+        Require(lines.size() == 2 && lines[1].rfind("[ab] phase A 0 begins at present 1 (t 0.0", 0) == 0, "the first present did not begin phase A near t 0: " + (lines.empty() ? std::string() : lines.back()));
+        std::uint64_t present = 2;
+        std::string phaseB;
+        while (phaseB.empty() && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            for (const auto& line : AgcDriver::Graphics::AbAtPresent(present++)) {
+                if (line.find("phase B 1 begins") != std::string::npos) phaseB = line;
+            }
+        }
+        const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        Require(!phaseB.empty(), "phase B never began on the A/B clock");
+        const auto at = phaseB.find("(t ");
+        const double seconds = at == std::string::npos ? -1.0 : std::strtod(phaseB.c_str() + at + 3, nullptr);
+        Require(seconds >= 1.0 && seconds <= elapsed + 0.0005, "phase B began at t " + std::to_string(seconds) + " s, not between the phase length and the " + std::to_string(elapsed) + " s that passed: " + phaseB);
+        Require(!RuntimeSwitches::Set(RuntimeSwitch::NoBarrierBatch), "phase B on the A/B clock did not toggle the listed switch");
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "FAILED: %s\n", error.what());
+        return 1;
+    }
+    std::printf("A/B clock test passed\n");
+    return 0;
 }
 
 int refused() {
@@ -166,6 +217,7 @@ int refused() {
 
 int main(int argc, char** argv) {
     if (argc > 1 && std::string_view(argv[1]) == "refused") return refused();
+    if (argc > 1 && std::string_view(argv[1]) == "clock") return abClock();
     try {
         SetEnvironment("APS5_NO_BARRIER_BATCH", "1");
         SetEnvironment("APS5_AB", "5:APS5_NO_BARRIER_BATCH");

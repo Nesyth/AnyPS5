@@ -4,6 +4,7 @@ add_test_executable(agc_driver_pm4_tests EXCLUDE_FROM_ALL
 
 target_include_directories(agc_driver_pm4_tests PRIVATE
         ${LIBS_INCLUDE_DIR}
+        ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
 )
 
 target_link_libraries(agc_driver_pm4_tests PRIVATE
@@ -248,7 +249,7 @@ if(BUILD_TESTING)
                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
-    foreach(pm4LoopMode IN ITEMS rewind-chain rewind-kick rewind-labels)
+    foreach(pm4LoopMode IN ITEMS rewind-chain rewind-kick rewind-labels rewind-presents rewind-cap-moved)
         string(REPLACE "-" "_" pm4LoopTest "agc_driver_pm4_${pm4LoopMode}")
         add_test(NAME ${pm4LoopTest} COMMAND agc_driver_pm4_tests ${pm4LoopMode})
         set_tests_properties(${pm4LoopTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 60)

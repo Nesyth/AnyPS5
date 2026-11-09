@@ -111,6 +111,15 @@ void LeanTails::ClearKept() {
     keptFront = keptEnd = 0;
 }
 
+void LeanTails::TrimKept() {
+    for (std::size_t index = 0; index < kept.size(); ++index) {
+        auto& commands = kept[index].copy.commands;
+        if ((index >= keptFront && index < keptEnd) || commands.capacity() == 0) continue;
+        GiveCommands(std::move(commands));
+        std::vector<std::uint32_t>().swap(commands);
+    }
+}
+
 std::vector<std::uint32_t> LeanTails::TakeCommands() {
     if (spareCommands.empty()) return {};
     auto commands = std::move(spareCommands.back());
@@ -167,6 +176,7 @@ void Driver::keepReleasedTails(const Submission& submission) {
         tail = kept.copy.rewindTail;
         words = kept.copy.rewindWords;
     }
+    leanTails.TrimKept();
 }
 
 bool Driver::keptTailCurrent(const KeptTail& kept, const Submission& stalled) const {

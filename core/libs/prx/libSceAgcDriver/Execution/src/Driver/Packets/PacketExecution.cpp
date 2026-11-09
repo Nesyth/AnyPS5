@@ -198,6 +198,17 @@ void Driver::deliverGuestEopInterrupt(std::uint32_t queue, std::uint32_t context
     AgcDriverDeliverEopInterrupt(queue, context);
 }
 
+void Driver::abAtFlip() {
+    std::vector<std::string> lines;
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        lines = Graphics::AbAtPresent(flipsCounted.load());
+    }
+    for (const auto& line : lines) AgcDriver::ProfilePrint_nid_no_patch("%s", line.c_str());
+    if (!lines.empty()) ThreadReport::Phase();
+}
+
 std::optional<std::uint32_t> Driver::releaseInterrupt(std::span<const std::uint32_t> packet, std::uint32_t opcode, bool carriesFlip) {
     if (opcode != 0x49 || carriesFlip || packet.size() < 3) return std::nullopt;
     const auto interruptSelect = (packet[2] >> 24u) & 7u;
@@ -560,17 +571,7 @@ void Driver::execute(const Submission& submission) {
             Graphics::NoteHostImportFrame();
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;
-            if (Graphics::AbConfigured()) {
-                static const auto abClock = std::chrono::steady_clock::now();
-                std::vector<std::string> abLines;
-                {
-                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
-                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
-                    abLines = Graphics::AbAtPresent(flipsCounted.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - abClock).count());
-                }
-                for (const auto& line : abLines) AgcDriver::ProfilePrint_nid_no_patch("%s", line.c_str());
-                if (!abLines.empty()) ThreadReport::Phase();
-            }
+            if (Graphics::AbConfigured()) abAtFlip();
 
             timing.Mark("flip_flush");
             timing.FinishPacket(submission.serial, cursor, 0xffffu, count);

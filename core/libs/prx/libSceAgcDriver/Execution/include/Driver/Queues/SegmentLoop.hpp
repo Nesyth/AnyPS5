@@ -79,6 +79,7 @@ private:
 struct FlushGate {
     bool everyPacket = false;
     std::uint64_t cap = 0;
+    std::uint64_t capGeneration = 0;
     bool labelArmed = false;
     std::chrono::steady_clock::time_point label{};
     std::int64_t labelDue = 0;

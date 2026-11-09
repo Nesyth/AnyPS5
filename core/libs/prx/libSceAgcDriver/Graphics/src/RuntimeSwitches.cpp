@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -279,6 +280,12 @@ AbSchedule::Config AbSchedule::Parse(std::string_view ab, std::string_view start
 AbSchedule::AbSchedule(Config config) : config(std::move(config)) {}
 
 AbSchedule::Step AbSchedule::AtPresent(std::uint64_t present, double seconds) {
+    if (firstSeconds.has_value() && seconds < lastSeconds) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "APS5_AB: present %llu at %.3f s comes before the previous present's %.3f s; every present must read one clock", static_cast<unsigned long long>(present), seconds, lastSeconds);
+        throw std::logic_error(text);
+    }
+    lastSeconds = seconds;
     if (!firstSeconds.has_value()) firstSeconds = seconds;
     if (!started) {
         const bool due = config.startSeconds.has_value() ? seconds - *firstSeconds >= *config.startSeconds : present >= config.startPresent;
@@ -308,6 +315,7 @@ struct AbState {
     std::mutex mutex;
     std::optional<AbSchedule> schedule;
     std::array<bool, SwitchCount> environment{};
+    std::chrono::steady_clock::time_point origin = std::chrono::steady_clock::now();
 };
 
 AbState& Ab() {
@@ -336,17 +344,7 @@ std::string SwitchSettings(const AbState& state, bool b) {
     return text;
 }
 
-}
-
-bool AbConfigured() {
-    static const bool configured = std::getenv("APS5_AB") != nullptr;
-    return configured;
-}
-
-std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds) {
-    if (!AbConfigured()) return {};
-    auto& state = Ab();
-    std::lock_guard lock(state.mutex);
+std::vector<std::string> abAtPresent(AbState& state, std::uint64_t present, double seconds) {
     std::vector<std::string> lines;
     char text[512];
     const auto& config = state.schedule->Settings();
@@ -367,6 +365,27 @@ std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds) {
     }
     lines.emplace_back(text);
     return lines;
+}
+
+}
+
+bool AbConfigured() {
+    static const bool configured = std::getenv("APS5_AB") != nullptr;
+    return configured;
+}
+
+std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds) {
+    if (!AbConfigured()) return {};
+    auto& state = Ab();
+    std::lock_guard lock(state.mutex);
+    return abAtPresent(state, present, seconds);
+}
+
+std::vector<std::string> AbAtPresent(std::uint64_t present) {
+    if (!AbConfigured()) return {};
+    auto& state = Ab();
+    std::lock_guard lock(state.mutex);
+    return abAtPresent(state, present, std::chrono::duration<double>(std::chrono::steady_clock::now() - state.origin).count());
 }
 
 }

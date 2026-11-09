@@ -496,6 +496,7 @@ private:
     FrameTiming* includeTimingSubmission(const Submission& submission, bool firstSegment);
     void execute(const Submission& submission);
     void deliverGuestEopInterrupt(std::uint32_t queue, std::uint32_t context);
+    void abAtFlip();
     static std::optional<std::uint32_t> releaseInterrupt(std::span<const std::uint32_t> packet, std::uint32_t opcode, bool carriesFlip);
     void markCompleted(std::uint64_t serial);
     static const std::atomic<std::uint64_t>*& workerQueued();

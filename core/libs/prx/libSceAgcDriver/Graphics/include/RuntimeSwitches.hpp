@@ -146,10 +146,12 @@ private:
     std::uint64_t phase = 0;
     double phaseStart = 0;
     std::optional<double> firstSeconds;
+    double lastSeconds = 0;
 };
 
 bool AbConfigured();
 std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds);
+std::vector<std::string> AbAtPresent(std::uint64_t present);
 
 }
 

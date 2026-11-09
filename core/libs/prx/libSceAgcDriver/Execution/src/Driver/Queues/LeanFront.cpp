@@ -214,7 +214,7 @@ void Report(bool force) {
     for (std::size_t index = 0; index < AllowedKinds; ++index) byDesignTotal += byDesign[index] = allowed[index].Window();
     printed.store(0, std::memory_order_relaxed);
     const auto lean = counts[static_cast<std::size_t>(Counter::LeanSegments)];
-    if (lean != 0) {
+    if (lean != 0 || counts[static_cast<std::size_t>(Counter::ModeChanges)] != 0) {
         const auto parts = listed("; ", CounterCount - CoreCounters, [&](std::size_t index) { return counts[CoreCounters + index]; }, [&](std::size_t index) { return std::string(CounterNames[CoreCounters + index]); });
         AgcDriver::ProfilePrint_nid_no_patch("[lean-front] %.1f s: lean segments %llu, today's segments %llu, mode changes %llu, switch copies %llu, deepest lean nesting %u%s\n", seconds,
             static_cast<unsigned long long>(lean), static_cast<unsigned long long>(counts[static_cast<std::size_t>(Counter::TodaySegments)]),

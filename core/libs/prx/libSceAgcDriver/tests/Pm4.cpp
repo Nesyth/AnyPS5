@@ -3,14 +3,17 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanFront.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SegmentLoop.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
@@ -2396,6 +2399,141 @@ void testRewindLabels() {
         static_cast<unsigned long long>(LeanFront::Total(Counter::FlushCalls) - calls), static_cast<unsigned long long>(LeanFront::Checked(LeanFront::Item::Packet) - checked));
 }
 
+void testRewindPresents() {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    using AgcDriver::DriverDetail::Driver;
+    namespace LeanFront = AgcDriver::DriverDetail::LeanFront;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    using Counter = LeanFront::Counter;
+    if (DrawPipeline::Depth() == 0) throw std::runtime_error("the REWIND present test needs the pipelined draw path");
+    struct Output final : AgcDriver::IVideoOutput, AgcDriver::IFlipRequest, std::enable_shared_from_this<Output> {
+        std::atomic<std::uint64_t> reserved{0};
+        std::atomic<std::uint64_t> ready{0};
+        std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo&) override {
+            reserved.fetch_add(1);
+            return shared_from_this();
+        }
+        void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>&) override { ready.fetch_add(1); }
+        void Fail(std::exception_ptr) noexcept override {}
+    };
+    constexpr std::uint32_t Handle = 9;
+    const auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+    const bool startedLean = leanFront();
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+    warmQueueWorker();
+    constexpr std::size_t Tails = 9;
+    constexpr std::size_t TodayFrom = 3;
+    constexpr std::size_t LeanAgainFrom = 6;
+    alignas(8) static std::array<std::uint32_t, Tails> gates{};
+    alignas(8) static std::array<std::uint32_t, Tails> ran{};
+    alignas(8) static std::uint32_t done = 0;
+    for (auto& word : gates) std::atomic_ref<std::uint32_t>(word).store(0);
+    for (auto& word : ran) std::atomic_ref<std::uint32_t>(word).store(0);
+    std::atomic_ref<std::uint32_t>(done).store(0);
+    const auto flip = [](std::uint32_t index) { return std::vector<std::uint32_t>{AgcDriver::FlipPacketHeader, Handle, index, 1, 0, 0}; };
+    const auto rewind = makePacket(0x59, {0x80000000u});
+    static std::vector<std::uint32_t> words;
+    words.clear();
+    appendPacket(words, flip(0));
+    for (std::size_t index = 0; index < Tails; ++index) {
+        appendPacket(words, rewind);
+        appendPacket(words, makePacket(0x3c, {0x13, low(&gates[index]), high(&gates[index]), 1, 0xffffffffu, 0x19}));
+        appendPacket(words, flip(static_cast<std::uint32_t>(index + 1)));
+        appendPacket(words, writeWord(ran[index], static_cast<std::uint32_t>(index + 1)));
+    }
+    appendPacket(words, writeWord(done, 1));
+    const auto presents = [] { return Driver::Get().OverlayCounters().flips; };
+    const auto presentsBase = presents();
+    const auto readyBase = output->ready.load();
+    const auto reservedBase = output->reserved.load();
+    const auto leanBase = LeanFront::Total(Counter::LeanSegments);
+    const auto todayBase = LeanFront::Total(Counter::TodaySegments);
+    const auto changesBase = LeanFront::Total(Counter::ModeChanges);
+    const auto differences = LeanFront::Differences();
+    submitWords(words);
+    for (std::size_t index = 0; index < Tails; ++index) {
+        const auto at = " at the gate of REWIND tail " + std::to_string(index);
+        awaitWorkerAt(gates[index], ("the queue worker did not reach the gate of REWIND tail " + std::to_string(index)).c_str());
+        check(output->ready.load() == readyBase + index + 1, (std::to_string(output->ready.load() - readyBase) + " of " + std::to_string(index + 1) + " flips before the gate were handed to the output" + at + "; a flip is held while the chain runs").c_str());
+        check(presents() == presentsBase + index + 1, ("the present count moved by " + std::to_string(presents() - presentsBase) + " instead of one per flip" + at).c_str());
+        check(std::atomic_ref<std::uint32_t>(done).load() == 0, ("the chain ended before" + at).c_str());
+        check(std::atomic_ref<std::uint32_t>(ran[index]).load() == 0 && (index == 0 || std::atomic_ref<std::uint32_t>(ran[index - 1]).load() == index), ("the REWIND tails did not run in order up to" + at).c_str());
+        if (index + 1 == TodayFrom) RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, false);
+        if (index + 1 == LeanAgainFrom) RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+        std::atomic_ref<std::uint32_t>(gates[index]).store(1);
+    }
+    AgcDriverWaitIdle_nid_postfix();
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, startedLean);
+    AgcDriverUnregisterVideoOutput_nid_postfix(Handle, output);
+    check(std::atomic_ref<std::uint32_t>(done).load() == 1, "the last REWIND tail of the flipping chain did not run");
+    for (std::size_t index = 0; index < Tails; ++index) check(std::atomic_ref<std::uint32_t>(ran[index]).load() == index + 1, ("REWIND tail " + std::to_string(index) + " of the flipping chain did not run once").c_str());
+    check(output->reserved.load() == reservedBase + Tails + 1, "a flip of the chain was reserved twice or not at all");
+    check(output->ready.load() == readyBase + Tails + 1, "a flip of the chain was not handed to the output");
+    check(presents() == presentsBase + Tails + 1, "the present count does not match the chain's flips");
+    const auto leanSegments = LeanFront::Total(Counter::LeanSegments) - leanBase;
+    const auto todaySegments = LeanFront::Total(Counter::TodaySegments) - todayBase;
+    const auto changes = LeanFront::Total(Counter::ModeChanges) - changesBase;
+    check(leanSegments == 1 + TodayFrom + (Tails - LeanAgainFrom) && todaySegments == LeanAgainFrom - TodayFrom,
+          ("the chain ran " + std::to_string(leanSegments) + " lean and " + std::to_string(todaySegments) + " of today's segments instead of switching lean, today, lean mid-chain").c_str());
+    check(changes == 2, ("the chain counted " + std::to_string(changes) + " mode changes instead of two").c_str());
+    check(LeanFront::Differences() == differences, "the lean front verify found differences over the flipping REWIND chain");
+    std::printf("REWIND chain of %zu flipping tails switched lean, today, lean: %llu lean and %llu of today's segments, %llu presents\n", Tails, static_cast<unsigned long long>(leanSegments), static_cast<unsigned long long>(todaySegments),
+                static_cast<unsigned long long>(presents() - presentsBase));
+}
+
+void testRewindCapMoved() {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    namespace LeanFront = AgcDriver::DriverDetail::LeanFront;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    if (DrawPipeline::Depth() == 0) throw std::runtime_error("the REWIND batch cap test needs the pipelined draw path");
+    constexpr std::uint32_t ShaderLow = 0x10;
+#ifdef _WIN32
+    check(_putenv_s("APS5_SKIP_SHADER", "1000") == 0, "cannot skip the batch cap test's compute shader");
+#else
+    check(setenv("APS5_SKIP_SHADER", "1000", 1) == 0, "cannot skip the batch cap test's compute shader");
+#endif
+    const bool startedLean = leanFront();
+    const bool startedLarge = RuntimeSwitches::Set(RuntimeSwitch::LargeBatches);
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+    warmQueueWorker();
+    RuntimeSwitches::Assign(RuntimeSwitch::LargeBatches, true);
+    constexpr std::size_t Before = 100;
+    constexpr std::size_t After = 4;
+    alignas(8) static std::uint32_t gate = 0;
+    alignas(8) static std::uint32_t done = 0;
+    std::atomic_ref<std::uint32_t>(gate).store(0);
+    std::atomic_ref<std::uint32_t>(done).store(0);
+    const auto dispatch = makePacket(0x15, {1, 1, 1, 0x2041});
+    static std::vector<std::uint32_t> words;
+    words.clear();
+    appendPacket(words, makePacket(0x59, {0x80000000u}));
+    appendPacket(words, makePacket(0x76, {0x20c, ShaderLow, 0}));
+    for (std::size_t index = 0; index < Before; ++index) appendPacket(words, dispatch);
+    appendPacket(words, makePacket(0x3c, {0x13, low(&gate), high(&gate), 1, 0xffffffffu, 0x19}));
+    for (std::size_t index = 0; index < After; ++index) appendPacket(words, dispatch);
+    appendPacket(words, writeWord(done, 1));
+    const auto differences = LeanFront::Differences();
+    const auto moved = LeanFront::AllowedCount(LeanFront::Allowed::CapMoved);
+    const auto work = AgcDriver::Graphics::Recorder::RecordedWorkSinceSubmit();
+    submitWords(words);
+    awaitWorkerAt(gate, "the queue worker did not reach the batch cap test's gate");
+    const auto counted = AgcDriver::Graphics::Recorder::RecordedWorkSinceSubmit() - work;
+    RuntimeSwitches::Assign(RuntimeSwitch::LargeBatches, false);
+    std::atomic_ref<std::uint32_t>(gate).store(1);
+    AgcDriverWaitIdle_nid_postfix();
+    RuntimeSwitches::Assign(RuntimeSwitch::LargeBatches, startedLarge);
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, startedLean);
+    check(std::atomic_ref<std::uint32_t>(done).load() == 1, "the batch cap test's REWIND tail did not run");
+    check(counted == Before, ("the batch cap test counted " + std::to_string(counted) + " recorded dispatches before its gate instead of " + std::to_string(Before)).c_str());
+    check(LeanFront::Differences() == differences, "the lean front verify reported a batch cap that moved under the flush gate as a difference");
+    const auto movedNow = LeanFront::AllowedCount(LeanFront::Allowed::CapMoved) - moved;
+    if (LeanFront::VerifyEvery() != 0) check(movedNow != 0, "the lean front verify did not count a batch cap that moved under the flush gate as by design");
+    std::printf("batch cap moved under the flush gate after %llu dispatches: %llu by-design cap checks\n", static_cast<unsigned long long>(counted), static_cast<unsigned long long>(movedNow));
+}
+
 struct RenderingGateState {
     std::mutex mutex;
     std::condition_variable changed;
@@ -2660,7 +2798,8 @@ int main(int argc, char** argv) {
             {"ring-invalid", testInvalidSubmissionRing}, {"ring-report", testSubmissionRingFailureReport}, {"stall-watchdog", testStallWatchdog},
             {"stall-watchdog-invalid", testInvalidStallWatchdog}, {"stall-watchdog-rewind", testStallWatchdogRewind}, {"stall-watchdog-order", testStallWatchdogOrder}, {"rewind-trace", testRewindTailTrace}, {"rewind-flip", testRewindFrontFlips}, {"rewind-lists", testRewindRegisterLists},
             {"rewind-kept-tails", testRewindKeptTails}, {"rewind-kept-cpu-write", testRewindKeptCpuWrite}, {"rewind-list-cache", testRewindListCache},
-            {"rewind-chain", testRewindChainLoop}, {"rewind-kick", testRewindKick}, {"rewind-labels", testRewindLabels}};
+            {"rewind-chain", testRewindChainLoop}, {"rewind-kick", testRewindKick}, {"rewind-labels", testRewindLabels}, {"rewind-presents", testRewindPresents},
+            {"rewind-cap-moved", testRewindCapMoved}};
         if (argc == 2 && std::string(argv[1]) == "ring-report-heap") {
 #ifdef _WIN32
             testSubmissionRingFailureReportHeap();
