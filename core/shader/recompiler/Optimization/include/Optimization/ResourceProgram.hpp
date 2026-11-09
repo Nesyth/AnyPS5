@@ -58,6 +58,14 @@ struct SourceHandle {
     std::shared_ptr<const CompiledVariant> artifact;
     std::vector<std::uint64_t> staticKey;
 };
+// A stage result shared by every capture with the same SharedKey (the donor) and the recipe
+// (MemoPatch) that turns a capture's per-draw words into the side FillSharedSide writes.
+struct MemoPatch;
+struct SharedStage {
+    std::shared_ptr<const RecompileResult> donor;
+    std::shared_ptr<const MemoPatch> patch;
+    explicit operator bool() const { return donor != nullptr; }
+};
 class PreparedShaderInvocation {
 public:
     static std::optional<PreparedShaderInvocation> TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);
@@ -70,6 +78,18 @@ public:
     const std::shared_ptr<const IrResourcePlan>& Plan() const;
     std::shared_ptr<const IrResourcePlan> LoadPlan() const;
     std::uint64_t VariantId() const;
+    const std::shared_ptr<const SourceHandle>& Handle() const { return handle; }
+    // The masked snapshot hash with the vertex buffers' per-draw fields left out: captures with
+    // the same key share one donor. Nullopt for a capture of another prepared shader.
+    std::optional<std::uint64_t> SharedKey(const ResourceCapture& capture) const;
+    // The donor for the capture's SharedKey: the masked result memo's entry when it holds one,
+    // else a new result, inserted there. Empty when the result cannot be patched or the capture
+    // belongs to another prepared shader. Throws what materializing the result throws.
+    SharedStage ShareStage(const ResourceCapture& capture) const;
+    // The capture's words that differ from the donor's, as applying the patch to a copy of the
+    // donor would write them, plus the live draw's vertex attributes. False (the side then holds
+    // no usable words) where that patch would throw or the donor cannot carry the capture.
+    bool FillSharedSide(const ResourceCapture& capture, const RecompileResult& donor, const MemoPatch& patch, HeapStageWords& side) const;
 
 private:
     PreparedShaderInvocation(RecompileRequest request, const std::shared_ptr<const SourceHandle>& handle);
