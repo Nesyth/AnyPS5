@@ -373,7 +373,7 @@ constexpr std::array<const char*, AllowedKinds> AllowedNames{"fragment outputs k
 
 constexpr std::array<const char*, CounterCount> CounterNames{
     "draws", "hits", "input refetches", "hits on today's path", "new identity", "second sighting", "build pending", "shape replaced", "refused",
-    "content differs", "generation moved", "not queued", "keyless", "no fetch plan", "user word moved", "hidden user word moved", "relocated user word misaligned", "value user word zero", "walked user word moved", "user words unreadable", "fetch gate", "image views moved", "vertex layout differs", "moved buffer fields", "memory changed", "fetch error",
+    "content differs", "generation moved", "not queued", "keyless", "no fetch plan", "user word moved", "hidden user word moved", "relocated user word misaligned", "value user word zero", "walked user word moved", "callee user word moved", "base and value user word moved", "user words unreadable", "fetch gate", "image views moved", "vertex layout differs", "moved buffer fields", "memory changed", "fetch error",
     "today's draw", "indirect", "lean front verify", "inline",
     "records built", "fetch plans built", "fetch plans refused", "builds refused", "records installed", "builds dropped", "dropped without an answer slot", "dropped as stale", "dropped over the byte cap", "dropped without an identity", "dropped for a refused identity", "identities evicted", "records cleared", "record mode changes", "demotions",
     "recorded", "pushed", "moved without push", "targets held by the pass", "kept once per batch", "target notes skipped", "moved buffers trusted", "committer halves built", "verified on today's path",
@@ -808,6 +808,7 @@ std::shared_ptr<const DrawRecordPlan> Driver::buildDrawRecordPlan(const Graphics
         stage.userData = program.userData;
         stage.userDataMask = capture.userDataMask;
         stage.walkedWords = capture.userDataUse.asBase | capture.userDataUse.asValue;
+        stage.valueUseWords = capture.userDataUse.asValue;
         auto variant = std::make_shared<DispatchVariant>();
         variant->compiled = capture.compiled;
         variant->registeredViews = capture.registeredViews;
@@ -825,6 +826,7 @@ std::shared_ptr<const DrawRecordPlan> Driver::buildDrawRecordPlan(const Graphics
         stage.valueWords = variant->valueWords;
         stage.valueSlots = variant->valueSlots;
         stage.walkedWords |= variant->calleeWords;
+        stage.calleeWords = variant->calleeWords;
         auto& targets = stage.targets;
         const auto byPosition = [](const DrawRecordTarget& a, const DrawRecordTarget& b) { return a.position < b.position || (a.position == b.position && (a.binding < b.binding || (a.binding == b.binding && a.word < b.word))); };
         std::uint32_t flatBinding = NoBinding;
@@ -1033,6 +1035,8 @@ DrawRecords::Counter Driver::fetchDrawRecord(const LeanDrawJob& job, const DrawR
             } else if ((stage.valueWords & bit) != 0) {
                 if (from == 0 || to == 0) return Counter::MissUserWordValue;
             } else if ((stage.walkedWords & bit) != 0) {
+                if ((stage.calleeWords & bit) != 0) return Counter::MissUserWordCallee;
+                if ((stage.valueUseWords & bit) != 0) return Counter::MissUserWordBaseValue;
                 return Counter::MissUserWordWalked;
             } else if ((stage.vertexWords & bit) == 0 && (stage.forwardedWords & bit) == 0 && (stage.userDataMask & bit) != 0) {
                 return Counter::MissUserWord;

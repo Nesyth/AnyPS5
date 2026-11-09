@@ -69,6 +69,8 @@ enum class Counter : std::uint8_t {
     MissUserWordRelocation,
     MissUserWordValue,
     MissUserWordWalked,
+    MissUserWordCallee,
+    MissUserWordBaseValue,
     MissUserWordUnread,
     MissFetchGate,
     MissImageViews,

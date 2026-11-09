@@ -71,6 +71,8 @@ struct DrawRecordStage {
     std::uint64_t relocatableWords = 0;
     std::uint64_t valueWords = 0;
     std::uint64_t walkedWords = 0;
+    std::uint64_t valueUseWords = 0;
+    std::uint64_t calleeWords = 0;
     std::uint64_t forwardedWords = 0;
     std::uint64_t vertexWords = 0;
     std::uint64_t userDataMask = 0;
@@ -195,10 +197,10 @@ constexpr std::uint8_t VerifyDue = 8;
 class DrawRecordStore {
 public:
     static constexpr std::size_t Ways = 4;
-    static constexpr std::size_t Sets = 2048;
-    static constexpr std::size_t Variants = 4;
+    static constexpr std::size_t Sets = 8192;
+    static constexpr std::size_t Variants = 16;
     static constexpr std::uint64_t KeepPresents = 3;
-    static constexpr std::size_t DefaultByteCap = std::size_t{256} << 20;
+    static constexpr std::size_t DefaultByteCap = std::size_t{768} << 20;
     static std::size_t ConfiguredByteCap();
 
     struct Entry {
