@@ -142,7 +142,7 @@ std::shared_ptr<DrawRecord> DrawRecord::Build(const DrawRecordKey& key, std::sha
 }
 
 std::size_t DrawRecord::Bytes() const {
-    return sizeof(DrawRecord) + 4 * (contentKey.capacity() + vertexLayout.capacity() + vertexInputs.capacity()) + sizeof(DrawPipeline::Range) * writes.capacity() + (plan != nullptr ? plan->bytes : 0);
+    return sizeof(DrawRecord) + 4 * (contentKey.capacity() + vertexLayout.capacity() + vertexInputs.capacity()) + sizeof(DrawPipeline::Range) * writes.capacity() + sizeof(DrawRecordProbe) * probes.capacity() + (plan != nullptr ? plan->bytes : 0);
 }
 
 const LeanShape* DrawRecordSet::Shape() const {
@@ -154,6 +154,89 @@ const DrawRecord* DrawRecordSet::Match(const DrawRecordHash& content) const {
         if (record->content == content) return record.get();
     }
     return nullptr;
+}
+
+namespace {
+
+struct ProbeWord {
+    std::int16_t base = -1;
+    std::uint64_t address = 0;
+    std::uint32_t value = 0;
+
+    bool Before(const ProbeWord& other) const { return base < other.base || (base == other.base && address < other.address); }
+};
+
+void StageProbeWords(const DrawRecordStage& stage, std::vector<ProbeWord>& out) {
+    out.clear();
+    if (stage.variant == nullptr) return;
+    const auto& variant = *stage.variant;
+    std::size_t offset = 0;
+    std::size_t data = 0;
+    for (std::size_t run = 0; run < variant.runs.size(); ++run) {
+        const auto [begin, end] = variant.runs[run];
+        const auto count = static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
+        const bool based = run < stage.runBases.size() && stage.runBases[run] >= 0 && static_cast<std::size_t>(stage.runBases[run]) < stage.userData.size();
+        const auto base = based ? static_cast<std::int16_t>(stage.runBases[run]) : std::int16_t{-1};
+        const auto origin = based ? static_cast<std::uint64_t>(stage.userData[static_cast<std::size_t>(base)] & ~std::uint32_t{3}) : std::uint64_t{0};
+        for (std::size_t word = 0; word < count && offset + word < variant.words.size(); ++word) {
+            const auto position = offset + word;
+            while (data < variant.dataPositions.size() && variant.dataPositions[data] < position) ++data;
+            if (data < variant.dataPositions.size() && variant.dataPositions[data] == position) continue;
+            out.push_back({base, begin + word * sizeof(std::uint32_t) - origin, variant.words[position]});
+        }
+        offset += count;
+    }
+    std::sort(out.begin(), out.end(), [](const ProbeWord& a, const ProbeWord& b) { return a.Before(b); });
+}
+
+}
+
+std::vector<DrawRecordProbe> DrawRecordProbes(const DrawRecordPlan& plan, const DrawRecordSet* kept) {
+    std::vector<DrawRecordProbe> probes;
+    if (kept == nullptr) return probes;
+    std::vector<ProbeWord> mine;
+    std::vector<ProbeWord> theirs;
+    for (const auto& record : kept->records) {
+        if (probes.size() >= DrawRecordStore::MaxProbes) break;
+        if (record->plan == nullptr || record->plan->stages.size() != plan.stages.size()) continue;
+        std::size_t added = 0;
+        for (std::size_t i = 0; i < plan.stages.size() && added < DrawRecordStore::ProbesPerVariant && probes.size() < DrawRecordStore::MaxProbes; ++i) {
+            StageProbeWords(plan.stages[i], mine);
+            StageProbeWords(record->plan->stages[i], theirs);
+            const auto stage = static_cast<std::uint16_t>(i);
+            for (std::size_t a = 0, b = 0; a < mine.size() && b < theirs.size() && added < DrawRecordStore::ProbesPerVariant && probes.size() < DrawRecordStore::MaxProbes;) {
+                if (mine[a].Before(theirs[b])) {
+                    ++a;
+                    continue;
+                }
+                if (theirs[b].Before(mine[a])) {
+                    ++b;
+                    continue;
+                }
+                const auto word = mine[a];
+                const bool differs = theirs[b].value != word.value;
+                ++a;
+                ++b;
+                if (!differs || std::any_of(probes.begin(), probes.end(), [&](const DrawRecordProbe& probe) { return probe.stage == stage && probe.base == word.base && probe.address == word.address; })) continue;
+                probes.push_back({word.address, word.value, stage, word.base});
+                ++added;
+            }
+        }
+    }
+    return probes;
+}
+
+bool DrawRecordProbesHold(std::span<const DrawRecordProbe> probes, std::span<const std::vector<std::uint32_t>> users) {
+    for (const auto& probe : probes) {
+        auto address = probe.address;
+        if (probe.base >= 0) {
+            if (probe.stage >= users.size() || static_cast<std::size_t>(probe.base) >= users[probe.stage].size()) return false;
+            address += users[probe.stage][static_cast<std::size_t>(probe.base)] & ~std::uint32_t{3};
+        }
+        std::uint32_t word = 0;
+        if (GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(&word, 1))) != GuestMemory::Compare::Equal || word != probe.value) return false;
+    }
+    return true;
 }
 
 std::size_t DrawRecordStore::SetOf(std::uint64_t probe) {
@@ -352,6 +435,7 @@ constexpr std::array<FieldInfo, FieldCount> FieldInfos{{
     {Item::Fetch, "draw parameters"},
     {Item::Fetch, "read ranges"},
     {Item::Fetch, "snapshot words"},
+    {Item::Fetch, "fetched runs"},
     {Item::Commit, "templates"},
     {Item::Commit, "pipelines"},
     {Item::Commit, "framebuffers"},
@@ -372,7 +456,7 @@ constexpr std::array<FieldInfo, FieldCount> FieldInfos{{
 constexpr std::array<const char*, AllowedKinds> AllowedNames{"fragment outputs known on one side only", "today's draw not queued", "the record's commit fell back", "today's commit built no recipe", "today's commit served another template"};
 
 constexpr std::array<const char*, CounterCount> CounterNames{
-    "draws", "hits", "input refetches", "hits on today's path", "new identity", "second sighting", "build pending", "shape replaced", "refused",
+    "draws", "hits", "input refetches", "hits on today's path", "relocated base and value words", "moved buffer bases patched", "new identity", "second sighting", "build pending", "shape replaced", "refused",
     "content differs", "generation moved", "not queued", "keyless", "no fetch plan", "user word moved", "hidden user word moved", "relocated user word misaligned", "value user word zero", "walked user word moved", "callee user word moved", "base and value user word moved", "user words unreadable", "fetch gate", "image views moved", "vertex layout differs", "moved buffer fields", "memory changed", "fetch error",
     "today's draw", "indirect", "lean front verify", "inline",
     "records built", "fetch plans built", "fetch plans refused", "builds refused", "records installed", "builds dropped", "dropped without an answer slot", "dropped as stale", "dropped over the byte cap", "dropped without an identity", "dropped for a refused identity", "identities evicted", "records cleared", "record mode changes", "demotions",
@@ -522,9 +606,10 @@ void Report(bool force) {
     const auto draws = at(counts, Counter::Draws);
     if (draws != 0 || at(counts, Counter::RecordModeChanges) != 0 || at(counts, Counter::RecordsCleared) != 0) {
         const auto hits = at(counts, Counter::Hits);
-        AgcDriver::ProfilePrint_nid_no_patch("[draw-records] %.1f s: draws %llu, hits %llu (%.1f%%), input refetches %llu, hits on today's path %llu; misses: %s; records off: %s; store: %s; %llu identities, %llu records, %.1f KiB; commit: %s; commit misses: %s\n", seconds,
+        AgcDriver::ProfilePrint_nid_no_patch("[draw-records] %.1f s: draws %llu, hits %llu (%.1f%%), input refetches %llu, hits on today's path %llu, relocated base and value words %llu, moved buffer bases patched %llu; misses: %s; records off: %s; store: %s; %llu identities, %llu records, %.1f KiB; commit: %s; commit misses: %s\n", seconds,
             static_cast<unsigned long long>(draws), static_cast<unsigned long long>(hits), draws != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(draws) : 0.0,
             static_cast<unsigned long long>(at(counts, Counter::InputRefetches)), static_cast<unsigned long long>(at(counts, Counter::HitsOnTodaysPath)),
+            static_cast<unsigned long long>(at(counts, Counter::HitsBaseValue)), static_cast<unsigned long long>(at(counts, Counter::HitsBuffersPatched)),
             counted(counts, Counter::MissNewIdentity, Counter::MissFetchError).c_str(), counted(counts, Counter::OffTodaysDraw, Counter::OffInline).c_str(), counted(counts, Counter::RecordsBuilt, Counter::Demotions).c_str(),
             static_cast<unsigned long long>(storeIdentities.load(std::memory_order_relaxed)), static_cast<unsigned long long>(storeRecords.load(std::memory_order_relaxed)), static_cast<double>(storeBytes.load(std::memory_order_relaxed)) / 1024.0,
             counted(counts, Counter::CommitHits, Counter::CommitVerified).c_str(), counted(counts, Counter::CommitFirst, Counter::CommitDemoted).c_str());
@@ -696,6 +781,8 @@ bool SameVertexLayout(const ShaderRecompiler::ShaderVertexStageInfo& kept, const
     return true;
 }
 
+struct FetchScratchStorage {};
+
 struct FetchScratch {
     std::vector<std::vector<std::uint32_t>> userData;
     std::vector<std::vector<std::uint32_t>> liveWords;
@@ -705,6 +792,38 @@ struct FetchScratch {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> live;
     DispatchVariant moved;
 };
+
+DrawRecords::Counter PrecheckDrawRecord(const LeanDrawJob& job, const DrawRecord& record, std::span<const std::vector<std::uint32_t>> users) {
+    using DrawRecords::Counter;
+    const auto* plan = record.plan.get();
+    if (plan == nullptr) return Counter::MissNoFetchPlan;
+    if (record.generation != job.recordGeneration || record.deviceSerial != job.deviceSerial || record.shape.get() != job.shape) return Counter::MissGenerationMoved;
+    if (plan->stages.size() != users.size()) return Counter::MissNoFetchPlan;
+    for (std::size_t i = 0; i < users.size(); ++i) {
+        const auto& stage = plan->stages[i];
+        const auto& user = users[i];
+        if (user.size() != stage.userData.size()) return Counter::MissUserWordUnread;
+        for (std::size_t index = 0; index < user.size(); ++index) {
+            const auto from = stage.userData[index];
+            const auto to = user[index];
+            if (from == to) continue;
+            if (index < stage.hiddenUserWords || index >= 64u) return Counter::MissUserWordHidden;
+            const auto bit = std::uint64_t{1} << index;
+            if ((stage.relocatableWords & bit) != 0 || (stage.baseValueWords & bit) != 0) {
+                if (from == 0 || to == 0 || ((from ^ to) & 3u) != 0) return Counter::MissUserWordRelocation;
+            } else if ((stage.valueWords & bit) != 0) {
+                if (from == 0 || to == 0) return Counter::MissUserWordValue;
+            } else if ((stage.walkedWords & bit) != 0) {
+                if ((stage.calleeWords & bit) != 0) return Counter::MissUserWordCallee;
+                if ((stage.valueUseWords & bit) != 0) return Counter::MissUserWordBaseValue;
+                return Counter::MissUserWordWalked;
+            } else if ((stage.vertexWords & bit) == 0 && (stage.forwardedWords & bit) == 0 && (stage.userDataMask & bit) != 0) {
+                return Counter::MissUserWord;
+            }
+        }
+    }
+    return DrawRecordProbesHold(record.probes, users) ? Counter::Hits : Counter::MissContentDiffers;
+}
 
 std::string drawText(const LeanDrawJob& job, const DrawRecordKey& key) {
     return "draw at submission " + std::to_string(job.serial) + " DWORD " + std::to_string(job.packetOffset) + " (" + keyText(key) + ")";
@@ -818,8 +937,15 @@ std::shared_ptr<const DrawRecordPlan> Driver::buildDrawRecordPlan(const Graphics
         variant->userDataMask = capture.userDataMask;
         std::vector<ShaderRecompiler::MemoryRegion> regions(capture.regions.begin(), capture.regions.end());
         std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
-        tagVariantRuns(*variant, regions, capture.userDataUse, true, program.hiddenUserWords, capture.supplied);
+        const auto users = std::min<std::size_t>(program.userData.size(), 64);
+        const auto below = [](std::size_t bits) { return bits >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << bits) - 1; };
+        auto use = capture.userDataUse;
+        const auto both = use.asBase & use.asValue & below(users) & ~below(program.hiddenUserWords);
+        use.asValue &= ~both;
+        tagVariantRuns(*variant, regions, use, true, program.hiddenUserWords, capture.supplied);
         tagUserValueWords(*variant, program, nullptr);
+        auto baseValue = variant->relocatableWords & both;
+        variant->relocatableWords &= ~both;
         if (!capture.capture->readTrace.leaves.empty()) recordStageDataPositions(*variant, *capture.capture, decodeReads[i]);
         stage.runBases = variant->runBases;
         stage.relocatableWords = variant->relocatableWords;
@@ -862,22 +988,80 @@ std::shared_ptr<const DrawRecordPlan> Driver::buildDrawRecordPlan(const Graphics
             return false;
         };
         const auto countIn = [](std::span<const std::uint32_t> values, std::uint32_t value) { return static_cast<std::size_t>(std::count(values.begin(), values.end(), value)); };
+        const auto userWord = [&](std::uint32_t value) { return std::find(program.userData.begin(), program.userData.end(), value) != program.userData.end(); };
         const auto* flatSlots = flat ? &compiled.bindings[flatBinding].guestDescriptor : nullptr;
         bool explained = true;
         for (std::size_t slot = 0; flat && explained && slot < flatSlots->size(); ++slot) {
             const bool leaf = std::any_of(targets.begin(), targets.end(), [&](const DrawRecordTarget& target) { return target.binding == flatBinding && target.word == slot; });
-            if (!leaf && countIn(words, (*flatSlots)[slot]) == 0) explained = false;
+            if (!leaf && countIn(words, (*flatSlots)[slot]) == 0 && !userWord((*flatSlots)[slot])) explained = false;
+        }
+        bool derived = false;
+        for (const auto& binding : compiled.bindings) {
+            if (binding.role != DescriptorRole::GuestBuffers) continue;
+            if (binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) {
+                derived = true;
+                break;
+            }
+            for (std::uint32_t element = 0; element < binding.count && !derived; ++element) {
+                const auto* descriptor = binding.guestDescriptor.data() + element * 4u;
+                derived = BufferPresent(descriptor) && countIn(words, descriptor[0]) == 0 && !userWord(descriptor[0]);
+            }
         }
         std::vector<std::uint32_t> pushWords(compiled.pushConstants.size() / sizeof(std::uint32_t));
         if (!pushWords.empty()) std::memcpy(pushWords.data(), compiled.pushConstants.data(), pushWords.size() * sizeof(std::uint32_t));
+        const auto& forwarded = compiled.shaderDataUserWords;
+        const auto forwardedFrom = [&](std::size_t slot, std::uint32_t index) { return slot < forwarded.size() && forwarded[slot] == index; };
+        for (std::uint32_t index = 0; index < users; ++index) {
+            const auto bit = std::uint64_t{1} << index;
+            if ((baseValue & bit) == 0) continue;
+            const auto value = program.userData[index];
+            bool refused = derived || !explained || value == 0 || index + 2u >= program.userData.size() || countIn(words, value) != 0 || countIn(program.userData, value) != 1 || std::any_of(compiled.specialization.begin(), compiled.specialization.end(), [&](const auto& constant) { return constant.value == value; });
+            for (std::size_t slot = 0; !refused && slot < pushWords.size(); ++slot) refused = pushWords[slot] == value && !forwardedFrom(slot, index);
+            std::vector<std::array<std::uint32_t, 3>> slots;
+            for (std::size_t b = 0; !refused && b < compiled.bindings.size(); ++b) {
+                const auto& binding = compiled.bindings[b];
+                const auto& descriptor = binding.guestDescriptor;
+                for (std::size_t word = 0; !refused && word < descriptor.size(); ++word) {
+                    if (descriptor[word] != value || (binding.role == DescriptorRole::ShaderData && forwardedFrom(word, index))) continue;
+                    const auto element = word / 4u;
+                    const bool readOnly = binding.role == DescriptorRole::GuestBuffers && descriptor.size() == static_cast<std::size_t>(binding.count) * 4u && word % 4u == 0 && element < binding.bufferWritten.size() && !binding.bufferWritten[element] && (element >= binding.bufferAtomic.size() || !binding.bufferAtomic[element]);
+                    if (!readOnly || descriptor[word + 1] != program.userData[index + 1] || descriptor[word + 2] != program.userData[index + 2]) {
+                        refused = true;
+                        break;
+                    }
+                    const auto base = (static_cast<std::uint64_t>(descriptor[word + 1] & 0xffffu) << 32u) | AlignedWord(value);
+                    const auto stride = (descriptor[word + 1] >> 16u) & 0x3fffu;
+                    const auto bytes = std::max<std::uint64_t>(stride != 0 ? static_cast<std::uint64_t>(stride) * descriptor[word + 2] : descriptor[word + 2], sizeof(std::uint32_t));
+                    refused = std::any_of(capture.userDataUse.reads.begin(), capture.userDataUse.reads.end(), [&](const auto& read) { return read.second != static_cast<std::int32_t>(index) && read.first >= base && read.first < base + bytes; });
+                    slots.push_back({index, static_cast<std::uint32_t>(b), static_cast<std::uint32_t>(word)});
+                }
+            }
+            if (refused || slots.empty()) {
+                baseValue &= ~bit;
+                continue;
+            }
+            stage.baseValueSlots.insert(stage.baseValueSlots.end(), slots.begin(), slots.end());
+        }
+        stage.baseValueWords = baseValue;
+        const auto foreignValue = [&](std::uint32_t value) {
+            for (std::size_t other = 0; other < compiled.bindings.size(); ++other) {
+                const auto& kept = compiled.bindings[other];
+                if (other != flatBinding && kept.role != DescriptorRole::GuestBuffers && countIn(kept.guestDescriptor, value) != 0) return true;
+            }
+            return false;
+        };
+        const auto userSlot = [&](std::size_t b, std::uint32_t element) {
+            const auto names = [&](const std::array<std::uint32_t, 3>& slot) { return slot[1] == b && slot[2] / 4u == element; };
+            return std::any_of(stage.valueSlots.begin(), stage.valueSlots.end(), names) || std::any_of(stage.baseValueSlots.begin(), stage.baseValueSlots.end(), names);
+        };
         std::vector<DrawRecordTarget> bufferTargets;
-        for (std::size_t b = 0; explained && b < compiled.bindings.size(); ++b) {
+        for (std::size_t b = 0; explained && !derived && b < compiled.bindings.size(); ++b) {
             const auto& binding = compiled.bindings[b];
             if (binding.role != DescriptorRole::GuestBuffers || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) continue;
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 if ((element < binding.bufferWritten.size() && binding.bufferWritten[element]) || (element < binding.bufferAtomic.size() && binding.bufferAtomic[element])) continue;
                 const auto word = element * 4u;
-                if (std::any_of(stage.valueSlots.begin(), stage.valueSlots.end(), [&](const auto& slot) { return slot[1] == b && slot[2] / 4u == element; })) continue;
+                if (userSlot(b, element)) continue;
                 const auto* descriptor = binding.guestDescriptor.data() + word;
                 if (!BufferPresent(descriptor) || inUserData(descriptor) || readThrough(descriptor)) continue;
                 std::optional<std::uint32_t> found;
@@ -890,31 +1074,40 @@ std::shared_ptr<const DrawRecordPlan> Driver::buildDrawRecordPlan(const Graphics
                     }
                 }
                 if (!found || ambiguous || flatTarget(*found)) continue;
-                const auto base = descriptor[0];
-                if (countIn(words, base) != 1 || countIn(pushWords, base) != 0 || std::find(program.userData.begin(), program.userData.end(), base) != program.userData.end()) continue;
-                bool foreign = false;
-                for (std::size_t other = 0; other < compiled.bindings.size() && !foreign; ++other) {
-                    const auto& kept = compiled.bindings[other];
-                    if (other == flatBinding || kept.role == DescriptorRole::GuestBuffers) continue;
-                    foreign = countIn(kept.guestDescriptor, base) != 0;
-                }
-                if (foreign) continue;
+                const auto movable = [&](std::uint32_t value) { return countIn(words, value) == 1 && countIn(pushWords, value) == 0 && !userWord(value) && !foreignValue(value); };
+                if (!movable(descriptor[0])) continue;
                 stage.buffers.push_back({static_cast<std::uint32_t>(b), element, *found});
-                bufferTargets.push_back({*found, static_cast<std::uint32_t>(b), word});
-                for (std::size_t slot = 0; flat && slot < flatSlots->size(); ++slot) {
-                    if ((*flatSlots)[slot] == base) bufferTargets.push_back({*found, flatBinding, static_cast<std::uint32_t>(slot)});
+                for (const std::uint32_t field : {0u, 2u}) {
+                    const auto value = descriptor[field];
+                    if (field != 0 && (flatTarget(*found + field) || !movable(value))) continue;
+                    bufferTargets.push_back({*found + field, static_cast<std::uint32_t>(b), word + field});
+                    for (std::size_t slot = 0; flat && slot < flatSlots->size(); ++slot) {
+                        if ((*flatSlots)[slot] == value) bufferTargets.push_back({*found + field, flatBinding, static_cast<std::uint32_t>(slot)});
+                    }
                 }
             }
         }
-        for (std::size_t b = 0; b < compiled.bindings.size(); ++b) {
-            const auto& kept = compiled.bindings[b];
-            if (kept.role != DescriptorRole::GuestBuffers) continue;
-            for (std::size_t word = 0; word < kept.guestDescriptor.size(); ++word) {
-                const auto value = kept.guestDescriptor[word];
-                const bool listed = std::any_of(bufferTargets.begin(), bufferTargets.end(), [&](const DrawRecordTarget& target) { return target.binding == b && target.word == word; });
-                if (listed || std::none_of(bufferTargets.begin(), bufferTargets.end(), [&](const DrawRecordTarget& target) { return words[target.position] == value; })) continue;
-                std::erase_if(bufferTargets, [&](const DrawRecordTarget& target) { return words[target.position] == value; });
-                std::erase_if(stage.buffers, [&](const DrawRecordBuffer& buffer) { return words[buffer.position] == value; });
+        const auto dropValue = [&](std::uint32_t value) {
+            std::vector<std::uint32_t> bases;
+            for (const auto& target : bufferTargets) {
+                if (words[target.position] == value && target.word % 4u == 0 && compiled.bindings[target.binding].role == DescriptorRole::GuestBuffers) bases.push_back(target.position);
+            }
+            const auto inBase = [&](std::uint32_t position) { return std::any_of(bases.begin(), bases.end(), [&](std::uint32_t base) { return position >= base && position < base + 4u; }); };
+            std::erase_if(bufferTargets, [&](const DrawRecordTarget& target) { return words[target.position] == value || inBase(target.position); });
+            std::erase_if(stage.buffers, [&](const DrawRecordBuffer& buffer) { return std::find(bases.begin(), bases.end(), buffer.position) != bases.end(); });
+        };
+        for (bool pruned = true; pruned;) {
+            pruned = false;
+            for (std::size_t b = 0; b < compiled.bindings.size() && !pruned; ++b) {
+                const auto& kept = compiled.bindings[b];
+                if (kept.role != DescriptorRole::GuestBuffers) continue;
+                for (std::size_t word = 0; word < kept.guestDescriptor.size() && !pruned; ++word) {
+                    const auto value = kept.guestDescriptor[word];
+                    const bool listed = std::any_of(bufferTargets.begin(), bufferTargets.end(), [&](const DrawRecordTarget& target) { return target.binding == b && target.word == word; });
+                    if (listed || std::none_of(bufferTargets.begin(), bufferTargets.end(), [&](const DrawRecordTarget& target) { return words[target.position] == value; })) continue;
+                    dropValue(value);
+                    pruned = true;
+                }
             }
         }
         targets.insert(targets.end(), bufferTargets.begin(), bufferTargets.end());
@@ -932,7 +1125,6 @@ std::shared_ptr<const DrawRecordPlan> Driver::buildDrawRecordPlan(const Graphics
                 break;
             }
         }
-        const auto& forwarded = compiled.shaderDataUserWords;
         std::uint64_t refused = 0;
         for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
             const auto index = forwarded[slot];
@@ -965,7 +1157,7 @@ std::shared_ptr<const DrawRecordPlan> Driver::buildDrawRecordPlan(const Graphics
         stage.regions.clear();
         appendEntryRegions(*variant, stage.regions);
         stage.variant = std::move(variant);
-        const auto structural = stage.walkedWords & ~stage.relocatableWords & ~stage.valueWords;
+        const auto structural = stage.walkedWords & ~stage.relocatableWords & ~stage.valueWords & ~stage.baseValueWords;
         sign(i);
         sign(compiled.variantId);
         for (std::size_t index = 0; index < stage.userData.size(); ++index) {
@@ -980,7 +1172,7 @@ std::shared_ptr<const DrawRecordPlan> Driver::buildDrawRecordPlan(const Graphics
             }
             if (!data) sign(stage.variant->words[position]);
         }
-        plan->bytes += sizeof(DrawRecordStage) + sizeof(DispatchVariant) + sizeof(std::uint32_t) * (stage.variant->words.size() + stage.variant->dataPositions.size() + stage.userData.size()) + sizeof(std::pair<std::uint64_t, std::uint64_t>) * stage.variant->runs.size() + sizeof(ShaderRecompiler::MemoryRegion) * stage.regions.size() + sizeof(DrawRecordTarget) * targets.size() + sizeof(ShaderRecompiler::RecompileResult) + compiled.pushConstants.size();
+        plan->bytes += sizeof(DrawRecordStage) + sizeof(DispatchVariant) + sizeof(std::uint32_t) * (stage.variant->words.size() + stage.variant->dataPositions.size() + stage.userData.size()) + sizeof(std::pair<std::uint64_t, std::uint64_t>) * stage.variant->runs.size() + sizeof(ShaderRecompiler::MemoryRegion) * stage.regions.size() + sizeof(DrawRecordTarget) * targets.size() + sizeof(std::array<std::uint32_t, 3>) * (stage.valueSlots.size() + stage.baseValueSlots.size()) + sizeof(ShaderRecompiler::RecompileResult) + compiled.pushConstants.size();
         for (const auto& binding : compiled.bindings) plan->bytes += sizeof(binding) + sizeof(std::uint32_t) * binding.guestDescriptor.size();
     }
     plan->signature = signature == 0 ? 1 : signature;
@@ -996,22 +1188,20 @@ DrawRecords::Counter Driver::fetchDrawRecord(const LeanDrawJob& job, const DrawR
     const auto& decode = *job.shape->decode;
     const auto& programs = decode.programs;
     const auto count = programs.size();
-    if (plan->stages.size() != count) return Counter::MissNoFetchPlan;
-    struct ScratchStorage {};
-    auto& scratch = HostThreadLocal<FetchScratch, ScratchStorage>();
-    if (scratch.userData.size() < count) {
-        scratch.userData.resize(count);
-        scratch.liveWords.resize(count);
-        scratch.decodeReads.resize(count);
-    }
+    auto& scratch = HostThreadLocal<FetchScratch, FetchScratchStorage>();
+    if (plan->stages.size() != count || scratch.userData.size() < count) return Counter::MissNoFetchPlan;
+    const bool verifying = (job.recordFlags & DrawRecordFlags::VerifyDue) != 0;
     scratch.memory.clear();
     hit.sides.assign(count, {});
     hit.words.assign(plan->addressed ? count : 0, {});
     hit.decodeReads.assign(plan->addressed ? count : 0, {});
     hit.snapshots.clear();
+    hit.fetched.clear();
     hit.stages.clear();
     hit.stages.reserve(count);
     hit.inputsMoved = false;
+    hit.baseValueMoved = false;
+    hit.buffersPatched = false;
     std::uint64_t imagesFlushed = 0, runsSynced = 0;
     std::optional<SampledReadScope> sampling;
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
@@ -1019,28 +1209,14 @@ DrawRecords::Counter Driver::fetchDrawRecord(const LeanDrawJob& job, const DrawR
         const auto& stage = plan->stages[i];
         const auto& program = programs[i];
         const auto& compiled = *stage.compiled;
-        auto& user = scratch.userData[i];
-        if (!ReadRecordUserWords(program, job.words, user) || user.size() != stage.userData.size()) return Counter::MissUserWordUnread;
+        const auto& user = scratch.userData[i];
+        if (user.size() != stage.userData.size()) return Counter::MissUserWordUnread;
         if (stage.registeredViews != nullptr && !CaptureRegisteredViewsCurrent(*stage.registeredViews)) return Counter::MissImageViews;
+        const auto userMoved = [&](std::size_t index) { return index < user.size() && user[index] != stage.userData[index]; };
         bool relocated = false;
-        for (std::size_t index = 0; index < user.size(); ++index) {
-            const auto from = stage.userData[index];
-            const auto to = user[index];
-            if (from == to) continue;
-            if (index < stage.hiddenUserWords || index >= 64u) return Counter::MissUserWordHidden;
-            const auto bit = std::uint64_t{1} << index;
-            if ((stage.relocatableWords & bit) != 0) {
-                if (from == 0 || to == 0 || ((from ^ to) & 3u) != 0) return Counter::MissUserWordRelocation;
-                relocated = true;
-            } else if ((stage.valueWords & bit) != 0) {
-                if (from == 0 || to == 0) return Counter::MissUserWordValue;
-            } else if ((stage.walkedWords & bit) != 0) {
-                if ((stage.calleeWords & bit) != 0) return Counter::MissUserWordCallee;
-                if ((stage.valueUseWords & bit) != 0) return Counter::MissUserWordBaseValue;
-                return Counter::MissUserWordWalked;
-            } else if ((stage.vertexWords & bit) == 0 && (stage.forwardedWords & bit) == 0 && (stage.userDataMask & bit) != 0) {
-                return Counter::MissUserWord;
-            }
+        for (const auto base : stage.runBases) relocated = relocated || (base >= 0 && userMoved(static_cast<std::size_t>(base)));
+        for (std::size_t index = 0; index < user.size() && index < 64u; ++index) {
+            if ((stage.baseValueWords >> index & 1u) != 0 && userMoved(index)) hit.baseValueMoved = true;
         }
         const DispatchVariant* variant = stage.variant.get();
         const auto* regions = &stage.regions;
@@ -1086,11 +1262,14 @@ DrawRecords::Counter Driver::fetchDrawRecord(const LeanDrawJob& job, const DrawR
             if (target == stage.targets.size() || stage.targets[target].position != position || position >= liveWords.size()) return Counter::MissFetchError;
             for (auto at = target; at < stage.targets.size() && stage.targets[at].position == position; ++at) {
                 if (!patch(stage.targets[at].binding, stage.targets[at].word, value)) return Counter::MissFetchError;
+                if (compiled.bindings[stage.targets[at].binding].role == DescriptorRole::GuestBuffers) hit.buffersPatched = true;
             }
             liveWords[position] = value;
         }
-        for (const auto& [index, binding, word] : stage.valueSlots) {
-            if (index < user.size() && user[index] != stage.userData[index] && !patch(binding, word, user[index])) return Counter::MissFetchError;
+        for (const auto& slots : {&stage.valueSlots, &stage.baseValueSlots}) {
+            for (const auto& [index, binding, word] : *slots) {
+                if (userMoved(index) && !patch(binding, word, user[index])) return Counter::MissFetchError;
+            }
         }
         for (const auto& forward : stage.forwards) {
             const auto value = user[forward.word];
@@ -1128,6 +1307,14 @@ DrawRecords::Counter Driver::fetchDrawRecord(const LeanDrawJob& job, const DrawR
         const bool sided = !side.bindings.empty() || !side.pushWords.empty() || !side.vertexAttributes.empty();
         hit.stages.push_back({stage.stage, stage.compiled.get(), stage.pushConstantOffset, stage.registeredViews.get(), sided ? &side : nullptr});
         appendEntryRegions(*variant, scratch.memory, &liveWords);
+        if (!verifying) continue;
+        for (const auto& [begin, end] : variant->runs) {
+            for (auto address = begin; address < end; address += sizeof(std::uint32_t)) hit.fetched.push_back(address);
+        }
+    }
+    if (verifying) {
+        std::sort(hit.fetched.begin(), hit.fetched.end());
+        hit.fetched.erase(std::unique(hit.fetched.begin(), hit.fetched.end()), hit.fetched.end());
     }
     AppendProgramMemory(scratch.memory, programs);
     hit.parameters = job.parameters;
@@ -1165,9 +1352,32 @@ std::shared_ptr<DrawRecordHit> Driver::fetchDrawRecords(const LeanDrawJob& job) 
     DrawPipeline::Active() = true;
     GuestMemory::SetCurrentPacket(job.opcode, job.queue);
     const DrawFinisher::AheadScope ahead;
-    auto hit = std::make_shared<DrawRecordHit>();
+    const auto& programs = job.shape->decode->programs;
+    const auto count = programs.size();
+    auto& scratch = HostThreadLocal<FetchScratch, FetchScratchStorage>();
+    if (scratch.userData.size() < count) {
+        scratch.userData.resize(count);
+        scratch.liveWords.resize(count);
+        scratch.decodeReads.resize(count);
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        if (ReadRecordUserWords(programs[i], job.words, scratch.userData[i])) continue;
+        DrawRecords::Add(Counter::MissUserWordUnread);
+        return nullptr;
+    }
+    const auto& records = job.records->records;
+    const std::span<const std::vector<std::uint32_t>> users(scratch.userData.data(), count);
+    std::array<std::size_t, DrawRecordStore::Candidates> candidates{};
+    std::size_t found = 0;
     std::optional<Counter> first;
-    for (const auto& record : job.records->records) {
+    for (std::size_t index = 0; index < records.size() && found < candidates.size(); ++index) {
+        const auto reason = PrecheckDrawRecord(job, *records[index], users);
+        if (reason == Counter::Hits) candidates[found++] = index;
+        else if (index == 0) first = reason;
+    }
+    auto hit = std::make_shared<DrawRecordHit>();
+    for (std::size_t candidate = 0; candidate < found; ++candidate) {
+        const auto& record = records[candidates[candidate]];
         Counter outcome = Counter::MissFetchError;
         try {
             outcome = fetchDrawRecord(job, *record, *hit);
@@ -1178,7 +1388,7 @@ std::shared_ptr<DrawRecordHit> Driver::fetchDrawRecords(const LeanDrawJob& job) 
             hit->record = record;
             return hit;
         }
-        if (!first) first = outcome;
+        if (candidates[candidate] == 0) first = outcome;
     }
     DrawRecords::Add(first.value_or(Counter::MissNoFetchPlan));
     return nullptr;
@@ -1411,6 +1621,8 @@ void Driver::finishRecordDraw(const LeanDrawJob& job) {
         if (hit != nullptr) {
             DrawRecords::Add(Counter::Hits);
             if (hit->inputsMoved) DrawRecords::Add(Counter::InputRefetches);
+            if (hit->baseValueMoved) DrawRecords::Add(Counter::HitsBaseValue);
+            if (hit->buffersPatched) DrawRecords::Add(Counter::HitsBuffersPatched);
             if (!verify) {
                 commitRecordDraw(job, anchor, std::move(hit));
                 return;
@@ -1422,6 +1634,7 @@ void Driver::finishRecordDraw(const LeanDrawJob& job) {
             answer.contentKey = hit->record->contentKey;
             answer.fragmentOutputs = hit->record->fragmentOutputs;
             if (hit->record->plan->addressed) answer.CaptureSnapshots(hit->snapshots);
+            answer.fetched = std::move(hit->fetched);
             if (DrawRecords::CorruptingAnswers()) answer.parameters[3] ^= 1u;
         }
     }
@@ -1483,6 +1696,14 @@ void Driver::verifyRecordHit(const LeanDrawJob& job, const DrawRecord& record, c
     if (answer.contentKey != today.contentKey) note(Field::ContentKeys, firstDifference(answer.contentKey, today.contentKey));
     if (record.vertexLayout != sink.vertexLayout) note(Field::VertexLayouts, firstDifference(record.vertexLayout, sink.vertexLayout));
     if (record.plan->addressed && answer.snapshotWords != today.snapshotWords) note(Field::Snapshots, "the record's snapshots cover " + std::to_string(answer.snapshotWords.size()) + " words, today's " + std::to_string(today.snapshotWords.size()) + "; " + firstDifference(answer.snapshotWords, today.snapshotWords));
+    if (!today.snapshotWords.empty()) {
+        const auto unread = [&](std::uint64_t address) {
+            const auto found = std::lower_bound(today.snapshotWords.begin(), today.snapshotWords.end(), std::pair<std::uint64_t, std::uint32_t>{address, 0u});
+            return found == today.snapshotWords.end() || found->first != address;
+        };
+        const auto first = std::find_if(answer.fetched.begin(), answer.fetched.end(), unread);
+        if (first != answer.fetched.end()) note(Field::FetchedRuns, "the record fetched " + std::to_string(answer.fetched.size()) + " run words, " + std::to_string(std::count_if(first, answer.fetched.end(), unread)) + " of them at addresses today's draw did not read, the first at " + hex(*first));
+    }
     if (answer.fragmentOutputs.has_value() != today.fragmentOutputs.has_value()) DrawRecords::NoteAllowed(DrawRecords::Allowed::FragmentOutputsOneSide);
     else if (answer.fragmentOutputs != today.fragmentOutputs) note(Field::FragmentOutputs, "the record's fragment outputs " + hex(*answer.fragmentOutputs) + ", today's " + hex(*today.fragmentOutputs));
     if (!differs) return;
@@ -1512,7 +1733,9 @@ void Driver::settleDrawRecord(const LeanDrawJob& job, const DrawRecordSink& sink
     }
     auto answer = std::make_shared<DrawRecordAnswer>();
     answer->key = DrawRecordKey::For(job.shapeKey, job.parameters);
-    answer->built = DrawRecord::Build(answer->key, job.shape->shared_from_this(), job.deviceSerial, job.recordGeneration, Graphics::Recorder::Presents(), sink);
+    auto built = DrawRecord::Build(answer->key, job.shape->shared_from_this(), job.deviceSerial, job.recordGeneration, Graphics::Recorder::Presents(), sink);
+    if (sink.built != nullptr) built->probes = DrawRecordProbes(*sink.built, job.records);
+    answer->built = std::move(built);
     DrawRecords::Add(Counter::RecordsBuilt);
     DrawRecords::Add(sink.built != nullptr ? Counter::PlansBuilt : Counter::PlansRefused);
     if (!DrawFinisher::AnswerLean(std::move(answer))) {

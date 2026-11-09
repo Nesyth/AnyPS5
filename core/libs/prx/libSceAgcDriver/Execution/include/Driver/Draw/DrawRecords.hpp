@@ -70,6 +70,7 @@ struct DrawRecordStage {
     std::vector<std::int8_t> runBases;
     std::uint64_t relocatableWords = 0;
     std::uint64_t valueWords = 0;
+    std::uint64_t baseValueWords = 0;
     std::uint64_t walkedWords = 0;
     std::uint64_t valueUseWords = 0;
     std::uint64_t calleeWords = 0;
@@ -77,6 +78,7 @@ struct DrawRecordStage {
     std::uint64_t vertexWords = 0;
     std::uint64_t userDataMask = 0;
     std::vector<std::array<std::uint32_t, 3>> valueSlots;
+    std::vector<std::array<std::uint32_t, 3>> baseValueSlots;
     std::vector<DrawRecordTarget> targets;
     std::vector<DrawRecordBuffer> buffers;
     std::vector<DrawRecordForward> forwards;
@@ -89,6 +91,13 @@ struct DrawRecordPlan {
     std::size_t bytes = 0;
     std::uint64_t signature = 0;
     bool addressed = false;
+};
+
+struct DrawRecordProbe {
+    std::uint64_t address = 0;
+    std::uint32_t value = 0;
+    std::uint16_t stage = 0;
+    std::int16_t base = -1;
 };
 
 struct DrawRecordStageView {
@@ -110,6 +119,7 @@ struct DrawRecordView {
     std::vector<std::uint32_t> contentKey;
     std::optional<std::uint32_t> fragmentOutputs;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> snapshotWords;
+    std::vector<std::uint64_t> fetched;
 
     void CaptureSnapshots(std::span<const Graphics::GuestMemorySnapshot> snapshots);
     void Capture(std::span<const Graphics::CompiledShader> shaders, const Pm4::DrawParameters& drawParameters);
@@ -153,6 +163,7 @@ struct DrawRecord : std::enable_shared_from_this<DrawRecord> {
     std::vector<DrawPipeline::Range> writes;
     std::shared_ptr<const DrawRecordPlan> plan;
     std::uint64_t signature = 0;
+    std::vector<DrawRecordProbe> probes;
     std::shared_ptr<DrawRecordCommit> commit = std::make_shared<DrawRecordCommit>();
 
     static std::shared_ptr<DrawRecord> Build(const DrawRecordKey& key, std::shared_ptr<const LeanShape> shape, std::uint64_t deviceSerial, std::uint64_t generation, std::uint64_t present, const DrawRecordSink& sink);
@@ -166,6 +177,9 @@ struct DrawRecordSet {
     const LeanShape* Shape() const;
     const DrawRecord* Match(const DrawRecordHash& content) const;
 };
+
+std::vector<DrawRecordProbe> DrawRecordProbes(const DrawRecordPlan& plan, const DrawRecordSet* kept);
+bool DrawRecordProbesHold(std::span<const DrawRecordProbe> probes, std::span<const std::vector<std::uint32_t>> users);
 
 struct DrawRecordAnswer {
     std::shared_ptr<const DrawRecord> built;
@@ -182,7 +196,10 @@ struct DrawRecordHit {
     std::vector<std::vector<std::uint32_t>> words;
     std::vector<std::vector<Graphics::DecodeRead>> decodeReads;
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    std::vector<std::uint64_t> fetched;
     bool inputsMoved = false;
+    bool baseValueMoved = false;
+    bool buffersPatched = false;
 };
 
 namespace DrawRecordFlags {
@@ -198,9 +215,12 @@ class DrawRecordStore {
 public:
     static constexpr std::size_t Ways = 4;
     static constexpr std::size_t Sets = 8192;
-    static constexpr std::size_t Variants = 16;
+    static constexpr std::size_t Variants = 8;
+    static constexpr std::size_t Candidates = 2;
+    static constexpr std::size_t ProbesPerVariant = 2;
+    static constexpr std::size_t MaxProbes = 8;
     static constexpr std::uint64_t KeepPresents = 3;
-    static constexpr std::size_t DefaultByteCap = std::size_t{768} << 20;
+    static constexpr std::size_t DefaultByteCap = std::size_t{512} << 20;
     static std::size_t ConfiguredByteCap();
 
     struct Entry {

@@ -63,6 +63,15 @@ constexpr std::uint32_t Unwritten = 0xdeadbeefu;
 constexpr std::uint32_t FetchIndexOffset = 5;
 constexpr std::uint32_t FetchVertexOffset = 3;
 constexpr std::uint32_t DrawsPerSubmission = 6;
+constexpr std::size_t RingSlotsOffset = 0x1000;
+constexpr std::size_t RingSlotBytes = 0x100;
+constexpr std::size_t InnerOffset = 0x4000;
+constexpr std::size_t InnerBytes = 0x100;
+constexpr std::size_t RingSlots = 16;
+constexpr std::size_t InnerBuffers = 8;
+constexpr std::uint32_t ConstantRecords = 64;
+constexpr std::uint32_t InnerRecords = 16;
+constexpr std::array<std::uint32_t, 4> RawFormats{0x31016facu, 0x31014facu, 0x31015facu, 0x21016facu};
 
 alignas(256) constexpr std::array<std::uint32_t, 16> PlainVertex{
     0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
@@ -106,6 +115,17 @@ alignas(256) constexpr std::array<std::uint32_t, 30> FetchVertex{
     0xbf810000u,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 16> RingPixel{
+    0xf4280100u, 0xfa000010u,
+    0xf4200200u, 0xfa000000u,
+    0xbf8cc07fu,
+    0xe0300000u, 0x80010400u,
+    0xbf8c3f70u,
+    0x7e000208u, 0x7e020304u, 0x7e040280u, 0x7e0602f2u,
+    0xf800180fu, 0x03020100u,
+    0xbf810000u, 0xbf810000u,
+};
+
 struct Header {
     Shader shader{};
     ShaderUserData userData{};
@@ -115,6 +135,7 @@ alignas(8) Header PlainVertexHeader{};
 alignas(8) Header ConstantPixelHeader{};
 alignas(8) Header TableVertexHeader{};
 alignas(8) Header ReadPixelHeader{};
+alignas(8) Header RingPixelHeader{};
 
 void Register(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
     header.shader.file_header = 0x34333231u;
@@ -256,6 +277,10 @@ std::array<std::uint32_t, 4> OutputDescriptor(std::uint64_t address) {
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), OutputSlots * 16u, 0x31016facu};
 }
 
+std::array<std::uint32_t, 4> RawDescriptor(std::uint64_t address, std::uint32_t records, std::uint32_t format = RawFormats[0]) {
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), records, format};
+}
+
 void WriteWords(const GuestBlock& block, std::size_t offset, std::array<std::uint32_t, 4> words) {
     std::memcpy(block.Bytes(offset), words.data(), sizeof(words));
 }
@@ -273,11 +298,12 @@ struct Blocks {
     GuestBlock target;
     GuestBlock fetch;
     GuestBlock output;
+    GuestBlock ring;
 };
 
 Blocks* Scene = nullptr;
 
-enum class Kind { Constants, Table, Fetch };
+enum class Kind { Constants, Table, Fetch, Ring, Inner, RingInner, Sized, Format };
 
 struct State {
     Kind kind = Kind::Table;
@@ -285,8 +311,37 @@ struct State {
     std::uint32_t stride = 16;
 };
 
+bool RingKind(Kind kind) {
+    return kind == Kind::Ring || kind == Kind::Inner || kind == Kind::RingInner || kind == Kind::Sized || kind == Kind::Format;
+}
+
+std::size_t OuterSlot(const State& state) {
+    switch (state.kind) {
+    case Kind::Ring: return state.variant % 6;
+    case Kind::RingInner: return 6 + state.variant % 6;
+    case Kind::Inner: return 12;
+    case Kind::Sized: return 13;
+    default: return 14;
+    }
+}
+
+std::size_t InnerAt(const State& state) {
+    switch (state.kind) {
+    case Kind::Inner:
+    case Kind::RingInner: return InnerOffset + (state.variant % 6) * InnerBytes;
+    case Kind::Sized: return InnerOffset + 6 * InnerBytes;
+    default: return InnerOffset + 7 * InnerBytes;
+    }
+}
+
 void Apply(const State& state) {
     auto& blocks = *Scene;
+    if (RingKind(state.kind)) {
+        const auto records = state.kind == Kind::Sized ? InnerRecords * (1 + state.variant % 6) : InnerRecords;
+        const auto format = state.kind == Kind::Format ? RawFormats[state.variant % RawFormats.size()] : RawFormats[0];
+        WriteWords(blocks.ring, RingSlotsOffset + OuterSlot(state) * RingSlotBytes + 16u, RawDescriptor(blocks.ring.At(InnerAt(state)), records, format));
+        return;
+    }
     switch (state.kind) {
     case Kind::Constants: {
         const float value = state.variant == 0 ? 0.25f : 0.5f;
@@ -299,6 +354,8 @@ void Apply(const State& state) {
         break;
     case Kind::Fetch:
         WriteWords(blocks.fetch, FetchBufferTableOffset, SlotDescriptor(blocks.fetch.At(state.variant == 0 ? CurrentSlotsOffset : ShiftedSlotsOffset)));
+        break;
+    default:
         break;
     }
 }
@@ -327,6 +384,11 @@ void Submit(const State& state, std::uint32_t draws) {
         for (std::uint32_t word = 0; word < user.size(); ++word) registers.emplace_back(0x8cu + word, user[word]);
         for (const auto& entry : RegisterWrites{{0x00b, 8u << 1u}, {0x00c, 0}, {0x00d, 0}, {0x00e, static_cast<std::uint32_t>(pointer)}, {0x00f, static_cast<std::uint32_t>(pointer >> 32u)}}) registers.push_back(entry);
         SubmitDraws(reinterpret_cast<std::uintptr_t>(FetchVertex.data()), reinterpret_cast<std::uintptr_t>(ReadPixel.data()), {{0x242, 4}, {0x24a, FetchIndexOffset}}, registers, blocks.target, draws);
+        break;
+    }
+    default: {
+        const auto constants = RawDescriptor(blocks.ring.At(RingSlotsOffset + OuterSlot(state) * RingSlotBytes), ConstantRecords);
+        SubmitDraws(reinterpret_cast<std::uintptr_t>(PlainVertex.data()), reinterpret_cast<std::uintptr_t>(RingPixel.data()), {{0x242, 4}}, {{0x8b, 0}, {0x8c, 0}, {0x00b, 4u << 1u}, {0x00c, constants[0]}, {0x00d, constants[1]}, {0x00e, constants[2]}, {0x00f, constants[3]}}, blocks.target, draws);
         break;
     }
     }
@@ -472,6 +534,14 @@ void Prepare() {
     const std::array<std::uint32_t, 2> attributes{0u, 1u | (1u << 26u)};
     std::memcpy(blocks.fetch.Bytes(FetchAttribTableOffset), attributes.data(), sizeof(attributes));
     WriteWords(blocks.fetch, FetchBufferTableOffset + 16u, SlotDescriptor(blocks.fetch.At(InstanceSlotsOffset)));
+    for (std::size_t slot = 0; slot < RingSlots; ++slot) {
+        const float red = 0.125f * static_cast<float>(1 + slot % 7);
+        std::memcpy(blocks.ring.Bytes(RingSlotsOffset + slot * RingSlotBytes), &red, sizeof(red));
+    }
+    for (std::size_t inner = 0; inner < InnerBuffers; ++inner) {
+        const float green = 0.1f + 0.1f * static_cast<float>(inner);
+        std::memcpy(blocks.ring.Bytes(InnerOffset + inner * InnerBytes), &green, sizeof(green));
+    }
 }
 
 void Hits(Arms& arms) {
@@ -489,6 +559,64 @@ void Hits(Arms& arms) {
         ExpectRecordPath("fetch", now, base);
         Require(now.Since(base, Counter::InputRefetches) != 0 && now.Since(base, Counter::MissVertexLayout) == 0, "fetch: hits whose fetched vertex buffer moved did not refetch their inputs" + Describe(now, base));
     });
+}
+
+std::vector<State> Moving(Kind kind, std::size_t count) {
+    std::vector<State> states;
+    for (std::size_t index = 0; index < count; ++index) states.push_back({kind, static_cast<std::uint32_t>(index), 16});
+    return states;
+}
+
+void Ring(Arms& arms) {
+    arms.Run("an inline constant buffer descriptor read through and bound, moving to a new ring slot every submission", Moving(Kind::Ring, 6), DrawsPerSubmission, [](const Totals& now, const Totals& base) {
+        ExpectRecordPath("ring", now, base);
+        Require(now.Since(base, Counter::MissUserWordBaseValue) == 0 && now.Since(base, Counter::MissContentDiffers) == 0, "ring: draws whose inline buffer descriptor moved with the runs read through it missed" + Describe(now, base));
+        Require(now.Since(base, Counter::HitsBaseValue) != 0, "ring: no hit relocated a base and value user word" + Describe(now, base));
+        Require(now.Since(base, Counter::RecordsBuilt) == 1, "ring: the moving descriptor built more than one record" + Describe(now, base));
+    });
+    arms.Run("a read-only buffer descriptor moving inside a fixed constant buffer", Moving(Kind::Inner, 6), DrawsPerSubmission, [](const Totals& now, const Totals& base) {
+        ExpectRecordPath("inner", now, base);
+        Require(now.Since(base, Counter::MissContentDiffers) == 0 && now.Since(base, Counter::MissBufferFields) == 0, "inner: draws whose read-only buffer base moved inside a captured run missed" + Describe(now, base));
+        Require(now.Since(base, Counter::HitsBuffersPatched) != 0, "inner: no hit patched a moved buffer base" + Describe(now, base));
+    });
+    arms.Run("a read-only buffer descriptor moving inside an inline constant buffer that moves too", Moving(Kind::RingInner, 6), DrawsPerSubmission, [](const Totals& now, const Totals& base) {
+        ExpectRecordPath("ring and inner", now, base);
+        Require(now.Since(base, Counter::MissUserWordBaseValue) == 0 && now.Since(base, Counter::MissContentDiffers) == 0, "ring and inner: draws whose descriptors moved missed" + Describe(now, base));
+        Require(now.Since(base, Counter::HitsBaseValue) != 0 && now.Since(base, Counter::HitsBuffersPatched) != 0, "ring and inner: hits did not both relocate the inline descriptor and patch the moved buffer base" + Describe(now, base));
+    });
+    arms.Run("a read-only buffer descriptor whose record count changes", Moving(Kind::Sized, 6), DrawsPerSubmission, [](const Totals& now, const Totals& base) {
+        ExpectRecordPath("sized", now, base);
+        Require(now.Since(base, Counter::MissContentDiffers) == 0 && now.Since(base, Counter::HitsBuffersPatched) != 0, "sized: draws whose read-only buffer size changed inside a captured run did not hit with the patched size" + Describe(now, base));
+    });
+}
+
+void Formats(Arms& arms) {
+    const auto passes = 3u;
+    const auto formats = static_cast<std::uint32_t>(RawFormats.size());
+    std::vector<State> states;
+    for (std::uint32_t pass = 0; pass < passes; ++pass) {
+        for (std::uint32_t format = 0; format < formats; ++format) states.push_back({Kind::Format, format, 16});
+    }
+    std::vector<std::vector<std::uint8_t>> today;
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
+    for (const auto& state : states) today.push_back(Render(state, DrawsPerSubmission));
+    RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, true);
+    const auto base = Totals::Now();
+    auto warmed = base;
+    for (std::size_t index = 0; index < states.size(); ++index) {
+        Require(Render(states[index], DrawsPerSubmission) == today[index], "formats: submission " + std::to_string(index) + " with draw records rendered differently from today's path" + Describe(Totals::Now(), base));
+        if (index + 1 == formats) warmed = Totals::Now();
+    }
+    const auto now = Totals::Now();
+    std::cout << "a descriptor format word cycling through " << formats << " values:" << Describe(now, base) << '\n';
+    if (arms.ring) {
+        Require(now.differences == base.differences, "formats: the draw record verify found differences" + Describe(now, base));
+        Require(warmed.Since(base, Counter::MissContentDiffers) != 0, "formats: a changed descriptor format word did not miss on content" + Describe(warmed, base));
+        Require(now.Since(warmed, Counter::MissContentDiffers) == 0, "formats: once every format had a record, a draw missed on content, so the variant pre-check did not pick the record of the draw's format" + Describe(now, warmed));
+        Require(now.Since(warmed, Counter::Hits) >= DrawsPerSubmission, "formats: draws of formats that had records did not hit" + Describe(now, warmed));
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
 }
 
 void Misses(Arms& arms) {
@@ -589,6 +717,7 @@ int main(int argc, char** argv) {
         Register(ConstantPixelHeader, ConstantPixel.data(), sizeof(ConstantPixel), 1);
         Register(TableVertexHeader, TableVertex.data(), sizeof(TableVertex), 2);
         Register(ReadPixelHeader, ReadPixel.data(), sizeof(ReadPixel), 1);
+        Register(RingPixelHeader, RingPixel.data(), sizeof(RingPixel), 1);
         RegisterFetchVertex();
         Blocks blocks;
         Scene = &blocks;
@@ -599,6 +728,8 @@ int main(int argc, char** argv) {
             InjectedCommit(arms);
         } else {
             Hits(arms);
+            Ring(arms);
+            Formats(arms);
             Misses(arms);
             Fallbacks(arms);
         }
@@ -606,7 +737,7 @@ int main(int argc, char** argv) {
         RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, leanEnvironment);
         RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, recordsEnvironment);
         AgcDriverShutdown_nid_postfix();
-        std::cout << (inject || injectCommit ? "the draw record verify caught a corrupted answer and today's path drew" : "draw record hits render as today's path for moved constants, descriptors and vertex buffers, record through the committer half with pushed constants, held targets and per-batch keeps, and fall back on structural changes, writes after the fetch and failed committer checks") << (arms.ring ? "" : " (no finisher ring: records never ran)") << '\n';
+        std::cout << (inject || injectCommit ? "the draw record verify caught a corrupted answer and today's path drew" : "draw record hits render as today's path for moved constants, descriptors and vertex buffers, relocate inline buffer descriptors read through and bound, patch read-only buffer bases and sizes moved inside captured runs, pick the variant of a changed format word, record through the committer half with pushed constants, held targets and per-batch keeps, and fall back on structural changes, writes after the fetch and failed committer checks") << (arms.ring ? "" : " (no finisher ring: records never ran)") << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

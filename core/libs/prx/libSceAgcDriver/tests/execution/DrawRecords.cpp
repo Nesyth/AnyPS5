@@ -24,8 +24,12 @@
 namespace {
 
 using AgcDriver::Graphics::Require;
+using AgcDriver::DriverDetail::DispatchVariant;
 using AgcDriver::DriverDetail::DrawRecord;
 using AgcDriver::DriverDetail::DrawRecordKey;
+using AgcDriver::DriverDetail::DrawRecordPlan;
+using AgcDriver::DriverDetail::DrawRecordProbe;
+using AgcDriver::DriverDetail::DrawRecordSet;
 using AgcDriver::DriverDetail::DrawRecordSink;
 using AgcDriver::DriverDetail::DrawRecordStore;
 using AgcDriver::DriverDetail::LeanShape;
@@ -189,6 +193,79 @@ void Invalidation() {
     Require(held.expired() && store.Identities() == 0 && store.RetiredSets() == 0, "a reset kept records");
 }
 
+alignas(64) std::array<std::uint32_t, 16> ProbedMemory{};
+
+std::uint64_t ProbedAt(std::size_t word) {
+    return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(ProbedMemory.data() + word));
+}
+
+std::uint32_t ProbedBase(std::size_t word) {
+    return static_cast<std::uint32_t>(ProbedAt(word));
+}
+
+std::shared_ptr<const DrawRecordPlan> ProbedPlan(std::array<std::uint32_t, 6> fixed, std::array<std::uint32_t, 2> based, std::uint32_t data, std::uint32_t base = ProbedBase(4)) {
+    auto plan = std::make_shared<DrawRecordPlan>();
+    plan->stages.emplace_back();
+    auto& stage = plan->stages.emplace_back();
+    stage.userData = {base};
+    auto variant = std::make_shared<DispatchVariant>();
+    const auto shift = static_cast<std::uint64_t>(base & ~3u) - (ProbedBase(4) & ~3u);
+    variant->runs = {{ProbedAt(0), ProbedAt(4)}, {ProbedAt(4) + shift, ProbedAt(6) + shift}, {ProbedAt(8), ProbedAt(9)}, {ProbedAt(10), ProbedAt(12)}};
+    variant->words = {fixed[0], fixed[1], fixed[2], fixed[3], based[0], based[1], data, fixed[4], fixed[5]};
+    variant->dataPositions = {6};
+    stage.runBases = {-1, 0, -1, -1};
+    stage.variant = std::move(variant);
+    return plan;
+}
+
+std::shared_ptr<const DrawRecord> ProbedRecord(std::shared_ptr<const DrawRecordPlan> plan, const DrawRecordSet* kept) {
+    auto record = std::make_shared<DrawRecord>();
+    if (kept != nullptr) record->probes = AgcDriver::DriverDetail::DrawRecordProbes(*plan, kept);
+    record->plan = std::move(plan);
+    return record;
+}
+
+const DrawRecord* Picked(const DrawRecordSet& set, std::uint32_t base) {
+    const std::array<std::vector<std::uint32_t>, 2> users{std::vector<std::uint32_t>{}, std::vector<std::uint32_t>{base}};
+    for (const auto& record : set.records) {
+        if (AgcDriver::DriverDetail::DrawRecordProbesHold(record->probes, users)) return record.get();
+    }
+    return nullptr;
+}
+
+void Probes() {
+    using AgcDriver::DriverDetail::DrawRecordProbes;
+    const auto first = ProbedPlan({1, 2, 3, 4, 11, 12}, {5, 6}, 7);
+    const auto second = ProbedPlan({1, 2, 9, 4, 11, 12}, {5, 6}, 70, ProbedBase(6));
+    DrawRecordSet set;
+    set.records.push_back(ProbedRecord(first, nullptr));
+    Require(set.records.front()->probes.empty(), "a record built without variants beside it got probe words");
+    const auto probes = DrawRecordProbes(*second, &set);
+    Require(probes.size() == 1 && probes.front().address == ProbedAt(2) && probes.front().value == 9 && probes.front().base < 0 && probes.front().stage == 1, "the probes of a variant are not exactly the fixed structural word it differs in (equal words of a run that moved with its user word and data words must not be probed): " + std::to_string(probes.size()) + " probes");
+    set.records.insert(set.records.begin(), ProbedRecord(second, &set));
+    ProbedMemory = {1, 2, 3, 4, 5, 6, 0, 0, 7, 0, 11, 12, 0, 0, 0, 0};
+    Require(Picked(set, ProbedBase(4)) == set.records.back().get(), "the pre-check did not pass over the newer variant to the record of the memory's structure");
+    ProbedMemory[2] = 9;
+    ProbedMemory[8] = 78;
+    Require(Picked(set, ProbedBase(4)) == set.records.front().get(), "the pre-check did not pick the newest variant in its own memory, whatever its data words hold");
+    const auto based = ProbedPlan({1, 2, 9, 4, 11, 12}, {5, 66}, 7, ProbedBase(8));
+    const auto probed = DrawRecordProbes(*based, &set);
+    const auto relative = std::find_if(probed.begin(), probed.end(), [](const DrawRecordProbe& probe) { return probe.base == 0; });
+    Require(relative != probed.end() && relative->value == 66 && relative->stage == 1 && relative->address + (ProbedBase(4) & ~3u) == ProbedAt(5), "a variant differing in a word of a run based on a user word was not probed relative to that user word");
+    const std::vector<DrawRecordProbe> follow{*relative};
+    const std::array<std::vector<std::uint32_t>, 2> moved{std::vector<std::uint32_t>{}, std::vector<std::uint32_t>{ProbedBase(10)}};
+    ProbedMemory[11] = 66;
+    Require(AgcDriver::DriverDetail::DrawRecordProbesHold(follow, moved), "a probe relative to a user word did not follow the draw's moved user word");
+    ProbedMemory[11] = 12;
+    Require(!AgcDriver::DriverDetail::DrawRecordProbesHold(follow, moved), "a probe relative to a user word held with another value at the moved address");
+    const auto third = ProbedPlan({21, 22, 23, 24, 25, 26}, {5, 6}, 7);
+    const auto many = DrawRecordProbes(*third, &set);
+    Require(many.size() == 2 * AgcDriver::DriverDetail::DrawRecordStore::ProbesPerVariant, "a variant differing in every fixed word got " + std::to_string(many.size()) + " probes against two variants, expected the per-variant limit for each at distinct addresses");
+    ProbedMemory = {21, 22, 23, 24, 0, 0, 0, 0, 0, 0, 25, 26, 0, 0, 0, 0};
+    Require(AgcDriver::DriverDetail::DrawRecordProbesHold(many, moved), "the probes of a variant failed in its own memory");
+    Require(!AgcDriver::DriverDetail::DrawRecordProbesHold(std::vector<DrawRecordProbe>{{0, 0, 0, -1}}, moved), "a probe at an unmapped address held");
+}
+
 alignas(256) constexpr std::array<std::uint32_t, 16> VertexCode{
     0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
     0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
@@ -349,7 +426,7 @@ int Device() {
         Require(draws == Submissions * DrawsPerSubmission, "draw records counted " + std::to_string(draws) + " draws, expected " + std::to_string(Submissions * DrawsPerSubmission) + name + Describe(now, base));
         std::uint64_t outcomes = 0;
         for (auto counter = static_cast<std::size_t>(Counter::Hits); counter <= static_cast<std::size_t>(Counter::OffInline); ++counter) {
-            if (static_cast<Counter>(counter) == Counter::InputRefetches || static_cast<Counter>(counter) == Counter::HitsOnTodaysPath) continue;
+            if (static_cast<Counter>(counter) == Counter::InputRefetches || static_cast<Counter>(counter) == Counter::HitsOnTodaysPath || static_cast<Counter>(counter) == Counter::HitsBaseValue || static_cast<Counter>(counter) == Counter::HitsBuffersPatched) continue;
             outcomes += now.Since(base, static_cast<Counter>(counter));
         }
         Require(outcomes == draws, "the hits, misses and draws without records add up to " + std::to_string(outcomes) + " of " + std::to_string(draws) + " draws" + name + Describe(now, base));
@@ -392,8 +469,9 @@ int main() {
         Bounds();
         Eviction();
         Invalidation();
+        Probes();
         const auto device = Device();
-        std::cout << "draw record keys, store bounds, eviction and invalidation passed" << (device == 0 ? "; repeated lean draws hit their identity records" : "; the device part was skipped") << '\n';
+        std::cout << "draw record keys, store bounds, eviction, invalidation and variant probes passed" << (device == 0 ? "; repeated lean draws hit their identity records" : "; the device part was skipped") << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
