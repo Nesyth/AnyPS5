@@ -29,10 +29,21 @@ enum class Field : std::uint8_t {
     Parameters,
     ReadRanges,
     Snapshots,
+    Templates,
+    Pipelines,
+    Framebuffers,
+    TargetViews,
+    Targets,
+    PassKeys,
+    MovedBuffers,
+    CommitPushConstants,
+    VertexInputs,
+    ShaderStages,
+    CommitFragmentOutputs,
     Count,
 };
 
-enum class Allowed : std::uint8_t { FragmentOutputsOneSide, TodayNotQueued, Count };
+enum class Allowed : std::uint8_t { FragmentOutputsOneSide, TodayNotQueued, CommitRecordMissed, CommitTodayUnrecorded, CommitTemplateRebuilt, Count };
 
 enum class Counter : std::uint8_t {
     Draws,
@@ -70,6 +81,24 @@ enum class Counter : std::uint8_t {
     RecordsCleared,
     RecordModeChanges,
     Demotions,
+    CommitHits,
+    CommitPushed,
+    CommitUnpushed,
+    CommitPassHeld,
+    CommitKeptOnce,
+    CommitNotesSkipped,
+    CommitMovedTrusted,
+    CommitBuilt,
+    CommitVerified,
+    CommitFirst,
+    CommitNotRecordable,
+    CommitTargets,
+    CommitTemplate,
+    CommitObjects,
+    CommitProof,
+    CommitMoved,
+    CommitUnbuilt,
+    CommitDemoted,
     Count,
 };
 
@@ -78,6 +107,8 @@ constexpr std::size_t ItemCount = static_cast<std::size_t>(Item::Count);
 std::uint64_t VerifyEvery();
 void CorruptAnswers(bool corrupt);
 bool CorruptingAnswers();
+void CorruptCommits(bool corrupt);
+bool CorruptingCommits();
 
 inline bool Due(LeanFront::Latch& latch) {
     if (latch.recordsVerifyEvery == 0) return false;

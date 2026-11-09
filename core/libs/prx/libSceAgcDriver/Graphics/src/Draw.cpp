@@ -2595,29 +2595,62 @@ struct Kept {
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
-void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::pair<std::uint32_t, std::uint32_t>> slices, VkRect2D scissor, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, std::shared_ptr<ShaderResources::DrawUse> use, std::shared_ptr<const void>* spaceKeep) {
-    auto kept = std::make_shared<Kept>();
-    kept->resources = resources;
-    kept->pipeline = std::move(pipeline);
-    kept->framebuffer = std::move(framebuffer);
-    kept->indices = std::move(inputs.indices);
-    kept->vertexBuffers = std::move(inputs.vertexBuffers);
-    kept->scratch = std::move(scratch);
-    kept->targets = std::move(targets);
-    const auto& residents = kept->targets;
-    resources->KeepStorageImageBytes(recorder);
-    for (const auto& target : residents) {
-        if (target != nullptr && !target->Cached()) recorder.KeepBytes(target.get(), static_cast<std::size_t>(target->BudgetBytes()));
+struct RecordKeeping {
+    DrawRecordKeep* keep = nullptr;
+    bool passNotes = false;
+    std::uint32_t* notesSkipped = nullptr;
+    bool* keptOnce = nullptr;
+};
+
+void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::pair<std::uint32_t, std::uint32_t>> slices, VkRect2D scissor, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, std::shared_ptr<ShaderResources::DrawUse> use, std::shared_ptr<const void>* spaceKeep, const RecordKeeping& keeping = {}) {
+    const auto sameTargets = [&] { return std::ranges::equal(keeping.keep->targets, targets, [](const void* kept, const std::shared_ptr<StorageTexture>& target) { return kept == target.get(); }); };
+    const bool keptOnce = keeping.keep != nullptr && keeping.keep->recorder == recorder.Id() && keeping.keep->batch == recorder.OpenSerial() && keeping.keep->resources == resources.get() && keeping.keep->pipeline == pipeline.get() && keeping.keep->framebuffer == framebuffer.get() && sameTargets() && !checkRecords && !completion && use == nullptr && spaceKeep == nullptr;
+    std::shared_ptr<Kept> kept;
+    if (keptOnce) {
+        if (inputs.indices != nullptr || !inputs.vertexBuffers.empty() || scratch != nullptr) {
+            auto perDraw = std::make_shared<Kept>();
+            perDraw->indices = std::move(inputs.indices);
+            perDraw->vertexBuffers = std::move(inputs.vertexBuffers);
+            perDraw->scratch = std::move(scratch);
+            recorder.Keep(std::move(perDraw));
+        }
+    } else {
+        kept = std::make_shared<Kept>();
+        kept->resources = resources;
+        kept->pipeline = std::move(pipeline);
+        kept->framebuffer = std::move(framebuffer);
+        kept->indices = std::move(inputs.indices);
+        kept->vertexBuffers = std::move(inputs.vertexBuffers);
+        kept->scratch = std::move(scratch);
+        kept->targets = std::move(targets);
     }
-    recorder.Keep(kept);
-    if (resources != nullptr) recorder.KeepBytes(resources.get(), resources->CopiedBytes());
+    if (keeping.keptOnce != nullptr) *keeping.keptOnce = keptOnce;
+    const auto& residents = keptOnce ? targets : kept->targets;
+    if (!keptOnce) {
+        resources->KeepStorageImageBytes(recorder);
+        for (const auto& target : residents) {
+            if (target != nullptr && !target->Cached()) recorder.KeepBytes(target.get(), static_cast<std::size_t>(target->BudgetBytes()));
+        }
+        recorder.Keep(kept);
+        if (resources != nullptr) recorder.KeepBytes(resources.get(), resources->CopiedBytes());
+        if (keeping.keep != nullptr) {
+            auto& stamp = *keeping.keep;
+            stamp.recorder = recorder.Id();
+            stamp.batch = recorder.OpenSerial();
+            stamp.resources = kept->resources.get();
+            stamp.pipeline = kept->pipeline.get();
+            stamp.framebuffer = kept->framebuffer.get();
+            stamp.targets.clear();
+            for (const auto& target : kept->targets) stamp.targets.push_back(target.get());
+        }
+    }
     if (checkRecords) recorder.OnComplete(std::move(checkRecords));
     // Counted for the [address-sync] line: a lease released by the completion (the pin waiter
     // finishes the recorder up to the open batch, which holds the kept resources and gets the
     // next serial), or waited for by the caller (any wait releases it at once).
     if (resources->HoldsLease()) CountLeaseOutcome(outcome.waited, outcome.waited ? 0 : recorder.Submissions() + 1);
     // Every use of a (possibly shared) resources object registers its GPU writes anew.
-    resources->MarkGpuWrites(recorder);
+    if (!keptOnce || !resources->RecordLean()) resources->MarkGpuWrites(recorder);
     NoteHtileWriter_nid_no_patch("draw", 0, resources->GpuWrites());
     if (spaceKeep != nullptr) *spaceKeep = resources->ReleaseSpace();
     // The write-back (fault check, copied buffers) runs when the batch completed; a fault is
@@ -2647,10 +2680,16 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
             const bool store = !residents[index]->MarkDrawn(index < slices.size() ? slices[index].first : 0u, index < slices.size() ? slices[index].second : 0u, scissor) || !residents[index]->Cached();
             if (storeMask) storeBits |= static_cast<std::uint64_t>(store) << index;
             else storeNow[index] = store;
-        } else if (index < slices.size()) {
-            residents[index]->MarkSliceDirty(slices[index].first, slices[index].second);
         } else {
-            residents[index]->MarkDirty();
+            const auto slice = index < slices.size() ? slices[index].first : ~0u;
+            const auto count = index < slices.size() ? slices[index].second : 0u;
+            if (keeping.passNotes && residents[index]->RenoteInPass(recorder.Id(), recorder.RenderPassGeneration(), slice, count)) {
+                if (keeping.notesSkipped != nullptr) ++*keeping.notesSkipped;
+                continue;
+            }
+            if (index < slices.size()) residents[index]->MarkSliceDirty(slice, count);
+            else residents[index]->MarkDirty();
+            if (recorder.RenderPassOpen()) residents[index]->RememberPassNote(recorder.Id(), recorder.RenderPassGeneration(), slice, count);
         }
     }
     for (std::size_t index = 0; index < residents.size(); ++index) {
@@ -2697,6 +2736,12 @@ struct RecordedDraw {
     SampleOrderPass reorderPass;
     std::optional<DepthSampleLocations> depthLocations;
     std::shared_ptr<std::shared_ptr<const void>>* spaceKeep = nullptr;
+    DrawRecordAccess* access = nullptr;
+    RecordKeeping keeping;
+    const ShaderResources::PushPlan* push = nullptr;
+    std::shared_ptr<Pipeline> pushPipeline;
+    std::shared_ptr<Framebuffer> pushFramebuffer;
+    bool* pushed = nullptr;
 };
 
 // A remapped viewport depth range reads its scale and offset from the draw's push block (the vertex shader's
@@ -2882,17 +2927,7 @@ bool WriteOnlyPasses() {
 // reads (in-place vertex and index ranges, GPU-side indirect records) are added per draw. The
 // pass keeps the template alive, so the pointer cannot name another object while it lasts.
 // Address-based and address-table builds never use it.
-struct PassAccessMemo {
-    const Recorder* recorder = nullptr;
-    std::uint64_t generation = 0;
-    const ShaderResources* resources = nullptr;
-    std::vector<const StorageTexture*> targets;
-    bool readsTarget = false;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> writeOnly;
-    std::vector<std::pair<VkImage, bool>> images;
-};
+using PassAccessMemo = DrawRecordAccess;
 struct PassAccessMemoStorage {};
 
 PassAccessMemo& passAccessMemo() {
@@ -2933,9 +2968,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // draw neither reads its attachments (a barrier would be owed, which no pass allows) nor
     // records anything outside a pass (an indirect draw's argument barrier and scratch copies).
     const auto passKey = DrawRenderPassKey(context, state, record.targetViews);
-    auto& memo = passAccessMemo();
-    const bool memoUsable = !resources.HoldsLease() && !resources.UsesAddressTable() && !RuntimeSwitches::Set(RuntimeSwitch::NoPassAccessMemo);
-    const bool memoMatched = memoUsable && memo.recorder == recorder && memo.generation == recorder->RenderPassGeneration() && memo.resources == &resources && std::ranges::equal(memo.targets, record.targets, [](const StorageTexture* kept, const std::shared_ptr<StorageTexture>& target) { return kept == target.get(); });
+    auto& memo = record.access != nullptr ? *record.access : passAccessMemo();
+    const bool memoUsable = !resources.HoldsLease() && !resources.UsesAddressTable() && (record.access != nullptr || !RuntimeSwitches::Set(RuntimeSwitch::NoPassAccessMemo));
+    const bool memoMatched = memoUsable && memo.recorder == recorder && memo.generation == recorder->RenderPassGeneration() && memo.resources == &resources && std::ranges::equal(memo.targets, record.targets, [](const void* kept, const std::shared_ptr<StorageTexture>& target) { return kept == target.get(); });
     const bool memoHit = memoMatched && !PassAccessMemoVerify();
     const bool readsTarget = memoHit ? memo.readsTarget : std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
@@ -2986,7 +3021,13 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     ShaderResources::HeapReplayProof replayProof;
     const bool hitCensus = ReplayCensusEnabled() && outcome.kind == KindTemplateHit && resources.HeapStage();
     const auto* faultRecord = drawUse != nullptr ? drawUse->record.get() : nullptr;
-    const auto drawBindings = record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus);
+    const auto drawBindings = record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus);
+    const bool pushing = drawBindings != nullptr && drawBindings->pushedSet >= 0;
+    if (pushing) {
+        record.pipeline = record.pushPipeline;
+        record.framebuffer = record.pushFramebuffer;
+        if (record.pushed != nullptr) *record.pushed = true;
+    }
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
     const bool readOnlyBda = addressReadPasses && resources.BdaReadOnly();
     outcome.addressDraw = addressBased;
@@ -3124,6 +3165,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (heapPipeline) {
         resources.BindDescriptorHeaps(commands);
         NoteEmptyResourceSet();
+    } else if (pushing) {
+        resources.PushDrawBindings(commands, record.pipeline->Layout(), *drawBindings, *record.push);
     } else if (drawBindings != nullptr) {
         Require(!resources.HeapStage(), "a GPU-mode draw needs a VK_EXT_descriptor_heap pipeline");
         const auto set = drawBindings->allocation.set;
@@ -3191,7 +3234,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
     timer.phase(PhaseRecord);
-    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), state.scissor, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, drawUse, record.spaceKeep != nullptr && *record.spaceKeep != nullptr ? record.spaceKeep->get() : nullptr);
+    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), state.scissor, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, drawUse, record.spaceKeep != nullptr && *record.spaceKeep != nullptr ? record.spaceKeep->get() : nullptr, record.keeping);
     timer.phase(PhaseKeep);
     if (!record.staged.empty()) {
         const auto merged = recorder->Commands();
@@ -3303,6 +3346,7 @@ struct PreparedDraw {
     const std::vector<std::uint32_t>* contentKey = nullptr;
     const std::uint32_t* fragmentOutputs = nullptr;
     bool passAttachments = false;
+    bool recordRecipe = false;
     bool attachmentsFromMemo = false;
     std::vector<std::uint32_t> stencilReferences;
     std::optional<PerformanceTimer> timing;
@@ -4236,14 +4280,44 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.reorderPass = reorderPass;
         record.depthLocations = depthLocations;
         record.spaceKeep = &prepared.spaceKeep;
+        if (auto* view = DrawCommitViewSlot::Get(); view != nullptr) {
+            view->filled = true;
+            view->resources = resources.get();
+            view->pipeline = pipeline.get();
+            view->framebuffer = framebuffer.get();
+            view->key = contentKey;
+            view->views.assign(targetViews.begin(), targetViews.end());
+            view->targets.clear();
+            for (const auto& owner : owners) view->targets.push_back(owner.get());
+            view->passKey = DrawRenderPassKey(context, state, targetViews);
+            view->moved.clear();
+            view->movedSizes.clear();
+            view->movedWords.clear();
+            for (const auto& entry : resolved.moved) {
+                view->moved.emplace_back(entry.allocation, entry.address);
+                view->movedSizes.push_back(entry.size);
+                view->movedWords.emplace_back(entry.words.begin(), entry.words.end());
+            }
+            view->pushStages = PushConstantStages(shaders);
+            view->push = {};
+            if (view->pushStages != 0) {
+                view->push = AssemblePushConstants(shaders);
+                resources->PatchPushConstants(view->push);
+            }
+            view->vertexInput = inputs.VertexLayout();
+            view->fragmentOutputs = inputs.fragmentOutputs;
+            view->shaderStages = inputs.shaderStages;
+            view->hasDepth = state.depth.has_value();
+            view->pushed = false;
+        }
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, prepared.trace);
         if (prepared.passAttachments) rememberAttachments(context, state, prepared);
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        const bool dataRecipes = !RuntimeSwitches::Set(RuntimeSwitch::NoDataRecipes);
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->SpaceReuse() && (resolved.moved.empty() || dataRecipes) && !multisampled && !pipeline->ReordersSamples()) {
+        const bool dataRecipes = prepared.recordRecipe || !RuntimeSwitches::Set(RuntimeSwitch::NoDataRecipes);
+        if (recipeOut != nullptr && (DrawRecipes() || prepared.recordRecipe) && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->SpaceReuse() && (resolved.moved.empty() || dataRecipes) && !multisampled && !pipeline->ReordersSamples()) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -4746,7 +4820,7 @@ std::vector<std::uint32_t> DrawResourceContentKey(const Context& context, const 
     return DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey, const std::uint32_t* fragmentOutputs) {
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey, const std::uint32_t* fragmentOutputs, bool recordRecipe) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (state.stages.tessellationGeometry) {
         drawTessellationGeometry(context, state, draw, shaders, snapshots, trace);
@@ -4786,6 +4860,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     prepared.contentKey = contentKey;
     prepared.fragmentOutputs = fragmentOutputs;
     prepared.passAttachments = PassAttachmentMemoEnabled();
+    prepared.recordRecipe = recordRecipe;
     const struct HeldSpace {
         PreparedDraw& prepared;
         ~HeldSpace() {
@@ -4952,6 +5027,256 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     }
     timing.Mark("draw_and_resource_release");
     reportDrawEnd(state, timer, nullptr, outcome, waitedBefore, ownWaitedMs, " recorded from recipe");
+    result.recorded = true;
+    return result;
+}
+
+namespace {
+
+std::array<std::atomic<std::uint32_t>, static_cast<std::size_t>(DrawRecipeMiss::Count)> recordFailures{};
+
+bool failRecordCheck(DrawRecipeMiss check) {
+    auto& left = recordFailures[static_cast<std::size_t>(check)];
+    auto value = left.load(std::memory_order_relaxed);
+    while (value != 0 && !left.compare_exchange_weak(value, value - 1, std::memory_order_relaxed)) {}
+    return value != 0;
+}
+
+}
+
+void FailRecordChecks(DrawRecipeMiss check, std::uint32_t count) {
+    recordFailures[static_cast<std::size_t>(check)].store(count, std::memory_order_relaxed);
+}
+
+DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer) {
+    const DepthCopySourceScope depthCopySource(state.depthCopySource);
+    auto* recorder = Recorder::Active();
+    const bool recording = answer == nullptr;
+    const auto failed = [&](DrawRecipeMiss check) { return recording && failRecordCheck(check); };
+    if (recorder != nullptr && recording) recorder->BoundKeptBytes();
+    PerformanceTimer timing("Graphics.DrawWithRecord");
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    DrawTimer timer(profile);
+    DrawRecipeOutcome result;
+    DrawOutcome outcome;
+    outcome.kind = KindRecipeHit;
+    record.effects = {};
+    const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
+    double ownWaitedMs = 0;
+    const auto miss = [&](DrawRecipeMiss reason) {
+        result.miss = reason;
+        return result;
+    };
+    if (record.recipe == nullptr) return miss(DrawRecipeMiss::TemplateGone);
+    const auto& recipe = *record.recipe;
+    if (draw.indirect || state.quadList || StripPatches(state, shaders) || !RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0 || state.stages.mesh || state.stages.tessellationGeometry || state.tessellationCapture != nullptr) return miss(DrawRecipeMiss::NotRecordable);
+    if (recipe.device != context.device) return miss(DrawRecipeMiss::ObjectsGone);
+    const std::size_t expectedViews = state.colors.size() + (recipe.hasDepth ? 1u : 0u);
+    if (recipe.hasDepth != state.depth.has_value() || recipe.targets.size() != state.colors.size() || recipe.targetViews.size() != expectedViews) return miss(DrawRecipeMiss::TargetGone);
+    auto resources = recipe.templateRef.lock();
+    if (resources == nullptr) return miss(DrawRecipeMiss::TemplateGone);
+    if (!resources->Reusable() || resources->HeapStage()) return miss(DrawRecipeMiss::Moved);
+    const bool lean = resources->RecordLean();
+    DrawInputs inputs;
+    if (recording) {
+        inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, timing, &recipe);
+        if (inputs.nothing) {
+            result.recorded = true;
+            return result;
+        }
+        for (const auto& color : state.colors) {
+            if (color.fmaskAddress != 0) GuardOneFragmentFmask(context, color);
+        }
+    }
+    std::vector<std::shared_ptr<StorageTexture>> targets;
+    targets.reserve(recipe.targets.size());
+    const auto& pass = record.pass;
+    bool held = pass.valid && pass.recorder == recorder->Id() && recorder->RenderPassOpen() && pass.generation == recorder->RenderPassGeneration() && pass.epoch == GuestMemory::CollectEpoch() && pass.proof == GuestMemory::ProofSerial() && pass.pending == StorageTexture::PendingSerial() && pass.versions.size() == recipe.targets.size() && (!recipe.hasDepth || (pass.depthSerial == DepthSurfacesSerial() && pass.depthReleased == DepthSurfacesReleased()));
+    for (std::size_t index = 0; held && index < recipe.targets.size(); ++index) {
+        auto stored = recipe.targets[index].lock();
+        if (stored == nullptr || stored->UploadVersion() != pass.versions[index] || !stored->Cached() || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) {
+            held = false;
+            break;
+        }
+        targets.push_back(std::move(stored));
+    }
+    if (!held) {
+        targets.clear();
+        if (failed(DrawRecipeMiss::TargetGone)) return miss(DrawRecipeMiss::TargetGone);
+        for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
+            timer.phase(PhaseSetup);
+            auto stored = recipe.targets[index].lock();
+            if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) return miss(DrawRecipeMiss::TargetGone);
+            auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
+                if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, 1);
+                else stored->Refresh();
+                return stored;
+            });
+            timer.phase(PhaseReadTarget);
+            if (resident == nullptr) return miss(DrawRecipeMiss::TargetGone);
+            targets.push_back(std::move(resident));
+        }
+        if (recipe.hasDepth) {
+            timer.phase(PhaseSetup);
+            const auto depthView = DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state));
+            timer.phase(PhaseReadTarget);
+            if (recipe.targetViews.back() != depthView) return miss(DrawRecipeMiss::TargetGone);
+        }
+    }
+    timer.phase(PhasePrepare);
+    if (failed(DrawRecipeMiss::Proof) || !resources->ProveCurrent(shaders, &result.proof)) {
+        if (recording) {
+            SharedResourceCache().Remove(recipe.key, resources.get());
+            countCache(&DrawProfile::cacheInvalidated);
+            resources->KeepStorageImageBytes(*recorder);
+            recorder->Keep(std::move(resources));
+        }
+        timer.phase(PhaseLookup);
+        return miss(DrawRecipeMiss::Proof);
+    }
+    std::vector<ShaderResources::MovedBuffer> moved;
+    {
+        bool patched = false;
+        auto ticket = record.ticket;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> probedRanges;
+        if (recording) {
+            ticket.ranges = &record.ticketRanges;
+        } else {
+            probedRanges = record.ticketRanges;
+            ticket.ranges = &probedRanges;
+        }
+        ticket.checked = 0;
+        ticket.trusted = 0;
+        auto found = resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched, &ticket);
+        if (!found.has_value() || failed(DrawRecipeMiss::Moved)) {
+            if (recording) record.ticket.valid = false;
+            timer.phase(PhaseLookup);
+            return miss(DrawRecipeMiss::Moved);
+        }
+        if (recording) {
+            ticket.ranges = nullptr;
+            record.ticket = ticket;
+            record.effects.movedChecked = ticket.checked;
+            record.effects.movedTrusted = ticket.trusted;
+        }
+        moved = std::move(*found);
+    }
+    if (recording) {
+        CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
+        if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
+        if (const auto present = Recorder::Presents(); record.touchedPresent != present) {
+            SharedResourceCache().Touch(recipe.key);
+            record.touchedPresent = present;
+        }
+        countCache(&DrawProfile::cacheHits);
+    }
+    timer.phase(PhaseLookup);
+    auto pipeline = recipe.pipeline.lock();
+    if (pipeline == nullptr || failed(DrawRecipeMiss::ObjectsGone)) return miss(DrawRecipeMiss::ObjectsGone);
+    const std::vector<std::shared_ptr<void>> framebufferOwners(targets.begin(), targets.end());
+    auto framebuffer = recipe.framebuffer.lock();
+    if (framebuffer == nullptr) framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
+    const ShaderResources::PushPlan* push = nullptr;
+    std::shared_ptr<Pipeline> pushPipeline;
+    std::shared_ptr<Framebuffer> pushFramebuffer;
+    const bool stencilReferences = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->stencilReferences.empty(); });
+    if (lean && !stencilReferences && !UsesMeshWindow(shaders) && !pipeline->DescriptorHeap()) push = resources->PushLayouts();
+    if (push != nullptr) {
+        if (record.pushTemplate == resources.get()) {
+            pushPipeline = record.pushPipeline.lock();
+            pushFramebuffer = record.pushFramebuffer.lock();
+        }
+        const bool movesPushed = std::ranges::any_of(moved, [&](const ShaderResources::MovedBuffer& entry) { return entry.allocation < push->allocationSets.size() && push->allocationSets[entry.allocation] == push->set; });
+        if (pushPipeline == nullptr && movesPushed) {
+            const State& pipelineState = recipe.masked.has_value() ? *recipe.masked : state;
+            pushPipeline = CachedPipeline(context, pipelineState, recipe.vertexInput, push->layouts, shaders, VK_IMAGE_LAYOUT_GENERAL);
+            record.pushPipeline = pushPipeline;
+            record.pushTemplate = resources.get();
+            pushFramebuffer.reset();
+        }
+        if (pushPipeline != nullptr && pushFramebuffer == nullptr) {
+            pushFramebuffer = pushPipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
+            record.pushFramebuffer = pushFramebuffer;
+        }
+        if (pushPipeline == nullptr) push = nullptr;
+    }
+    record.effects.unpushed = lean && push == nullptr && !moved.empty();
+    timer.phase(PhasePipeline);
+    if (!recording) {
+        answer->filled = true;
+        answer->resources = resources.get();
+        answer->pipeline = pipeline.get();
+        answer->framebuffer = framebuffer.get();
+        answer->key = recipe.key;
+        answer->views = recipe.targetViews;
+        answer->targets.clear();
+        for (const auto& target : targets) answer->targets.push_back(target.get());
+        answer->passKey = recipe.passKey;
+        answer->moved.clear();
+        answer->movedSizes.clear();
+        answer->movedWords.clear();
+        for (const auto& entry : moved) {
+            answer->moved.emplace_back(entry.allocation, entry.address);
+            answer->movedSizes.push_back(entry.size);
+            answer->movedWords.emplace_back(entry.words.begin(), entry.words.end());
+        }
+        answer->pushStages = recipe.pushStages;
+        answer->push = {};
+        if (recipe.pushStages != 0) {
+            answer->push = AssemblePushConstants(shaders);
+            resources->PatchPushConstants(answer->push);
+        }
+        answer->vertexInput = recipe.vertexInput;
+        answer->fragmentOutputs = recipe.fragmentOutputs;
+        answer->shaderStages = recipe.shaderStages;
+        answer->hasDepth = recipe.hasDepth;
+        answer->pushed = push != nullptr;
+        record.effects.passHeld = held;
+        return result;
+    }
+    outcome.completion = resources->ChecksFaults();
+    outcome.recorded = true;
+    std::vector<StorageTexture*> residents;
+    residents.reserve(targets.size());
+    for (const auto& target : targets) residents.push_back(target.get());
+    RecordedDraw drawn;
+    drawn.recorder = recorder;
+    drawn.completion = outcome.completion;
+    drawn.resources = std::move(resources);
+    drawn.pipeline = std::move(pipeline);
+    drawn.framebuffer = std::move(framebuffer);
+    drawn.targetViews = recipe.targetViews;
+    drawn.targets = std::move(targets);
+    for (const auto& color : state.colors) drawn.targetSlices.emplace_back(color.arraySlice, color.arrayLastSlice != 0 ? color.layers : 1u);
+    drawn.moved = moved;
+    drawn.pushBytes = nullptr;
+    drawn.pushStages = recipe.pushStages;
+    drawn.depthLocations = passDepthLocations(context, state, *drawn.pipeline);
+    drawn.access = &record.access;
+    if (lean) drawn.keeping = {&record.keep, true, &record.effects.notesSkipped, &record.effects.keptOnce};
+    drawn.push = push;
+    drawn.pushPipeline = std::move(pushPipeline);
+    drawn.pushFramebuffer = std::move(pushFramebuffer);
+    drawn.pushed = &record.effects.pushed;
+    recordDraw(context, state, draw, shaders, inputs, drawn, outcome, timer, ownWaitedMs, trace);
+    record.effects.passHeld = held;
+    if (recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {
+        auto& remembered = record.pass;
+        remembered.valid = true;
+        remembered.recorder = recorder->Id();
+        remembered.generation = recorder->RenderPassGeneration();
+        remembered.epoch = GuestMemory::CollectEpoch();
+        remembered.proof = GuestMemory::ProofSerial();
+        remembered.pending = StorageTexture::PendingSerial();
+        remembered.depthSerial = DepthSurfacesSerial();
+        remembered.depthReleased = DepthSurfacesReleased();
+        remembered.versions.clear();
+        for (const auto* target : residents) remembered.versions.push_back(target != nullptr ? target->UploadVersion() : 0u);
+    } else {
+        record.pass.valid = false;
+    }
+    timing.Mark("draw_and_resource_release");
+    reportDrawEnd(state, timer, nullptr, outcome, waitedBefore, ownWaitedMs, " recorded from record");
     result.recorded = true;
     return result;
 }

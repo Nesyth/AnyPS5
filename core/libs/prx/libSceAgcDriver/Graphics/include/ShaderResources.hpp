@@ -89,6 +89,7 @@ struct PipelineSetLayouts {
     bool split = false;
     std::span<const std::uint32_t> mainKey;
     std::span<const std::uint32_t> fragmentKey;
+    std::int32_t pushSet = -1;
 };
 
 struct TableDescriptors {
@@ -107,7 +108,7 @@ public:
 
     // The layout for `key` (binding, type, count, stage flags per binding, as ShaderResources builds
     // it from `bindings`), created on first use.
-    VkDescriptorSetLayout Layout(std::span<const std::uint32_t> key, std::span<const VkDescriptorSetLayoutBinding> bindings, bool updateAfterBind = false, std::span<const VkDescriptorBindingFlags> flags = {});
+    VkDescriptorSetLayout Layout(std::span<const std::uint32_t> key, std::span<const VkDescriptorSetLayoutBinding> bindings, bool updateAfterBind = false, std::span<const VkDescriptorBindingFlags> flags = {}, bool push = false);
     struct SetAllocation {
         VkDescriptorSet set = VK_NULL_HANDLE;
         VkDescriptorPool pool = VK_NULL_HANDLE;
@@ -232,7 +233,19 @@ public:
         std::vector<VkDescriptorBufferInfo> addressOverrides;
         std::shared_ptr<OwnDrawSets> ownSets;
         std::array<bool, 2> owned{};
+        std::int32_t pushedSet = -1;
+        std::vector<std::size_t> pushSelected;
         ~DrawBindings();
+    };
+    struct PushPlan {
+        std::uint32_t set = 0;
+        std::uint32_t descriptors = 0;
+        PipelineSetLayouts layouts;
+        std::vector<std::uint32_t> mainKey;
+        std::vector<std::uint32_t> fragmentKey;
+        std::vector<std::uint8_t> allocationSets;
+        std::vector<std::vector<std::size_t>> slots;
+        std::vector<std::size_t> writes;
     };
     void RefreshMovedAddresses(DrawBindings& rewritten) const;
     struct MovedBuffer {
@@ -241,6 +254,10 @@ public:
         std::size_t size;
         std::span<const std::uint32_t> words;
     };
+    const PushPlan* PushLayouts() const;
+    std::shared_ptr<DrawBindings> PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan) const;
+    void PushDrawBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
+    bool RecordLean() const;
     struct DrawUse {
         DrawUse() = default;
         DrawUse(const DrawUse&) = delete;
@@ -264,7 +281,18 @@ public:
     std::shared_ptr<DrawBindings> PrepareReplayDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, std::span<const CompiledShader> shaders, const BdaResources* faultRecord, HeapReplayProof& proof, bool census = false, std::span<const std::uint32_t> contentKey = {});
     void ConfirmHeapReplay(Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& bindings, const HeapReplayProof& proof);
     std::uint64_t HeapStageWrites() const { return heapStageWrites; }
-    std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr) const;
+    struct MoveTicket {
+        bool valid = false;
+        std::uint64_t recorder = 0;
+        std::uint64_t note = 0;
+        std::uint64_t pending = 0;
+        std::uint64_t allocations = 0;
+        std::uint64_t epoch = 0;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>>* ranges = nullptr;
+        std::size_t checked = 0;
+        std::size_t trusted = 0;
+    };
+    std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr, MoveTicket* ticket = nullptr) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
     struct MoveProof {
@@ -787,7 +815,7 @@ private:
     void buildHeapStageWords(const CompiledShader& shader, const HeapStageState& state, std::span<const std::uint32_t> words, std::span<const std::uint32_t> userData, std::vector<std::uint32_t>& patched) const;
     void verifyHeapReplay(Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& bindings, const HeapReplayProof& proof, bool overlaid);
     std::shared_ptr<DrawBindings> selectDrawSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, std::vector<std::size_t>& selected, bool census) const;
-    std::shared_ptr<DrawBindings> finishDrawBindings(Recorder& recorder, std::shared_ptr<DrawBindings> result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
+    std::shared_ptr<DrawBindings> finishDrawBindings(Recorder& recorder, std::shared_ptr<DrawBindings> result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     bool ownsHeapBinding(const Binding& binding, VkShaderStageFlags stageBit) const;
     VkImageView heapPlaceholderView(std::uint32_t kind) const;
     VkImageView heapSampledView(std::size_t index) const;
@@ -845,8 +873,10 @@ private:
     mutable bool bindingsChecked = false;
     mutable std::atomic<std::uint64_t> depthGuardsClear{std::numeric_limits<std::uint64_t>::max()};
     mutable std::atomic<std::uint64_t> multisampleGuardsClear{std::numeric_limits<std::uint64_t>::max()};
-    void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
-    void writeOwnDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
+    void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
+    void writeOwnDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
+    mutable std::unique_ptr<PushPlan> pushPlan;
+    mutable bool pushPlanBuilt = false;
     std::shared_ptr<OwnDrawSets> makeOwnDrawSets() const;
     mutable std::shared_ptr<OwnDrawSets> ownDrawSets;
     void writeAddressedOverlay(DrawBindings& result, std::span<const std::size_t> selected) const;

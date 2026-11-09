@@ -809,7 +809,9 @@ function(agc_add_draw_records_test agcTestName)
             ENV ${agcRecordsEnvironment})
     agc_add_env_test(${agcTestName}_records_verify ${agcTestName}_tests
             ENV ${agcRecordsEnvironment} APS5_VERIFY_DRAW_RECORDS=1)
-    set(agcRecordsTests ${agcTestName}_records ${agcTestName}_records_verify)
+    agc_add_env_test(${agcTestName}_records_commit_verify ${agcTestName}_tests
+            ENV ${agcRecordsEnvironment} APS5_VERIFY_DRAW_RECORDS=3)
+    set(agcRecordsTests ${agcTestName}_records ${agcTestName}_records_verify ${agcTestName}_records_commit_verify)
     if("LATE" IN_LIST ARGN)
         agc_add_env_test(${agcTestName}_records_late ${agcTestName}_tests
                 ENV ${agcRecordsEnvironment} ${agcLateStackEnvironment} APS5_VERIFY_DRAW_RECORDS=2)

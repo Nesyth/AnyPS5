@@ -370,6 +370,10 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
         keys.preRasterizationSets |= HeapSetBit;
         keys.fragmentSets |= HeapSetBit;
     }
+    if (resources.pushSet >= 0) {
+        appendKey(keys.preRasterization, PushLayoutKeyTag + static_cast<std::uint32_t>(resources.pushSet));
+        appendKey(keys.fragmentShader, PushLayoutKeyTag + static_cast<std::uint32_t>(resources.pushSet));
+    }
     if (resources.split) {
         const auto unused = 3u & ~(keys.preRasterizationSets | keys.fragmentSets);
         keys.preRasterizationSets |= unused & MainSetBit;
@@ -1448,7 +1452,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         if (storeHash != nullptr && store.index.contains(hash)) *storeHash = hash;
     }
     if (created != nullptr) *created = true;
-    if (PipelineJournalEnabled() && !PipelineJournalReplaying() && state.tessellationCapture == nullptr) RecordGraphicsPipeline(MakeGraphicsPipelineRecipe(state, vertexInput, resources, shaders, attachmentLayout), shaders);
+    if (PipelineJournalEnabled() && !PipelineJournalReplaying() && state.tessellationCapture == nullptr && resources.pushSet < 0) RecordGraphicsPipeline(MakeGraphicsPipelineRecipe(state, vertexInput, resources, shaders, attachmentLayout), shaders);
     return pipeline;
 }
 

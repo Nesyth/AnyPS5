@@ -326,6 +326,8 @@ private:
     std::shared_ptr<DrawRecordHit> fetchDrawRecords(const LeanDrawJob& job);
     DrawRecords::Counter fetchDrawRecord(const LeanDrawJob& job, const DrawRecord& record, DrawRecordHit& hit);
     void commitRecordDraw(const LeanDrawJob& job, const LeanAnchor& anchor, std::shared_ptr<DrawRecordHit> hit);
+    void commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, DrawRecordHit& hit, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape);
+    bool verifyRecordCommit(const DrawRecord& record, const DrawCommitView& answer, const DrawCommitView& today);
     void verifyRecordHit(const LeanDrawJob& job, const DrawRecord& record, const DrawRecordView& answer, const DrawRecordSink& sink);
     static std::shared_ptr<const DrawRecordPlan> buildDrawRecordPlan(const Graphics::State& graphics, const Pm4::DrawParameters& parameters, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, std::span<const Graphics::CompiledShader> stages);
     void installDrawRecord(const LeanDrawJob& job, const DrawRecordAnswer& answer);

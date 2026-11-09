@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -89,6 +90,102 @@ struct DrawRecipe {
     // with its own data words and read-only buffer bases, which DrawWithRecipe moves per draw as a
     // template hit does.
     bool perDrawMoves = false;
+};
+
+struct DrawRecordPass {
+    bool valid = false;
+    std::uint64_t recorder = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t epoch = 0;
+    std::uint64_t proof = 0;
+    std::uint64_t pending = 0;
+    std::uint64_t depthSerial = 0;
+    std::uint64_t depthReleased = 0;
+    std::vector<std::uint64_t> versions;
+};
+
+struct DrawRecordKeep {
+    std::uint64_t recorder = 0;
+    std::uint64_t batch = 0;
+    const void* resources = nullptr;
+    const void* pipeline = nullptr;
+    const void* framebuffer = nullptr;
+    std::vector<const void*> targets;
+};
+
+struct DrawRecordEffects {
+    bool pushed = false;
+    bool unpushed = false;
+    bool passHeld = false;
+    bool keptOnce = false;
+    std::uint32_t notesSkipped = 0;
+    std::size_t movedChecked = 0;
+    std::size_t movedTrusted = 0;
+};
+
+struct DrawRecordAccess {
+    const void* recorder = nullptr;
+    std::uint64_t generation = 0;
+    const void* resources = nullptr;
+    std::vector<const void*> targets;
+    bool readsTarget = false;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writeOnly;
+    std::vector<std::pair<VkImage, bool>> images;
+};
+
+struct DrawCommitView {
+    bool filled = false;
+    const void* resources = nullptr;
+    const void* pipeline = nullptr;
+    const void* framebuffer = nullptr;
+    Graphics::ResourceCache::Key key;
+    std::vector<VkImageView> views;
+    std::vector<const void*> targets;
+    std::uint64_t passKey = 0;
+    std::vector<std::pair<std::size_t, std::uint64_t>> moved;
+    std::vector<std::size_t> movedSizes;
+    std::vector<std::vector<std::uint32_t>> movedWords;
+    std::array<std::byte, Graphics::PipelinePushConstantBytes> push{};
+    VkShaderStageFlags pushStages = 0;
+    Graphics::VertexInputLayout vertexInput;
+    std::uint32_t fragmentOutputs = 0;
+    VkPipelineStageFlags shaderStages = 0;
+    bool hasDepth = false;
+    bool pushed = false;
+};
+
+struct DrawCommitViewTag {};
+using DrawCommitViewSlot = HostThreadSlot<DrawCommitView*, DrawCommitViewTag>;
+
+struct DrawRecordCommit {
+    std::shared_ptr<const DrawRecipe> recipe;
+    DrawRecordPass pass;
+    DrawRecordKeep keep;
+    Graphics::ShaderResources::MoveTicket ticket;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ticketRanges;
+    DrawRecordAccess access;
+    DrawRecordEffects effects;
+    std::weak_ptr<Graphics::Pipeline> pushPipeline;
+    std::weak_ptr<Graphics::Framebuffer> pushFramebuffer;
+    const void* pushTemplate = nullptr;
+    std::uint64_t touchedPresent = ~std::uint64_t{0};
+    std::uint64_t builds = 0;
+
+    void Adopt(std::shared_ptr<const DrawRecipe> built) {
+        recipe = std::move(built);
+        pass = {};
+        keep = {};
+        ticket = {};
+        ticketRanges.clear();
+        access = {};
+        pushPipeline.reset();
+        pushFramebuffer.reset();
+        pushTemplate = nullptr;
+        touchedPresent = ~std::uint64_t{0};
+        ++builds;
+    }
 };
 
 }

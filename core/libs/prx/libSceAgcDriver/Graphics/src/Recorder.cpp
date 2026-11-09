@@ -3570,6 +3570,25 @@ bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) co
     return false;
 }
 
+bool Recorder::WriteNotedSince(std::uint64_t note, std::uint64_t address, std::size_t bytes) const {
+    if (note == writeNoteCount || bytes == 0) return false;
+    const auto end = address + bytes;
+    const auto noted = [&](const Batch& batch) {
+        if (batch.writeNotes.size() != batch.writes.size()) return true;
+        for (std::size_t index = batch.writes.size(); index-- > 0;) {
+            if (batch.writeNotes[index] <= note) return false;
+            const auto& [begin, finish] = batch.writes[index];
+            if (begin < end && address < finish) return true;
+        }
+        return false;
+    };
+    if (open != nullptr && noted(*open)) return true;
+    for (const auto& batch : inFlight) {
+        if (noted(*batch)) return true;
+    }
+    return false;
+}
+
 bool Recorder::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
     return bytes != 0 && open != nullptr && overlaps(*open, address, address + bytes);
 }

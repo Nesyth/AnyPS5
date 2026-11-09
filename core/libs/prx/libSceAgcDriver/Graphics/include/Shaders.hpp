@@ -17,6 +17,7 @@ inline constexpr std::uint32_t PipelinePushSlotBytes = 128;
 inline constexpr std::uint32_t ComputePushConstantBytes = 128;
 
 inline constexpr std::uint32_t HeapLayoutKeyTag = 0x48454150u;
+inline constexpr std::uint32_t PushLayoutKeyTag = 0x50555348u;
 inline constexpr std::uint32_t DataSetKeyTag = 0x44415441u;
 inline constexpr std::uint32_t MainSetBit = 1u;
 inline constexpr std::uint32_t HeapSetBit = 2u;

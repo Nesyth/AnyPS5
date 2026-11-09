@@ -320,6 +320,8 @@ public:
     void WriteBack();
     // Deferred write-back (APS5_EAGER_WRITEBACK=1 stores at once instead).
     void MarkDirty();
+    bool RenoteInPass(std::uint64_t recorder, std::uint64_t pass, std::uint32_t slice, std::uint32_t count);
+    void RememberPassNote(std::uint64_t recorder, std::uint64_t pass, std::uint32_t slice, std::uint32_t count);
     void MarkWholeWritten();
     void MarkUnitsWritten(const std::vector<bool>& units);
     std::vector<VkRect2D> UnitRects(const std::vector<bool>& units) const;
@@ -502,6 +504,7 @@ public:
     // Generation (the write generation guest memory was last known to match the content at) it
     // validates textures copied from this image.
     std::uint64_t Version() const { return version; }
+    std::uint64_t UploadVersion() const { return uploads; }
     std::uint64_t Generation() const { return generation; }
     std::uint64_t GenerationFor(std::uint64_t address, std::uint64_t bytes) const;
     // The DCC keys the content was uploaded under and the last scan of the surface's keys
@@ -868,8 +871,22 @@ private:
     std::uint64_t writtenFlip = 0;
     std::atomic<bool> writtenOccasionally{false};
     std::uint64_t version = 0;
+    std::uint64_t uploads = 0;
     std::uint64_t writes = 0;
     std::uint64_t layoutRecord = 0;
+    struct PassNote {
+        bool valid = false;
+        std::uint64_t recorder = 0;
+        std::uint64_t pass = 0;
+        std::uint64_t version = 0;
+        std::uint32_t slice = 0;
+        std::uint32_t count = 0;
+        std::uint32_t first = 0;
+        std::uint32_t layers = 0;
+    };
+    PassNote passNote;
+    std::uint32_t markedFirst = 0;
+    std::uint32_t markedLayers = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     std::vector<bool> layerOriginal;
     std::map<std::uint64_t, std::uint64_t> keptAtUnwatch;

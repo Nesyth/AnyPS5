@@ -340,15 +340,28 @@ constexpr std::array<FieldInfo, FieldCount> FieldInfos{{
     {Item::Fetch, "draw parameters"},
     {Item::Fetch, "read ranges"},
     {Item::Fetch, "snapshot words"},
+    {Item::Commit, "templates"},
+    {Item::Commit, "pipelines"},
+    {Item::Commit, "framebuffers"},
+    {Item::Commit, "target views"},
+    {Item::Commit, "targets"},
+    {Item::Commit, "pass keys"},
+    {Item::Commit, "moved buffers"},
+    {Item::Commit, "push constants"},
+    {Item::Commit, "vertex inputs"},
+    {Item::Commit, "shader stages"},
+    {Item::Commit, "fragment outputs"},
 }};
 
-constexpr std::array<const char*, AllowedKinds> AllowedNames{"fragment outputs known on one side only", "today's draw not queued"};
+constexpr std::array<const char*, AllowedKinds> AllowedNames{"fragment outputs known on one side only", "today's draw not queued", "the record's commit fell back", "today's commit built no recipe", "today's commit served another template"};
 
 constexpr std::array<const char*, CounterCount> CounterNames{
     "draws", "hits", "input refetches", "hits on today's path", "new identity", "second sighting", "build pending", "shape replaced", "refused",
     "content differs", "generation moved", "not queued", "keyless", "no fetch plan", "user word moved", "fetch gate", "image views moved", "vertex layout differs", "moved buffer fields", "memory changed", "fetch error",
     "today's draw", "indirect", "lean front verify", "inline",
     "records built", "fetch plans built", "fetch plans refused", "builds refused", "records installed", "builds dropped", "identities evicted", "records cleared", "record mode changes", "demotions",
+    "recorded", "pushed", "moved without push", "targets held by the pass", "kept once per batch", "target notes skipped", "moved buffers trusted", "committer halves built", "verified on today's path",
+    "no committer half", "not recordable", "targets", "template gone", "objects gone", "texture proof", "moved buffers", "no recipe built", "demoted",
 };
 
 static_assert(ItemNames.back() != nullptr && FieldInfos.back().name != nullptr && AllowedNames.back() != nullptr && CounterNames.back() != nullptr, "every draw record item, field, by-design case and counter needs a name");
@@ -409,6 +422,7 @@ std::string counted(const std::array<std::uint64_t, CounterCount>& counts, Count
 namespace {
 
 std::atomic<bool> corrupting{false};
+std::atomic<bool> corruptingCommits{false};
 
 }
 
@@ -418,6 +432,14 @@ void CorruptAnswers(bool corrupt) {
 
 bool CorruptingAnswers() {
     return corrupting.load(std::memory_order_relaxed);
+}
+
+void CorruptCommits(bool corrupt) {
+    corruptingCommits.store(corrupt, std::memory_order_relaxed);
+}
+
+bool CorruptingCommits() {
+    return corruptingCommits.load(std::memory_order_relaxed);
 }
 
 std::uint64_t VerifyEvery() {
@@ -484,11 +506,12 @@ void Report(bool force) {
     const auto draws = at(counts, Counter::Draws);
     if (draws != 0 || at(counts, Counter::RecordModeChanges) != 0 || at(counts, Counter::RecordsCleared) != 0) {
         const auto hits = at(counts, Counter::Hits);
-        AgcDriver::ProfilePrint_nid_no_patch("[draw-records] %.1f s: draws %llu, hits %llu (%.1f%%), input refetches %llu, hits on today's path %llu; misses: %s; records off: %s; store: %s; %llu identities, %llu records, %.1f KiB\n", seconds,
+        AgcDriver::ProfilePrint_nid_no_patch("[draw-records] %.1f s: draws %llu, hits %llu (%.1f%%), input refetches %llu, hits on today's path %llu; misses: %s; records off: %s; store: %s; %llu identities, %llu records, %.1f KiB; commit: %s; commit misses: %s\n", seconds,
             static_cast<unsigned long long>(draws), static_cast<unsigned long long>(hits), draws != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(draws) : 0.0,
             static_cast<unsigned long long>(at(counts, Counter::InputRefetches)), static_cast<unsigned long long>(at(counts, Counter::HitsOnTodaysPath)),
             counted(counts, Counter::MissNewIdentity, Counter::MissFetchError).c_str(), counted(counts, Counter::OffTodaysDraw, Counter::OffInline).c_str(), counted(counts, Counter::RecordsBuilt, Counter::Demotions).c_str(),
-            static_cast<unsigned long long>(storeIdentities.load(std::memory_order_relaxed)), static_cast<unsigned long long>(storeRecords.load(std::memory_order_relaxed)), static_cast<double>(storeBytes.load(std::memory_order_relaxed)) / 1024.0);
+            static_cast<unsigned long long>(storeIdentities.load(std::memory_order_relaxed)), static_cast<unsigned long long>(storeRecords.load(std::memory_order_relaxed)), static_cast<double>(storeBytes.load(std::memory_order_relaxed)) / 1024.0,
+            counted(counts, Counter::CommitHits, Counter::CommitVerified).c_str(), counted(counts, Counter::CommitFirst, Counter::CommitDemoted).c_str());
     }
     if (VerifyEvery() == 0 || (draws == 0 && checksTotal == 0 && differingTotal == 0 && byDesignTotal == 0)) return;
     const auto fields = listed(FieldCount, [&](std::size_t index) { return differing[index]; }, [&](std::size_t index) { return std::string(ItemName(FieldInfos[index].item)) + " " + FieldInfos[index].name; });
@@ -1146,14 +1169,148 @@ void Driver::commitRecordDraw(const LeanDrawJob& job, const LeanAnchor& anchor, 
     auto reads = std::move(hit->reads);
     const auto& graphics = job.shape->decode->state;
     const VulkanDevice::DrawTraceContext trace{0, job.serial, job.queue, static_cast<std::size_t>(job.packetOffset), graphics.hasColorTarget ? graphics.color.address : 0};
-    auto commit = [this, hit = std::move(hit), localDevice = anchor.device, decode = job.shape->decode, queue = job.queue, opcode = job.opcode, epoch = job.epoch, trace, drawKey = job.drawKey, shape = job.shapeKey] {
-        static const std::vector<std::shared_ptr<DispatchVariant>> noRecipeStages;
+    auto commit = [this, hit = std::move(hit), localDevice = anchor.device, decode = job.shape->decode, queue = job.queue, opcode = job.opcode, epoch = job.epoch, trace, shape = job.shapeKey] {
         DrawPipeline::FollowEpoch(epoch);
         GuestMemory::SetCurrentPacket(opcode, queue);
-        const auto& record = *hit->record;
-        commitDraw(localDevice, queue, decode->state, hit->parameters, hit->stages, hit->snapshots, nullptr, noRecipeStages, drawKey, trace, shape, record.contentKey.empty() ? nullptr : &record.contentKey, record.fragmentOutputs);
+        commitRecord(localDevice, queue, decode->state, *hit, trace, shape);
     };
     DrawPipeline::Queue0().Enqueue(std::move(commit), std::move(writes), 0, {}, std::move(reads), true);
+}
+
+namespace {
+
+DrawRecords::Counter CommitMiss(Graphics::DrawRecipeMiss miss) {
+    using DrawRecords::Counter;
+    switch (miss) {
+    case Graphics::DrawRecipeMiss::NotRecordable: return Counter::CommitNotRecordable;
+    case Graphics::DrawRecipeMiss::TargetGone: return Counter::CommitTargets;
+    case Graphics::DrawRecipeMiss::TemplateGone: return Counter::CommitTemplate;
+    case Graphics::DrawRecipeMiss::Proof: return Counter::CommitProof;
+    case Graphics::DrawRecipeMiss::Moved: return Counter::CommitMoved;
+    default: return Counter::CommitObjects;
+    }
+}
+
+bool SameVertexInput(const Graphics::VertexInputLayout& a, const Graphics::VertexInputLayout& b) {
+    const auto sameBinding = [](const VkVertexInputBindingDescription& x, const VkVertexInputBindingDescription& y) { return x.binding == y.binding && x.stride == y.stride && x.inputRate == y.inputRate; };
+    const auto sameAttribute = [](const VkVertexInputAttributeDescription& x, const VkVertexInputAttributeDescription& y) { return x.location == y.location && x.binding == y.binding && x.format == y.format && x.offset == y.offset; };
+    return std::ranges::equal(a.bindings, b.bindings, sameBinding) && std::ranges::equal(a.attributes, b.attributes, sameAttribute);
+}
+
+}
+
+void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, DrawRecordHit& hit, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape) {
+    using DrawRecords::Counter;
+    const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    auto fragmentOutputs = hit.record->fragmentOutputs;
+    if (auto current = device.Load(); current != nullptr && current != localDevice) {
+        localDevice = std::move(current);
+        fragmentOutputs.reset();
+    }
+    struct SubmitDue {
+        Driver& driver;
+        const std::shared_ptr<VulkanDevice>& device;
+        ~SubmitDue() noexcept(false) {
+            if (std::uncaught_exceptions() == 0) driver.submitDueAfterCommit(device.get());
+        }
+    } submitDue{*this, localDevice};
+    recordLabelsForPacket(localDevice.get(), queue);
+    noteDrawWriters(hit.stages, queue);
+    auto& commit = *hit.record->commit;
+    static std::uint64_t ordinal = 0;
+    const auto every = DrawRecords::VerifyEvery();
+    const bool verify = commit.recipe != nullptr && every != 0 && ++ordinal % every == 0;
+    if (commit.recipe == nullptr) {
+        DrawRecords::Add(Counter::CommitFirst);
+    } else if (!verify) {
+        const auto outcome = localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr);
+        if (outcome.recorded) {
+            const auto& effects = commit.effects;
+            DrawRecords::Add(Counter::CommitHits);
+            if (effects.pushed) DrawRecords::Add(Counter::CommitPushed);
+            if (effects.unpushed) DrawRecords::Add(Counter::CommitUnpushed);
+            if (effects.passHeld) DrawRecords::Add(Counter::CommitPassHeld);
+            if (effects.keptOnce) DrawRecords::Add(Counter::CommitKeptOnce);
+            if (effects.notesSkipped != 0) DrawRecords::Add(Counter::CommitNotesSkipped, effects.notesSkipped);
+            if (effects.movedTrusted != 0) DrawRecords::Add(Counter::CommitMovedTrusted, effects.movedTrusted);
+            return;
+        }
+        DrawRecords::Add(CommitMiss(outcome.miss));
+    }
+    DrawCommitView answer;
+    if (verify) static_cast<void>(localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, &answer));
+    DrawCommitView today;
+    struct ViewScope {
+        ~ViewScope() { DrawCommitViewSlot::Set(nullptr); }
+    } viewScope;
+    if (verify) DrawCommitViewSlot::Set(&today);
+    std::shared_ptr<const DrawRecipe> built;
+    const auto& record = *hit.record;
+    localDevice->Draw(graphics, hit.parameters, hit.stages, hit.snapshots, &built, tracePtr, shape, record.contentKey.empty() ? nullptr : &record.contentKey, fragmentOutputs ? &*fragmentOutputs : nullptr, true);
+    DrawCommitViewSlot::Set(nullptr);
+    bool differs = false;
+    if (verify) {
+        DrawRecords::Add(Counter::CommitVerified);
+        differs = verifyRecordCommit(record, answer, today);
+    }
+    if (differs) {
+        commit.Adopt(nullptr);
+        DrawRecords::Add(Counter::CommitDemoted);
+        return;
+    }
+    if (built != nullptr && (!verify || !answer.filled || answer.resources != today.resources)) {
+        commit.Adopt(std::move(built));
+        DrawRecords::Add(Counter::CommitBuilt);
+    } else if (!verify) {
+        DrawRecords::Add(Counter::CommitUnbuilt);
+    }
+}
+
+bool Driver::verifyRecordCommit(const DrawRecord& record, const DrawCommitView& answer, const DrawCommitView& today) {
+    using DrawRecords::Field;
+    DrawRecords::NoteChecked(DrawRecords::Item::Commit);
+    if (!answer.filled) {
+        DrawRecords::NoteAllowed(DrawRecords::Allowed::CommitRecordMissed);
+        return false;
+    }
+    if (!today.filled) {
+        DrawRecords::NoteAllowed(DrawRecords::Allowed::CommitTodayUnrecorded);
+        return false;
+    }
+    const auto at = keyText(record.key);
+    bool differs = false;
+    const auto note = [&](Field field, const std::string& detail) {
+        DrawRecords::NoteDifference(field, at + ": " + detail);
+        differs = true;
+    };
+    if (answer.resources != today.resources) {
+        if (answer.key != today.key) note(Field::Templates, "the record's template key has " + std::to_string(answer.key.size()) + " words, today's " + std::to_string(today.key.size()) + "; " + firstDifference(answer.key, today.key));
+        else DrawRecords::NoteAllowed(DrawRecords::Allowed::CommitTemplateRebuilt);
+        return differs;
+    }
+    if (answer.pipeline != today.pipeline) note(Field::Pipelines, "the record binds another pipeline object than today's draw");
+    if (answer.framebuffer != today.framebuffer) note(Field::Framebuffers, "the record renders into another framebuffer than today's draw");
+    if (answer.views != today.views) note(Field::TargetViews, "the record has " + std::to_string(answer.views.size()) + " attachment views, today's draw " + std::to_string(today.views.size()));
+    if (answer.targets != today.targets) note(Field::Targets, "the record's resident targets are other objects than today's");
+    if (answer.passKey != today.passKey) note(Field::PassKeys, "the record's pass key " + hex(answer.passKey) + ", today's " + hex(today.passKey));
+    if (answer.moved != today.moved || answer.movedSizes != today.movedSizes || answer.movedWords != today.movedWords) {
+        std::size_t index = 0;
+        while (index < answer.moved.size() && index < today.moved.size() && answer.moved[index] == today.moved[index] && answer.movedSizes[index] == today.movedSizes[index] && answer.movedWords[index] == today.movedWords[index]) ++index;
+        const auto describe = [&](const DrawCommitView& view) { return index < view.moved.size() ? "allocation " + std::to_string(view.moved[index].first) + " at " + hex(view.moved[index].second) + " (" + std::to_string(view.movedSizes[index]) + " bytes, " + std::to_string(view.movedWords[index].size()) + " words)" : std::string("nothing"); };
+        note(Field::MovedBuffers, "the record moves " + std::to_string(answer.moved.size()) + " buffers, today's draw " + std::to_string(today.moved.size()) + "; at " + std::to_string(index) + " the record has " + describe(answer) + ", today's " + describe(today));
+    }
+    if (answer.pushStages != today.pushStages || answer.push != today.push) {
+        std::size_t dword = 0;
+        while (dword * 4 < answer.push.size() && std::memcmp(answer.push.data() + dword * 4, today.push.data() + dword * 4, 4) == 0) ++dword;
+        note(Field::CommitPushConstants, "the record's push constants differ at dword " + std::to_string(dword) + " (stages " + hex(answer.pushStages) + ", today's " + hex(today.pushStages) + ")");
+    }
+    if (!SameVertexInput(answer.vertexInput, today.vertexInput)) note(Field::VertexInputs, "the record's vertex input has " + std::to_string(answer.vertexInput.attributes.size()) + " attributes, today's " + std::to_string(today.vertexInput.attributes.size()));
+    if (answer.shaderStages != today.shaderStages || answer.hasDepth != today.hasDepth) note(Field::ShaderStages, "the record's stages " + hex(answer.shaderStages) + ", today's " + hex(today.shaderStages));
+    if (answer.fragmentOutputs != today.fragmentOutputs) note(Field::CommitFragmentOutputs, "the record's fragment outputs " + hex(answer.fragmentOutputs) + ", today's " + hex(today.fragmentOutputs));
+    if (DrawRecords::CorruptingCommits() && !differs) note(Field::PassKeys, "a corrupted committer answer");
+    return differs;
 }
 
 void Driver::finishRecordDraw(const LeanDrawJob& job) {

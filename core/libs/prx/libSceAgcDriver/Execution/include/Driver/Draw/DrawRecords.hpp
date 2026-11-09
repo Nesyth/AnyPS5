@@ -151,6 +151,7 @@ struct DrawRecord : std::enable_shared_from_this<DrawRecord> {
     std::vector<DrawPipeline::Range> writes;
     std::shared_ptr<const DrawRecordPlan> plan;
     std::uint64_t signature = 0;
+    std::shared_ptr<DrawRecordCommit> commit = std::make_shared<DrawRecordCommit>();
 
     static std::shared_ptr<DrawRecord> Build(const DrawRecordKey& key, std::shared_ptr<const LeanShape> shape, std::uint64_t deviceSerial, std::uint64_t generation, std::uint64_t present, const DrawRecordSink& sink);
     std::size_t Bytes() const;

@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -413,6 +414,28 @@ void ExpectRecordPath(const std::string& name, const Totals& now, const Totals& 
     Require(DrawRecords::VerifyEvery() == 0 || now.fetches > base.fetches, name + ": the verify checked no hit" + Describe(now, base));
 }
 
+bool CommitsRun() {
+    return DrawRecords::VerifyEvery() != 1;
+}
+
+void ExpectCommits(const std::string& name, const Totals& now, const Totals& base, bool moves) {
+    if (!CommitsRun()) {
+        Require(now.Since(base, Counter::CommitHits) == 0, name + ": the committer recorded a hit the finisher verified" + Describe(now, base));
+        return;
+    }
+    const auto recorded = now.Since(base, Counter::CommitHits);
+    const auto held = now.Since(base, Counter::CommitPassHeld);
+    Require(now.Since(base, Counter::CommitBuilt) >= 1, name + ": no committer half was built from today's draw" + Describe(now, base));
+    Require(recorded != 0, name + ": no record hit was recorded by the committer half" + Describe(now, base));
+    Require(held < recorded, name + ": the committer held targets across a pass break" + Describe(now, base));
+    if (DrawRecords::VerifyEvery() == 0) {
+        Require(held != 0, name + ": the committer did not hold targets within a pass" + Describe(now, base));
+        Require(now.Since(base, Counter::CommitKeptOnce) != 0 && now.Since(base, Counter::CommitNotesSkipped) != 0, name + ": record hits did not keep once per batch and note their targets once per pass" + Describe(now, base));
+    }
+    if (moves) Require(now.Since(base, Counter::CommitPushed) != 0 || now.Since(base, Counter::CommitUnpushed) != 0, name + ": record hits with moved buffers were neither pushed nor counted without a push" + Describe(now, base));
+    if (DrawRecords::VerifyEvery() > 1) Require(DrawRecords::Checked(DrawRecords::Item::Commit) != 0, name + ": the committer verify checked no hit" + Describe(now, base));
+}
+
 std::vector<State> Alternating(Kind kind, std::size_t count) {
     std::vector<State> states;
     for (std::size_t index = 0; index < count; ++index) states.push_back({kind, static_cast<std::uint32_t>(index & 1u), 16});
@@ -455,6 +478,8 @@ void Hits(Arms& arms) {
     arms.Run("constants behind a moving user data pointer", Alternating(Kind::Constants, 6), DrawsPerSubmission, [](const Totals& now, const Totals& base) {
         ExpectRecordPath("constants", now, base);
         Require(now.Since(base, Counter::MissContentDiffers) == 0, "constants: draws whose flattened constants changed missed on content" + Describe(now, base));
+        ExpectCommits("constants", now, base, true);
+        Require(now.Since(base, Counter::CommitUnpushed) != 0 || now.Since(base, Counter::CommitPushed) != 0 || !CommitsRun(), "constants: no record hit bound its moved constants through push descriptors" + Describe(now, base));
     });
     arms.Run("a vertex buffer descriptor moving inside a memory table", Alternating(Kind::Table, 6), DrawsPerSubmission, [](const Totals& now, const Totals& base) {
         ExpectRecordPath("table", now, base);
@@ -500,16 +525,48 @@ void Misses(Arms& arms) {
     RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
 }
 
+void Fallbacks(Arms& arms) {
+    using AgcDriver::Graphics::DrawRecipeMiss;
+    using AgcDriver::Graphics::FailRecordChecks;
+    const std::array<std::pair<DrawRecipeMiss, Counter>, 4> checks{{
+        {DrawRecipeMiss::Proof, Counter::CommitProof},
+        {DrawRecipeMiss::TargetGone, Counter::CommitTargets},
+        {DrawRecipeMiss::Moved, Counter::CommitMoved},
+        {DrawRecipeMiss::ObjectsGone, Counter::CommitObjects},
+    }};
+    for (const auto& [check, counter] : checks) {
+        const auto name = std::string("a failed committer check (") + AgcDriver::Graphics::DrawRecipeMissName(check) + ")";
+        FailRecordChecks(check, 2);
+        arms.Run(name, Alternating(Kind::Constants, 10), DrawsPerSubmission, [&, counter = counter](const Totals& now, const Totals& base) {
+            Require(now.differences == base.differences, name + ": the draw record verify found differences" + Describe(now, base));
+            if (!CommitsRun()) return;
+            Require(now.Since(base, counter) != 0, name + ": the failed check did not send the draw to today's path" + Describe(now, base));
+            Require(now.Since(base, Counter::CommitBuilt) >= 2 && now.Since(base, Counter::CommitHits) != 0, name + ": today's path did not rebuild the committer half, or the record did not hit again after it" + Describe(now, base));
+        });
+        FailRecordChecks(check, 0);
+    }
+}
+
 void Injected(Arms& arms) {
     if (DrawRecords::VerifyEvery() == 0) return;
     const auto before = DrawRecords::Differences();
     DrawRecords::CorruptAnswers(true);
-    arms.Run("a corrupted record answer", Alternating(Kind::Table, 6), DrawsPerSubmission, [&](const Totals& now, const Totals& base) {
+    arms.Run("a corrupted record answer", Alternating(Kind::Constants, 6), DrawsPerSubmission, [&](const Totals& now, const Totals& base) {
         Require(now.differences > base.differences && now.Since(base, Counter::Demotions) != 0, "inject: the verify did not catch a corrupted record answer" + Describe(now, base));
         Require(DrawRecords::Differences(DrawRecords::Field::Parameters) != 0, "inject: the verify caught the corrupted answer in another field");
     });
     DrawRecords::CorruptAnswers(false);
     if (arms.ring) Require(DrawRecords::Differences() > before, "inject: no difference was counted");
+}
+
+void InjectedCommit(Arms& arms) {
+    Require(DrawRecords::VerifyEvery() >= 2, "inject commit: the committer verify needs APS5_VERIFY_DRAW_RECORDS of 2 or more, so hits reach the committer");
+    DrawRecords::CorruptCommits(true);
+    arms.Run("a corrupted committer answer", Alternating(Kind::Constants, 8), DrawsPerSubmission, [&](const Totals& now, const Totals& base) {
+        Require(DrawRecords::Differences(DrawRecords::Field::PassKeys) != 0 && now.Since(base, Counter::CommitDemoted) != 0, "inject commit: the committer verify did not catch a corrupted committer answer" + Describe(now, base));
+        Require(now.Since(base, Counter::CommitBuilt) != 0, "inject commit: today's path did not rebuild the committer half after a demotion" + Describe(now, base));
+    });
+    DrawRecords::CorruptCommits(false);
 }
 
 }
@@ -521,6 +578,7 @@ int main(int argc, char** argv) {
             if (!device) return VulkanTestSkipped;
         }
         const bool inject = argc > 1 && std::string_view(argv[1]) == "--inject";
+        const bool injectCommit = argc > 1 && std::string_view(argv[1]) == "--inject-commit";
         using AgcDriver::DriverDetail::DrawFinisher;
         using AgcDriver::DriverDetail::DrawPipeline;
         const bool leanEnvironment = RuntimeSwitches::Set(RuntimeSwitch::LeanFront);
@@ -537,15 +595,18 @@ int main(int argc, char** argv) {
         Prepare();
         if (inject) {
             Injected(arms);
+        } else if (injectCommit) {
+            InjectedCommit(arms);
         } else {
             Hits(arms);
             Misses(arms);
+            Fallbacks(arms);
         }
         DrawRecords::Report(true);
         RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, leanEnvironment);
         RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, recordsEnvironment);
         AgcDriverShutdown_nid_postfix();
-        std::cout << (inject ? "the draw record verify caught a corrupted answer and today's path drew" : "draw record hits render as today's path for moved constants, descriptors and vertex buffers, and fall back on structural changes and writes after the fetch") << (arms.ring ? "" : " (no finisher ring: records never ran)") << '\n';
+        std::cout << (inject || injectCommit ? "the draw record verify caught a corrupted answer and today's path drew" : "draw record hits render as today's path for moved constants, descriptors and vertex buffers, record through the committer half with pushed constants, held targets and per-batch keeps, and fall back on structural changes, writes after the fetch and failed committer checks") << (arms.ring ? "" : " (no finisher ring: records never ran)") << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
