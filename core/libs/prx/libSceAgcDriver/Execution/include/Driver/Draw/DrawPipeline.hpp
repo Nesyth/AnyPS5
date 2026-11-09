@@ -181,6 +181,8 @@ public:
     static bool OnFinisherThread();
     static unsigned Finishers();
     static bool Busy() { return outstanding.load(std::memory_order_acquire) != 0; }
+    std::uint64_t Issued() const { return issued.load(std::memory_order_relaxed); }
+    std::uint64_t Front() const { return frontSeq.load(std::memory_order_acquire); }
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
     void Drain();
@@ -219,6 +221,7 @@ private:
     unsigned turnSleepers = 0;
     unsigned idleWaiters = 0;
     std::atomic<std::uint64_t> frontSeq{1};
+    std::atomic<std::uint64_t> issued{1};
     bool closing = false;
     std::uint64_t nextSeq = 1;
     std::condition_variable turnWake;

@@ -176,6 +176,7 @@ struct DrawTail {
     const Submission* submission = nullptr;
     std::uint32_t submissionQueue = 0;
     std::uint64_t submissionSerial = 0;
+    std::uint64_t slotGeneration = 0;
     std::size_t packetOffset = 0;
     std::uint32_t packetOpcode = 0;
     std::uint32_t reg207 = 0;
@@ -191,6 +192,12 @@ struct DrawTail {
 };
 
 namespace {
+
+void checkSegmentSlot(const DrawTail& job, const char* when) {
+    if (job.slotGeneration == 0 || LeanFront::VerifyEvery() == 0) return;
+    if (job.submission->slotGeneration == job.slotGeneration) return;
+    LeanFront::NoteDifference(LeanFront::Field::SlotReuse, "draw at submission " + std::to_string(job.submissionSerial) + " offset " + std::to_string(job.packetOffset) + ": the lean segment slot it reads was taken by another segment when the finisher " + when + " the job");
+}
 
 void noteFinisherHandOff(bool handed) {
     static std::atomic<std::uint64_t> handedOff{0}, kept{0};
@@ -818,12 +825,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (handOff) {
         tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         tail.submissionSerial = submission.serial;
+        tail.slotGeneration = submission.slotGeneration;
         tail.packetOffset = static_cast<std::size_t>(packet.data() - submission.commands.data());
         noteFinisherHandOff(true);
         DrawFinisher::Pending held;
         if (DrawFinisher::Overlap()) held = heldWrites(tail);
         DrawFinisher::Get().Enqueue([this, tailHolder] {
             auto& job = *tailHolder;
+            checkSegmentSlot(job, "started");
             DrawPipeline::FollowEpoch(job.epoch);
             DrawPipeline::Active() = job.pipelined;
             GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
@@ -837,6 +846,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 CaptureTrace::Log("draw-error submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, error.what());
                 throw std::runtime_error("draw at submission " + std::to_string(job.submissionSerial) + " offset " + std::to_string(job.packetOffset) + " (finished on the draw finisher): " + error.what());
             }
+            checkSegmentSlot(job, "finished");
         }, std::move(held));
         timing.Mark("draw_handed_off");
         return drawn();

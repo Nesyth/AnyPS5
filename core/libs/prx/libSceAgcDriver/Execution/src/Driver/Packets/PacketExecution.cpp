@@ -28,6 +28,28 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
+struct RingOrder {
+    std::uint32_t queue = 0xffffffffu;
+    std::uint64_t serial = 0;
+    bool afterDispatch = false;
+};
+
+thread_local RingOrder ringOrder;
+
+void noteRingPacket(std::uint32_t queueId, std::uint64_t serial, std::uint32_t opcode, std::uint32_t header) {
+    if (ringOrder.queue != queueId || ringOrder.serial != serial) ringOrder = {queueId, serial, false};
+    if (opcode == 0x15 || opcode == 0x16 || opcode == 0x76) return;
+    if (opcode == 0x10) {
+        const auto sub = (header >> 2u) & 0x3fu;
+        if ((header & 0xfcu) == 0 || sub == 0x0b || sub == 0x0c) return;
+    }
+    ringOrder.afterDispatch = false;
+}
+
+}
+
+namespace PacketRules {
+
 void noteXpStream(bool seal) {
     static std::atomic<std::uint64_t> ends{0}, seals{0};
     static std::atomic<std::int64_t> lastReport{0};
@@ -69,24 +91,6 @@ bool xpDropsDraw() {
         }
     }
     return drop;
-}
-
-struct RingOrder {
-    std::uint32_t queue = 0xffffffffu;
-    std::uint64_t serial = 0;
-    bool afterDispatch = false;
-};
-
-thread_local RingOrder ringOrder;
-
-void noteRingPacket(std::uint32_t queueId, std::uint64_t serial, std::uint32_t opcode, std::uint32_t header) {
-    if (ringOrder.queue != queueId || ringOrder.serial != serial) ringOrder = {queueId, serial, false};
-    if (opcode == 0x15 || opcode == 0x16 || opcode == 0x76) return;
-    if (opcode == 0x10) {
-        const auto sub = (header >> 2u) & 0x3fu;
-        if ((header & 0xfcu) == 0 || sub == 0x0b || sub == 0x0c) return;
-    }
-    ringOrder.afterDispatch = false;
 }
 
 bool orderedFills() {
@@ -163,7 +167,31 @@ bool& drawnSinceSeal() {
     return drawn;
 }
 
+void dumpQueue(const Submission& submission) {
+    static const long dumpQueue = [] { const char* text = std::getenv("APS5_DUMP_QUEUE"); return text ? std::strtol(text, nullptr, 16) : -1L; }();
+    if (static_cast<long>(submission.queue) == dumpQueue) {
+
+        static int dumped = 0;
+        if (dumped++ < 40) {
+            std::string text = "[queue] submission " + std::to_string(submission.serial) + ":\n";
+            for (std::size_t cursor = 0; cursor < submission.commands.size();) {
+                const auto header = submission.commands[cursor];
+                const auto count = Pm4::PacketWords(header);
+                char line[200];
+                int length = std::snprintf(line, sizeof(line), "[queue]   %s", Pm4::Name(header).c_str());
+                for (std::size_t i = 1; i < count && i < 10 && length < 180; ++i) length += std::snprintf(line + length, sizeof(line) - length, " %08x", submission.commands[cursor + i]);
+                text += line;
+                text += "\n";
+                cursor += count;
+            }
+            std::fputs(text.c_str(), stderr);
+        }
+    }
 }
+
+}
+
+using namespace PacketRules;
 
 void Driver::deliverGuestEopInterrupt(std::uint32_t queue, std::uint32_t context) {
     AgcDriverDeliverEopInterrupt(queue, context);
@@ -199,7 +227,87 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
     if (report && bucket != &WorkerProfile::waitMs) PerformanceCounters::AddDriverNanoseconds(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count()));
 }
 
+template <bool Lean>
+bool Driver::endSegment(const Submission& submission, FlipHold& flipHold, bool pipelined, FrontMode front) {
+    const auto switchSet = [&](Graphics::RuntimeSwitch id) { return front == FrontMode::Lean ? LeanFront::SwitchSet(frontLatch, id) : Graphics::RuntimeSwitches::Set(id); };
+    static const bool orderedCompletion = std::getenv("APS5_PIPELINE_DRAIN_SUBMISSIONS") == nullptr && std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
+    const bool streamEnd = submission.queue == 0 && pipelined && orderedCompletion && !submission.progress && submission.rewindTail != nullptr && deferredLabels().labels.empty() && (std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0 && switchSet(Graphics::RuntimeSwitch::XpStreamSegments);
+    if (submission.queue == 0 && !streamEnd) DrawFinisher::Get().Drain();
+    PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
+    PerformanceTimer endTiming("Driver.EndSubmission");
+    static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
+    if (streamEnd) {
+        const bool holdsFlip = std::exchange(flipHold.working, false);
+        auto enqueue = [this, holdsFlip] {
+            DrawPipeline::Queue0().EnqueueQuiet([this, holdsFlip] {
+                if (holdsFlip) finishFlipWork(submitFlipWork(0));
+                else submitDueAfterCommit(device.Load().get());
+                wakeQueueZeroForCompletions();
+            });
+        };
+        if (DrawFinisher::Overlap() && DrawFinisher::Busy()) {
+            DrawFinisher::Pending held;
+            held.unknown = false;
+            DrawFinisher::Get().Enqueue(std::move(enqueue), std::move(held));
+        } else {
+            enqueue();
+        }
+        noteXpStream(false);
+        endTiming.Finish();
+        if constexpr (!Lean) executeRewindTail(submission);
+        return true;
+    }
+    if (pipelined && orderedCompletion && deferredLabels().labels.empty()) {
+        if (submission.rewindTail == nullptr) {
+            flipHold.working = false;
+            deferCompletion(submission);
+            return false;
+        }
+        if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0) {
+            const bool holdsFlip = std::exchange(flipHold.working, false);
+            DrawPipeline::Queue0().Enqueue([this, holdsFlip, progress = submission.progress] {
+                if (holdsFlip) finishFlipWork(submitFlipWork(0));
+                else submitOpenWork(progress);
+                wakeQueueZeroForCompletions();
+            }, {});
+            endTiming.Finish();
+            if constexpr (!Lean) executeRewindTail(submission);
+            return true;
+        }
+    }
+    if (pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+    if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0) {
+        auto& costs = submissionCosts(submission.queue);
+        if (!submitAtEnd && submission.rewindTail == nullptr && submission.queue == 0 && workerQueued() != nullptr && workerQueued()->load(std::memory_order_acquire) != 0) {
+            ++costs.endSkipped;
+            flipHold.Finish();
+            return false;
+        }
+        ++costs.endSubmits;
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        const auto localDevice = device.Load();
+
+        recordDeferredLabels(localDevice.get(), submission.queue);
+        if (localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
+    }
+    flipHold.Finish();
+    endTiming.Finish();
+    if (submission.rewindTail == nullptr) return false;
+    if (submission.progress) submitOpenWork(submission.progress);
+    if constexpr (!Lean) executeRewindTail(submission);
+    return true;
+}
+
+template bool Driver::endSegment<false>(const Submission& submission, FlipHold& flipHold, bool pipelined, FrontMode front);
+template bool Driver::endSegment<true>(const Submission& submission, FlipHold& flipHold, bool pipelined, FrontMode front);
+
 void Driver::execute(const Submission& submission) {
+    const auto front = submission.front != FrontMode::Unlatched ? submission.front : latchFront(submission.queue, submission.suspend);
+    if (front == FrontMode::Lean) {
+        executeLean(submission);
+        return;
+    }
     struct SubmissionReport {
         bool reported = false;
         bool queue0 = false;
@@ -220,29 +328,8 @@ void Driver::execute(const Submission& submission) {
     } submissionReport{ThreadReport::Enabled(), submission.queue == 0};
     const ThreadReport::WorkerStateScope executing(ThreadReport::WorkerState::Packets, submission.queue == 0);
     auto* submissionTiming = includeTimingSubmission(submission, true);
-    struct FlipHold {
-        Driver& driver;
-        std::uint32_t queue;
-        bool held;
-        bool working;
-        void Release() {
-            if (!held) return;
-            held = false;
-            driver.releaseFlipHold();
-        }
-        void Finish() {
-            if (!working) return;
-            const auto workSerial = driver.submitFlipWork(queue);
-            working = false;
-            driver.finishFlipWork(workSerial);
-        }
-        ~FlipHold() {
-            Release();
-            if (working) driver.finishFlipWork(0);
-        }
-    } flipHold{*this, submission.queue, submission.holdsFlip, submission.holdsFlip};
+    FlipHold flipHold{*this, submission.queue, submission.holdsFlip, submission.holdsFlip};
     const bool pipelined = submission.queue == 0 && DrawPipeline::Depth() != 0;
-    const auto front = submission.front != FrontMode::Unlatched ? submission.front : latchFront(submission.queue, submission.suspend);
     const LeanFront::SegmentNesting nesting(submission.queue == 0 ? &frontLatch : nullptr);
     const auto switchSet = [&](Graphics::RuntimeSwitch id) { return front == FrontMode::Lean ? LeanFront::SwitchSet(frontLatch, id) : Graphics::RuntimeSwitches::Set(id); };
     static const bool orderedWaits = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
@@ -299,25 +386,7 @@ void Driver::execute(const Submission& submission) {
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f execute serial=%llu queue=0x%x dwords=%zu\n", TraceMs(), static_cast<unsigned long long>(submission.serial), submission.queue, submission.commands.size());
 
-    static const long dumpQueue = [] { const char* text = std::getenv("APS5_DUMP_QUEUE"); return text ? std::strtol(text, nullptr, 16) : -1L; }();
-    if (static_cast<long>(submission.queue) == dumpQueue) {
-
-        static int dumped = 0;
-        if (dumped++ < 40) {
-            std::string text = "[queue] submission " + std::to_string(submission.serial) + ":\n";
-            for (std::size_t cursor = 0; cursor < submission.commands.size();) {
-                const auto header = submission.commands[cursor];
-                const auto count = Pm4::PacketWords(header);
-                char line[200];
-                int length = std::snprintf(line, sizeof(line), "[queue]   %s", Pm4::Name(header).c_str());
-                for (std::size_t i = 1; i < count && i < 10 && length < 180; ++i) length += std::snprintf(line + length, sizeof(line) - length, " %08x", submission.commands[cursor + i]);
-                text += line;
-                text += "\n";
-                cursor += count;
-            }
-            std::fputs(text.c_str(), stderr);
-        }
-    }
+    dumpQueue(submission);
     PacketHistory recent{submission.commands};
 
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -699,72 +768,7 @@ void Driver::execute(const Submission& submission) {
         cursor = nextCursor;
     }
 
-    const bool streamEnd = submission.queue == 0 && pipelined && orderedCompletion && !submission.progress && submission.rewindTail != nullptr && deferredLabels().labels.empty() && (std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0 && switchSet(Graphics::RuntimeSwitch::XpStreamSegments);
-    if (submission.queue == 0 && !streamEnd) DrawFinisher::Get().Drain();
-    PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
-    PerformanceTimer endTiming("Driver.EndSubmission");
-    static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
-    if (streamEnd) {
-        const bool holdsFlip = std::exchange(flipHold.working, false);
-        auto enqueue = [this, holdsFlip] {
-            DrawPipeline::Queue0().EnqueueQuiet([this, holdsFlip] {
-                if (holdsFlip) finishFlipWork(submitFlipWork(0));
-                else submitDueAfterCommit(device.Load().get());
-                wakeQueueZeroForCompletions();
-            });
-        };
-        if (DrawFinisher::Overlap() && DrawFinisher::Busy()) {
-            DrawFinisher::Pending held;
-            held.unknown = false;
-            DrawFinisher::Get().Enqueue(std::move(enqueue), std::move(held));
-        } else {
-            enqueue();
-        }
-        noteXpStream(false);
-        endTiming.Finish();
-        executeRewindTail(submission);
-        return;
-    }
-    if (pipelined && orderedCompletion && deferredLabels().labels.empty()) {
-        if (submission.rewindTail == nullptr) {
-            flipHold.working = false;
-            deferCompletion(submission);
-            return;
-        }
-        if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0) {
-            const bool holdsFlip = std::exchange(flipHold.working, false);
-            DrawPipeline::Queue0().Enqueue([this, holdsFlip, progress = submission.progress] {
-                if (holdsFlip) finishFlipWork(submitFlipWork(0));
-                else submitOpenWork(progress);
-                wakeQueueZeroForCompletions();
-            }, {});
-            endTiming.Finish();
-            executeRewindTail(submission);
-            return;
-        }
-    }
-    if (pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
-    if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0) {
-        auto& costs = submissionCosts(submission.queue);
-        if (!submitAtEnd && submission.rewindTail == nullptr && submission.queue == 0 && workerQueued() != nullptr && workerQueued()->load(std::memory_order_acquire) != 0) {
-            ++costs.endSkipped;
-            flipHold.Finish();
-            return;
-        }
-        ++costs.endSubmits;
-        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
-        std::lock_guard gpuLock(GuestMemory::GpuMutex());
-        const auto localDevice = device.Load();
-
-        recordDeferredLabels(localDevice.get(), submission.queue);
-        if (localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
-    }
-    flipHold.Finish();
-    endTiming.Finish();
-    if (submission.rewindTail != nullptr) {
-        if (submission.progress) submitOpenWork(submission.progress);
-        executeRewindTail(submission);
-    }
+    endSegment<false>(submission, flipHold, pipelined, front);
 }
 
 }

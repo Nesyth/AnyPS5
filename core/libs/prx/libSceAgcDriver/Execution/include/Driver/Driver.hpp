@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanTails.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SegmentLoop.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
@@ -163,6 +164,27 @@ private:
     friend struct PendingView;
     friend struct PacketTimer;
     friend struct DriverTestAccess;
+    struct FlipHold {
+        Driver& driver;
+        std::uint32_t queue;
+        bool held;
+        bool working;
+        void Release() {
+            if (!held) return;
+            held = false;
+            driver.releaseFlipHold();
+        }
+        void Finish() {
+            if (!working) return;
+            const auto workSerial = driver.submitFlipWork(queue);
+            working = false;
+            driver.finishFlipWork(workSerial);
+        }
+        ~FlipHold() {
+            Release();
+            if (working) driver.finishFlipWork(0);
+        }
+    };
     void stop();
     Driver();
     void rethrowFailure() const;
@@ -177,8 +199,10 @@ private:
     void verifyLeanLists(const Submission& submission, bool cacheable, std::uint64_t ownWrites);
     bool keptTailCurrent(const KeptTail& kept, const Submission& stalled) const;
     void recycleLeanTail(Submission& tail);
-    void prepareLeanTail(const Submission& stalled, Submission& tail, bool popped);
+    void prepareLeanTail(const Submission& stalled, Submission& tail, bool popped, bool verify, PacketTable* table);
     void waitForFlipRoom(const Submission& submission);
+    void waitForFlipRoomAt(const Submission& submission, const PacketTable& table);
+    void waitForFlipRoomOf(const Submission& submission, std::size_t cursor);
     void holdFlipBehindWorker(const Submission& submission, bool cpuFlip);
     bool awaitsTitle(std::uint64_t awaited) const;
     void noteAwaitingTitle(std::uint32_t queue, std::uint64_t awaited);
@@ -187,7 +211,24 @@ private:
     std::uint64_t submitFlipWork(std::uint32_t queue);
     void waitFlipWork(std::uint64_t workSerial);
     void reserveOutputs(Submission& submission);
+    void reserveOutputsAt(Submission& submission, const PacketTable& table);
+    void reserveOutput(Submission& submission, std::size_t cursor, std::set<std::uint32_t>& eopTokens);
     void executeRewindTail(const Submission& stalled);
+    void awaitRewindTail(const Submission& stalled, FrontMode front);
+    std::uint64_t prepareTail(const Submission& stalled, Submission& tail, FrontMode front, bool ring, PacketTable* table, bool verify);
+    void executeLean(const Submission& first);
+    void runLeanSegment(const Submission& submission, QueueState& queue, SegmentSlot& slot, FlipHold& flipHold, LeanRun& run, bool verify);
+    template <bool Timers>
+    void runLeanPackets(const Submission& submission, QueueState& queue, const PacketTable& table, FlipHold& flipHold, LeanRun& run);
+    template <bool Lean>
+    bool endSegment(const Submission& submission, FlipHold& flipHold, bool pipelined, FrontMode front);
+    static void scanSegment(const Submission& submission, PacketTable& table, bool validating = false, const std::uint32_t* guest = nullptr);
+    static void markOutputs(const Submission& submission, PacketTable& table);
+    static void verifyOutputs(const Submission& submission, const PacketTable& table);
+    static void verifySegmentTable(const Submission& submission, const PacketTable& table);
+    bool flushDue(FlushGate& gate);
+    static void checkFlush(const Submission& submission, std::size_t cursor, bool gateDue, std::uint32_t decision, std::chrono::steady_clock::time_point before, std::optional<std::chrono::steady_clock::time_point> pending, std::chrono::steady_clock::time_point reapedAt);
+    void releaseSegmentSlot(SegmentSlot& slot);
     void enqueue(Submission submission);
     void noteHeldAtSubmit(Submission& submission, std::size_t cursor);
     static void forgetUnfinishedWrites(QueueWorker& worker, const Submission& submission);
@@ -431,7 +472,7 @@ private:
     void noteQueuedLabels(std::uint32_t queue);
     void recordQueuedLabelsByTry(std::uint32_t queue, std::atomic<std::uint64_t>& counter);
     static void recordQueuedLabelsFromHook();
-    void flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket);
+    std::uint32_t flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket);
     bool preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, std::optional<std::uint32_t> interrupt, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump);
     void dumpSampleCounters(std::uint64_t address);
     template <typename TWork>
@@ -471,6 +512,8 @@ private:
 
     alignas(64) LeanFront::Latch frontLatch;
     LeanTails leanTails;
+    SegmentSlots segmentSlots;
+    std::array<std::chrono::steady_clock::time_point, SubmissionQueueEnd - 0x20 + 1> lastReapTries{};
 
     std::atomic<std::uint64_t> eventSerial{0};
     alignas(64) std::shared_ptr<ShaderRegistry> shaders = std::make_shared<ShaderRegistry>();

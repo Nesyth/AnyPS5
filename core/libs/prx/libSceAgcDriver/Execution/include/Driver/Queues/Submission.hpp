@@ -37,7 +37,9 @@ struct Submission {
     bool waitFree = false;
     bool holdsFlip = false;
     bool leanLists = false;
+    bool verifySegment = false;
     FrontMode front = FrontMode::Unlatched;
+    std::uint64_t slotGeneration = 0;
 
     std::uint64_t received = 0;
     std::vector<std::uint64_t> labelWrites;

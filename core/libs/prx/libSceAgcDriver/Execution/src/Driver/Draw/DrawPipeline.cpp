@@ -424,6 +424,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherRoomNs : ThreadReport::Count::OtherRoomNs, ThreadReport::Nanoseconds(roomStart, ThreadReport::Clock::now()));
     }
     jobs.push_back({std::move(job), nextSeq++});
+    issued.store(nextSeq, std::memory_order_relaxed);
     frontSeq.store(jobs.front().seq, std::memory_order_release);
     untakenJobs.fetch_add(1, std::memory_order_release);
     if (countPending(held, true)) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);

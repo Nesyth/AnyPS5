@@ -168,10 +168,9 @@ void Driver::recycleLeanTail(Submission& tail) {
     if (tail.leanLists) leanTails.GiveLists(std::move(tail.lists));
 }
 
-void Driver::prepareLeanTail(const Submission& stalled, Submission& tail, bool popped) {
+void Driver::prepareLeanTail(const Submission& stalled, Submission& tail, bool popped, bool verify, PacketTable* table) {
     using LeanFront::Counter;
     const auto control = stalled.rewindTail - 1;
-    const bool verify = LeanFront::Due(frontLatch, LeanFront::Item::Segment);
     if (frontLatch.Renew(leanTails.cache.stamp)) leanTails.cache.Clear();
     KeptTail* kept = nullptr;
     if (leanTails.Kept()) {
@@ -205,7 +204,12 @@ void Driver::prepareLeanTail(const Submission& stalled, Submission& tail, bool p
     }
     if (kept != nullptr) leanTails.Pop();
     if (APS5_ENABLE_TIMING_LOG) tail.copiedAt = std::chrono::steady_clock::now();
-    validate(tail, stalled.rewindTail);
+    if (table != nullptr && !verify) {
+        scanSegment(tail, *table, true, stalled.rewindTail);
+        LeanFront::AddOnWorker(Counter::PacketTables);
+    } else {
+        validate(tail, stalled.rewindTail);
+    }
     const bool cacheable = stalled.queue == 0 && listCacheEnabled();
     if (cacheable && !popped) {
         noteReleasedTails(tail, FrontMode::Lean);

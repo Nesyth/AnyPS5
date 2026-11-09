@@ -31,6 +31,7 @@ enum class Field : std::uint8_t {
     FlushRecords,
     FlushSubmits,
     FlushCaps,
+    FlushReaps,
     DrawVerdicts,
     DrawKeys,
     DrawIdentity,
@@ -45,7 +46,7 @@ enum class Field : std::uint8_t {
     Count,
 };
 
-enum class Allowed : std::uint8_t { DeferredReaps, DeferredPacketSubmits, FlushBoundary, EarlyFlushChecks, HeldWaitsRaced, SwitchesMoved, ListsRewrittenInEpoch, Count };
+enum class Allowed : std::uint8_t { DeferredReaps, DeferredPacketSubmits, FlushBoundary, EarlyFlushChecks, HeldWaitsRaced, SwitchesMoved, ListsRewrittenInEpoch, OverlapMoved, Count };
 
 enum class Counter : std::uint8_t {
     LeanSegments,
@@ -68,6 +69,14 @@ enum class Counter : std::uint8_t {
     ListCacheAdmits,
     ListCacheBypassed,
     ListCacheEvictions,
+    RewindWaits,
+    ReleasesWithoutKick,
+    KicksWithoutWaiter,
+    IdleKickWakes,
+    FlushCalls,
+    PacketTables,
+    SlotsCreated,
+    SlotsHeld,
     Count,
 };
 
