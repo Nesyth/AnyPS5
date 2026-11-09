@@ -93,6 +93,7 @@ void DrawRecordSink::Reset() {
     queued = false;
     plan = false;
     verify = false;
+    refusal = DrawRecordPlanRefusal::None;
     built = nullptr;
     shape = 0;
     contentKey.clear();
@@ -620,7 +621,9 @@ void Report(bool force) {
     for (std::size_t index = 0; index < AllowedKinds; ++index) byDesignTotal += byDesign[index] = allowed[index].Window();
     printed.store(0, std::memory_order_relaxed);
     const auto draws = at(counts, Counter::Draws);
-    if (draws != 0 || at(counts, Counter::RecordModeChanges) != 0 || at(counts, Counter::RecordsCleared) != 0) {
+    std::uint64_t commits = 0;
+    for (auto index = static_cast<std::size_t>(Counter::CommitHits); index <= static_cast<std::size_t>(Counter::CommitDemoted); ++index) commits += counts[index];
+    if (draws != 0 || commits != 0 || at(counts, Counter::RecordModeChanges) != 0 || at(counts, Counter::RecordsCleared) != 0) {
         const auto hits = at(counts, Counter::Hits);
         AgcDriver::ProfilePrint_nid_no_patch("[draw-records] %.1f s: draws %llu, hits %llu (%.1f%%), input refetches %llu, hits on today's path %llu, relocated base and value words %llu, moved buffer bases patched %llu; misses: %s; records off: %s; store: %s; %llu identities, %llu records, %.1f KiB; commit: %s; commit misses: %s\n", seconds,
             static_cast<unsigned long long>(draws), static_cast<unsigned long long>(hits), draws != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(draws) : 0.0,
@@ -761,6 +764,8 @@ bool BufferPresent(const std::uint32_t* words) {
     return words[2] != 0u && (words[0] != 0u || (words[1] & 0xffffu) != 0u);
 }
 
+}
+
 bool SameBufferFields(const std::uint32_t* before, const std::uint32_t* after) {
     if (before[1] != after[1] || before[3] != after[3] || BufferPresent(before) != BufferPresent(after)) return false;
     if (!BufferPresent(after)) return true;
@@ -780,6 +785,8 @@ bool ReadRecordUserWords(const DrawProgram& program, const DrawUserWords& words,
     out[1] = words.Value(program.mergedPointer + 1);
     return !program.mergedPointerRequired || out[0] != 0u || out[1] != 0u;
 }
+
+namespace {
 
 bool SameVertexLayout(const ShaderRecompiler::ShaderVertexStageInfo& kept, const ShaderRecompiler::ShaderVertexStageInfo& now, bool& moved) {
     if (kept.resourcesNum != now.resourcesNum || kept.fetchAttribReg != now.fetchAttribReg || kept.fetchBufferReg != now.fetchBufferReg || kept.fetchEmbedded != now.fetchEmbedded || kept.paClVsOutCntl != now.paClVsOutCntl || kept.depthRemapMode != now.depthRemapMode || kept.pointList != now.pointList) return false;
@@ -916,12 +923,17 @@ void DrawRecordView::CaptureSnapshots(std::span<const Graphics::GuestMemorySnaps
     snapshotWords.erase(std::unique(snapshotWords.begin(), snapshotWords.end()), snapshotWords.end());
 }
 
-std::shared_ptr<const DrawRecordPlan> Driver::buildDrawRecordPlan(const Graphics::State& graphics, const Pm4::DrawParameters& parameters, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, std::span<const Graphics::CompiledShader> stages) {
+std::shared_ptr<const DrawRecordPlan> Driver::buildDrawRecordPlan(const Graphics::State& graphics, const Pm4::DrawParameters& parameters, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, std::span<const Graphics::CompiledShader> stages, DrawRecordPlanRefusal* refusal) {
     using Role = ShaderRecompiler::ProgramRole;
     using DescriptorRole = ShaderRecompiler::DescriptorRole;
-    if (graphics.rectList || graphics.stages.mesh || graphics.stages.tessellation || graphics.stages.tessellationGeometry || graphics.stages.path != Graphics::ShaderPath::Vertex || parameters.indirect) return nullptr;
+    const auto refuse = [&](DrawRecordPlanRefusal reason) -> std::shared_ptr<const DrawRecordPlan> {
+        if (refusal != nullptr) *refusal = reason;
+        return nullptr;
+    };
+    if (parameters.indirect) return refuse(DrawRecordPlanRefusal::Indirect);
+    if (graphics.rectList || graphics.stages.mesh || graphics.stages.tessellation || graphics.stages.tessellationGeometry || graphics.stages.path != Graphics::ShaderPath::Vertex) return refuse(DrawRecordPlanRefusal::Shape);
     const auto count = programs.size();
-    if (count == 0 || stages.size() != count || stageCaptures.size() != count || roles.size() != count || vertexInfos.size() != count || decodeReads.size() != count) return nullptr;
+    if (count == 0 || stages.size() != count || stageCaptures.size() != count || roles.size() != count || vertexInfos.size() != count || decodeReads.size() != count) return refuse(DrawRecordPlanRefusal::Stages);
     auto plan = std::make_shared<DrawRecordPlan>();
     plan->stages.resize(count);
     std::uint64_t signature = 0xcbf29ce484222325ull;
@@ -929,10 +941,12 @@ std::shared_ptr<const DrawRecordPlan> Driver::buildDrawRecordPlan(const Graphics
     for (std::size_t i = 0; i < count; ++i) {
         const auto& program = programs[i];
         const auto& capture = stageCaptures[i];
-        if (roles[i] == Role::GeometryBack || capture.compiled == nullptr || capture.capture == nullptr || stages[i].program != capture.compiled.get() || stages[i].heap != nullptr) return nullptr;
-        if (capture.direct || capture.ring || capture.heapWords != nullptr || program.snapshot == nullptr || program.snapshot->header.empty() || program.tailContinuation != nullptr) return nullptr;
+        if (roles[i] == Role::GeometryBack) return refuse(DrawRecordPlanRefusal::GeometryBack);
+        if (capture.compiled == nullptr || capture.capture == nullptr || stages[i].program != capture.compiled.get() || stages[i].heap != nullptr) return refuse(DrawRecordPlanRefusal::Capture);
+        if (capture.direct || capture.ring || capture.heapWords != nullptr) return refuse(DrawRecordPlanRefusal::Direct);
+        if (program.snapshot == nullptr || program.snapshot->header.empty() || program.tailContinuation != nullptr) return refuse(DrawRecordPlanRefusal::Program);
         const auto& compiled = *capture.compiled;
-        if (compiled.gpuResolvedImages || compiled.heapTemplateId != 0 || compiled.deviceImageTables || compiled.dataAddressPush || !CacheableResult(compiled)) return nullptr;
+        if (compiled.gpuResolvedImages || compiled.heapTemplateId != 0 || compiled.deviceImageTables || compiled.dataAddressPush || !CacheableResult(compiled)) return refuse(DrawRecordPlanRefusal::Result);
         if (std::ranges::any_of(compiled.bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == DescriptorRole::BdaPagetable; })) plan->addressed = true;
         auto& stage = plan->stages[i];
         stage.stage = stages[i].stage;
@@ -1209,15 +1223,26 @@ std::shared_ptr<const DrawRecordPlan> Driver::buildDrawRecordPlan(const Graphics
 
 DrawRecords::Counter Driver::fetchDrawRecord(const LeanDrawJob& job, const DrawRecord& record, DrawRecordHit& hit) {
     using DrawRecords::Counter;
-    using DescriptorRole = ShaderRecompiler::DescriptorRole;
     const auto* plan = record.plan.get();
     if (plan == nullptr) return Counter::MissNoFetchPlan;
     if (record.generation != job.recordGeneration || record.deviceSerial != job.deviceSerial || record.shape.get() != job.shape) return Counter::MissGenerationMoved;
+    const auto count = job.shape->decode->programs.size();
+    auto& scratch = HostThreadLocal<FetchScratch, FetchScratchStorage>();
+    if (scratch.userData.size() < count) return Counter::MissNoFetchPlan;
+    return fetchRecordPlan(job, *plan, std::span<const std::vector<std::uint32_t>>(scratch.userData.data(), count), hit);
+}
+
+DrawRecords::Counter Driver::fetchRecordPlan(const LeanDrawJob& job, const DrawRecordPlan& recordPlan, std::span<const std::vector<std::uint32_t>> users, DrawRecordHit& hit, EntryOutcome* gate) {
+    using DrawRecords::Counter;
+    using DescriptorRole = ShaderRecompiler::DescriptorRole;
+    const auto* plan = &recordPlan;
     const auto& decode = *job.shape->decode;
     const auto& programs = decode.programs;
     const auto count = programs.size();
     auto& scratch = HostThreadLocal<FetchScratch, FetchScratchStorage>();
-    if (plan->stages.size() != count || scratch.userData.size() < count) return Counter::MissNoFetchPlan;
+    if (plan->stages.size() != count || users.size() < count) return Counter::MissNoFetchPlan;
+    if (scratch.liveWords.size() < count) scratch.liveWords.resize(count);
+    if (scratch.decodeReads.size() < count) scratch.decodeReads.resize(count);
     const bool verifying = (job.recordFlags & DrawRecordFlags::VerifyDue) != 0;
     scratch.memory.clear();
     hit.sides.assign(count, {});
@@ -1230,6 +1255,7 @@ DrawRecords::Counter Driver::fetchDrawRecord(const LeanDrawJob& job, const DrawR
     hit.inputsMoved = false;
     hit.baseValueMoved = false;
     hit.buffersPatched = false;
+    hit.relocated = false;
     std::uint64_t imagesFlushed = 0, runsSynced = 0;
     std::optional<SampledReadScope> sampling;
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
@@ -1237,7 +1263,7 @@ DrawRecords::Counter Driver::fetchDrawRecord(const LeanDrawJob& job, const DrawR
         const auto& stage = plan->stages[i];
         const auto& program = programs[i];
         const auto& compiled = *stage.compiled;
-        const auto& user = scratch.userData[i];
+        const auto& user = users[i];
         if (user.size() != stage.userData.size()) return Counter::MissUserWordUnread;
         if (stage.registeredViews != nullptr && !CaptureRegisteredViewsCurrent(*stage.registeredViews)) return Counter::MissImageViews;
         const auto userMoved = [&](std::size_t index) { return index < user.size() && user[index] != stage.userData[index]; };
@@ -1249,6 +1275,7 @@ DrawRecords::Counter Driver::fetchDrawRecord(const LeanDrawJob& job, const DrawR
         const DispatchVariant* variant = stage.variant.get();
         const auto* regions = &stage.regions;
         if (relocated) {
+            hit.relocated = true;
             auto& moved = scratch.moved;
             moved.runs.assign(variant->runs.begin(), variant->runs.end());
             for (std::size_t run = 0; run < moved.runs.size() && run < stage.runBases.size(); ++run) {
@@ -1270,7 +1297,10 @@ DrawRecords::Counter Driver::fetchDrawRecord(const LeanDrawJob& job, const DrawR
         auto outcome = validateVariant(program.binary.codeAddress, job.queue, *variant, *regions, imagesFlushed, runsSynced, sampling, &live);
         if (gateRetry() && (outcome == EntryOutcome::PublishMoved || outcome == EntryOutcome::PendingMoved)) outcome = validateVariant(program.binary.codeAddress, job.queue, *variant, *regions, imagesFlushed, runsSynced, sampling, &live);
         if (outcome == EntryOutcome::Differing) return Counter::MissContentDiffers;
-        if (outcome != EntryOutcome::Equal && outcome != EntryOutcome::EqualData) return Counter::MissFetchGate;
+        if (outcome != EntryOutcome::Equal && outcome != EntryOutcome::EqualData) {
+            if (gate != nullptr) *gate = outcome;
+            return Counter::MissFetchGate;
+        }
         if (outcome == EntryOutcome::Equal) live.clear();
         auto& side = hit.sides[i];
         const auto patch = [&](std::uint32_t binding, std::uint32_t word, std::uint32_t value) {
@@ -1347,7 +1377,7 @@ DrawRecords::Counter Driver::fetchDrawRecord(const LeanDrawJob& job, const DrawR
     AppendProgramMemory(scratch.memory, programs);
     hit.parameters = job.parameters;
     const auto& front = *plan->stages.front().compiled;
-    const auto& firstUser = scratch.userData.front();
+    const auto& firstUser = users.front();
     const auto userWord = [&](std::int32_t sgpr, std::uint32_t& value) {
         if (sgpr < 0 || static_cast<std::uint32_t>(sgpr) < programs.front().firstUserSgpr) return false;
         const auto index = static_cast<std::uint32_t>(sgpr) - programs.front().firstUserSgpr;
@@ -1685,17 +1715,25 @@ void Driver::finishRecordDraw(const LeanDrawJob& job) {
 }
 
 void Driver::verifyRecordHit(const LeanDrawJob& job, const DrawRecord& record, const DrawRecordView& answer, const DrawRecordSink& sink) {
-    using DrawRecords::Field;
     DrawRecords::NoteChecked(DrawRecords::Item::Fetch);
+    if (!compareRecordAnswer(job, record, answer, sink, &DrawRecords::NoteDifference, &DrawRecords::NoteAllowed)) return;
+    auto demote = std::make_shared<DrawRecordAnswer>();
+    demote->key = record.key;
+    demote->demote = true;
+    DrawFinisher::AnswerLean(std::move(demote));
+}
+
+bool Driver::compareRecordAnswer(const LeanDrawJob& job, const DrawRecord& record, const DrawRecordView& answer, const DrawRecordSink& sink, void (*noteDifference)(DrawRecords::Field, std::string_view), void (*noteAllowed)(DrawRecords::Allowed)) {
+    using DrawRecords::Field;
     if (!sink.queued) {
-        DrawRecords::NoteAllowed(DrawRecords::Allowed::TodayNotQueued);
-        return;
+        noteAllowed(DrawRecords::Allowed::TodayNotQueued);
+        return false;
     }
     const auto& today = sink.today;
     const auto at = drawText(job, record.key);
     bool differs = false;
     const auto note = [&](Field field, const std::string& detail) {
-        DrawRecords::NoteDifference(field, at + ": " + detail);
+        noteDifference(field, at + ": " + detail);
         differs = true;
     };
     if (answer.stages.size() != today.stages.size()) {
@@ -1735,13 +1773,9 @@ void Driver::verifyRecordHit(const LeanDrawJob& job, const DrawRecord& record, c
         const auto first = std::find_if(answer.fetched.begin(), answer.fetched.end(), unread);
         if (first != answer.fetched.end()) note(Field::FetchedRuns, "the record fetched " + std::to_string(answer.fetched.size()) + " run words, " + std::to_string(std::count_if(first, answer.fetched.end(), unread)) + " of them at addresses today's draw did not read, the first at " + hex(*first));
     }
-    if (answer.fragmentOutputs.has_value() != today.fragmentOutputs.has_value()) DrawRecords::NoteAllowed(DrawRecords::Allowed::FragmentOutputsOneSide);
+    if (answer.fragmentOutputs.has_value() != today.fragmentOutputs.has_value()) noteAllowed(DrawRecords::Allowed::FragmentOutputsOneSide);
     else if (answer.fragmentOutputs != today.fragmentOutputs) note(Field::FragmentOutputs, "the record's fragment outputs " + hex(*answer.fragmentOutputs) + ", today's " + hex(*today.fragmentOutputs));
-    if (!differs) return;
-    auto demote = std::make_shared<DrawRecordAnswer>();
-    demote->key = record.key;
-    demote->demote = true;
-    DrawFinisher::AnswerLean(std::move(demote));
+    return differs;
 }
 
 void Driver::settleDrawRecord(const LeanDrawJob& job, const DrawRecordSink& sink, bool hit, std::size_t checked) {

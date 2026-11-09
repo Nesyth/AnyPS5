@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/LeanDraw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StagePlans.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanFront.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -294,6 +295,183 @@ void Twins() {
     Require(!DrawRecordTwin(set, last.content, last.generation + 1, last.deviceSerial, &signature).has_value() && !DrawRecordTwin(set, last.content, last.generation, last.deviceSerial + 1, &signature).has_value(), "a record of another switch generation or device was taken for a twin");
 }
 
+alignas(64) std::array<std::uint32_t, 64> PlanMemory{};
+constexpr std::size_t PlanTable = 0;
+constexpr std::size_t PlanMovedTable = 16;
+constexpr std::size_t PlanFixedRun = 40;
+constexpr std::uint32_t PlanFormat = 0x31016facu;
+
+std::uint64_t PlanAt(std::size_t word) {
+    return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(PlanMemory.data() + word));
+}
+
+struct PlanDraw {
+    std::size_t table = PlanTable;
+    std::uint32_t buffer = 0x1000;
+    std::uint32_t records = 16;
+    std::uint32_t format = PlanFormat;
+    std::uint32_t data = 7;
+    std::uint32_t forwarded = 3;
+};
+
+std::vector<std::uint32_t> PlanUsers(const PlanDraw& draw) {
+    const auto table = PlanAt(draw.table);
+    return {static_cast<std::uint32_t>(table), static_cast<std::uint32_t>(table >> 32u), draw.forwarded, 0xabcdu};
+}
+
+void WritePlanMemory(const PlanDraw& draw) {
+    const std::array<std::uint32_t, 8> table{draw.buffer, 0x00100000u, draw.records, draw.format, 0x11u, 0x22u, 0x33u, 0x44u};
+    std::copy(table.begin(), table.end(), PlanMemory.begin() + static_cast<std::ptrdiff_t>(draw.table));
+    PlanMemory[PlanFixedRun] = draw.data;
+    PlanMemory[PlanFixedRun + 1] = 0x5150u;
+}
+
+std::vector<std::uint32_t> PlanWords(const PlanDraw& draw) {
+    return {draw.buffer, 0x00100000u, draw.records, draw.format, 0x11u, 0x22u, 0x33u, 0x44u, draw.data, 0x5150u};
+}
+
+AgcDriver::DriverDetail::DrawRecordStage PlanStage(const PlanDraw& draw, std::uint64_t variantId) {
+    using ShaderRecompiler::DescriptorRole;
+    auto compiled = std::make_shared<ShaderRecompiler::RecompileResult>();
+    compiled->variantId = variantId;
+    compiled->bindings.resize(2);
+    compiled->bindings[0].role = DescriptorRole::GuestBuffers;
+    compiled->bindings[0].count = 1;
+    compiled->bindings[0].guestDescriptor = {draw.buffer, 0x00100000u, draw.records, draw.format};
+    compiled->bindings[0].bufferWritten = {false};
+    compiled->bindings[1].role = DescriptorRole::FlattenedSrt;
+    compiled->bindings[1].count = 1;
+    compiled->bindings[1].guestDescriptor = {draw.data};
+    AgcDriver::DriverDetail::DrawRecordStage stage;
+    stage.stage = ShaderRecompiler::ShaderStage::Fragment;
+    stage.compiled = compiled;
+    stage.userData = PlanUsers(draw);
+    stage.relocatableWords = 1u;
+    stage.walkedWords = 3u;
+    stage.valueUseWords = 2u;
+    stage.forwardedWords = 4u;
+    stage.userDataMask = 7u;
+    stage.runBases = {0, -1};
+    stage.targets = {{0, 0, 0}, {2, 0, 2}, {8, 1, 0}};
+    auto variant = std::make_shared<DispatchVariant>();
+    variant->runs = {{PlanAt(draw.table), PlanAt(draw.table + 8)}, {PlanAt(PlanFixedRun), PlanAt(PlanFixedRun + 2)}};
+    variant->words = PlanWords(draw);
+    variant->dataPositions = {0, 2, 8};
+    variant->compiled = compiled;
+    stage.variant = std::move(variant);
+    return stage;
+}
+
+std::shared_ptr<const AgcDriver::DriverDetail::StagePlanAnswer> PlanAnswer(const std::shared_ptr<const LeanShape>& shape, std::initializer_list<std::shared_ptr<const AgcDriver::DriverDetail::StagePlan>> stages, std::uint32_t content) {
+    auto answer = std::make_shared<AgcDriver::DriverDetail::StagePlanAnswer>();
+    answer->shape = shape;
+    answer->generation = 1;
+    answer->deviceSerial = 1;
+    answer->stages.assign(stages.begin(), stages.end());
+    DrawRecordKey key{};
+    key.shape = 0x77;
+    answer->record = Record(key, shape, content);
+    return answer;
+}
+
+void StagePlanKeys() {
+    namespace Plans = AgcDriver::DriverDetail;
+    using Plans::StagePlans::Counter;
+    using AgcDriver::DriverDetail::StagePlanKey;
+    const PlanDraw first{};
+    const auto built = Plans::MakeStagePlan(PlanStage(first, 0x51));
+    Require(built != nullptr, "a stage plan was not made from a fetch plan stage");
+    const auto& layout = *built->layout;
+    Require(layout.runs.size() == 2 && layout.runs[0].base == 0 && layout.runs[1].base < 0 && layout.runs[1].offset == PlanAt(PlanFixedRun) && layout.words == 10, "a stage layout does not keep its runs relative to their user word bases");
+    Require(layout.runs[0].offset + (PlanUsers(first)[0] & ~3u) == PlanAt(first.table), "a based run's offset does not lead back to its address from the user word");
+    Require(layout.keyPositions == std::vector<std::uint32_t>{1, 3, 4, 5, 6, 7, 9} && layout.bitPositions == std::vector<std::uint32_t>{0, 2}, "the key does not hold every run word but the buffer base, its record count and the flattened data word, or the low bits of those two buffer words");
+    Require(layout.exactUsers == 2u && layout.bitUsers == 1u, "the key's user words are not the walked high word exactly and the relocatable base by its low bits (the forwarded and the unread words stay out)");
+    WritePlanMemory(first);
+    std::vector<std::uint32_t> words;
+    StagePlanKey key;
+    Require(Plans::ReadStageRuns(layout, PlanUsers(first), words) && words == PlanWords(first), "reading a layout's runs at the build's user words did not give the build's words");
+    Plans::StageKeyOf(layout, PlanUsers(first), words, key);
+    Require(key == built->key, "the key read from memory at the build's user words differs from the plan's");
+    PlanDraw moved{PlanMovedTable, 0x2340, 32, PlanFormat, 99, 8};
+    WritePlanMemory(moved);
+    Require(Plans::ReadStageRuns(layout, PlanUsers(moved), words) && words == PlanWords(moved), "reading a layout's runs did not follow the moved table pointer");
+    Plans::StageKeyOf(layout, PlanUsers(moved), words, key);
+    Require(key == built->key, "a draw whose table moved, whose constant buffer moved inside it and whose data and forwarded words changed got another key");
+    Plans::StagePlanStage stage;
+    stage.layouts.push_back(built->layout);
+    stage.plans.push_back(built);
+    Require(Plans::FindStagePlan(stage, built->layout.get(), key) == built.get(), "the stage plan of a moved draw's key was not found");
+    const auto missOf = [&](const PlanDraw& draw, std::vector<std::uint32_t> users) {
+        Plans::StageKeyOf(layout, users, PlanWords(draw), key);
+        Require(Plans::FindStagePlan(stage, built->layout.get(), key) == nullptr, "a key that differs from the plan's found the plan");
+        return Plans::StageKeyMiss(stage, built->layout.get(), key);
+    };
+    auto format = moved;
+    format.format = 0x31014facu;
+    Require(missOf(format, PlanUsers(format)) == Counter::MissNewRunWords, "a changed buffer format word was not a new run word key");
+    auto high = PlanUsers(moved);
+    high[1] ^= 0x10u;
+    Require(missOf(moved, high) == Counter::MissNewUserWords, "a changed walked user word was not a new user word key");
+    auto aligned = PlanUsers(moved);
+    aligned[0] |= 1u;
+    Require(missOf(moved, aligned) == Counter::MissNewBits, "a run base with other low bits was not a new low bits key");
+    auto tail = moved;
+    tail.records = 33;
+    Require(missOf(tail, PlanUsers(tail)) == Counter::MissNewBits, "a buffer record count with another tail was not a new low bits key");
+    auto offset = moved;
+    offset.buffer = 0x2342;
+    Require(missOf(offset, PlanUsers(offset)) == Counter::MissNewBits, "a buffer base with other low bits was not a new low bits key");
+    auto unread = PlanUsers(moved);
+    unread[3] = 0x9999u;
+    Plans::StageKeyOf(layout, unread, PlanWords(moved), key);
+    Require(Plans::FindStagePlan(stage, built->layout.get(), key) == built.get(), "a user word the stage never reads moved the key");
+}
+
+void StagePlanMerges() {
+    namespace Plans = AgcDriver::DriverDetail;
+    auto shape = std::make_shared<LeanShape>();
+    const auto a = Plans::MakeStagePlan(PlanStage(PlanDraw{}, 0x51));
+    Plans::StagePlanMerge merge;
+    auto set = Plans::MergeStagePlans(nullptr, *PlanAnswer(shape, {a}, 1), merge);
+    Require(set != nullptr && set->stages.size() == 1 && set->stages[0].plans.size() == 1 && set->stages[0].layouts.size() == 1 && set->draws.size() == 1 && merge.added == 1 && merge.layouts == 1 && merge.drawsAdded == 1, "the first build did not make one layout, one stage plan and one draw plan");
+    const auto* first = set->stages[0].plans.front().get();
+    Require(set->draws.front().record->plan != nullptr && set->draws.front().record->plan->stages.size() == 1 && set->draws.front().record->plan->stages[0].compiled == a->stage.compiled && set->draws.front().record->commit != nullptr, "a draw plan's record does not carry its stage plans' fetch plans and a committer half");
+    const auto moved = Plans::MakeStagePlan(PlanStage(PlanDraw{PlanMovedTable, 0x2340, 32, PlanFormat, 99, 8}, 0x51));
+    merge = {};
+    set = Plans::MergeStagePlans(set.get(), *PlanAnswer(shape, {moved}, 1), merge);
+    Require(set->stages[0].plans.size() == 1 && set->draws.size() == 1 && merge.shared == 1 && merge.drawsKnown == 1 && set->stages[0].plans.front().get() == first, "a build of a moved draw with the same key did not share the stage plan and its draw plan");
+    PlanDraw other{};
+    other.format = 0x31014facu;
+    const auto c = Plans::MakeStagePlan(PlanStage(other, 0x52));
+    merge = {};
+    set = Plans::MergeStagePlans(set.get(), *PlanAnswer(shape, {c}, 2), merge);
+    Require(set->stages[0].plans.size() == 2 && set->stages[0].layouts.size() == 1 && set->draws.size() == 2 && merge.added == 1 && merge.drawsAdded == 1, "a build with another key did not add a stage plan and a draw plan beside the first in the same layout");
+    const std::array<const Plans::StagePlan*, 1> withFirst{first};
+    const std::array<const Plans::StagePlan*, 1> withOther{set->stages[0].plans.front().get()};
+    Require(Plans::FindDrawPlan(*set, withFirst) != nullptr && Plans::FindDrawPlan(*set, withOther) != nullptr && Plans::FindDrawPlan(*set, withFirst) != Plans::FindDrawPlan(*set, withOther), "each key's stage plan did not lead to its own draw plan");
+    const auto recompiled = Plans::MakeStagePlan(PlanStage(PlanDraw{}, 0x53));
+    merge = {};
+    set = Plans::MergeStagePlans(set.get(), *PlanAnswer(shape, {recompiled}, 3), merge);
+    Require(merge.replaced == 1 && merge.drawsEvicted == 1 && merge.drawsAdded == 1 && set->stages[0].plans.size() == 2 && Plans::FindDrawPlan(*set, withFirst) == nullptr, "a build whose key matched a stage plan with another compiled variant did not replace it and drop its draw plan");
+    for (std::uint32_t index = 0; index < Plans::StagePlanLimits::PlansPerStage + 4; ++index) {
+        PlanDraw many{};
+        many.format = 0x01000000u + index;
+        merge = {};
+        set = Plans::MergeStagePlans(set.get(), *PlanAnswer(shape, {Plans::MakeStagePlan(PlanStage(many, 0x60 + index))}, 10 + index), merge);
+    }
+    Require(set->stages[0].plans.size() == Plans::StagePlanLimits::PlansPerStage && set->draws.size() <= Plans::StagePlanLimits::DrawPlans, "a stage holds " + std::to_string(set->stages[0].plans.size()) + " stage plans, past its cap");
+    for (const auto& draw : set->draws) {
+        Require(std::find(set->stages[0].plans.begin(), set->stages[0].plans.end(), draw.stages[0]) != set->stages[0].plans.end(), "a draw plan outlived its evicted stage plan");
+    }
+    std::size_t bytes = sizeof(Plans::StagePlanSet);
+    for (const auto& plan : set->stages[0].plans) bytes += plan->bytes;
+    Require(set->bytes >= bytes, "a stage plan set does not count the bytes of its plans");
+    auto stranger = std::make_shared<LeanShape>();
+    merge = {};
+    const auto fresh = Plans::MergeStagePlans(set.get(), *PlanAnswer(stranger, {a}, 1), merge);
+    Require(fresh->stages[0].plans.size() == 1 && fresh->draws.size() == 1 && fresh->shape == stranger, "a build for another shape kept the plans of the set it replaces");
+}
+
 alignas(256) constexpr std::array<std::uint32_t, 16> VertexCode{
     0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
     0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
@@ -405,6 +583,91 @@ std::string Describe(const Totals& now, const Totals& base) {
     return text;
 }
 
+namespace StagePlanReport = AgcDriver::DriverDetail::StagePlans;
+using PlanCounter = StagePlanReport::Counter;
+
+struct PlanTotals {
+    std::array<std::uint64_t, static_cast<std::size_t>(PlanCounter::Count)> counters{};
+    std::uint64_t differences = 0;
+    std::uint64_t checked = 0;
+
+    static PlanTotals Now() {
+        PlanTotals totals;
+        for (std::size_t index = 0; index < totals.counters.size(); ++index) totals.counters[index] = StagePlanReport::Total(static_cast<PlanCounter>(index));
+        totals.differences = StagePlanReport::Differences();
+        totals.checked = StagePlanReport::Checked(DrawRecords::Item::Fetch);
+        return totals;
+    }
+
+    std::uint64_t Since(const PlanTotals& base, PlanCounter counter) const { return counters[static_cast<std::size_t>(counter)] - base.counters[static_cast<std::size_t>(counter)]; }
+    std::uint64_t Since(const PlanTotals& base, PlanCounter first, PlanCounter last) const {
+        std::uint64_t total = 0;
+        for (auto index = static_cast<std::size_t>(first); index <= static_cast<std::size_t>(last); ++index) total += Since(base, static_cast<PlanCounter>(index));
+        return total;
+    }
+};
+
+std::string DescribePlans(const PlanTotals& now, const PlanTotals& base) {
+    std::string text;
+    for (std::size_t index = 0; index < now.counters.size(); ++index) {
+        const auto moved = now.Since(base, static_cast<PlanCounter>(index));
+        if (moved != 0) text += std::string("; ") + StagePlanReport::CounterName(static_cast<PlanCounter>(index)) + " " + std::to_string(moved);
+    }
+    return text;
+}
+
+void DevicePlans(bool ring, const std::array<std::byte, 1024>& todayColors) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    const std::string name = " (lean front with stage plans)";
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, true);
+    ColorMemory.fill(std::byte{0});
+    const auto base = PlanTotals::Now();
+    const auto recordsBase = Totals::Now();
+    for (std::uint32_t submission = 0; submission < Submissions; ++submission) Submit(submission & 1u, 3, DrawsPerSubmission, name);
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size());
+    Require(ColorMemory == todayColors, "the draws rendered differently from today's front" + name);
+    const auto now = PlanTotals::Now();
+    Require(now.differences == base.differences, "the stage plan verify found differences" + name + DescribePlans(now, base));
+    Require(Totals::Now().Since(recordsBase, Counter::Draws) == 0, "draws were counted for draw records while stage plans replace them" + name);
+    const auto draws = now.Since(base, PlanCounter::Draws);
+    const auto off = now.Since(base, PlanCounter::OffTodaysDraw, PlanCounter::OffInline);
+    if (!ring) {
+        Require(now.Since(base, PlanCounter::Hits) == 0 && off == draws, "draws without the finisher ring were not counted as draws without stage plans" + name + DescribePlans(now, base));
+        RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
+        return;
+    }
+    Require(draws == Submissions * DrawsPerSubmission, "stage plans counted " + std::to_string(draws) + " draws, expected " + std::to_string(Submissions * DrawsPerSubmission) + name + DescribePlans(now, base));
+    const auto hits = now.Since(base, PlanCounter::Hits);
+    const auto outcomes = hits + now.Since(base, PlanCounter::MissNoPlans, PlanCounter::MissFetchError) + off;
+    Require(outcomes == draws, "the hits, misses and draws without stage plans add up to " + std::to_string(outcomes) + " of " + std::to_string(draws) + " draws" + name + DescribePlans(now, base));
+    const auto jobs = draws - off;
+    Require(jobs > DrawsPerSubmission && hits + DrawsPerSubmission >= jobs, "stage plans hit " + std::to_string(hits) + " of " + std::to_string(jobs) + " finisher jobs of one shape whose user data pointer moves between submissions" + name + DescribePlans(now, base));
+    Require(now.Since(base, PlanCounter::DrawPlansAdded) == 1 && now.Since(base, PlanCounter::StagePlansAdded) == 2 && now.Since(base, PlanCounter::MissNewLayout, PlanCounter::MissNewCombination) == 0 && now.Since(base, PlanCounter::MissContentDiffers) == 0, "one shape whose constants move did not keep one draw plan of two stage plans that every later draw hits" + name + DescribePlans(now, base));
+    const auto verified = now.Since(base, PlanCounter::HitsOnTodaysPath);
+    const bool verifiedAsDue = StagePlanReport::VerifyEvery() == 0 ? verified == 0 : StagePlanReport::VerifyEvery() == 1 ? verified == hits : verified != 0 && verified < hits;
+    Require(verifiedAsDue && (StagePlanReport::VerifyEvery() == 0 || now.checked > base.checked), "the stage plan verify did not run on the hits it was due for" + name + DescribePlans(now, base));
+    const auto other = PlanTotals::Now();
+    Submit(0, 6, 2, name);
+    Submit(1, 6, 2, name);
+    Submit(0, 9, 2, name);
+    const auto counted = PlanTotals::Now();
+    Require(counted.Since(other, PlanCounter::Hits) >= 1 && counted.Since(other, PlanCounter::Builds) == 0 && counted.Since(other, PlanCounter::MissNoPlans, PlanCounter::MissFetchError) == 0, "draws with other vertex counts, which are other draw identities, did not hit the shape's stage plans without a build" + name + DescribePlans(counted, other));
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
+    Submit(0, 3, 2, name);
+    const auto off0 = PlanTotals::Now();
+    Require(off0.Since(counted, PlanCounter::Draws) == 0 && off0.Since(counted, PlanCounter::ModeChanges) == 1 && off0.Since(counted, PlanCounter::SetsCleared) >= 1, "turning stage plans off did not clear the plans and stop counting draws" + name + DescribePlans(off0, counted));
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, true);
+    Submit(0, 3, 2, name);
+    const auto on = PlanTotals::Now();
+    Require(on.Since(off0, PlanCounter::ModeChanges) == 1 && on.Since(off0, PlanCounter::MissNoPlans) >= 1 && on.Since(off0, PlanCounter::Hits) == 0, "turning stage plans on again did not start without plans" + name + DescribePlans(on, off0));
+    Require(on.differences == base.differences, "the stage plan verify found differences after the switch flips" + name);
+    StagePlanReport::Report(true);
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
+}
+
 int Device() {
     bool libraries = false;
     {
@@ -420,10 +683,12 @@ int Device() {
     const bool ring = DrawFinisher::Enabled() && DrawFinisher::Overlap() && DrawPipeline::Depth() != 0;
     const bool leanEnvironment = RuntimeSwitches::Set(RuntimeSwitch::LeanFront);
     const bool recordsEnvironment = RuntimeSwitches::Set(RuntimeSwitch::DrawRecords);
+    const bool plansEnvironment = RuntimeSwitches::Set(RuntimeSwitch::StagePlans);
     Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
     for (auto& table : PixelConstants) table[0] = 0.25f;
     std::array<std::byte, 1024> todayColors{};
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
     for (const int arm : {0, 1, 2}) {
         const bool lean = arm != 0;
         const bool records = arm == 2;
@@ -483,8 +748,10 @@ int Device() {
         Require(on.differences == base.differences, "the draw record verify found differences after the switch flips" + name);
         DrawRecords::Report(true);
     }
+    DevicePlans(ring, todayColors);
     RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, leanEnvironment);
     RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, recordsEnvironment);
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, plansEnvironment);
     AgcDriverShutdown_nid_postfix();
     return 0;
 }
@@ -499,8 +766,10 @@ int main() {
         Invalidation();
         Probes();
         Twins();
+        StagePlanKeys();
+        StagePlanMerges();
         const auto device = Device();
-        std::cout << "draw record keys, store bounds, eviction, invalidation, variant probes and twins passed" << (device == 0 ? "; repeated lean draws hit their identity records" : "; the device part was skipped") << '\n';
+        std::cout << "draw record keys, store bounds, eviction, invalidation, variant probes, twins, stage plan keys and stage plan merges passed" << (device == 0 ? "; repeated lean draws hit their identity records and their shape's stage plans" : "; the device part was skipped") << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

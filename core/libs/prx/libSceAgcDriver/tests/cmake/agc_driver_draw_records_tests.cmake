@@ -1,5 +1,6 @@
 if(BUILD_TESTING)
     agc_add_draw_pipeline_test(agc_driver_draw_records LATE)
     agc_add_draw_records_test(agc_driver_draw_records LATE)
+    agc_add_stage_plans_test(agc_driver_draw_records LATE)
     set_tests_properties(agc_driver_draw_records_draw_pipeline agc_driver_draw_records_late PROPERTIES FAIL_REGULAR_EXPRESSION "${agcDrawRecordsDifference}")
 endif()

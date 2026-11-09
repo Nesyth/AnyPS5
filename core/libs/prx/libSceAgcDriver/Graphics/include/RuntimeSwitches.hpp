@@ -80,6 +80,7 @@ enum class RuntimeSwitch : std::size_t {
     XpStreamSegments,
     LeanFront,
     DrawRecords,
+    StagePlans,
     Count,
 };
 

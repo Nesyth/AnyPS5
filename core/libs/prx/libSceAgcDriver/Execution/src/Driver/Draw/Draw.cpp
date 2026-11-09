@@ -905,6 +905,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 void Driver::runLeanDraw(const std::byte* payload) {
     auto& driver = Get();
     const auto& job = *std::launder(reinterpret_cast<const LeanDrawJob*>(payload));
+    if ((job.recordFlags & DrawRecordFlags::StagePlans) != 0) {
+        driver.finishStagePlanDraw(job);
+        return;
+    }
     if ((job.recordFlags & DrawRecordFlags::On) == 0) {
         driver.finishLeanDraw(job, driver.leanDraws.AnchorAt(job.anchor));
         return;
@@ -1792,7 +1796,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             recordSink->fragmentOutputs = fragmentOutputs;
             recordSink->writes.assign(writes.begin(), writes.end());
             recordSink->NoteVertices(vertexInfos);
-            if (recordSink->plan && results.empty()) recordSink->built = buildDrawRecordPlan(graphics, drawParameters, programs, roles, stageCaptures, vertexInfos, decodeReads, stages);
+            if (recordSink->plan && results.empty()) recordSink->built = buildDrawRecordPlan(graphics, drawParameters, programs, roles, stageCaptures, vertexInfos, decodeReads, stages, &recordSink->refusal);
+            else if (recordSink->plan) recordSink->refusal = DrawRecordPlanRefusal::Patched;
             if (recordSink->verify) {
                 auto& today = recordSink->today;
                 today.Capture(stages, drawParameters);

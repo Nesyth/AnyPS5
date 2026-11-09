@@ -99,12 +99,16 @@ struct Latch {
     FrontMode taken = FrontMode::Unlatched;
     bool checkSwitches = false;
     bool records = false;
+    bool stagePlans = false;
     std::uint8_t recordsTaken = 0;
+    std::uint8_t stagePlansTaken = 0;
     std::uint32_t depth = 0;
     std::uint64_t generation = 0;
     std::uint64_t verifyEvery = 0;
     std::uint64_t recordsVerifyEvery = 0;
     std::uint64_t recordOrdinal = 0;
+    std::uint64_t stagePlansVerifyEvery = 0;
+    std::uint64_t stagePlanOrdinal = 0;
     std::uint64_t latches = 0;
     Graphics::SwitchSnapshot switches;
     std::array<std::uint64_t, ItemCount> ordinals{};

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StagePlanReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
@@ -72,6 +73,7 @@ constexpr std::size_t InnerBuffers = 8;
 constexpr std::uint32_t ConstantRecords = 64;
 constexpr std::uint32_t InnerRecords = 16;
 constexpr std::array<std::uint32_t, 4> RawFormats{0x31016facu, 0x31014facu, 0x31015facu, 0x21016facu};
+constexpr std::array<std::uint32_t, 2> SlotFormats{0x01014facu, 0x01015facu};
 
 alignas(256) constexpr std::array<std::uint32_t, 16> PlainVertex{
     0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
@@ -222,7 +224,7 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-void SubmitDraws(std::uint64_t vertex, std::uint64_t pixel, const RegisterWrites& userConfig, const RegisterWrites& shaderRegisters, const GuestBlock& target, std::uint32_t draws) {
+void SubmitDraws(std::uint64_t vertex, std::uint64_t pixel, const RegisterWrites& userConfig, const RegisterWrites& shaderRegisters, const GuestBlock& target, std::uint32_t draws, std::uint32_t vertices = 3) {
     const auto color = target.At(0);
     const float scale = 32.0f;
     const RegisterWrites context{
@@ -254,7 +256,7 @@ void SubmitDraws(std::uint64_t vertex, std::uint64_t pixel, const RegisterWrites
     Append(commands, 0x76, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)});
     Append(commands, 0x76, {0x008, static_cast<std::uint32_t>(pixel >> 8u), static_cast<std::uint32_t>(pixel >> 40u)});
     for (const auto& [offset, value] : shaderRegisters) Append(commands, 0x76, {offset, value});
-    for (std::uint32_t draw = 0; draw < draws; ++draw) Append(commands, 0x2d, {3, 2});
+    for (std::uint32_t draw = 0; draw < draws; ++draw) Append(commands, 0x2d, {vertices, 2});
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "draw record hits: a draw submission failed");
     AgcDriverWaitIdle_nid_postfix();
@@ -269,8 +271,8 @@ std::array<std::uint32_t, 4> VertexDescriptor(std::uint64_t address, std::uint32
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), 3u, 0x0104dfacu};
 }
 
-std::array<std::uint32_t, 4> SlotDescriptor(std::uint64_t address) {
-    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (4u << 16u), SlotRecords, 0x01014facu};
+std::array<std::uint32_t, 4> SlotDescriptor(std::uint64_t address, std::uint32_t format = SlotFormats[0]) {
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (4u << 16u), SlotRecords, format};
 }
 
 std::array<std::uint32_t, 4> OutputDescriptor(std::uint64_t address) {
@@ -303,12 +305,13 @@ struct Blocks {
 
 Blocks* Scene = nullptr;
 
-enum class Kind { Constants, Table, Fetch, Ring, Inner, RingInner, Sized, Format };
+enum class Kind { Constants, Table, Fetch, Ring, Inner, RingInner, Sized, Format, FetchFormat };
 
 struct State {
     Kind kind = Kind::Table;
     std::uint32_t variant = 0;
     std::uint32_t stride = 16;
+    std::uint32_t vertices = 3;
 };
 
 bool RingKind(Kind kind) {
@@ -355,6 +358,9 @@ void Apply(const State& state) {
     case Kind::Fetch:
         WriteWords(blocks.fetch, FetchBufferTableOffset, SlotDescriptor(blocks.fetch.At(state.variant == 0 ? CurrentSlotsOffset : ShiftedSlotsOffset)));
         break;
+    case Kind::FetchFormat:
+        WriteWords(blocks.fetch, FetchBufferTableOffset, SlotDescriptor(blocks.fetch.At(CurrentSlotsOffset), SlotFormats[state.variant % SlotFormats.size()]));
+        break;
     default:
         break;
     }
@@ -365,7 +371,7 @@ void Submit(const State& state, std::uint32_t draws) {
     switch (state.kind) {
     case Kind::Constants: {
         const auto pointer = blocks.data.At(ConstantsOffset + state.variant * 0x40u);
-        SubmitDraws(reinterpret_cast<std::uintptr_t>(PlainVertex.data()), reinterpret_cast<std::uintptr_t>(ConstantPixel.data()), {{0x242, 4}}, {{0x8b, 0}, {0x8c, 0}, {0x00b, 3u << 1u}, {0x00c, static_cast<std::uint32_t>(pointer)}, {0x00d, static_cast<std::uint32_t>(pointer >> 32u)}, {0x00e, std::bit_cast<std::uint32_t>(0.25f)}}, blocks.target, draws);
+        SubmitDraws(reinterpret_cast<std::uintptr_t>(PlainVertex.data()), reinterpret_cast<std::uintptr_t>(ConstantPixel.data()), {{0x242, 4}}, {{0x8b, 0}, {0x8c, 0}, {0x00b, 3u << 1u}, {0x00c, static_cast<std::uint32_t>(pointer)}, {0x00d, static_cast<std::uint32_t>(pointer >> 32u)}, {0x00e, std::bit_cast<std::uint32_t>(0.25f)}}, blocks.target, draws, state.vertices);
         break;
     }
     case Kind::Table: {
@@ -374,7 +380,8 @@ void Submit(const State& state, std::uint32_t draws) {
         SubmitDraws(reinterpret_cast<std::uintptr_t>(TableVertex.data()), reinterpret_cast<std::uintptr_t>(ReadPixel.data()), {{0x242, 4}}, {{0x8b, 2u << 1u}, {0x8c, static_cast<std::uint32_t>(table)}, {0x8d, static_cast<std::uint32_t>(table >> 32u)}, {0x00b, 8u << 1u}, {0x00c, 0}, {0x00d, 0}, {0x00e, static_cast<std::uint32_t>(pointer)}, {0x00f, static_cast<std::uint32_t>(pointer >> 32u)}}, blocks.target, draws);
         break;
     }
-    case Kind::Fetch: {
+    case Kind::Fetch:
+    case Kind::FetchFormat: {
         const auto stored = OutputDescriptor(blocks.output.At(0));
         const auto buffers = blocks.fetch.At(FetchBufferTableOffset);
         const auto attributes = blocks.fetch.At(FetchAttribTableOffset);
@@ -383,12 +390,12 @@ void Submit(const State& state, std::uint32_t draws) {
         RegisterWrites registers{{0x8b, static_cast<std::uint32_t>(user.size()) << 1u}};
         for (std::uint32_t word = 0; word < user.size(); ++word) registers.emplace_back(0x8cu + word, user[word]);
         for (const auto& entry : RegisterWrites{{0x00b, 8u << 1u}, {0x00c, 0}, {0x00d, 0}, {0x00e, static_cast<std::uint32_t>(pointer)}, {0x00f, static_cast<std::uint32_t>(pointer >> 32u)}}) registers.push_back(entry);
-        SubmitDraws(reinterpret_cast<std::uintptr_t>(FetchVertex.data()), reinterpret_cast<std::uintptr_t>(ReadPixel.data()), {{0x242, 4}, {0x24a, FetchIndexOffset}}, registers, blocks.target, draws);
+        SubmitDraws(reinterpret_cast<std::uintptr_t>(FetchVertex.data()), reinterpret_cast<std::uintptr_t>(ReadPixel.data()), {{0x242, 4}, {0x24a, FetchIndexOffset}}, registers, blocks.target, draws, state.vertices);
         break;
     }
     default: {
         const auto constants = RawDescriptor(blocks.ring.At(RingSlotsOffset + OuterSlot(state) * RingSlotBytes), ConstantRecords);
-        SubmitDraws(reinterpret_cast<std::uintptr_t>(PlainVertex.data()), reinterpret_cast<std::uintptr_t>(RingPixel.data()), {{0x242, 4}}, {{0x8b, 0}, {0x8c, 0}, {0x00b, 4u << 1u}, {0x00c, constants[0]}, {0x00d, constants[1]}, {0x00e, constants[2]}, {0x00f, constants[3]}}, blocks.target, draws);
+        SubmitDraws(reinterpret_cast<std::uintptr_t>(PlainVertex.data()), reinterpret_cast<std::uintptr_t>(RingPixel.data()), {{0x242, 4}}, {{0x8b, 0}, {0x8c, 0}, {0x00b, 4u << 1u}, {0x00c, constants[0]}, {0x00d, constants[1]}, {0x00e, constants[2]}, {0x00f, constants[3]}}, blocks.target, draws, state.vertices);
         break;
     }
     }
@@ -408,7 +415,7 @@ std::vector<std::uint8_t> Render(const State& state, std::uint32_t draws) {
     Apply(state);
     Submit(state, draws);
     auto image = Image(blocks.target);
-    if (state.kind == Kind::Fetch) {
+    if (state.kind == Kind::Fetch || state.kind == Kind::FetchFormat) {
         const auto written = Output();
         image.insert(image.end(), written.begin(), written.end());
     }
@@ -449,6 +456,7 @@ struct Arms {
     template <typename Step>
     void Run(const std::string& name, const std::vector<State>& states, std::uint32_t draws, const Step& check) {
         std::vector<std::vector<std::uint8_t>> today;
+        RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
         RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
         RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
         for (const auto& state : states) today.push_back(Render(state, draws));
@@ -598,6 +606,7 @@ void Formats(Arms& arms) {
         for (std::uint32_t format = 0; format < formats; ++format) states.push_back({Kind::Format, format, 16});
     }
     std::vector<std::vector<std::uint8_t>> today;
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
     RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
     RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
     for (const auto& state : states) today.push_back(Render(state, DrawsPerSubmission));
@@ -628,6 +637,7 @@ void Misses(Arms& arms) {
         Require(now.Since(base, Counter::MissContentDiffers) != 0, "structural: draws whose buffer stride changed in memory did not miss on content" + Describe(now, base));
     });
     AgcDriver::DriverDetail::Driver::SetCaptureCheckHook(&MoveTableBeforeCheck);
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
     RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
     RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
     const auto nearImage = Render({Kind::Table, 0, 16}, 1);
@@ -687,6 +697,122 @@ void Injected(Arms& arms) {
     if (arms.ring) Require(DrawRecords::Differences() > before, "inject: no difference was counted");
 }
 
+namespace StagePlanReport = AgcDriver::DriverDetail::StagePlans;
+using PlanCounter = StagePlanReport::Counter;
+
+struct PlanTotals {
+    std::array<std::uint64_t, static_cast<std::size_t>(PlanCounter::Count)> counters{};
+    std::uint64_t differences = 0;
+    std::uint64_t checked = 0;
+    std::uint64_t commits = 0;
+
+    static PlanTotals Now() {
+        PlanTotals totals;
+        for (std::size_t index = 0; index < totals.counters.size(); ++index) totals.counters[index] = StagePlanReport::Total(static_cast<PlanCounter>(index));
+        totals.differences = StagePlanReport::Differences() + DrawRecords::Differences();
+        totals.checked = StagePlanReport::Checked(DrawRecords::Item::Fetch);
+        totals.commits = DrawRecords::Total(Counter::CommitHits);
+        return totals;
+    }
+
+    std::uint64_t Since(const PlanTotals& base, PlanCounter counter) const { return counters[static_cast<std::size_t>(counter)] - base.counters[static_cast<std::size_t>(counter)]; }
+    std::uint64_t Since(const PlanTotals& base, PlanCounter first, PlanCounter last) const {
+        std::uint64_t total = 0;
+        for (auto index = static_cast<std::size_t>(first); index <= static_cast<std::size_t>(last); ++index) total += Since(base, static_cast<PlanCounter>(index));
+        return total;
+    }
+};
+
+std::string DescribePlans(const PlanTotals& now, const PlanTotals& base) {
+    std::string text;
+    for (std::size_t index = 0; index < now.counters.size(); ++index) {
+        const auto moved = now.Since(base, static_cast<PlanCounter>(index));
+        if (moved != 0) text += std::string("; ") + StagePlanReport::CounterName(static_cast<PlanCounter>(index)) + " " + std::to_string(moved);
+    }
+    if (now.commits != base.commits) text += "; committer hits " + std::to_string(now.commits - base.commits);
+    return text;
+}
+
+struct PlanArms {
+    bool ring = false;
+
+    template <typename Step>
+    void Run(const std::string& name, const std::vector<State>& states, std::uint32_t draws, const Step& check, bool clean = true) {
+        std::vector<std::vector<std::uint8_t>> today;
+        RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+        RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
+        RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
+        for (const auto& state : states) today.push_back(Render(state, draws));
+        RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, true);
+        const auto base = PlanTotals::Now();
+        for (std::size_t index = 0; index < states.size(); ++index) {
+            const auto image = Render(states[index], draws);
+            Require(image == today[index], name + ": submission " + std::to_string(index) + " with stage plans rendered differently from today's path" + DescribePlans(PlanTotals::Now(), base));
+        }
+        const auto now = PlanTotals::Now();
+        std::cout << "stage plans, " << name << ":" << DescribePlans(now, base) << '\n';
+        if (ring) {
+            Require(!clean || now.differences == base.differences, name + ": the stage plan or committer verify found differences" + DescribePlans(now, base));
+            check(now, base);
+        }
+        RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
+    }
+};
+
+std::uint64_t NewKeyMisses(const PlanTotals& now, const PlanTotals& base) {
+    return now.Since(base, PlanCounter::MissNewLayout, PlanCounter::MissNewCombination);
+}
+
+void ExpectPlanHits(const std::string& name, const PlanTotals& now, const PlanTotals& base, std::uint64_t at) {
+    const auto hits = now.Since(base, PlanCounter::Hits);
+    Require(hits >= at, name + ": " + std::to_string(hits) + " draws hit stage plans, expected at least " + std::to_string(at) + DescribePlans(now, base));
+    if (StagePlanReport::VerifyEvery() == 1) Require(now.Since(base, PlanCounter::HitsOnTodaysPath) == hits, name + ": a hit skipped the verify of every hit" + DescribePlans(now, base));
+    else Require(now.Since(base, PlanCounter::HitsOnTodaysPath) < hits, name + ": no stage plan hit skipped today's path" + DescribePlans(now, base));
+    if (StagePlanReport::VerifyEvery() != 0) Require(now.checked > base.checked, name + ": the stage plan verify checked no hit" + DescribePlans(now, base));
+    if (StagePlanReport::VerifyEvery() != 1 && DrawRecords::VerifyEvery() != 1) Require(now.commits > base.commits, name + ": the committer half recorded no stage plan hit" + DescribePlans(now, base));
+}
+
+std::vector<State> MovingIdentities(Kind kind, std::size_t count) {
+    std::vector<State> states;
+    for (std::size_t index = 0; index < count; ++index) states.push_back({kind, static_cast<std::uint32_t>(index), 16, (index & 1u) != 0 ? 6u : 3u});
+    return states;
+}
+
+void Plans(PlanArms& arms) {
+    arms.Run("draws of other identities whose constant buffer and the table in it move every submission", MovingIdentities(Kind::RingInner, 6), DrawsPerSubmission, [](const PlanTotals& now, const PlanTotals& base) {
+        ExpectPlanHits("moved", now, base, DrawsPerSubmission);
+        Require(now.Since(base, PlanCounter::DrawPlansAdded) == 1 && now.Since(base, PlanCounter::StagePlansAdded) == 2, "moved: draws whose descriptors moved did not share one draw plan of two stage plans" + DescribePlans(now, base));
+        Require(NewKeyMisses(now, base) == 0 && now.Since(base, PlanCounter::MissContentDiffers) == 0 && now.Since(base, PlanCounter::MissBufferFields) == 0, "moved: a draw whose constant buffer and table moved missed its stage plan" + DescribePlans(now, base));
+        Require(now.Since(base, PlanCounter::HitsRelocated) != 0 && now.Since(base, PlanCounter::HitsBaseValue) != 0 && now.Since(base, PlanCounter::HitsBuffersPatched) != 0, "moved: hits did not relocate the moved constant buffer's runs, patch its inline descriptor and patch the buffer moved inside it" + DescribePlans(now, base));
+    });
+    const auto formats = static_cast<std::uint32_t>(RawFormats.size());
+    std::vector<State> cycled;
+    for (std::uint32_t pass = 0; pass < 3; ++pass) {
+        for (std::uint32_t format = 0; format < formats; ++format) cycled.push_back({Kind::Format, format, 16, pass == 1 ? 6u : 3u});
+    }
+    arms.Run("a buffer format word in the key cycling through " + std::to_string(formats) + " values", cycled, DrawsPerSubmission, [&](const PlanTotals& now, const PlanTotals& base) {
+        ExpectPlanHits("formats", now, base, DrawsPerSubmission * 2);
+        Require(now.Since(base, PlanCounter::MissNewRunWords) != 0, "formats: a changed format word did not miss on a new key" + DescribePlans(now, base));
+        Require(now.Since(base, PlanCounter::DrawPlansAdded) == formats && now.Since(base, PlanCounter::StagePlansAdded) == formats + 1 && now.Since(base, PlanCounter::StagePlansReplaced) == 0, "formats: each format did not get its own pixel stage plan and draw plan beside one vertex stage plan" + DescribePlans(now, base));
+        Require(now.Since(base, PlanCounter::Builds) <= DrawsPerSubmission * formats, "formats: draws of formats that had stage plans kept building" + DescribePlans(now, base));
+    });
+    std::vector<State> fetched;
+    for (std::uint32_t index = 0; index < 6; ++index) fetched.push_back({Kind::FetchFormat, (index / 2u) % 2u, 16, (index & 1u) != 0 ? 6u : 3u});
+    arms.Run("a vertex buffer format, outside the key, that the vertex stage's module depends on", fetched, DrawsPerSubmission, [](const PlanTotals& now, const PlanTotals& base) {
+        Require(now.Since(base, PlanCounter::MissVertexLayout) != 0, "vertex format: a vertex buffer format change under one stage plan key did not fall back on its vertex layout" + DescribePlans(now, base));
+        Require(now.Since(base, PlanCounter::StagePlansReplaced) != 0 && now.Since(base, PlanCounter::Hits) != 0, "vertex format: the fallback did not replace the stage plan with one for the new format, or no draw hit" + DescribePlans(now, base));
+    });
+}
+
+void InjectedPlans(PlanArms& arms) {
+    Require(StagePlanReport::VerifyEvery() == 1, "inject plans: the stage plan verify needs APS5_VERIFY_STAGE_PLANS=1");
+    DrawRecords::CorruptAnswers(true);
+    arms.Run("a corrupted stage plan answer", MovingIdentities(Kind::Constants, 6), DrawsPerSubmission, [](const PlanTotals&, const PlanTotals&) {}, false);
+    DrawRecords::CorruptAnswers(false);
+    if (!arms.ring) return;
+    Require(StagePlanReport::Differences(DrawRecords::Field::Parameters) != 0 && StagePlanReport::Total(PlanCounter::Demotions) != 0 && StagePlanReport::Total(PlanCounter::MissRefused) != 0, "inject plans: the verify did not catch a corrupted stage plan answer, or the shape was not refused after it");
+}
+
 void InjectedCommit(Arms& arms) {
     Require(DrawRecords::VerifyEvery() >= 2, "inject commit: the committer verify needs APS5_VERIFY_DRAW_RECORDS of 2 or more, so hits reach the committer");
     DrawRecords::CorruptCommits(true);
@@ -707,12 +833,16 @@ int main(int argc, char** argv) {
         }
         const bool inject = argc > 1 && std::string_view(argv[1]) == "--inject";
         const bool injectCommit = argc > 1 && std::string_view(argv[1]) == "--inject-commit";
+        const bool injectPlans = argc > 1 && std::string_view(argv[1]) == "--inject-plans";
         using AgcDriver::DriverDetail::DrawFinisher;
         using AgcDriver::DriverDetail::DrawPipeline;
         const bool leanEnvironment = RuntimeSwitches::Set(RuntimeSwitch::LeanFront);
         const bool recordsEnvironment = RuntimeSwitches::Set(RuntimeSwitch::DrawRecords);
+        const bool plansEnvironment = RuntimeSwitches::Set(RuntimeSwitch::StagePlans);
         Arms arms;
         arms.ring = DrawFinisher::Enabled() && DrawFinisher::Overlap() && DrawPipeline::Depth() != 0;
+        PlanArms planArms;
+        planArms.ring = arms.ring;
         Register(PlainVertexHeader, PlainVertex.data(), sizeof(PlainVertex), 2);
         Register(ConstantPixelHeader, ConstantPixel.data(), sizeof(ConstantPixel), 1);
         Register(TableVertexHeader, TableVertex.data(), sizeof(TableVertex), 2);
@@ -726,18 +856,25 @@ int main(int argc, char** argv) {
             Injected(arms);
         } else if (injectCommit) {
             InjectedCommit(arms);
+        } else if (injectPlans) {
+            InjectedPlans(planArms);
+        } else if (plansEnvironment) {
+            Plans(planArms);
         } else {
             Hits(arms);
             Ring(arms);
             Formats(arms);
             Misses(arms);
             Fallbacks(arms);
+            Plans(planArms);
         }
         DrawRecords::Report(true);
+        StagePlanReport::Report(true);
         RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, leanEnvironment);
         RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, recordsEnvironment);
+        RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, plansEnvironment);
         AgcDriverShutdown_nid_postfix();
-        std::cout << (inject || injectCommit ? "the draw record verify caught a corrupted answer and today's path drew" : "draw record hits render as today's path for moved constants, descriptors and vertex buffers, relocate inline buffer descriptors read through and bound, patch read-only buffer bases and sizes moved inside captured runs, pick the variant of a changed format word, record through the committer half with pushed constants, held targets and per-batch keeps, and fall back on structural changes, writes after the fetch and failed committer checks") << (arms.ring ? "" : " (no finisher ring: records never ran)") << '\n';
+        std::cout << (inject || injectCommit || injectPlans ? "the draw record verify caught a corrupted answer and today's path drew" : "draw record hits render as today's path for moved constants, descriptors and vertex buffers, relocate inline buffer descriptors read through and bound, patch read-only buffer bases and sizes moved inside captured runs, pick the variant of a changed format word, record through the committer half with pushed constants, held targets and per-batch keeps, and fall back on structural changes, writes after the fetch and failed committer checks") << (arms.ring ? "" : " (no finisher ring: records never ran)") << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

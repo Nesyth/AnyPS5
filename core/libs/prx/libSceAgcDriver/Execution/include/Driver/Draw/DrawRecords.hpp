@@ -125,10 +125,13 @@ struct DrawRecordView {
     void Capture(std::span<const Graphics::CompiledShader> shaders, const Pm4::DrawParameters& drawParameters);
 };
 
+enum class DrawRecordPlanRefusal : std::uint8_t { None, Shape, Indirect, Stages, GeometryBack, Capture, Direct, Program, Result, Patched };
+
 struct DrawRecordSink {
     bool queued = false;
     bool plan = false;
     bool verify = false;
+    DrawRecordPlanRefusal refusal = DrawRecordPlanRefusal::None;
     std::uint64_t shape = 0;
     std::vector<std::uint32_t> contentKey;
     std::vector<std::uint32_t> vertexLayout;
@@ -201,6 +204,7 @@ struct DrawRecordHit {
     bool inputsMoved = false;
     bool baseValueMoved = false;
     bool buffersPatched = false;
+    bool relocated = false;
 };
 
 namespace DrawRecordFlags {
@@ -209,8 +213,12 @@ constexpr std::uint8_t On = 1;
 constexpr std::uint8_t Probed = 2;
 constexpr std::uint8_t BuildWanted = 4;
 constexpr std::uint8_t VerifyDue = 8;
+constexpr std::uint8_t StagePlans = 16;
 
 }
+
+bool ReadRecordUserWords(const DrawProgram& program, const DrawUserWords& words, std::vector<std::uint32_t>& out);
+bool SameBufferFields(const std::uint32_t* before, const std::uint32_t* after);
 
 class DrawRecordStore {
 public:

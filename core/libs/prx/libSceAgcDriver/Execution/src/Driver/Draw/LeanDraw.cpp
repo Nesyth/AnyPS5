@@ -191,19 +191,69 @@ ShapeRecord& LeanDraws::Place(std::uint64_t shape, std::uint64_t deviceSerial, s
 void LeanDraws::Retire(ShapeRecord& record, std::uint64_t front) {
     if (record.built != nullptr && record.lastSeq >= front) retired.emplace_back(std::move(record.built), record.lastSeq);
     record.built = nullptr;
+    RetirePlans(record, front);
+    record.plansRefused = false;
+}
+
+void LeanDraws::RetirePlans(ShapeRecord& record, std::uint64_t front) {
+    if (record.plans == nullptr) return;
+    planBytes -= record.plans->bytes;
+    --planShapes;
+    stagePlans -= record.plans->PlanCount();
+    drawPlans -= record.plans->draws.size();
+    if (record.plansSeq >= front) retiredPlans.emplace_back(std::move(record.plans), record.plansSeq);
+    record.plans = nullptr;
+    notePlans();
+}
+
+bool LeanDraws::InstallPlans(ShapeRecord& record, std::shared_ptr<const StagePlanSet> set, std::uint64_t front, std::uint64_t present) {
+    const auto cap = DrawRecordStore::ConfiguredByteCap();
+    const auto held = [&] { return record.plans != nullptr ? record.plans->bytes : std::size_t{0}; };
+    if (planBytes - held() + set->bytes > cap) {
+        sweepPlans(present, front, &record);
+        if (planBytes - held() + set->bytes > cap) return false;
+    }
+    RetirePlans(record, front);
+    planBytes += set->bytes;
+    ++planShapes;
+    stagePlans += set->PlanCount();
+    drawPlans += set->draws.size();
+    record.plans = std::move(set);
+    record.plansPresent = present;
+    notePlans();
+    return true;
+}
+
+void LeanDraws::sweepPlans(std::uint64_t present, std::uint64_t front, const ShapeRecord* keep) {
+    if (sweptPlansPresent == present) return;
+    sweptPlansPresent = present;
+    for (auto& record : records) {
+        if (!record.used || &record == keep || record.plans == nullptr || present <= record.plansPresent + StagePlanLimits::KeepPresents) continue;
+        RetirePlans(record, front);
+        StagePlans::AddOnWorker(StagePlans::Counter::SetsSwept);
+    }
+}
+
+void LeanDraws::notePlans() const {
+    StagePlans::NoteStore(planShapes, stagePlans, drawPlans, planBytes);
 }
 
 void LeanDraws::Clear(std::uint64_t front) {
+    std::uint64_t cleared = 0;
     for (auto& record : records) {
         if (!record.used) continue;
+        if (record.plans != nullptr) ++cleared;
         Retire(record, front);
         record = ShapeRecord{};
     }
+    if (cleared != 0) StagePlans::AddOnWorker(StagePlans::Counter::SetsCleared, cleared);
+    sweptPlansPresent = ~std::uint64_t{0};
     identities.Clear(front);
 }
 
 void LeanDraws::Release(std::uint64_t front, std::uint64_t issued) {
     if (!retired.empty()) std::erase_if(retired, [&](const auto& entry) { return entry.second < front; });
+    if (!retiredPlans.empty()) std::erase_if(retiredPlans, [&](const auto& entry) { return entry.second < front; });
     identities.Release(front);
     while (anchorTail - anchorHead > 1 && anchors[static_cast<std::size_t>((anchorHead + 1) % Anchors)].firstSeq <= front) {
         anchors[static_cast<std::size_t>(anchorHead % Anchors)] = LeanAnchor{};
@@ -227,6 +277,13 @@ void LeanDraws::Reset() {
     identitiesSerial = 0;
     records.clear();
     retired.clear();
+    retiredPlans.clear();
+    planBytes = 0;
+    planShapes = 0;
+    stagePlans = 0;
+    drawPlans = 0;
+    sweptPlansPresent = ~std::uint64_t{0};
+    notePlans();
     registry = nullptr;
     ++registryEpoch;
 }
@@ -367,7 +424,14 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
         return drawEntries() && registerKeyEnabled() && !verifyDrawDataHits() && !verifyDrawRecipe() && !verifyDrawEntries() && !traceDrawCache() && !drawRelocationDrain() && DrawFinisher::Enabled() && DrawFinisher::Overlap();
     }();
     const bool records = frontLatch.records;
+    const bool plans = frontLatch.stagePlans;
     const auto recordsOff = [&](DrawRecords::Counter reason) {
+        if (plans) {
+            using Off = StagePlans::Counter;
+            StagePlans::AddOnWorker(Off::Draws);
+            StagePlans::AddOnWorker(reason == DrawRecords::Counter::OffIndirect ? Off::OffIndirect : reason == DrawRecords::Counter::OffLeanVerify ? Off::OffLeanVerify : reason == DrawRecords::Counter::OffInline ? Off::OffInline : Off::OffTodaysDraw);
+            return;
+        }
         if (!records) return;
         DrawRecords::AddOnWorker(DrawRecords::Counter::Draws);
         DrawRecords::AddOnWorker(reason);
@@ -411,6 +475,7 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
         job.shapeKey = shape.finalShape;
         job.deviceSerial = record.deviceSerial;
         job.records = nullptr;
+        job.plans = nullptr;
         job.recordGeneration = 0;
         job.recordFlags = 0;
         recordsOff(DrawRecords::Counter::OffLeanVerify);
@@ -443,6 +508,7 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
     job->shapeKey = shape.finalShape;
     job->deviceSerial = record.deviceSerial;
     job->records = nullptr;
+    job->plans = nullptr;
     job->recordGeneration = 0;
     job->recordFlags = 0;
     LeanFront::AddOnWorker(Counter::LeanDraws);
@@ -451,10 +517,11 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
         finishLeanDraw(*local, LeanAnchor{submission.shaders, leanDraws.device, 0});
         return DrawVerdict::Drawn;
     }
-    if (records) probeDrawRecord(*job, shape);
+    if (plans) probeStagePlans(*job, record);
+    else if (records) probeDrawRecord(*job, shape);
     record.lastSeq = finisher.Issued();
     const bool answered = (job->recordFlags & (DrawRecordFlags::BuildWanted | DrawRecordFlags::VerifyDue)) != 0;
-    finisher.PublishLean(&Driver::runLeanDraw, shape.writes, job->drawKey, job->shapeKey, answered ? &Driver::retireDrawRecord : nullptr);
+    finisher.PublishLean(&Driver::runLeanDraw, shape.writes, job->drawKey, job->shapeKey, !answered ? nullptr : plans ? &Driver::retireStagePlans : &Driver::retireDrawRecord);
     return DrawVerdict::Drawn;
 }
 

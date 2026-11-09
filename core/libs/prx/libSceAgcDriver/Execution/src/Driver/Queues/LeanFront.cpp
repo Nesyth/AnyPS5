@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordReport.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StagePlanReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include <atomic>
 #include <chrono>
@@ -127,6 +128,8 @@ FrontMode Take(Latch& latch, bool eligible) {
         latch.checkSwitches = false;
         latch.records = false;
         latch.recordsVerifyEvery = 0;
+        latch.stagePlans = false;
+        latch.stagePlansVerifyEvery = 0;
         return FrontMode::Today;
     }
     const auto generation = Graphics::RuntimeSwitches::Generation();
@@ -141,7 +144,13 @@ FrontMode Take(Latch& latch, bool eligible) {
     latch.mode = mode;
     latch.verifyEvery = mode == FrontMode::Lean ? VerifyEvery() : 0;
     latch.checkSwitches = Due(latch, Item::SwitchRead);
-    const bool records = mode == FrontMode::Lean && latch.switches.Set(Graphics::RuntimeSwitch::DrawRecords);
+    const bool plans = mode == FrontMode::Lean && latch.switches.Set(Graphics::RuntimeSwitch::StagePlans);
+    const std::uint8_t plansTaken = plans ? 2 : 1;
+    if (latch.stagePlansTaken != 0 && latch.stagePlansTaken != plansTaken) StagePlans::AddOnWorker(StagePlans::Counter::ModeChanges);
+    latch.stagePlansTaken = plansTaken;
+    latch.stagePlans = plans;
+    latch.stagePlansVerifyEvery = plans ? StagePlans::VerifyEvery() : 0;
+    const bool records = mode == FrontMode::Lean && !plans && latch.switches.Set(Graphics::RuntimeSwitch::DrawRecords);
     const std::uint8_t recordsTaken = records ? 2 : 1;
     if (latch.recordsTaken != 0 && latch.recordsTaken != recordsTaken) DrawRecords::AddOnWorker(DrawRecords::Counter::RecordModeChanges);
     latch.recordsTaken = recordsTaken;
@@ -151,6 +160,7 @@ FrontMode Take(Latch& latch, bool eligible) {
     if ((++latch.latches & 15u) == 0) {
         Report(false);
         DrawRecords::Report(false);
+        StagePlans::Report(false);
     }
     return mode;
 }

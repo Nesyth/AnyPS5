@@ -385,6 +385,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawLookup.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPipeline.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRecords.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/StagePlans.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadReport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPrecheck.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRegisterKey.cpp
@@ -818,6 +819,26 @@ function(agc_add_draw_records_test agcTestName)
         list(APPEND agcRecordsTests ${agcTestName}_records_late)
     endif()
     set_tests_properties(${agcRecordsTests} PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDrawRecordsDifference}")
+endfunction()
+
+set(agcStagePlansDifference "\\[stage-plans-verify\\] [-a-z ]+ differs:")
+
+function(agc_add_stage_plans_test agcTestName)
+    set(agcPipelineEnvironment ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1)
+    set(agcPlansEnvironment ${agcPipelineEnvironment} ${agcLeanFrontEnvironment} APS5_STAGE_PLANS=1)
+    agc_add_env_test(${agcTestName}_stage_plans ${agcTestName}_tests
+            ENV ${agcPlansEnvironment})
+    agc_add_env_test(${agcTestName}_stage_plans_verify ${agcTestName}_tests
+            ENV ${agcPlansEnvironment} APS5_VERIFY_STAGE_PLANS=1)
+    agc_add_env_test(${agcTestName}_stage_plans_commit_verify ${agcTestName}_tests
+            ENV ${agcPlansEnvironment} APS5_VERIFY_STAGE_PLANS=3 APS5_VERIFY_DRAW_RECORDS=3)
+    set(agcPlansTests ${agcTestName}_stage_plans ${agcTestName}_stage_plans_verify ${agcTestName}_stage_plans_commit_verify)
+    if("LATE" IN_LIST ARGN)
+        agc_add_env_test(${agcTestName}_stage_plans_late ${agcTestName}_tests
+                ENV ${agcPlansEnvironment} ${agcLateStackEnvironment} APS5_VERIFY_STAGE_PLANS=2)
+        list(APPEND agcPlansTests ${agcTestName}_stage_plans_late)
+    endif()
+    set_tests_properties(${agcPlansTests} PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDrawRecordsDifference};${agcStagePlansDifference}")
 endfunction()
 
 function(agc_add_gpu_heap_test agcTestName)

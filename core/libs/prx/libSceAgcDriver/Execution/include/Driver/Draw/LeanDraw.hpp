@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StagePlans.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <array>
 #include <cstddef>
@@ -40,7 +41,11 @@ struct ShapeRecord {
     std::array<LeanVerdict, 3> verdicts{};
     bool used = false;
     bool refused = false;
+    bool plansRefused = false;
     std::shared_ptr<const LeanShape> built;
+    std::shared_ptr<const StagePlanSet> plans;
+    std::uint64_t plansSeq = 0;
+    std::uint64_t plansPresent = 0;
 };
 
 struct LeanDrawJob {
@@ -55,6 +60,7 @@ struct LeanDrawJob {
     std::uint32_t queue;
     std::uint32_t opcode;
     const DrawRecordSet* records;
+    const StagePlanSet* plans;
     std::uint64_t recordGeneration;
     std::uint8_t recordFlags;
     Pm4::DrawParameters parameters;
@@ -98,6 +104,8 @@ public:
     ShapeRecord* Find(std::uint64_t shape, std::uint64_t deviceSerial);
     ShapeRecord& Place(std::uint64_t shape, std::uint64_t deviceSerial, std::uint64_t front);
     void Retire(ShapeRecord& record, std::uint64_t front);
+    void RetirePlans(ShapeRecord& record, std::uint64_t front);
+    bool InstallPlans(ShapeRecord& record, std::shared_ptr<const StagePlanSet> set, std::uint64_t front, std::uint64_t present);
     void Clear(std::uint64_t front);
     void Release(std::uint64_t front, std::uint64_t issued);
     void ReleaseDevice();
@@ -116,8 +124,17 @@ public:
     std::uint64_t identitiesSerial = 0;
 
 private:
+    void sweepPlans(std::uint64_t present, std::uint64_t front, const ShapeRecord* keep);
+    void notePlans() const;
+
     std::vector<ShapeRecord> records;
     std::vector<std::pair<std::shared_ptr<const LeanShape>, std::uint64_t>> retired;
+    std::vector<std::pair<std::shared_ptr<const StagePlanSet>, std::uint64_t>> retiredPlans;
+    std::size_t planBytes = 0;
+    std::size_t planShapes = 0;
+    std::size_t stagePlans = 0;
+    std::size_t drawPlans = 0;
+    std::uint64_t sweptPlansPresent = ~std::uint64_t{0};
     std::array<LeanAnchor, Anchors> anchors{};
     std::uint64_t anchorHead = 0;
     std::uint64_t anchorTail = 0;
