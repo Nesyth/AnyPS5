@@ -2544,6 +2544,61 @@ SharedStage PreparedShaderInvocation::ShareStage(const ResourceCapture& capture)
     return {std::move(donor), std::move(patch)};
 }
 
+bool PreparedShaderInvocation::FillSharedSide(const ResourceCapture& capture, const RecompileResult& donor, const MemoPatch& patch, HeapStageWords& side) const {
+    const auto& snapshot = capture.snapshot;
+    if (capture.source != handle->source || !patch.valid) return false;
+    if (static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads != donor.poisonedSrtReads) return false;
+    const auto count = donor.bindings.size();
+    side.userData.clear();
+    side.flattenedSrt.clear();
+    side.pushWords.clear();
+    side.bindings.resize(count);
+    for (auto& words : side.bindings) words.clear();
+    for (const auto& [binding, resources] : patch.buffers) {
+        if (binding >= count || donor.bindings[binding].guestDescriptor.size() != resources.size() * 4u) return false;
+        auto& words = side.bindings[binding];
+        words.resize(resources.size() * 4u);
+        for (std::size_t element = 0; element < resources.size(); ++element) {
+            if (resources[element] >= snapshot.buffers.size()) return false;
+            std::copy_n(snapshot.buffers[resources[element]].dwords.begin(), 4u, words.begin() + element * 4u);
+        }
+    }
+    if (!patch.userWords.empty()) {
+        if (patch.pushData) {
+            if (patch.userWords.size() * sizeof(std::uint32_t) > donor.pushConstants.size()) return false;
+            for (std::size_t word = 0; word < patch.userWords.size(); ++word) {
+                if (patch.userWords[word] >= snapshot.userData.size()) return false;
+                side.pushWords.emplace_back(static_cast<std::uint32_t>(word), snapshot.userData[patch.userWords[word]]);
+            }
+        } else {
+            if (patch.shaderData >= count) return false;
+            const auto& kept = donor.bindings[patch.shaderData].guestDescriptor;
+            if (patch.userWords.size() > kept.size()) return false;
+            auto& words = side.bindings[patch.shaderData];
+            words.assign(kept.begin(), kept.end());
+            for (std::size_t word = 0; word < patch.userWords.size(); ++word) {
+                if (patch.userWords[word] >= snapshot.userData.size()) return false;
+                words[word] = snapshot.userData[patch.userWords[word]];
+            }
+        }
+    }
+    if (patch.flattenedSrt != MemoPatch::NoBinding) {
+        // An empty side binding reads as the donor's words, so an empty SRT cannot replace others.
+        if (patch.flattenedSrt >= count || (snapshot.flattenedSrt.empty() && !donor.bindings[patch.flattenedSrt].guestDescriptor.empty())) return false;
+        side.bindings[patch.flattenedSrt].assign(snapshot.flattenedSrt.begin(), snapshot.flattenedSrt.end());
+    }
+    side.vertexAttributes.clear();
+    if (!request.context.vertex) return donor.vertexAttributes.empty();
+    const auto& vertex = *request.context.vertex;
+    side.vertexAttributes.assign(donor.vertexAttributes.begin(), donor.vertexAttributes.end());
+    for (auto& attribute : side.vertexAttributes) {
+        if (attribute.location >= vertex.resourcesNum || attribute.location >= vertex.resources.size()) return false;
+        attribute.resource = vertex.resources[attribute.location];
+        if (vertex.fetchEmbedded) attribute.fetchIndex = vertex.resourcesDst[attribute.location].fetchIndex;
+    }
+    return true;
+}
+
 void CompleteHeapDataWords(const RecompileResult& shared, HeapStageWords& words) {
     const auto count = shared.bindings.size();
     if (!words.bindings.empty() && words.bindings.size() != count) throw std::runtime_error("ShaderRecompiler: a heap stage's per-draw bindings differ in number from its template");
