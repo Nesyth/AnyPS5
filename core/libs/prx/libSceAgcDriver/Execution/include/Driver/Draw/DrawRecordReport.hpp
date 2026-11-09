@@ -21,10 +21,18 @@ enum class Field : std::uint8_t {
     VertexLayouts,
     WriteTemplates,
     FragmentOutputs,
+    Variants,
+    PushConstants,
+    Bindings,
+    VertexAttributes,
+    ImageViews,
+    Parameters,
+    ReadRanges,
+    Snapshots,
     Count,
 };
 
-enum class Allowed : std::uint8_t { FragmentOutputsOneSide, Count };
+enum class Allowed : std::uint8_t { FragmentOutputsOneSide, TodayNotQueued, Count };
 
 enum class Counter : std::uint8_t {
     Draws,
@@ -40,11 +48,21 @@ enum class Counter : std::uint8_t {
     MissGenerationMoved,
     MissNotQueued,
     MissKeyless,
+    MissNoFetchPlan,
+    MissUserWord,
+    MissFetchGate,
+    MissImageViews,
+    MissVertexLayout,
+    MissBufferFields,
+    MissMemoryChanged,
+    MissFetchError,
     OffTodaysDraw,
     OffIndirect,
     OffLeanVerify,
     OffInline,
     RecordsBuilt,
+    PlansBuilt,
+    PlansRefused,
     BuildsRefused,
     RecordsInstalled,
     BuildsDropped,
@@ -58,6 +76,8 @@ enum class Counter : std::uint8_t {
 constexpr std::size_t ItemCount = static_cast<std::size_t>(Item::Count);
 
 std::uint64_t VerifyEvery();
+void CorruptAnswers(bool corrupt);
+bool CorruptingAnswers();
 
 inline bool Due(LeanFront::Latch& latch) {
     if (latch.recordsVerifyEvery == 0) return false;

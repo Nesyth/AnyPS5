@@ -356,7 +356,9 @@ int Device() {
         const auto jobs = draws - off;
         const auto hits = now.Since(base, Counter::Hits);
         Require(jobs > DrawsPerSubmission && hits + DrawsPerSubmission >= jobs, "draw records hit " + std::to_string(hits) + " of " + std::to_string(jobs) + " finisher jobs of one identity whose user data pointer moves between submissions" + name + Describe(now, base));
-        Require(now.Since(base, Counter::MissNewIdentity) == 1 && now.Since(base, Counter::RecordsInstalled) >= 1 && now.Since(base, Counter::HitsOnTodaysPath) == hits, "one identity did not install a record and run its hits on today's path" + name + Describe(now, base));
+        const auto verified = now.Since(base, Counter::HitsOnTodaysPath);
+        const bool verifiedAsDue = DrawRecords::VerifyEvery() == 0 ? verified == 0 : DrawRecords::VerifyEvery() == 1 ? verified == hits : verified != 0 && verified < hits;
+        Require(now.Since(base, Counter::MissNewIdentity) == 1 && now.Since(base, Counter::RecordsInstalled) >= 1 && now.Since(base, Counter::PlansBuilt) >= 1 && verifiedAsDue, "one identity did not install a record with a fetch plan, or its hits did not run the record path except where the verify ran today's" + name + Describe(now, base));
         Require(now.Since(base, Counter::MissContentDiffers) == 0 && now.Since(base, Counter::InputRefetches) == 0, "draws of one identity with moved constants missed on content or moved vertex inputs" + name + Describe(now, base));
         Require(DrawRecords::VerifyEvery() == 0 || (now.fetches > base.fetches && now.lookups > base.lookups), "the draw record verify checked no hit" + name);
         const auto other = Totals::Now();

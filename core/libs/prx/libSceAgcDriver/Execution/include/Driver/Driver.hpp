@@ -321,7 +321,13 @@ private:
     void finishLeanDraw(const LeanDrawJob& job, const LeanAnchor& anchor);
     static void runLeanDraw(const std::byte* payload);
     void probeDrawRecord(LeanDrawJob& job, const LeanShape& shape);
-    void settleDrawRecord(const LeanDrawJob& job, const DrawRecordSink& sink);
+    void settleDrawRecord(const LeanDrawJob& job, const DrawRecordSink& sink, bool hit);
+    void finishRecordDraw(const LeanDrawJob& job);
+    std::shared_ptr<DrawRecordHit> fetchDrawRecords(const LeanDrawJob& job);
+    DrawRecords::Counter fetchDrawRecord(const LeanDrawJob& job, const DrawRecord& record, DrawRecordHit& hit);
+    void commitRecordDraw(const LeanDrawJob& job, const LeanAnchor& anchor, std::shared_ptr<DrawRecordHit> hit);
+    void verifyRecordHit(const LeanDrawJob& job, const DrawRecord& record, const DrawRecordView& answer, const DrawRecordSink& sink);
+    static std::shared_ptr<const DrawRecordPlan> buildDrawRecordPlan(const Graphics::State& graphics, const Pm4::DrawParameters& parameters, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, std::span<const Graphics::CompiledShader> stages);
     void installDrawRecord(const LeanDrawJob& job, const DrawRecordAnswer& answer);
     static void retireDrawRecord(const std::byte* payload, std::shared_ptr<const void>&& answer);
     void restartFinishedDraw(DrawTail& tail);

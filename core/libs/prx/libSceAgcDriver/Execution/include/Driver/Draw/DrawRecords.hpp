@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include <array>
 #include <cstddef>
@@ -39,14 +40,91 @@ using DrawRecordHash = std::array<std::uint64_t, 2>;
 
 DrawRecordHash HashDrawRecordWords(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
 
+struct DrawRecordTarget {
+    std::uint32_t position = 0;
+    std::uint32_t binding = 0;
+    std::uint32_t word = 0;
+};
+
+struct DrawRecordBuffer {
+    std::uint32_t binding = 0;
+    std::uint32_t element = 0;
+    std::uint32_t position = 0;
+};
+
+struct DrawRecordForward {
+    static constexpr std::uint32_t Push = ~0u;
+    std::uint32_t word = 0;
+    std::uint32_t slot = 0;
+    std::uint32_t binding = Push;
+};
+
+struct DrawRecordStage {
+    ShaderRecompiler::ShaderStage stage = ShaderRecompiler::ShaderStage::Vertex;
+    std::uint32_t pushConstantOffset = 0;
+    std::uint32_t hiddenUserWords = 0;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+    std::shared_ptr<const std::vector<ShaderRecompiler::RegisteredImageView>> registeredViews;
+    std::shared_ptr<DispatchVariant> variant;
+    std::vector<ShaderRecompiler::MemoryRegion> regions;
+    std::vector<std::int8_t> runBases;
+    std::uint64_t relocatableWords = 0;
+    std::uint64_t valueWords = 0;
+    std::uint64_t walkedWords = 0;
+    std::uint64_t forwardedWords = 0;
+    std::uint64_t vertexWords = 0;
+    std::uint64_t userDataMask = 0;
+    std::vector<std::array<std::uint32_t, 3>> valueSlots;
+    std::vector<DrawRecordTarget> targets;
+    std::vector<DrawRecordBuffer> buffers;
+    std::vector<DrawRecordForward> forwards;
+    std::vector<std::uint32_t> userData;
+    std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
+};
+
+struct DrawRecordPlan {
+    std::vector<DrawRecordStage> stages;
+    std::size_t bytes = 0;
+    std::uint64_t signature = 0;
+    bool addressed = false;
+};
+
+struct DrawRecordStageView {
+    std::uint64_t variant = 0;
+    std::uint32_t stage = 0;
+    std::uint32_t pushOffset = 0;
+    std::vector<std::uint32_t> bindings;
+    std::vector<std::uint32_t> vertexAttributes;
+    std::vector<ShaderRecompiler::RegisteredImageView> views;
+};
+
+struct DrawRecordView {
+    std::vector<DrawRecordStageView> stages;
+    std::array<std::byte, Graphics::PipelinePushConstantBytes> push{};
+    bool pushed = false;
+    std::array<std::uint64_t, 8> parameters{};
+    std::vector<DrawPipeline::Range> reads;
+    std::vector<DrawPipeline::Range> writes;
+    std::vector<std::uint32_t> contentKey;
+    std::optional<std::uint32_t> fragmentOutputs;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> snapshotWords;
+
+    void CaptureSnapshots(std::span<const Graphics::GuestMemorySnapshot> snapshots);
+    void Capture(std::span<const Graphics::CompiledShader> shaders, const Pm4::DrawParameters& drawParameters);
+};
+
 struct DrawRecordSink {
     bool queued = false;
+    bool plan = false;
+    bool verify = false;
     std::uint64_t shape = 0;
     std::vector<std::uint32_t> contentKey;
     std::vector<std::uint32_t> vertexLayout;
     std::vector<std::uint32_t> vertexInputs;
     std::optional<std::uint32_t> fragmentOutputs;
     std::vector<DrawPipeline::Range> writes;
+    std::shared_ptr<const DrawRecordPlan> built;
+    DrawRecordView today;
 
     void Reset();
     void NoteVertices(std::span<const std::optional<ShaderRecompiler::ShaderVertexStageInfo>> infos);
@@ -71,6 +149,8 @@ struct DrawRecord : std::enable_shared_from_this<DrawRecord> {
     std::vector<std::uint32_t> vertexInputs;
     std::optional<std::uint32_t> fragmentOutputs;
     std::vector<DrawPipeline::Range> writes;
+    std::shared_ptr<const DrawRecordPlan> plan;
+    std::uint64_t signature = 0;
 
     static std::shared_ptr<DrawRecord> Build(const DrawRecordKey& key, std::shared_ptr<const LeanShape> shape, std::uint64_t deviceSerial, std::uint64_t generation, std::uint64_t present, const DrawRecordSink& sink);
     std::size_t Bytes() const;
@@ -88,6 +168,18 @@ struct DrawRecordAnswer {
     std::shared_ptr<const DrawRecord> built;
     DrawRecordKey key;
     bool demote = false;
+};
+
+struct DrawRecordHit {
+    std::shared_ptr<const DrawRecord> record;
+    std::vector<ShaderRecompiler::HeapStageWords> sides;
+    std::vector<Graphics::CompiledShader> stages;
+    Pm4::DrawParameters parameters{};
+    std::vector<DrawPipeline::Range> reads;
+    std::vector<std::vector<std::uint32_t>> words;
+    std::vector<std::vector<Graphics::DecodeRead>> decodeReads;
+    std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    bool inputsMoved = false;
 };
 
 namespace DrawRecordFlags {

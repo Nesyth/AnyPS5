@@ -454,7 +454,7 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
     if (records) probeDrawRecord(*job, shape);
     record.lastSeq = finisher.Issued();
     const bool answered = (job->recordFlags & (DrawRecordFlags::BuildWanted | DrawRecordFlags::VerifyDue)) != 0;
-    finisher.PublishLean(&Driver::runLeanDraw, shape.writes, job->drawKey, job->shapeKey, answered ? &Driver::retireDrawRecord : nullptr);
+    finisher.PublishLean(&Driver::runLeanDraw, shape.writes, job->drawKey, job->shapeKey, answered ? &Driver::retireDrawRecord : nullptr, job->records == nullptr);
     return DrawVerdict::Drawn;
 }
 

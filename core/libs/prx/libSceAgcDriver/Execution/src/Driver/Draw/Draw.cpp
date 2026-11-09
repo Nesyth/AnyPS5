@@ -909,16 +909,7 @@ void Driver::runLeanDraw(const std::byte* payload) {
         driver.finishLeanDraw(job, driver.leanDraws.AnchorAt(job.anchor));
         return;
     }
-    struct SinkStorage {};
-    auto& sink = HostThreadLocal<DrawRecordSink, SinkStorage>();
-    sink.Reset();
-    struct SinkScope {
-        ~SinkScope() { DrawRecordSinkSlot::Set(nullptr); }
-    } scope;
-    DrawRecordSinkSlot::Set(&sink);
-    driver.finishLeanDraw(job, driver.leanDraws.AnchorAt(job.anchor));
-    DrawRecordSinkSlot::Set(nullptr);
-    driver.settleDrawRecord(job, sink);
+    driver.finishRecordDraw(job);
 }
 
 void Driver::finishLeanDraw(const LeanDrawJob& job, const LeanAnchor& anchor) {
@@ -993,10 +984,12 @@ void Driver::finishLeanDraw(const LeanDrawJob& job, const LeanAnchor& anchor) {
                     DrawFinisher::Get().AwaitTurn();
                 }
             }
+            const auto* recordSink = DrawRecordSinkSlot::Get();
+            const bool recordPlan = recordSink != nullptr && recordSink->plan;
             std::unique_lock cacheLock(drawCacheMutex);
             ++drawEntryCounters.lookups;
             ++drawEntryCounters.registerKeyLookups;
-            const auto found = speculativeMiss ? drawCache.end() : drawCache.find(drawKey);
+            const auto found = speculativeMiss || recordPlan ? drawCache.end() : drawCache.find(drawKey);
             if (found != drawCache.end()) {
                 entry = found->second;
                 decode = entry->decode;
@@ -1008,7 +1001,7 @@ void Driver::finishLeanDraw(const LeanDrawJob& job, const LeanAnchor& anchor) {
                     cacheLock.lock();
                 }
                 if (drawIdentity != 0) tail.relocationPending = DrawRelocationPending{drawKey, drawAlias, drawIdentity};
-                if (drawAlias != 0) relocateDrawEntry(words, drawAlias, entry, decode, userPatches);
+                if (drawAlias != 0 && !recordPlan) relocateDrawEntry(words, drawAlias, entry, decode, userPatches);
                 if (relocation != nullptr) {
                     auto& trial = drawRelocationTrials[drawIdentity];
                     ++trial.lookups;
@@ -1018,7 +1011,7 @@ void Driver::finishLeanDraw(const LeanDrawJob& job, const LeanAnchor& anchor) {
                         trial.lookups = trial.hits = 0;
                     }
                 }
-                if (decode == nullptr && drawDataHits() && !drawParameters.indirect) {
+                if (decode == nullptr && drawDataHits() && !drawParameters.indirect && !recordPlan) {
                     if (const auto kept = drawShapes.find(shapeKey); kept != drawShapes.end()) {
                         const auto held = drawCache.find(kept->second);
                         if (held != drawCache.end() && held->second->decode != nullptr && held->second->shape == shapeKey) dataEntry = held->second;
@@ -1799,6 +1792,16 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             recordSink->fragmentOutputs = fragmentOutputs;
             recordSink->writes.assign(writes.begin(), writes.end());
             recordSink->NoteVertices(vertexInfos);
+            if (recordSink->plan && results.empty()) recordSink->built = buildDrawRecordPlan(graphics, drawParameters, programs, roles, stageCaptures, vertexInfos, decodeReads, stages);
+            if (recordSink->verify) {
+                auto& today = recordSink->today;
+                today.Capture(stages, drawParameters);
+                today.reads = reads;
+                today.writes = writes;
+                today.contentKey = recordSink->contentKey;
+                today.fragmentOutputs = fragmentOutputs;
+                today.CaptureSnapshots(snapshots);
+            }
         }
         auto commit = [this, contentKey = std::move(contentKey), fragmentOutputs, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
             DrawPipeline::FollowEpoch(epoch);
