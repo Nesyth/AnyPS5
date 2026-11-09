@@ -527,13 +527,16 @@ void DrawFinisher::Enqueue(Job job) {
 void DrawFinisher::Enqueue(Job job, Pending held) {
     FinisherProducer::Set(true);
     if (ringMode.load(std::memory_order_acquire)) {
-        retireLean();
         rethrowLeanFailure();
         if (closed.load(std::memory_order_acquire)) {
             job();
             return;
         }
         awaitLeanRoom();
+        if (closed.load(std::memory_order_acquire)) {
+            job();
+            return;
+        }
         auto& slot = leanSlot(nextSeq);
         slot.runner = nullptr;
         slot.closure = std::move(job);
@@ -612,6 +615,11 @@ void DrawFinisher::Adopt(bool ring) {
     const auto lock = lockFor(mutex);
     if (outstanding.load(std::memory_order_acquire) != 0 || !jobs.empty() || closing || failure != nullptr) return;
     if (ringMode.load(std::memory_order_relaxed)) retireLean();
+    if (!pendingWrites.empty() || pendingUnknown != 0) {
+        pendingWrites.clear();
+        pendingUnknown = 0;
+        published.Publish(pendingWrites, 0u);
+    }
     if (ring) {
         if (lean == nullptr) lean = std::make_unique<std::array<LeanSlot, LeanSlots>>();
         leanTake.store(nextSeq, std::memory_order_seq_cst);
@@ -645,9 +653,13 @@ void DrawFinisher::rethrowLeanFailure() {
 }
 
 void DrawFinisher::awaitLeanRoom() {
+    static_assert(PublishedKeys::Capacity <= LeanSlots && 16 <= LeanSlots, "the finisher ring must hold the deepest finisher queue");
     const std::uint64_t depth = deepQueues() ? PublishedKeys::Capacity : 16;
     const auto full = [&] { return nextSeq - frontSeq.load(std::memory_order_seq_cst) >= depth && !closed.load(std::memory_order_acquire); };
-    if (!full()) return;
+    if (!full()) {
+        retireLean();
+        return;
+    }
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
     const auto roomStart = ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
     std::optional<ThreadReport::WorkerStateScope> room;
@@ -706,7 +718,6 @@ void DrawFinisher::publishLean(LeanSlot& slot) {
 
 std::byte* DrawFinisher::ReserveLean() {
     FinisherProducer::Set(true);
-    retireLean();
     rethrowLeanFailure();
     if (closed.load(std::memory_order_acquire)) return nullptr;
     awaitLeanRoom();
