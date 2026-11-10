@@ -99,6 +99,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_XP_STAMPS_BY_EPOCH",
     "APS5_MSAA_RECORD_HOLD",
     "APS5_TEMPLATE_TOUCH",
+    "APS5_XP_BINDINGS_AS_IS",
     "APS5_NO_PLAN_CLEAN_PROOFS",
     "APS5_DEFERRED_ENCODE",
 };
@@ -200,6 +201,7 @@ struct SwitchValues {
             std::getenv("APS5_XP_STAMPS_BY_EPOCH") != nullptr,
             std::getenv("APS5_MSAA_RECORD_HOLD") != nullptr,
             std::getenv("APS5_TEMPLATE_TOUCH") != nullptr,
+            std::getenv("APS5_XP_BINDINGS_AS_IS") != nullptr,
             std::getenv("APS5_NO_PLAN_CLEAN_PROOFS") != nullptr,
             std::getenv("APS5_DEFERRED_ENCODE") != nullptr,
         };

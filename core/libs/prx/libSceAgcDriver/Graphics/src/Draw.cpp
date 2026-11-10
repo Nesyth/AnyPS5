@@ -2739,6 +2739,13 @@ struct StagedWrite {
     VkRect2D area{};
 };
 
+// What a record bound the last time (APS5_XP_BINDINGS_AS_IS, a ceiling experiment).
+struct BindingsAsIs {
+    const ShaderResources* resources = nullptr;
+    const ShaderResources::PushPlan* push = nullptr;
+    std::shared_ptr<ShaderResources::DrawBindings> bindings;
+};
+
 struct RecordedDraw {
     Recorder* recorder = nullptr;
     std::shared_ptr<ShaderResources> resources;
@@ -2776,6 +2783,7 @@ struct RecordedDraw {
     const ShaderResources::PreparedBuffers* preparedCheck = nullptr;
     DrawRecordBuffers* buffers = nullptr;
     ShaderResources::PreparedDifference* bufferDifference = nullptr;
+    BindingsAsIs* bindingsAsIs = nullptr;
 };
 
 // A remapped viewport depth range reads its scale and offset from the draw's push block (the vertex shader's
@@ -3063,7 +3071,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     auto* selectedOut = record.view != nullptr || record.preparedCheck != nullptr ? &viewSelected : nullptr;
     using PreparedSelection = ShaderResources::PreparedBuffers::Selection;
     auto preparedSelection = PreparedSelection::Hazard;
-    const auto drawBindings = record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, selectedOut, record.prepared, &preparedSelection) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus, selectedOut, record.prepared, &preparedSelection);
+    std::shared_ptr<ShaderResources::DrawBindings> keptBindings;
+    const bool bindingsKept = record.bindingsAsIs != nullptr && faultRecord == nullptr && !record.replay && record.view == nullptr && record.preparedCheck == nullptr;
+    if (bindingsKept && record.bindingsAsIs->resources == &resources && record.bindingsAsIs->push == record.push) keptBindings = record.bindingsAsIs->bindings;
+    const auto drawBindings = keptBindings != nullptr ? keptBindings : record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, selectedOut, record.prepared, &preparedSelection) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus, selectedOut, record.prepared, &preparedSelection);
+    if (keptBindings != nullptr) preparedSelection = PreparedSelection::Taken;
+    else if (bindingsKept) *record.bindingsAsIs = {&resources, record.push, drawBindings};
     if (record.prepared != nullptr && record.buffers != nullptr) *record.buffers = preparedSelection == PreparedSelection::Taken ? DrawRecordBuffers::Used : preparedSelection == PreparedSelection::DepthGuards ? DrawRecordBuffers::DepthGuards : DrawRecordBuffers::UnmovedHazard;
     if (record.preparedCheck != nullptr && record.buffers != nullptr && record.bufferDifference != nullptr) {
         auto& difference = *record.bufferDifference;
@@ -5203,6 +5216,11 @@ std::unordered_map<const DrawRecordCommit*, InputsAsIs>& inputsAsIs() {
     return kept;
 }
 
+std::unordered_map<const DrawRecordCommit*, BindingsAsIs>& bindingsAsIs() {
+    thread_local std::unordered_map<const DrawRecordCommit*, BindingsAsIs> kept;
+    return kept;
+}
+
 bool takeInputsAsIs(const Context& context, const DrawRecordCommit& record, const Pm4::DrawParameters& draw, DrawInputs& inputs) {
     auto& all = inputsAsIs();
     const auto found = all.find(&record);
@@ -5610,6 +5628,8 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     for (auto& owner : multisampleOwners) {
         if (owner != nullptr) drawn.multisampleTargets.push_back(std::move(owner));
     }
+    if (RuntimeSwitches::Set(RuntimeSwitch::XpBindingsAsIs)) drawn.bindingsAsIs = &bindingsAsIs()[&record];
+    else if (!bindingsAsIs().empty()) bindingsAsIs().clear();
     recordDraw(context, state, draw, shaders, inputs, drawn, outcome, timer, ownWaitedMs, trace);
     record.effects.passHeld = held;
     if ((!multisampleRecipe || RuntimeSwitches::Set(RuntimeSwitch::MsaaRecordHold)) && recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {
