@@ -1612,6 +1612,8 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         static std::uint64_t bufferOrdinal = 0;
         const auto bufferEvery = DirectDraws::BufferVerifyEvery();
         commit.verifyBuffers = prepared != nullptr && bufferEvery != 0 && ++bufferOrdinal % bufferEvery == 0;
+        // DrawFromRecord can return before DrawWithRecord resets them.
+        commit.effects = {};
         const auto outcome = localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, nullptr, prepared);
         if (hit.planned) NotePlannedCommit(commit);
         if (hit.direct) {
