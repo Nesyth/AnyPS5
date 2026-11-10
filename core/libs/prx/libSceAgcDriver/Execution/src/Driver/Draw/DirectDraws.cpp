@@ -587,6 +587,50 @@ std::optional<Counter> Driver::assembleDirectHit(const LeanDrawJob& job, DirectS
     return std::nullopt;
 }
 
+void Driver::buildDirectClass(const LeanDrawJob& job, const LeanAnchor& anchor, const DirectClassKey& key, std::uint64_t probe, const DirectStages& resolved, const DrawRecordHit& hit) {
+    DrawRecordView answer;
+    bool answered = false;
+    try {
+        answer.Capture(hit.stages, hit.parameters);
+        answer.reads = hit.reads;
+        answer.contentKey = anchor.device->DrawContentKey(resolved.decode->state, hit.parameters, hit.stages);
+        answered = true;
+    } catch (const std::exception&) {
+    }
+    struct SinkStorage {};
+    auto& sink = HostThreadLocal<DrawRecordSink, SinkStorage>();
+    sink.Reset();
+    sink.verify = true;
+    struct SinkScope {
+        ~SinkScope() { DrawRecordSinkSlot::Set(nullptr); }
+    } scope;
+    if (answered) DrawRecordSinkSlot::Set(&sink);
+    finishLeanDraw(job, anchor);
+    DrawRecordSinkSlot::Set(nullptr);
+    if (!answered) return;
+    auto entry = std::make_shared<DirectClass>();
+    entry->key = key;
+    entry->probe = probe;
+    for (std::size_t i = 0; i < resolved.stages.size(); ++i) entry->stages[i] = resolved.stages[i].shared;
+    if (!sink.queued) {
+        entry->refusal = Counter::RefusedNotQueued;
+    } else if (sink.writes != job.shape->writes) {
+        entry->refusal = Counter::RefusedWrites;
+    } else {
+        auto record = DrawRecord::Build(DrawRecordKey::For(job.shapeKey, job.parameters), job.shape->shared_from_this(), job.deviceSerial, job.recordGeneration, Graphics::Recorder::Presents(), sink);
+        record->contentKey.clear();
+        record->vertexLayout = resolved.vertexLayout;
+        answer.writes = record->writes;
+        answer.fragmentOutputs = record->fragmentOutputs;
+        if (compareRecordAnswer(job, *record, answer, sink, &DirectDraws::NoteBuildDifference, &DirectDraws::NoteAllowed)) entry->refusal = Counter::RefusedDiffers;
+        else entry->record = std::move(record);
+    }
+    const auto outcome = entry->record != nullptr ? Counter::ClassesBuilt : entry->refusal;
+    bool installed = false;
+    DirectStores::Get().classes.Install(std::move(entry), resolved.tag, installed);
+    if (installed) DirectDraws::Add(outcome);
+}
+
 void Driver::finishDirectDraw(const LeanDrawJob& job) {
     const auto& anchor = leanDraws.AnchorAt(job.anchor);
     DirectDraws::Add(Counter::Draws);
@@ -601,13 +645,16 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
         if (timer != nullptr) timer->Lap(step);
     };
     std::optional<Counter> reason;
+    DirectClassKey key;
+    std::uint64_t probe = 0;
     std::shared_ptr<const DirectClass> found;
     std::shared_ptr<DrawRecordHit> hit;
     try {
         reason = resolveDirectStages(job, anchor, resolved, timer);
         if (!reason) {
-            const auto key = DirectClassKey::For(job, resolved);
-            found = DirectStores::Get().classes.Find(key, key.Probe());
+            key = DirectClassKey::For(job, resolved);
+            probe = key.Probe();
+            found = DirectStores::Get().classes.Find(key, probe);
             if (found != nullptr && found->record == nullptr) reason = Counter::FallbackClassRefused;
             else if (found != nullptr && found->record->vertexLayout != resolved.vertexLayout) found = nullptr;
             lap(Step::Class);
@@ -637,6 +684,10 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
         ~FallbackMark() { ThreadReport::MarkItem(ThreadReport::ItemMark::PlanFallback); }
     } fallbackMark;
     DirectDraws::Add(*reason);
+    if (*reason == Counter::FallbackClassNew) {
+        buildDirectClass(job, anchor, key, probe, resolved, *hit);
+        return;
+    }
     finishLeanDraw(job, anchor);
 }
 
