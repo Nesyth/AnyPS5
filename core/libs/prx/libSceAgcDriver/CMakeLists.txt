@@ -843,6 +843,29 @@ function(agc_add_stage_plans_test agcTestName)
     set_tests_properties(${agcPlansTests} PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDrawRecordsDifference};${agcStagePlansDifference}")
 endfunction()
 
+set(agcDirectDrawsDifference "\\[direct-draws-verify\\] [-a-z ]+ differs:")
+set(agcDirectDrawsBuildDifference "\\[direct-draws-build\\] ")
+
+function(agc_add_direct_draws_test agcTestName)
+    set(agcPipelineEnvironment ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1)
+    set(agcDirectEnvironment ${agcPipelineEnvironment} ${agcLeanFrontEnvironment} APS5_DIRECT_DRAWS=1)
+    agc_add_env_test(${agcTestName}_direct_draws ${agcTestName}_tests
+            ENV ${agcDirectEnvironment})
+    agc_add_env_test(${agcTestName}_direct_draws_verify ${agcTestName}_tests
+            ENV ${agcDirectEnvironment} APS5_VERIFY_DIRECT_DRAWS=1)
+    agc_add_env_test(${agcTestName}_direct_draws_commit_verify ${agcTestName}_tests
+            ENV ${agcDirectEnvironment} APS5_VERIFY_DIRECT_DRAWS=3 APS5_VERIFY_DRAW_RECORDS=3)
+    agc_add_env_test(${agcTestName}_direct_draws_exact_key ${agcTestName}_tests
+            ENV ${agcDirectEnvironment} APS5_DIRECT_DRAWS_EXACT_KEY=1 APS5_VERIFY_DIRECT_DRAWS=1)
+    set(agcDirectTests ${agcTestName}_direct_draws ${agcTestName}_direct_draws_verify ${agcTestName}_direct_draws_commit_verify ${agcTestName}_direct_draws_exact_key)
+    if("LATE" IN_LIST ARGN)
+        agc_add_env_test(${agcTestName}_direct_draws_late ${agcTestName}_tests
+                ENV ${agcDirectEnvironment} ${agcLateStackEnvironment} APS5_VERIFY_DIRECT_DRAWS=2)
+        list(APPEND agcDirectTests ${agcTestName}_direct_draws_late)
+    endif()
+    set_tests_properties(${agcDirectTests} PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDrawRecordsDifference};${agcStagePlansDifference};${agcDirectDrawsDifference};${agcDirectDrawsBuildDifference}")
+endfunction()
+
 function(agc_add_gpu_heap_test agcTestName)
     agc_add_env_test(${agcTestName}_gpu_heap ${agcTestName}_tests
             ENV ANYPS5_NO_SHADER_CACHE=1 APS5_GPU_HEAP=1 APS5_VERIFY_GPU_HEAP=1 APS5_DRAW_PIPELINE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1)

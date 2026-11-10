@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/LeanDraw.hpp"
@@ -699,6 +700,42 @@ void DevicePlans(bool ring, const std::array<std::byte, 1024>& todayColors) {
     RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
 }
 
+void DeviceDirect(bool ring, const std::array<std::byte, 1024>& todayColors) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    namespace DirectReport = AgcDriver::DriverDetail::DirectDraws;
+    using DirectCounter = DirectReport::Counter;
+    const std::string name = " (lean front with direct draws)";
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, true);
+    ColorMemory.fill(std::byte{0});
+    std::array<std::uint64_t, static_cast<std::size_t>(DirectCounter::Count)> base{};
+    for (std::size_t index = 0; index < base.size(); ++index) base[index] = DirectReport::Total(static_cast<DirectCounter>(index));
+    const auto since = [&](DirectCounter counter) { return DirectReport::Total(counter) - base[static_cast<std::size_t>(counter)]; };
+    const auto recordsBase = Totals::Now();
+    const auto plansBase = PlanTotals::Now();
+    for (std::uint32_t submission = 0; submission < Submissions; ++submission) Submit(submission & 1u, 3, DrawsPerSubmission, name);
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size());
+    Require(ColorMemory == todayColors, "the draws rendered differently from today's front" + name);
+    Require(Totals::Now().Since(recordsBase, Counter::Draws) == 0 && PlanTotals::Now().Since(plansBase, PlanCounter::Draws) == 0, "draws were counted for draw records or stage plans while direct draws replace them" + name);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
+    DirectReport::Report(true);
+    std::string counted;
+    for (std::size_t index = 0; index < base.size(); ++index) {
+        if (const auto moved = since(static_cast<DirectCounter>(index)); moved != 0) counted += std::string("; ") + DirectReport::CounterName(static_cast<DirectCounter>(index)) + " " + std::to_string(moved);
+    }
+    if (!ring) return;
+    std::uint64_t fallbacks = 0;
+    for (auto index = static_cast<std::size_t>(DirectCounter::FallbackShape); index <= static_cast<std::size_t>(DirectCounter::FallbackVerify); ++index) fallbacks += since(static_cast<DirectCounter>(index));
+    const auto direct = since(DirectCounter::Direct);
+    Require(since(DirectCounter::Draws) != 0 && direct + fallbacks == since(DirectCounter::Draws), "the direct and fallback draws do not add up to the draws the finisher took" + name + counted);
+    Require(since(DirectCounter::VerifyDiffering) == 0 && since(DirectCounter::RefusedDiffers) == 0, "the direct draw verify or a class build found differences" + name + counted);
+    if (DirectReport::VerifyEvery() == 1) Require(direct == 0 && since(DirectCounter::VerifyChecked) != 0, "with every direct job due for a verify, a class hit committed directly or none was verified" + name + counted);
+    else Require(direct != 0, "no draw of one shape whose user data pointer moves committed directly" + name + counted);
+}
+
 int Device() {
     bool libraries = false;
     {
@@ -715,6 +752,8 @@ int Device() {
     const bool leanEnvironment = RuntimeSwitches::Set(RuntimeSwitch::LeanFront);
     const bool recordsEnvironment = RuntimeSwitches::Set(RuntimeSwitch::DrawRecords);
     const bool plansEnvironment = RuntimeSwitches::Set(RuntimeSwitch::StagePlans);
+    const bool directEnvironment = RuntimeSwitches::Set(RuntimeSwitch::DirectDraws);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
     Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
     for (auto& table : PixelConstants) table[0] = 0.25f;
@@ -780,9 +819,11 @@ int Device() {
         DrawRecords::Report(true);
     }
     DevicePlans(ring, todayColors);
+    if (directEnvironment) DeviceDirect(ring, todayColors);
     RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, leanEnvironment);
     RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, recordsEnvironment);
     RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, plansEnvironment);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, directEnvironment);
     AgcDriverShutdown_nid_postfix();
     return 0;
 }
