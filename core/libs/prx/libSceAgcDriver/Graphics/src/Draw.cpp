@@ -4398,8 +4398,13 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
         const bool dataRecipes = prepared.recordRecipe || !RuntimeSwitches::Set(RuntimeSwitch::NoDataRecipes);
-        if (recipeOut != nullptr && (DrawRecipes() || prepared.recordRecipe) && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->SpaceReuse() && (resolved.moved.empty() || dataRecipes) && !multisampled && !pipeline->ReordersSamples()) {
+        // A multisampled draw gets a recipe with APS5_MSAA_RECORDS, unless a target is staged.
+        const bool multisampleRecipe = multisampled && RuntimeSwitches::Set(RuntimeSwitch::MsaaRecords) && std::ranges::none_of(targets, [](const TargetBinding& binding) { return binding.multisampled && (binding.stagedTemporary != nullptr || binding.multisampleOwner == nullptr); });
+        if (recipeOut != nullptr && (DrawRecipes() || prepared.recordRecipe) && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->SpaceReuse() && (resolved.moved.empty() || dataRecipes) && (!multisampled || multisampleRecipe) && !pipeline->ReordersSamples()) {
             auto recipe = std::make_shared<DrawRecipe>();
+            if (multisampled) {
+                for (const auto& binding : targets) recipe->multisampled.push_back(binding.multisampled ? 1u : 0u);
+            }
             recipe->device = context.device;
             recipe->templateRef = resources;
             recipe->key = contentKey;
@@ -5215,6 +5220,18 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     auto resources = recipe.templateRef.lock();
     if (resources == nullptr) return miss(DrawRecipeMiss::TemplateGone);
     if (!resources->Reusable() || resources->HeapStage()) return miss(DrawRecipeMiss::Moved);
+    // A recipe with multisampled targets (APS5_MSAA_RECORDS): the draw must still have them where the
+    // recipe has them, none staged, and must not sample one it renders to (the full draw refuses that).
+    const bool multisampleRecipe = !recipe.multisampled.empty();
+    if (multisampleRecipe) {
+        if (!RuntimeSwitches::Set(RuntimeSwitch::MsaaRecords) || recipe.multisampled.size() != state.colors.size()) return miss(DrawRecipeMiss::TargetGone);
+        const auto& sources = resources->MultisampleSources();
+        for (std::size_t index = 0; index < state.colors.size(); ++index) {
+            const auto& color = state.colors[index];
+            if ((color.samples > 1) != (recipe.multisampled[index] != 0u)) return miss(DrawRecipeMiss::TargetGone);
+            if (color.samples > 1 && (color.staged || std::count(sources.begin(), sources.end(), color.surfaceAddress) != 0)) return miss(DrawRecipeMiss::TargetGone);
+        }
+    }
     const bool lean = resources->RecordLean();
     DrawInputs inputs;
     if (recording) {
@@ -5229,6 +5246,9 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     }
     std::vector<std::shared_ptr<StorageTexture>> targets;
     targets.reserve(recipe.targets.size());
+    // The owners and images of the multisampled targets, by color index (owners) and in order (images).
+    std::vector<std::shared_ptr<void>> multisampleOwners(multisampleRecipe ? recipe.targets.size() : 0u);
+    std::vector<VkImage> multisampleImages;
     const auto holdUnder = [&](const DrawRecordPass& pass) {
         if (!pass.valid) return DrawRecordHold::First;
         if (pass.recorder != recorder->Id() || !recorder->RenderPassOpen() || pass.generation != recorder->RenderPassGeneration()) return DrawRecordHold::Pass;
@@ -5265,6 +5285,16 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         if (failed(DrawRecipeMiss::TargetGone)) return miss(DrawRecipeMiss::TargetGone);
         for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
             timer.phase(PhaseSetup);
+            if (multisampleRecipe && recipe.multisampled[index] != 0u) {
+                // As the full draw: the target's view is asked for per draw; the hit stands while it is the recipe's.
+                VkImage image = VK_NULL_HANDLE;
+                const auto view = MultisampleTargetView(context, state.colors[index], multisampleOwners[index], &image);
+                timer.phase(PhaseReadTarget);
+                if (view != recipe.targetViews[index] || multisampleOwners[index] == nullptr) return miss(DrawRecipeMiss::TargetGone);
+                multisampleImages.push_back(image);
+                targets.push_back(nullptr);
+                continue;
+            }
             auto stored = recipe.targets[index].lock();
             if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) return miss(DrawRecipeMiss::TargetGone);
             auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
@@ -5391,7 +5421,10 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     timer.phase(PhaseLookup);
     auto pipeline = recipe.pipeline.lock();
     if (pipeline == nullptr || failed(DrawRecipeMiss::ObjectsGone)) return miss(DrawRecipeMiss::ObjectsGone);
-    const std::vector<std::shared_ptr<void>> framebufferOwners(targets.begin(), targets.end());
+    std::vector<std::shared_ptr<void>> framebufferOwners(targets.begin(), targets.end());
+    for (std::size_t index = 0; index < multisampleOwners.size(); ++index) {
+        if (multisampleOwners[index] != nullptr) framebufferOwners[index] = multisampleOwners[index];
+    }
     auto framebuffer = recipe.framebuffer.lock();
     if (framebuffer == nullptr) framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
     const ShaderResources::PushPlan* push = nullptr;
@@ -5498,9 +5531,13 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     drawn.preparedCheck = checked;
     drawn.buffers = &record.effects.buffers;
     drawn.bufferDifference = &record.effects.bufferDifference;
+    drawn.multisampleImages = std::move(multisampleImages);
+    for (auto& owner : multisampleOwners) {
+        if (owner != nullptr) drawn.multisampleTargets.push_back(std::move(owner));
+    }
     recordDraw(context, state, draw, shaders, inputs, drawn, outcome, timer, ownWaitedMs, trace);
     record.effects.passHeld = held;
-    if (recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {
+    if (!multisampleRecipe && recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {
         auto& remembered = record.pass;
         remembered.valid = true;
         remembered.recorder = recorder->Id();

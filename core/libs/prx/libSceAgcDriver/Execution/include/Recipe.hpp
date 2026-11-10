@@ -87,6 +87,9 @@ struct DrawRecipe {
     std::uint32_t fragmentOutputs = 0;
     VkPipelineStageFlags shaderStages = 0;
     bool hasDepth = false;
+    // One entry per color target when any of them is multisampled (APS5_MSAA_RECORDS), else empty.
+    // A multisampled target has no resident image in `targets`: a hit asks for its view per draw.
+    std::vector<std::uint8_t> multisampled;
     // Made while data recipes were on (APS5_NO_DATA_RECIPES unset): a hit may be a stage data hit
     // with its own data words and read-only buffer bases, which DrawWithRecipe moves per draw as a
     // template hit does.
