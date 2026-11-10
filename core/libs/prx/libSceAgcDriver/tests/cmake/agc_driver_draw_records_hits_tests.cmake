@@ -14,6 +14,17 @@ if(BUILD_TESTING)
     agc_add_env_test(agc_driver_draw_records_hits_direct_buffers_late agc_driver_draw_records_hits_tests
             ENV ${agcDirectBuffersEnvironment} ${agcLateStackEnvironment} APS5_VERIFY_DIRECT_BUFFERS=2)
     set_tests_properties(agc_driver_draw_records_hits_direct_buffers_draws agc_driver_draw_records_hits_direct_buffers_verify agc_driver_draw_records_hits_direct_buffers_late PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDrawRecordsDifference};${agcStagePlansDifference};${agcDirectDrawsDifference};${agcDirectDrawsBuildDifference};${agcDirectBuffersDifference}")
+    set(agcDirectInputsDifference "\\[direct-inputs\\] verify:")
+    agc_add_env_test(agc_driver_draw_records_hits_direct_inputs agc_driver_draw_records_hits_tests ARGS --direct-inputs
+            ENV ANYPS5_NO_SHADER_CACHE=1)
+    set(agcDirectInputsEnvironment ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1 ${agcLeanFrontEnvironment} APS5_DIRECT_DRAWS=1 APS5_DIRECT_INPUTS=1)
+    agc_add_env_test(agc_driver_draw_records_hits_direct_inputs_draws agc_driver_draw_records_hits_tests
+            ENV ${agcDirectInputsEnvironment})
+    agc_add_env_test(agc_driver_draw_records_hits_direct_inputs_verify agc_driver_draw_records_hits_tests
+            ENV ${agcDirectInputsEnvironment} APS5_VERIFY_DIRECT_INPUTS=1)
+    agc_add_env_test(agc_driver_draw_records_hits_direct_inputs_late agc_driver_draw_records_hits_tests
+            ENV ${agcDirectInputsEnvironment} APS5_DIRECT_BUFFERS=1 ${agcLateStackEnvironment} APS5_VERIFY_DIRECT_INPUTS=2)
+    set_tests_properties(agc_driver_draw_records_hits_direct_inputs agc_driver_draw_records_hits_direct_inputs_draws agc_driver_draw_records_hits_direct_inputs_verify agc_driver_draw_records_hits_direct_inputs_late PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDrawRecordsDifference};${agcStagePlansDifference};${agcDirectDrawsDifference};${agcDirectDrawsBuildDifference};${agcDirectBuffersDifference};${agcDirectInputsDifference}")
     agc_add_env_test(agc_driver_draw_records_hits_inject agc_driver_draw_records_hits_tests ARGS --inject
             ENV ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1 ${agcLeanFrontEnvironment} APS5_DRAW_RECORDS=1 APS5_VERIFY_DRAW_RECORDS=1)
     agc_add_env_test(agc_driver_draw_records_hits_inject_commit agc_driver_draw_records_hits_tests ARGS --inject-commit
