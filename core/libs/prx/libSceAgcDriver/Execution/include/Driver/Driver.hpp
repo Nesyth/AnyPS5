@@ -341,6 +341,7 @@ private:
     void verifyStagePlanHit(const LeanDrawJob& job, const DrawRecord& record, const DrawRecordView& answer, const DrawRecordSink& sink);
     void installStagePlans(const LeanDrawJob& job, const StagePlanAnswer& answer);
     static void retireStagePlans(const std::byte* payload, std::shared_ptr<const void>&& answer);
+    void finishDirectDraw(const LeanDrawJob& job);
     void restartFinishedDraw(DrawTail& tail);
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();

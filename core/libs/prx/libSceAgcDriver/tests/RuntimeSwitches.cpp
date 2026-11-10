@@ -60,6 +60,8 @@ void registry() {
     Require(RuntimeSwitches::Find("APS5_DRAW_RECORDS") == RuntimeSwitch::DrawRecords && RuntimeSwitches::Find("APS5_STAGE_PLANS") == RuntimeSwitch::StagePlans, "APS5_DRAW_RECORDS or APS5_STAGE_PLANS is not a runtime switch");
     Require(RuntimeSwitches::Find("APS5_NO_PLAN_CLEAN_PROOFS") == RuntimeSwitch::NoPlanCleanProofs, "APS5_NO_PLAN_CLEAN_PROOFS is not a runtime switch");
     Require(!RuntimeSwitches::Set(RuntimeSwitch::StagePlans) && !RuntimeSwitches::Set(RuntimeSwitch::NoPlanCleanProofs), "a stage plan switch the environment does not set started set");
+    Require(RuntimeSwitches::Find("APS5_DIRECT_DRAWS") == RuntimeSwitch::DirectDraws, "APS5_DIRECT_DRAWS is not a runtime switch");
+    Require(!RuntimeSwitches::Set(RuntimeSwitch::DirectDraws), "APS5_DIRECT_DRAWS started set without the environment setting it");
 }
 
 void snapshot() {
@@ -95,6 +97,8 @@ void parse() {
     Require(lean.switches.size() == 1 && lean.switches[0] == RuntimeSwitch::LeanFront, "APS5_AB does not accept APS5_LEAN_FRONT");
     const auto plans = AbSchedule::Parse("30:APS5_STAGE_PLANS+APS5_NO_PLAN_CLEAN_PROOFS", "", "");
     Require(plans.switches.size() == 2 && plans.switches[0] == RuntimeSwitch::StagePlans && plans.switches[1] == RuntimeSwitch::NoPlanCleanProofs, "APS5_AB does not accept APS5_STAGE_PLANS and APS5_NO_PLAN_CLEAN_PROOFS");
+    const auto direct = AbSchedule::Parse("30:APS5_DIRECT_DRAWS", "", "");
+    Require(direct.switches.size() == 1 && direct.switches[0] == RuntimeSwitch::DirectDraws, "APS5_AB does not accept APS5_DIRECT_DRAWS");
     Require(Refusal("60:APS5_FULL_BARRIERS").find("APS5_FULL_BARRIERS cannot change while the title runs; switches the A/B can change: APS5_NO_BARRIER_BATCH") != std::string::npos, "a startup-only variable was not refused with the list of switches");
     Require(Refusal("60:APS5_NO_BARRIER_BATCH+APS5_NO_BARRIER_BATCH").find("listed twice") != std::string::npos, "a duplicate switch was not refused");
     Require(Refusal("60:+APS5_NO_BARRIER_BATCH").find("empty switch name") != std::string::npos && Refusal("60:APS5_NO_BARRIER_BATCH+").find("empty switch name") != std::string::npos, "an empty switch name was not refused");

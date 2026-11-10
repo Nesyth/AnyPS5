@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordReport.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StagePlanReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanFront.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/HeapReplay.hpp"
@@ -164,6 +165,7 @@ void Phase() {
     DriverDetail::LeanFront::Report(true);
     DriverDetail::DrawRecords::Report(true);
     DriverDetail::StagePlans::Report(true);
+    DriverDetail::DirectDraws::Report(true);
 }
 
 bool OnQueue0Worker() {

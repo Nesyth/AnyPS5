@@ -100,6 +100,7 @@ struct Latch {
     bool checkSwitches = false;
     bool records = false;
     bool stagePlans = false;
+    bool directDraws = false;
     std::uint8_t recordsTaken = 0;
     std::uint8_t stagePlansTaken = 0;
     std::uint32_t depth = 0;
@@ -109,6 +110,8 @@ struct Latch {
     std::uint64_t recordOrdinal = 0;
     std::uint64_t stagePlansVerifyEvery = 0;
     std::uint64_t stagePlanOrdinal = 0;
+    std::uint64_t directVerifyEvery = 0;
+    std::uint64_t directOrdinal = 0;
     std::uint64_t latches = 0;
     Graphics::SwitchSnapshot switches;
     std::array<std::uint64_t, ItemCount> ordinals{};

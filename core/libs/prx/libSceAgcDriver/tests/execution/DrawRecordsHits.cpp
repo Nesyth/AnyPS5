@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StagePlanReport.hpp"
@@ -974,6 +975,37 @@ void InjectedCommit(Arms& arms) {
     DrawRecords::CorruptCommits(false);
 }
 
+void Direct(bool ring) {
+    namespace DirectReport = AgcDriver::DriverDetail::DirectDraws;
+    using DirectCounter = DirectReport::Counter;
+    const auto fallbacks = [] {
+        std::uint64_t total = 0;
+        for (auto index = static_cast<std::size_t>(DirectCounter::FallbackShape); index <= static_cast<std::size_t>(DirectCounter::FallbackPending); ++index) total += DirectReport::Total(static_cast<DirectCounter>(index));
+        return total;
+    };
+    const auto draws = DirectReport::Total(DirectCounter::Draws);
+    const auto direct = DirectReport::Total(DirectCounter::Direct);
+    const auto fellBack = fallbacks();
+    const auto stages = DirectReport::Total(DirectCounter::StagesBuilt);
+    for (const auto& states : {Alternating(Kind::Constants, 4), Alternating(Kind::Fetch, 4), Moving(Kind::RingInner, 4)}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+        RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
+        RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
+        std::vector<std::vector<std::uint8_t>> today;
+        for (const auto& state : states) today.push_back(Render(state, DrawsPerSubmission));
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, true);
+        for (std::size_t index = 0; index < states.size(); ++index) Require(Render(states[index], DrawsPerSubmission) == today[index], "direct draws: submission " + std::to_string(index) + " rendered differently from today's path");
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
+    }
+    const auto drawn = DirectReport::Total(DirectCounter::Draws) - draws;
+    const auto taken = DirectReport::Total(DirectCounter::Direct) - direct;
+    const auto missed = fallbacks() - fellBack;
+    std::cout << "direct draws: " << drawn << " draws, " << taken << " direct, " << missed << " fallbacks, " << DirectReport::Total(DirectCounter::StagesBuilt) - stages << " stages built\n";
+    if (!ring) return;
+    Require(drawn != 0 && taken + missed == drawn, "direct draws: the direct and fallback draws do not add up to the draws the finisher took");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -991,6 +1023,8 @@ int main(int argc, char** argv) {
         const bool leanEnvironment = RuntimeSwitches::Set(RuntimeSwitch::LeanFront);
         const bool recordsEnvironment = RuntimeSwitches::Set(RuntimeSwitch::DrawRecords);
         const bool plansEnvironment = RuntimeSwitches::Set(RuntimeSwitch::StagePlans);
+        const bool directEnvironment = RuntimeSwitches::Set(RuntimeSwitch::DirectDraws);
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
         Arms arms;
         arms.ring = DrawFinisher::Enabled() && DrawFinisher::Overlap() && DrawPipeline::Depth() != 0;
         PlanArms planArms;
@@ -1005,6 +1039,7 @@ int main(int argc, char** argv) {
         Blocks blocks;
         Scene = &blocks;
         Prepare();
+        if (directEnvironment) Direct(arms.ring);
         if (inject) {
             Injected(arms);
         } else if (injectCommit) {
@@ -1027,9 +1062,11 @@ int main(int argc, char** argv) {
         }
         DrawRecords::Report(true);
         StagePlanReport::Report(true);
+        AgcDriver::DriverDetail::DirectDraws::Report(true);
         RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, leanEnvironment);
         RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, recordsEnvironment);
         RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, plansEnvironment);
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, directEnvironment);
         AgcDriverShutdown_nid_postfix();
         std::cout << (inject || injectCommit || injectPlans ? "the draw record verify caught a corrupted answer and today's path drew" : "draw record hits render as today's path for moved constants, descriptors and vertex buffers, relocate inline buffer descriptors read through and bound, patch read-only buffer bases and sizes moved inside captured runs, pick the variant of a changed format word, record through the committer half with pushed constants, held targets and per-batch keeps, and fall back on structural changes, writes after the fetch and failed committer checks") << (arms.ring ? "" : " (no finisher ring: records never ran)") << '\n';
         return 0;
