@@ -2767,7 +2767,9 @@ struct RecordedDraw {
     bool* pushed = nullptr;
     DrawCommitView* view = nullptr;
     const ShaderResources::PreparedBuffers* prepared = nullptr;
+    const ShaderResources::PreparedBuffers* preparedCheck = nullptr;
     DrawRecordBuffers* buffers = nullptr;
+    ShaderResources::PreparedDifference* bufferDifference = nullptr;
 };
 
 // A remapped viewport depth range reads its scale and offset from the draw's push block (the vertex shader's
@@ -3052,10 +3054,15 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool hitCensus = ReplayCensusEnabled() && outcome.kind == KindTemplateHit && resources.HeapStage();
     const auto* faultRecord = drawUse != nullptr ? drawUse->record.get() : nullptr;
     std::vector<std::size_t> viewSelected;
-    auto* selectedOut = record.view != nullptr ? &viewSelected : nullptr;
+    auto* selectedOut = record.view != nullptr || record.preparedCheck != nullptr ? &viewSelected : nullptr;
     bool preparedTaken = false;
     const auto drawBindings = record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, selectedOut, record.prepared, &preparedTaken) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus, selectedOut, record.prepared, &preparedTaken);
     if (record.prepared != nullptr && record.buffers != nullptr) *record.buffers = preparedTaken ? DrawRecordBuffers::Used : DrawRecordBuffers::UnmovedHazard;
+    if (record.preparedCheck != nullptr && record.buffers != nullptr && record.bufferDifference != nullptr) {
+        auto& difference = *record.bufferDifference;
+        difference = ShaderResources::ComparePreparedSelection(*record.preparedCheck, drawBindings.get(), viewSelected);
+        *record.buffers = difference.what == nullptr ? DrawRecordBuffers::Checked : difference.memoryChanged ? DrawRecordBuffers::MemoryChanged : DrawRecordBuffers::Differs;
+    }
     if (record.view != nullptr && faultRecord == nullptr && !record.replay && !resources.HeapStage()) {
         resources.DescribeDrawBindings(drawBindings.get(), viewSelected, record.push, record.view->bindings);
         record.view->bound = true;
@@ -5290,11 +5297,14 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         timer.phase(PhaseLookup);
         return miss(DrawRecipeMiss::Proof);
     }
-    // Prepared buffers count only for the template whose plan they were prepared from.
+    // Prepared buffers count only for the template whose plan they were prepared from. A verify
+    // compares them with today's way, which then draws.
     const ShaderResources::PreparedBuffers* bound = nullptr;
+    const ShaderResources::PreparedBuffers* checked = nullptr;
     if (recording && prepared != nullptr && RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers)) {
-        if (prepared->plan != nullptr && prepared->plan == resources->DirectBufferPlan(shaders)) bound = prepared;
-        else record.effects.buffers = DrawRecordBuffers::PlanDiffers;
+        if (prepared->plan == nullptr || prepared->plan != resources->DirectBufferPlan(shaders)) record.effects.buffers = DrawRecordBuffers::PlanDiffers;
+        else if (record.verifyBuffers) checked = prepared;
+        else bound = prepared;
     }
     std::vector<ShaderResources::MovedBuffer> moved;
     {
@@ -5321,6 +5331,15 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
             }
         }
         if (!found.has_value()) found = resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched, &ticket);
+        if (checked != nullptr) {
+            auto& difference = record.effects.bufferDifference;
+            if (found.has_value()) difference = ShaderResources::ComparePreparedMoves(*checked, *found);
+            else if (resources->PreparedMovesClear(*checked, *recorder, nullptr)) difference = {"moved buffers", "today's way refuses the draw's moved buffers, which the finisher prepared and the committer's tests find clear"};
+            if (difference.what != nullptr) {
+                record.effects.buffers = DrawRecordBuffers::Differs;
+                checked = nullptr;
+            }
+        }
         if (!found.has_value() || failed(DrawRecipeMiss::Moved)) {
             if (recording) record.ticket.valid = false;
             timer.phase(PhaseLookup);
@@ -5450,7 +5469,9 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     drawn.pushFramebuffer = std::move(pushFramebuffer);
     drawn.pushed = &record.effects.pushed;
     drawn.prepared = bound;
+    drawn.preparedCheck = checked;
     drawn.buffers = &record.effects.buffers;
+    drawn.bufferDifference = &record.effects.bufferDifference;
     recordDraw(context, state, draw, shaders, inputs, drawn, outcome, timer, ownWaitedMs, trace);
     record.effects.passHeld = held;
     if (recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {

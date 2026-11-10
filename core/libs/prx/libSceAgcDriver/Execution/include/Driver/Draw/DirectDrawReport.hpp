@@ -67,7 +67,15 @@ enum class Counter : std::uint8_t {
     BuffersInaccessible,
     BuffersUploadLimit,
     BuffersBudget,
+    BuffersUnsettled,
     BuffersBlobBytes,
+    BuffersUsed,
+    BuffersPlanDiffers,
+    BuffersMovedHazard,
+    BuffersUnmovedHazard,
+    BuffersVerifyChecked,
+    BuffersVerifyDiffering,
+    BuffersMemoryChanged,
     Count,
 };
 
@@ -90,6 +98,8 @@ void NoteClasses(std::size_t known, std::size_t bytes);
 void NoteStages(std::size_t known);
 void NoteDifference(DrawRecords::Field field, std::string_view detail);
 void NoteBuildDifference(DrawRecords::Field field, std::string_view detail);
+// A prepared-buffers verify difference: one stderr line, at most 8 per 10 s report window.
+void NoteBufferDifference(std::string_view what, std::string_view detail);
 void NoteAllowed(DrawRecords::Allowed kind);
 void Report(bool force);
 

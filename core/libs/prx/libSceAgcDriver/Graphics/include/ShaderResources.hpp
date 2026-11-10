@@ -322,7 +322,22 @@ public:
         std::vector<Selected> selected;
         std::vector<std::byte> blob;
         Refusal refusal = Refusal::None;
+        // The tracker generation taken before the guest bytes were read.
+        std::uint64_t generation = 0;
     };
+    // The first difference between prepared buffers and today's way of the same draw, compared as
+    // data (APS5_VERIFY_DIRECT_BUFFERS): `what` names the part and stays null where they agree;
+    // `memoryChanged`: only bytes differ, in a guest range written after the finisher read it.
+    struct PreparedDifference {
+        const char* what = nullptr;
+        std::string detail;
+        bool memoryChanged = false;
+    };
+    // Against today's MovedReadOnlyBuffers list: allocations, addresses, sizes and words.
+    static PreparedDifference ComparePreparedMoves(const PreparedBuffers& prepared, std::span<const MovedBuffer> moved);
+    // Against today's selection and the snapshots `bindings` holds for it: allocations in order,
+    // guest ranges, then bytes.
+    static PreparedDifference ComparePreparedSelection(const PreparedBuffers& prepared, const DrawBindings* bindings, std::span<const std::size_t> selected);
     // Prepares the buffers of a draw with `shaders` from the plan, its stages' words and guest
     // memory alone, on any thread; `target` is the colour target MovedReadOnlyBuffers would get.
     // False, with the reason in `out.refusal`, where the draw's buffers cannot be prepared.

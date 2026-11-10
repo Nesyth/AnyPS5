@@ -201,13 +201,14 @@ Counter BufferRefusal(Graphics::ShaderResources::PreparedBuffers::Refusal refusa
 
 // The hit's buffers from its record's buffer plan, taken against the colour target the commit
 // will draw with (commitRecordDraw hands the committer the job's decode state).
-void prepareBuffers(const LeanDrawJob& job, DrawRecordHit& hit) {
+void prepareBuffers(const LeanDrawJob& job, const DirectStages& resolved, DrawRecordHit& hit) {
     auto plan = hit.record->commit->bufferPlan.load(std::memory_order_acquire);
     if (plan == nullptr) {
         DirectDraws::Add(Counter::BuffersNoPlan);
         return;
     }
     auto& prepared = hit.preparedBuffers.emplace();
+    prepared.generation = resolved.generation;
     bool done = false;
     try {
         done = Graphics::ShaderResources::PrepareDirectBuffers(*plan, hit.stages, &job.shape->decode->state.color, prepared);
@@ -753,7 +754,7 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
         hit->owner = found;
         hit->direct = true;
         if ((job.recordFlags & DrawRecordFlags::DirectBuffers) != 0) {
-            prepareBuffers(job, *hit);
+            prepareBuffers(job, resolved, *hit);
             lap(Step::Buffers);
         }
         commitRecordDraw(job, anchor, std::move(hit));

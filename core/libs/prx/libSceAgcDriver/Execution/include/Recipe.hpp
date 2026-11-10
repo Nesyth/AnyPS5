@@ -117,8 +117,8 @@ struct DrawRecordKeep {
 enum class DrawRecordHold : std::uint8_t { Held, First, Pass, Epoch, Proof, Pending, Depth, Target, Count };
 
 // What a record commit did with a direct hit's prepared buffers (APS5_DIRECT_BUFFERS): bound them,
-// or why it took today's way instead.
-enum class DrawRecordBuffers : std::uint8_t { None, Used, PlanDiffers, MovedHazard, UnmovedHazard, Count };
+// why it took today's way instead, or how a verify compared them with today's way.
+enum class DrawRecordBuffers : std::uint8_t { None, Used, PlanDiffers, MovedHazard, UnmovedHazard, Checked, Differs, MemoryChanged, Count };
 
 struct DrawRecordEffects {
     bool pushed = false;
@@ -133,6 +133,7 @@ struct DrawRecordEffects {
     bool proved = false;
     std::optional<Graphics::ShaderResources::CleanProof> cleanProof;
     DrawRecordBuffers buffers = DrawRecordBuffers::None;
+    Graphics::ShaderResources::PreparedDifference bufferDifference;
 };
 
 struct DrawRecordAccess {
@@ -212,6 +213,9 @@ struct DrawRecordCommit {
     std::uint64_t touchedPresent = ~std::uint64_t{0};
     std::uint64_t builds = 0;
     bool cleanProofs = false;
+    // Set by the committer for the next commit: compare the hit's prepared buffers with today's way
+    // (APS5_VERIFY_DIRECT_BUFFERS) and draw today's way.
+    bool verifyBuffers = false;
     // The buffer plan of the recipe's template while APS5_DIRECT_BUFFERS is set, published by the
     // committer after a recorded commit: the only member a finisher thread reads. It owns the plan,
     // because the recipe holds its template weakly.

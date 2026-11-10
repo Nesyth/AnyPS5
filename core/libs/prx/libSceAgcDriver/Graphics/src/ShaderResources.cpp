@@ -7966,6 +7966,43 @@ bool ShaderResources::PrepareDirectBuffers(const BufferPlan& plan, std::span<con
     return true;
 }
 
+ShaderResources::PreparedDifference ShaderResources::ComparePreparedMoves(const PreparedBuffers& prepared, std::span<const MovedBuffer> moved) {
+    const auto same = [](const MovedBuffer& a, const MovedBuffer& b) { return a.allocation == b.allocation && a.address == b.address && a.size == b.size && std::ranges::equal(a.words, b.words); };
+    std::size_t index = 0;
+    while (index < prepared.moved.size() && index < moved.size() && same(prepared.moved[index], moved[index])) ++index;
+    if (index == prepared.moved.size() && index == moved.size()) return {};
+    const auto describe = [&](std::span<const MovedBuffer> list) { return index < list.size() ? "allocation " + std::to_string(list[index].allocation) + " at 0x" + HexText(list[index].address) + " (" + std::to_string(list[index].size) + " bytes, " + std::to_string(list[index].words.size()) + " words)" : std::string("nothing"); };
+    return {"moved buffers", "the finisher moves " + std::to_string(prepared.moved.size()) + " buffers, today's way " + std::to_string(moved.size()) + "; at " + std::to_string(index) + " the finisher has " + describe(prepared.moved) + ", today's way " + describe(moved)};
+}
+
+ShaderResources::PreparedDifference ShaderResources::ComparePreparedSelection(const PreparedBuffers& prepared, const DrawBindings* bindings, std::span<const std::size_t> selected) {
+    const auto snapshots = bindings != nullptr ? std::span<const DrawBindings::Snapshot>(bindings->snapshots) : std::span<const DrawBindings::Snapshot>{};
+    const auto count = std::min(selected.size(), snapshots.size());
+    std::size_t index = 0;
+    while (index < prepared.selected.size() && index < count && prepared.selected[index].allocation == selected[index] && prepared.selected[index].begin == snapshots[index].address && prepared.selected[index].bytes == snapshots[index].bytes) ++index;
+    if (index != prepared.selected.size() || index != count || count != selected.size()) {
+        const auto mine = index < prepared.selected.size() ? "allocation " + std::to_string(prepared.selected[index].allocation) + " (" + std::to_string(prepared.selected[index].bytes) + " bytes at 0x" + HexText(prepared.selected[index].begin) + ")" : std::string("nothing");
+        const auto today = index < count ? "allocation " + std::to_string(selected[index]) + " (" + std::to_string(snapshots[index].bytes) + " bytes at 0x" + HexText(snapshots[index].address) + ")" : std::string("nothing");
+        return {"selection", "the finisher selects " + std::to_string(prepared.selected.size()) + " allocations, today's way " + std::to_string(selected.size()) + " with " + std::to_string(snapshots.size()) + " snapshots; at " + std::to_string(index) + " the finisher has " + mine + ", today's way " + today};
+    }
+    for (index = 0; index < count; ++index) {
+        const auto& item = prepared.selected[index];
+        const auto held = snapshots[index].Bytes();
+        const auto* blob = prepared.blob.data() + item.offset;
+        if (std::memcmp(held.data(), blob, item.bytes) == 0) continue;
+        std::size_t at = 0;
+        while (at < item.bytes && held[at] == blob[at]) ++at;
+        bool written = false;
+        if (item.begin != 0 && prepared.generation != 0) {
+            GuestMemory::CollectWritesUncached(item.begin, item.bytes);
+            written = GuestMemory::NewestStamp(item.begin, item.bytes) > prepared.generation;
+        }
+        const auto range = item.begin != 0 ? std::to_string(item.bytes) + " bytes at 0x" + HexText(item.begin) : std::to_string(item.bytes) + " data bytes";
+        return {"bytes", "allocation " + std::to_string(item.allocation) + ": " + range + " first differ at byte " + std::to_string(at) + (written ? ", written since the finisher read them" : ""), written};
+    }
+    return {};
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut, const PreparedBuffers* prepared, bool* preparedTaken) const {
     struct SelectedStorage {};
     auto& selected = HostThreadLocal<std::vector<std::size_t>, SelectedStorage>();

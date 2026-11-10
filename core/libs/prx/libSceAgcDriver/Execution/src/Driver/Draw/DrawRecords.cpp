@@ -1544,6 +1544,28 @@ void NoteDirectCommit(const DrawRecordCommit& commit, bool recorded) {
     else if (effects.hold != DrawRecordHold::Count) DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::HoldFirst) + static_cast<std::size_t>(effects.hold) - static_cast<std::size_t>(DrawRecordHold::First)));
 }
 
+void NoteDirectBuffers(const DrawRecordCommit& commit) {
+    using DirectDraws::Counter;
+    const auto& effects = commit.effects;
+    switch (effects.buffers) {
+    case DrawRecordBuffers::Used: DirectDraws::Add(Counter::BuffersUsed); break;
+    case DrawRecordBuffers::PlanDiffers: DirectDraws::Add(Counter::BuffersPlanDiffers); break;
+    case DrawRecordBuffers::MovedHazard: DirectDraws::Add(Counter::BuffersMovedHazard); break;
+    case DrawRecordBuffers::UnmovedHazard: DirectDraws::Add(Counter::BuffersUnmovedHazard); break;
+    case DrawRecordBuffers::Checked: DirectDraws::Add(Counter::BuffersVerifyChecked); break;
+    case DrawRecordBuffers::Differs:
+        DirectDraws::Add(Counter::BuffersVerifyChecked);
+        DirectDraws::Add(Counter::BuffersVerifyDiffering);
+        DirectDraws::NoteBufferDifference(effects.bufferDifference.what, effects.bufferDifference.detail);
+        break;
+    case DrawRecordBuffers::MemoryChanged:
+        DirectDraws::Add(Counter::BuffersVerifyChecked);
+        DirectDraws::Add(Counter::BuffersMemoryChanged);
+        break;
+    default: break;
+    }
+}
+
 void PublishBufferPlan(DrawRecordCommit& commit, std::span<const Graphics::CompiledShader> stages) {
     if (commit.bufferPlanAsked || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectBuffers)) return;
     commit.bufferPlanAsked = true;
@@ -1586,9 +1608,16 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         DrawRecords::AddOnCommitter(Counter::CommitFirst);
         if (hit.direct) DirectDraws::Add(DirectDraws::Counter::CommitFirst);
     } else if (!verify) {
-        const auto outcome = localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, nullptr, hit.preparedBuffers.has_value() ? &*hit.preparedBuffers : nullptr);
+        const auto* prepared = hit.preparedBuffers.has_value() ? &*hit.preparedBuffers : nullptr;
+        static std::uint64_t bufferOrdinal = 0;
+        const auto bufferEvery = DirectDraws::BufferVerifyEvery();
+        commit.verifyBuffers = prepared != nullptr && bufferEvery != 0 && ++bufferOrdinal % bufferEvery == 0;
+        const auto outcome = localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, nullptr, prepared);
         if (hit.planned) NotePlannedCommit(commit);
-        if (hit.direct) NoteDirectCommit(commit, outcome.recorded);
+        if (hit.direct) {
+            NoteDirectCommit(commit, outcome.recorded);
+            NoteDirectBuffers(commit);
+        }
         if (outcome.recorded) {
             if (hit.direct) PublishBufferPlan(commit, hit.stages);
             if (hit.planned || hit.direct) ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);

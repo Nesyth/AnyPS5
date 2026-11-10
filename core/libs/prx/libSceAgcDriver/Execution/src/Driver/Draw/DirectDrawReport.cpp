@@ -35,7 +35,8 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "classes built", "not queued", "writes differ", "verify differs", "build differs", "classes evicted", "stages built", "stages evicted", "invocations rebuilt", "verify checked", "verify differing",
     "commit hits", "first commits", "commit misses", "commits demoted", "proofs skipped", "proofs not skipped", "full proofs",
     "held by the record", "held by the pass", "first use", "new pass", "collect epoch", "proof serial", "pending stores", "depth surfaces", "target changed",
-    "buffers prepared", "no plan", "classification", "not accessible", "over the upload limit", "size budget", "blob bytes",
+    "buffers prepared", "no plan", "classification", "not accessible", "over the upload limit", "size budget", "not settled", "blob bytes",
+    "buffers used", "plan differs", "moved-range hazard", "unmoved-range hazard", "buffers verified", "buffers differing", "buffer memory changed",
 };
 
 constexpr std::array<const char*, StepCount> StepNames{"request", "invocation", "walk", "key", "side", "class", "checks", "buffers", "hand-off"};
@@ -132,6 +133,7 @@ std::array<std::atomic<std::uint64_t>, FieldCount> differences{};
 std::array<std::atomic<std::uint64_t>, FieldCount> buildDifferences{};
 std::array<std::atomic<std::uint64_t>, AllowedKinds> allowed{};
 std::atomic<std::uint64_t> printed{0};
+std::atomic<std::uint64_t> bufferPrinted{0};
 std::atomic<std::uint64_t> classesKnown{0};
 std::atomic<std::uint64_t> classBytes{0};
 std::atomic<std::uint64_t> stagesKnown{0};
@@ -202,6 +204,10 @@ void NoteBuildDifference(Field field, std::string_view detail) {
     if (buildDifferences[static_cast<std::size_t>(field)].fetch_add(1, std::memory_order_relaxed) < BuildLinesPerReason) std::fprintf(stderr, "[direct-draws-build] %s %s differs: %.*s\n", DrawRecords::ItemName(Item::Fetch), DrawRecords::FieldName(field), static_cast<int>(detail.size()), detail.data());
 }
 
+void NoteBufferDifference(std::string_view what, std::string_view detail) {
+    if (bufferPrinted.fetch_add(1, std::memory_order_relaxed) < PrintedPerWindow) std::fprintf(stderr, "[direct-buffers-verify] %.*s differs: %.*s\n", static_cast<int>(what.size()), what.data(), static_cast<int>(detail.size()), detail.data());
+}
+
 void NoteAllowed(Allowed kind) {
     allowed[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
 }
@@ -226,6 +232,7 @@ void Report(bool force) {
     }
     reported = current;
     printed.store(0, std::memory_order_relaxed);
+    bufferPrinted.store(0, std::memory_order_relaxed);
     const auto& counts = since.counters;
     const auto at = [&](Counter counter) { return counts[static_cast<std::size_t>(counter)]; };
     const auto draws = at(Counter::Draws);
