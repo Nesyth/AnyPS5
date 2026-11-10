@@ -4344,6 +4344,28 @@ void noteUncleanRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> 
 
 }
 
+namespace {
+
+// APS5_PIPELINE_STATS: which serial of the clean stamp moved when a kept clean proof is dropped
+// (several can move at once), and how often only the pending-store serial did.
+void noteCleanSerials(std::array<bool, 6> moved) {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!stats) return;
+    static std::array<std::atomic<std::uint64_t>, 6> counts{};
+    static std::atomic<std::uint64_t> drops{0}, pendingOnly{0};
+    static std::atomic<std::int64_t> reportedAt{0};
+    for (std::size_t index = 0; index < moved.size(); ++index) {
+        if (moved[index]) counts[index].fetch_add(1, std::memory_order_relaxed);
+    }
+    drops.fetch_add(1, std::memory_order_relaxed);
+    if (moved[1] && !moved[0] && !moved[2] && !moved[3] && !moved[4] && !moved[5]) pendingOnly.fetch_add(1, std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    std::fprintf(stderr, "[clean-serials] %llu kept clean proofs dropped for a moved serial: release %llu, pending %llu (pending only %llu), imports %llu, allocations %llu, unwatched %llu, depth surfaces %llu\n", static_cast<unsigned long long>(drops.exchange(0)), static_cast<unsigned long long>(counts[0].exchange(0)), static_cast<unsigned long long>(counts[1].exchange(0)), static_cast<unsigned long long>(pendingOnly.exchange(0)), static_cast<unsigned long long>(counts[2].exchange(0)), static_cast<unsigned long long>(counts[3].exchange(0)), static_cast<unsigned long long>(counts[4].exchange(0)), static_cast<unsigned long long>(counts[5].exchange(0)));
+}
+
+}
+
 ShaderResources::CleanStamp ShaderResources::cleanStampNow() const {
     return {GuestMemory::CleanForgetSerial(), TextureReleaseSerial().load(std::memory_order_acquire), StorageTexture::PendingSerial(), HostImportSetGeneration(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), GuestMemory::UnwatchSerial(), DepthSurfacesSerial()};
 }
@@ -4394,7 +4416,10 @@ bool ShaderResources::cleanCurrent(const CleanStamp& stamp, CleanProof& outcome)
         return false;
     }
     if (!registeredImageViewsCurrent(registeredImageViews)) return refuse(CleanEvent::Views, CleanProof::Views);
-    if (stamp.release != cleanAt.release || stamp.pending != cleanAt.pending || stamp.imports != cleanAt.imports || stamp.allocations != cleanAt.allocations || stamp.unwatched != cleanAt.unwatched || stamp.depthSurfaces != cleanAt.depthSurfaces) return refuse(CleanEvent::Serials, CleanProof::Serials);
+    if (stamp.release != cleanAt.release || stamp.pending != cleanAt.pending || stamp.imports != cleanAt.imports || stamp.allocations != cleanAt.allocations || stamp.unwatched != cleanAt.unwatched || stamp.depthSurfaces != cleanAt.depthSurfaces) {
+        noteCleanSerials({stamp.release != cleanAt.release, stamp.pending != cleanAt.pending, stamp.imports != cleanAt.imports, stamp.allocations != cleanAt.allocations, stamp.unwatched != cleanAt.unwatched, stamp.depthSurfaces != cleanAt.depthSurfaces});
+        return refuse(CleanEvent::Serials, CleanProof::Serials);
+    }
     outcome = CleanProof::Skipped;
     const auto* ranges = &cleanRangeList;
     if (stamp.forget != cleanAt.forget) {
