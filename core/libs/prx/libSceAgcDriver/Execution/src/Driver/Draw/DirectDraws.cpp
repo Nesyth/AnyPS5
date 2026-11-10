@@ -587,8 +587,7 @@ std::optional<Counter> Driver::assembleDirectHit(const LeanDrawJob& job, DirectS
     return std::nullopt;
 }
 
-void Driver::buildDirectClass(const LeanDrawJob& job, const LeanAnchor& anchor, const DirectClassKey& key, std::uint64_t probe, const DirectStages& resolved, const DrawRecordHit& hit) {
-    DrawRecordView answer;
+const DrawRecordSink* Driver::finishDirectAnswer(const LeanDrawJob& job, const LeanAnchor& anchor, const DirectStages& resolved, const DrawRecordHit& hit, DrawRecordView& answer) {
     bool answered = false;
     try {
         answer.Capture(hit.stages, hit.parameters);
@@ -607,7 +606,14 @@ void Driver::buildDirectClass(const LeanDrawJob& job, const LeanAnchor& anchor, 
     if (answered) DrawRecordSinkSlot::Set(&sink);
     finishLeanDraw(job, anchor);
     DrawRecordSinkSlot::Set(nullptr);
-    if (!answered) return;
+    return answered ? &sink : nullptr;
+}
+
+void Driver::buildDirectClass(const LeanDrawJob& job, const LeanAnchor& anchor, const DirectClassKey& key, std::uint64_t probe, const DirectStages& resolved, const DrawRecordHit& hit) {
+    DrawRecordView answer;
+    const auto* today = finishDirectAnswer(job, anchor, resolved, hit, answer);
+    if (today == nullptr) return;
+    const auto& sink = *today;
     auto entry = std::make_shared<DirectClass>();
     entry->key = key;
     entry->probe = probe;
@@ -629,6 +635,19 @@ void Driver::buildDirectClass(const LeanDrawJob& job, const LeanAnchor& anchor, 
     bool installed = false;
     DirectStores::Get().classes.Install(std::move(entry), resolved.tag, installed);
     if (installed) DirectDraws::Add(outcome);
+}
+
+void Driver::verifyDirectHit(const LeanDrawJob& job, const LeanAnchor& anchor, const DirectClass& found, const DirectStages& resolved, const DrawRecordHit& hit) {
+    DrawRecordView answer;
+    const auto* today = finishDirectAnswer(job, anchor, resolved, hit, answer);
+    if (today == nullptr) return;
+    DirectDraws::Add(Counter::VerifyChecked);
+    const auto& record = *found.record;
+    answer.writes = record.writes;
+    answer.fragmentOutputs = record.fragmentOutputs;
+    if (!compareRecordAnswer(job, record, answer, *today, &DirectDraws::NoteDifference, &DirectDraws::NoteAllowed)) return;
+    DirectDraws::Add(Counter::VerifyDiffering);
+    if (DirectStores::Get().classes.Refuse(found, Counter::RefusedVerify)) DirectDraws::Add(Counter::RefusedVerify);
 }
 
 void Driver::finishDirectDraw(const LeanDrawJob& job) {
@@ -665,6 +684,7 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
             lap(Step::Checks);
         }
         if (!reason && found == nullptr) reason = Counter::FallbackClassNew;
+        else if (!reason && (job.recordFlags & DrawRecordFlags::VerifyDue) != 0) reason = Counter::FallbackVerify;
     } catch (const std::exception&) {
         reason = Counter::FallbackWalk;
     }
@@ -686,6 +706,10 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
     DirectDraws::Add(*reason);
     if (*reason == Counter::FallbackClassNew) {
         buildDirectClass(job, anchor, key, probe, resolved, *hit);
+        return;
+    }
+    if (*reason == Counter::FallbackVerify) {
+        verifyDirectHit(job, anchor, *found, resolved, *hit);
         return;
     }
     finishLeanDraw(job, anchor);
