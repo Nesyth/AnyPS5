@@ -41,6 +41,9 @@ std::atomic<std::uint64_t> itemRebuilds{0};
 std::atomic<std::uint64_t> itemMisses{0};
 std::atomic<std::uint64_t> itemRecipeLess{0};
 std::atomic<std::uint64_t> itemNotPlain{0};
+std::atomic<std::uint64_t> itemFixups{0};
+enum class NotPlain : std::size_t { NoResult, HtileClear, KeysFill, DepthClear, Count };
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(NotPlain::Count)> itemNotPlainKinds{};
 
 bool DispatchMissItemsEnabled() {
     return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelineDispatchMisses);
@@ -63,7 +66,7 @@ void ReportDispatchItems(bool profile) {
         std::snprintf(item, sizeof(item), " %s %llu", ItemFallbackNames[i], static_cast<unsigned long long>(itemFallbacks[i].load(std::memory_order_relaxed)));
         drained += item;
     }
-    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer, %llu queued after a cache miss, %llu queued without a recipe, %llu cached ones kept off the queue as not plain); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemMisses.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRecipeLess.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemNotPlain.load(std::memory_order_relaxed)), drained.c_str());
+    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer, %llu queued after a cache miss, %llu queued without a recipe, %llu cached ones kept off the queue as not plain; not plain by kind: no result %llu, HTILE clear %llu, key fill %llu, depth plane clear %llu; ZMASK fix-ups queued %llu); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemMisses.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRecipeLess.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemNotPlain.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemNotPlainKinds[0].load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemNotPlainKinds[1].load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemNotPlainKinds[2].load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemNotPlainKinds[3].load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemFixups.load(std::memory_order_relaxed)), drained.c_str());
 }
 
 bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code) {
@@ -575,14 +578,20 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     // plain, the ones the cache already serves with a recipe included.
     bool plain = false;
     if ((pipelined && DispatchMissItemsEnabled()) || lateItem || recipeLess) {
-        plain = compiledResult != nullptr && !htileClearCompletion.has_value() && htileMask.bytes == 0u && !htileFixup.has_value();
-        if (plain && !partialLastGroup && MatchSgprPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute)) plain = false;
-        if (plain && !partialLastGroup) {
+        // A ZMASK fix-up is noted by the item itself (below), so it counts as plain.
+        NotPlain why = NotPlain::Count;
+        if (compiledResult == nullptr) why = NotPlain::NoResult;
+        else if (htileClearCompletion.has_value() || htileMask.bytes != 0u) why = NotPlain::HtileClear;
+        else if (!partialLastGroup && MatchSgprPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute)) why = NotPlain::KeysFill;
+        else if (!partialLastGroup) {
             if (const auto clear = Graphics::MatchStorageImageClear(std::span(snapshot.code).subspan(codeOffset), userData, compute, groups)) {
                 const auto clearAddress = Graphics::StorageImageClearAddress(*clear);
-                if (clearAddress != 0 && Graphics::DepthSurfaceAt(clearAddress)) plain = false;
+                if (clearAddress != 0 && Graphics::DepthSurfaceAt(clearAddress)) why = NotPlain::DepthClear;
             }
         }
+        plain = why == NotPlain::Count;
+        if (!plain) itemNotPlainKinds[static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+        else if (htileFixup.has_value()) itemFixups.fetch_add(1, std::memory_order_relaxed);
     }
     if (pipelined && DispatchMissItemsEnabled() && !plain) {
         pipelined = false;
@@ -620,7 +629,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, attach, prepareThreads, dataHit, epoch, htileClearCompletion, htileMask] {
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, attach, prepareThreads, dataHit, epoch, htileClearCompletion, htileMask, itemFixup = DispatchMissItemsEnabled() ? htileFixup : std::nullopt] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
@@ -639,6 +648,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                         noteWrittenBuffers(address, queueId, compiledCommit);
                         writersNoted = true;
                     }
+                    const bool fixupCarried = itemFixup.has_value() && localDevice->HtileClearStateCurrent(*itemFixup);
                     if (recipeHit != nullptr) {
                         VulkanDevice::IndirectOutcome outcome{0, 0};
                         const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], 0, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit);
@@ -652,6 +662,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                         localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() || attach == nullptr ? nullptr : &builtRecipe, htileClearCompletion, registeredViews);
                     }
                     if (htileMask.bytes != 0u) localDevice->NoteHtileMask(htileMask);
+                    if (itemFixup.has_value()) localDevice->NoteHtileZmaskFixup(*itemFixup, fixupCarried);
                     break;
                 }
                 if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
