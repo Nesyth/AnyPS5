@@ -189,6 +189,41 @@ bool ExactClassKeys() {
     return exact;
 }
 
+Counter BufferRefusal(Graphics::ShaderResources::PreparedBuffers::Refusal refusal) {
+    using Refusal = Graphics::ShaderResources::PreparedBuffers::Refusal;
+    switch (refusal) {
+    case Refusal::Inaccessible: return Counter::BuffersInaccessible;
+    case Refusal::UploadLimit: return Counter::BuffersUploadLimit;
+    case Refusal::Budget: return Counter::BuffersBudget;
+    default: return Counter::BuffersClassification;
+    }
+}
+
+// The hit's buffers from its record's buffer plan, taken against the colour target the commit
+// will draw with (commitRecordDraw hands the committer the job's decode state).
+void prepareBuffers(const LeanDrawJob& job, DrawRecordHit& hit) {
+    auto plan = hit.record->commit->bufferPlan.load(std::memory_order_acquire);
+    if (plan == nullptr) {
+        DirectDraws::Add(Counter::BuffersNoPlan);
+        return;
+    }
+    auto& prepared = hit.preparedBuffers.emplace();
+    bool done = false;
+    try {
+        done = Graphics::ShaderResources::PrepareDirectBuffers(*plan, hit.stages, &job.shape->decode->state.color, prepared);
+    } catch (const std::exception&) {
+        prepared.refusal = Graphics::ShaderResources::PreparedBuffers::Refusal::Classification;
+    }
+    if (!done) {
+        DirectDraws::Add(BufferRefusal(prepared.refusal));
+        hit.preparedBuffers.reset();
+        return;
+    }
+    prepared.plan = std::move(plan);
+    DirectDraws::Add(Counter::BuffersPrepared);
+    DirectDraws::Add(Counter::BuffersBlobBytes, prepared.blob.size());
+}
+
 }
 
 std::size_t DirectStageStore::KeyHash::operator()(const std::pair<std::uint64_t, std::uint64_t>& key) const {
@@ -717,6 +752,10 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
         hit->record = found->record;
         hit->owner = found;
         hit->direct = true;
+        if ((job.recordFlags & DrawRecordFlags::DirectBuffers) != 0) {
+            prepareBuffers(job, *hit);
+            lap(Step::Buffers);
+        }
         commitRecordDraw(job, anchor, std::move(hit));
         lap(Step::HandOff);
         if (timer != nullptr) timer->Report();

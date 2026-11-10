@@ -7812,6 +7812,104 @@ const std::shared_ptr<const ShaderResources::BufferPlan>& ShaderResources::Direc
     return bufferPlan;
 }
 
+bool ShaderResources::PrepareDirectBuffers(const BufferPlan& plan, std::span<const CompiledShader> shaders, const ColorTarget* target, PreparedBuffers& out) {
+    using Refusal = PreparedBuffers::Refusal;
+    out.moved.clear();
+    out.selected.clear();
+    out.blob.clear();
+    out.refusal = Refusal::None;
+    const auto refuse = [&](Refusal why) {
+        out.refusal = why;
+        return false;
+    };
+    if (shaders.size() != plan.stages) return refuse(Refusal::Classification);
+    std::size_t next = 0;
+    std::size_t movedBytes = 0;
+    for (std::size_t stage = 0; stage < shaders.size(); ++stage) {
+        const auto& shader = shaders[stage];
+        if (shader.program == nullptr || HeapShader(shader)) return refuse(Refusal::Classification);
+        const auto& programBindings = shader.program->bindings;
+        for (std::size_t index = 0; index < programBindings.size(); ++index) {
+            const auto& binding = programBindings[index];
+            const bool data = DataRole(binding.role);
+            if (!data && binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+            const auto planned = [&](std::uint32_t element) {
+                if (next >= plan.elements.size()) return false;
+                const auto& entry = plan.elements[next];
+                return entry.stage == stage && entry.binding == index && entry.slot == binding.binding && entry.count == binding.count && entry.role == binding.role && entry.element == element;
+            };
+            const auto& guestWords = DrawGuestWords(shader, binding);
+            if (data) {
+                if (!planned(0)) return refuse(Refusal::Classification);
+                const auto& entry = plan.elements[next++];
+                const auto size = plan.allocations[entry.allocation].size;
+                if (size != guestWords.size() * sizeof(std::uint32_t)) return refuse(Refusal::Classification);
+                if (entry.dataWords == guestWords) continue;
+                out.moved.push_back({entry.allocation, 0, size, guestWords});
+                continue;
+            }
+            if (guestWords.size() != static_cast<std::size_t>(binding.count) * 4u) return refuse(Refusal::Classification);
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                if (!planned(element) || plan.elements[next].written != written) return refuse(Refusal::Classification);
+                const auto& entry = plan.elements[next++];
+                const auto* words = guestWords.data() + static_cast<std::size_t>(element) * 4u;
+                const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
+                const auto address = descriptor.Base48();
+                const auto size = BytesUpToTarget(address, descriptor.GetSize(), descriptor.Stride(), written ? nullptr : target);
+                const auto& item = plan.allocations[entry.allocation];
+                const bool empty = size == 0 || address == 0;
+                if (!item.guest) {
+                    if (empty) continue;
+                    return refuse(Refusal::Classification);
+                }
+                if (item.address == address && item.size == size) continue;
+                if (written || empty || item.written || size > plan.maxStorageBufferRange) return refuse(Refusal::Classification);
+                const auto begin = address - item.adjustment;
+                const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
+                if (bytes > plan.maxDrawSnapshotBytes - movedBytes) return refuse(Refusal::Budget);
+                if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return refuse(Refusal::Inaccessible);
+                out.moved.push_back({entry.allocation, address, static_cast<std::size_t>(size)});
+                movedBytes += bytes;
+            }
+        }
+    }
+    if (next != plan.elements.size()) return refuse(Refusal::Classification);
+    const bool movedUploads = RuntimeSwitches::Set(RuntimeSwitch::MovedLargeUploads);
+    const auto place = [&](std::size_t bytes) {
+        const auto offset = (out.blob.size() + plan.alignment - 1) & ~(plan.alignment - 1);
+        out.blob.resize(offset + bytes);
+        return offset;
+    };
+    std::size_t totalSnapshotBytes = 0;
+    for (std::size_t index = 0; index < plan.allocations.size(); ++index) {
+        const auto& item = plan.allocations[index];
+        const auto override = std::find_if(out.moved.begin(), out.moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        const bool moved = override != out.moved.end();
+        if (moved && !override->words.empty()) {
+            const auto offset = place(override->size);
+            std::memcpy(out.blob.data() + offset, override->words.data(), override->size);
+            for (const auto& patch : plan.patches) {
+                if (patch.allocation == index && patch.byte < override->size) out.blob[offset + patch.byte] = static_cast<std::byte>(patch.adjustment);
+            }
+            out.selected.push_back({index, 0, override->size, offset, true});
+            continue;
+        }
+        if (!moved && (!item.guest || item.written || !item.inPlace)) continue;
+        const auto begin = (moved ? override->address : item.address) - item.adjustment;
+        const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(moved ? override->size : item.size, item.adjustment));
+        if (!moved && (bytes > plan.maxDrawSnapshotBytes || totalSnapshotBytes + bytes > plan.maxDrawSnapshotBytes)) continue;
+        const bool movedUpload = moved && bytes > plan.uploadLimit && bytes <= plan.movedUploadBytes && movedUploads;
+        if (bytes == 0 || (bytes > plan.uploadLimit && !movedUpload)) return refuse(Refusal::UploadLimit);
+        if (!moved && !GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return refuse(Refusal::Inaccessible);
+        const auto offset = place(bytes);
+        std::memcpy(out.blob.data() + offset, reinterpret_cast<const void*>(begin), bytes);
+        out.selected.push_back({index, begin, bytes, offset, moved});
+        totalSnapshotBytes += bytes;
+    }
+    return true;
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut) const {
     struct SelectedStorage {};
     auto& selected = HostThreadLocal<std::vector<std::size_t>, SelectedStorage>();

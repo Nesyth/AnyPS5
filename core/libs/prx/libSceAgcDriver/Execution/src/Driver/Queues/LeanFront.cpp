@@ -134,6 +134,7 @@ FrontMode Take(Latch& latch, bool eligible) {
         latch.stagePlans = false;
         latch.stagePlansVerifyEvery = 0;
         latch.directDraws = false;
+        latch.directBuffers = false;
         latch.directVerifyEvery = 0;
         return FrontMode::Today;
     }
@@ -151,6 +152,7 @@ FrontMode Take(Latch& latch, bool eligible) {
     latch.checkSwitches = Due(latch, Item::SwitchRead);
     const bool direct = mode == FrontMode::Lean && latch.switches.Set(Graphics::RuntimeSwitch::DirectDraws) && !Graphics::DescriptorHeapEnabled() && !HeapFragmentsEnabled();
     latch.directDraws = direct;
+    latch.directBuffers = direct && latch.switches.Set(Graphics::RuntimeSwitch::DirectBuffers);
     latch.directVerifyEvery = direct ? DirectDraws::VerifyEvery() : 0;
     const bool plans = mode == FrontMode::Lean && !direct && latch.switches.Set(Graphics::RuntimeSwitch::StagePlans);
     const std::uint8_t plansTaken = plans ? 2 : 1;

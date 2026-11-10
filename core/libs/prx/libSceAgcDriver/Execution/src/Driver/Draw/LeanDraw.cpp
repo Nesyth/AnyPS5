@@ -521,6 +521,7 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
     }
     if (direct) {
         job->recordFlags = DrawRecordFlags::Direct;
+        if (frontLatch.directBuffers) job->recordFlags |= DrawRecordFlags::DirectBuffers;
         if (DirectDraws::Due(frontLatch)) job->recordFlags |= DrawRecordFlags::VerifyDue;
     } else if (plans) {
         probeStagePlans(*job, record);

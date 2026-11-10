@@ -303,6 +303,30 @@ public:
     // stage, an address table, an object that is not reusable, or bindings MovedReadOnlyBuffers
     // refuses whatever the draw).
     const std::shared_ptr<const BufferPlan>& DirectBufferPlan(std::span<const CompiledShader> shaders) const;
+    // A draw's buffers as MovedReadOnlyBuffers and selectDrawSnapshots (movedOnly false) decide
+    // them, without their hazard tests: the moved list (its words point into the draw's stages),
+    // the selected allocations in ascending order with their guest ranges (moved data words: begin
+    // 0) and offsets into `blob`, which holds every selected byte, each slice aligned as
+    // Recorder::DrawUpload aligns its slices. `plan` is the plan it was prepared from.
+    struct PreparedBuffers {
+        enum class Refusal : std::uint8_t { None, Classification, Inaccessible, UploadLimit, Budget, Count };
+        struct Selected {
+            std::size_t allocation = 0;
+            std::uint64_t begin = 0;
+            std::size_t bytes = 0;
+            std::size_t offset = 0;
+            bool moved = false;
+        };
+        std::shared_ptr<const BufferPlan> plan;
+        std::vector<MovedBuffer> moved;
+        std::vector<Selected> selected;
+        std::vector<std::byte> blob;
+        Refusal refusal = Refusal::None;
+    };
+    // Prepares the buffers of a draw with `shaders` from the plan, its stages' words and guest
+    // memory alone, on any thread; `target` is the colour target MovedReadOnlyBuffers would get.
+    // False, with the reason in `out.refusal`, where the draw's buffers cannot be prepared.
+    static bool PrepareDirectBuffers(const BufferPlan& plan, std::span<const CompiledShader> shaders, const ColorTarget* target, PreparedBuffers& out);
     const PushPlan* PushLayouts() const;
     std::shared_ptr<DrawBindings> PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut = nullptr) const;
     void PushDrawBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;

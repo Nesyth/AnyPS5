@@ -35,9 +35,10 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "classes built", "not queued", "writes differ", "verify differs", "build differs", "classes evicted", "stages built", "stages evicted", "invocations rebuilt", "verify checked", "verify differing",
     "commit hits", "first commits", "commit misses", "commits demoted", "proofs skipped", "proofs not skipped", "full proofs",
     "held by the record", "held by the pass", "first use", "new pass", "collect epoch", "proof serial", "pending stores", "depth surfaces", "target changed",
+    "buffers prepared", "no plan", "classification", "not accessible", "over the upload limit", "size budget", "blob bytes",
 };
 
-constexpr std::array<const char*, StepCount> StepNames{"request", "invocation", "walk", "key", "side", "class", "checks", "hand-off"};
+constexpr std::array<const char*, StepCount> StepNames{"request", "invocation", "walk", "key", "side", "class", "checks", "buffers", "hand-off"};
 
 static_assert(CounterNames.back() != nullptr && StepNames.back() != nullptr, "every direct draw counter and step needs a name");
 
@@ -165,6 +166,14 @@ std::uint64_t VerifyEvery() {
     return every;
 }
 
+std::uint64_t BufferVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_DIRECT_BUFFERS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
 void Add(Counter counter, std::uint64_t count) {
     bump(own().counters[static_cast<std::size_t>(counter)], count);
 }
@@ -230,24 +239,34 @@ void Report(bool force) {
         return since.stepDraws[index] == 0 ? 0.0 : static_cast<double>(since.stepNanoseconds[index]) / static_cast<double>(since.stepDraws[index]) / 1000.0;
     };
     const auto direct = at(Counter::Direct);
-    AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] %llu draws: %llu direct (%.1f%%), %llu fallback%s; classes %llu known, %llu built, %llu refused%s, %llu evicted, %.1f KiB; stages %llu known, %llu built; invocations %llu rebuilt; verify %llu checked, %llu differing; us per direct draw: request %.2f, invocation %.2f, walk %.2f, key %.2f, side %.2f, class %.2f, checks %.2f, hand-off %.2f\n",
+    AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] %llu draws: %llu direct (%.1f%%), %llu fallback%s; classes %llu known, %llu built, %llu refused%s, %llu evicted, %.1f KiB; stages %llu known, %llu built; invocations %llu rebuilt; verify %llu checked, %llu differing; us per direct draw: request %.2f, invocation %.2f, walk %.2f, key %.2f, side %.2f, class %.2f, checks %.2f, buffers %.2f, hand-off %.2f\n",
         static_cast<unsigned long long>(draws), static_cast<unsigned long long>(direct), draws != 0 ? 100.0 * static_cast<double>(direct) / static_cast<double>(draws) : 0.0,
         static_cast<unsigned long long>(fallbacks), reasons(counts, Counter::FallbackShape, Counter::FallbackVerify).c_str(),
         static_cast<unsigned long long>(classesKnown.load(std::memory_order_relaxed)), static_cast<unsigned long long>(at(Counter::ClassesBuilt)), static_cast<unsigned long long>(refused), reasons(counts, Counter::RefusedNotQueued, Counter::RefusedDiffers).c_str(),
         static_cast<unsigned long long>(at(Counter::ClassesEvicted)), static_cast<double>(classBytes.load(std::memory_order_relaxed)) / 1024.0,
         static_cast<unsigned long long>(stagesKnown.load(std::memory_order_relaxed)), static_cast<unsigned long long>(at(Counter::StagesBuilt)),
         static_cast<unsigned long long>(at(Counter::InvocationsRebuilt)), static_cast<unsigned long long>(at(Counter::VerifyChecked)), static_cast<unsigned long long>(at(Counter::VerifyDiffering)),
-        perDraw(Step::Request), perDraw(Step::Invocation), perDraw(Step::Walk), perDraw(Step::Key), perDraw(Step::Side), perDraw(Step::Class), perDraw(Step::Checks), perDraw(Step::HandOff));
+        perDraw(Step::Request), perDraw(Step::Invocation), perDraw(Step::Walk), perDraw(Step::Key), perDraw(Step::Side), perDraw(Step::Class), perDraw(Step::Checks), perDraw(Step::Buffers), perDraw(Step::HandOff));
     const auto commits = at(Counter::CommitHits) + at(Counter::CommitFirst) + at(Counter::CommitMisses);
+    if (commits != 0) {
+        std::uint64_t refreshed = 0;
+        for (auto index = static_cast<std::size_t>(Counter::HoldFirst); index <= static_cast<std::size_t>(Counter::HoldTarget); ++index) refreshed += counts[index];
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] %llu commits: %llu from the record (%.1f%%), %llu first commits, %llu misses, %llu demoted; template proofs: %llu skipped clean, %llu not skipped, %llu in full; targets: %llu held by the record, %llu held by the pass, %llu refreshed%s; stages evicted %llu\n",
+            static_cast<unsigned long long>(commits), static_cast<unsigned long long>(at(Counter::CommitHits)), 100.0 * static_cast<double>(at(Counter::CommitHits)) / static_cast<double>(commits),
+            static_cast<unsigned long long>(at(Counter::CommitFirst)), static_cast<unsigned long long>(at(Counter::CommitMisses)), static_cast<unsigned long long>(at(Counter::CommitDemoted)),
+            static_cast<unsigned long long>(at(Counter::ProofsSkipped)), static_cast<unsigned long long>(at(Counter::ProofsNotSkipped)), static_cast<unsigned long long>(at(Counter::ProofsFull)),
+            static_cast<unsigned long long>(at(Counter::HoldOwn)), static_cast<unsigned long long>(at(Counter::HoldShared)), static_cast<unsigned long long>(refreshed), reasons(counts, Counter::HoldFirst, Counter::HoldTarget).c_str(),
+            static_cast<unsigned long long>(at(Counter::StagesEvicted)));
+    }
+    std::uint64_t unprepared = 0;
+    for (auto index = static_cast<std::size_t>(Counter::BuffersNoPlan); index <= static_cast<std::size_t>(Counter::BuffersBudget); ++index) unprepared += counts[index];
+    const auto prepared = at(Counter::BuffersPrepared);
+    if (prepared + unprepared != 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] buffers: %llu hits prepared, %llu not prepared%s; %.1f blob bytes per prepared hit\n",
+            static_cast<unsigned long long>(prepared), static_cast<unsigned long long>(unprepared), reasons(counts, Counter::BuffersNoPlan, Counter::BuffersBudget).c_str(),
+            prepared != 0 ? static_cast<double>(at(Counter::BuffersBlobBytes)) / static_cast<double>(prepared) : 0.0);
+    }
     if (commits == 0) return;
-    std::uint64_t refreshed = 0;
-    for (auto index = static_cast<std::size_t>(Counter::HoldFirst); index <= static_cast<std::size_t>(Counter::HoldTarget); ++index) refreshed += counts[index];
-    AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] %llu commits: %llu from the record (%.1f%%), %llu first commits, %llu misses, %llu demoted; template proofs: %llu skipped clean, %llu not skipped, %llu in full; targets: %llu held by the record, %llu held by the pass, %llu refreshed%s; stages evicted %llu\n",
-        static_cast<unsigned long long>(commits), static_cast<unsigned long long>(at(Counter::CommitHits)), 100.0 * static_cast<double>(at(Counter::CommitHits)) / static_cast<double>(commits),
-        static_cast<unsigned long long>(at(Counter::CommitFirst)), static_cast<unsigned long long>(at(Counter::CommitMisses)), static_cast<unsigned long long>(at(Counter::CommitDemoted)),
-        static_cast<unsigned long long>(at(Counter::ProofsSkipped)), static_cast<unsigned long long>(at(Counter::ProofsNotSkipped)), static_cast<unsigned long long>(at(Counter::ProofsFull)),
-        static_cast<unsigned long long>(at(Counter::HoldOwn)), static_cast<unsigned long long>(at(Counter::HoldShared)), static_cast<unsigned long long>(refreshed), reasons(counts, Counter::HoldFirst, Counter::HoldTarget).c_str(),
-        static_cast<unsigned long long>(at(Counter::StagesEvicted)));
     static std::array<std::uint64_t, static_cast<std::size_t>(Graphics::RecipeRefusal::Count)> refusalsReported{};
     const auto refusals = Graphics::RecipeRefusals();
     std::string unbuilt;

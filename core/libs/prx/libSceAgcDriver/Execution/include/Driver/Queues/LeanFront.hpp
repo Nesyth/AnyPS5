@@ -101,6 +101,7 @@ struct Latch {
     bool records = false;
     bool stagePlans = false;
     bool directDraws = false;
+    bool directBuffers = false;
     std::uint8_t recordsTaken = 0;
     std::uint8_t stagePlansTaken = 0;
     std::uint32_t depth = 0;

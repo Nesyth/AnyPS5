@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include <array>
@@ -213,6 +214,9 @@ struct DrawRecordHit {
     // whose registered image views the hit's stages point into.
     std::shared_ptr<const void> owner;
     std::vector<std::shared_ptr<const ShaderRecompiler::ResourceCapture>> captures;
+    // A direct hit's buffers prepared on the finisher (APS5_DIRECT_BUFFERS); the moved words point
+    // into `stages`, so they stay valid until the commit ran.
+    std::optional<Graphics::ShaderResources::PreparedBuffers> preparedBuffers;
 };
 
 namespace DrawRecordFlags {
@@ -224,6 +228,7 @@ constexpr std::uint8_t VerifyDue = 8;
 constexpr std::uint8_t StagePlans = 16;
 constexpr std::uint8_t PlanProbed = 32;
 constexpr std::uint8_t Direct = 64;
+constexpr std::uint8_t DirectBuffers = 128;
 
 }
 

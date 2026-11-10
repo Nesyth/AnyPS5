@@ -61,14 +61,23 @@ enum class Counter : std::uint8_t {
     HoldPending,
     HoldDepth,
     HoldTarget,
+    BuffersPrepared,
+    BuffersNoPlan,
+    BuffersClassification,
+    BuffersInaccessible,
+    BuffersUploadLimit,
+    BuffersBudget,
+    BuffersBlobBytes,
     Count,
 };
 
-enum class Step : std::uint8_t { Request, Invocation, Walk, Key, Side, Class, Checks, HandOff, Count };
+enum class Step : std::uint8_t { Request, Invocation, Walk, Key, Side, Class, Checks, Buffers, HandOff, Count };
 
 constexpr std::uint64_t StepSampleEvery = 64;
 
 std::uint64_t VerifyEvery();
+// APS5_VERIFY_DIRECT_BUFFERS, read once.
+std::uint64_t BufferVerifyEvery();
 
 inline bool Due(LeanFront::Latch& latch) {
     if (latch.directVerifyEvery == 0) return false;
