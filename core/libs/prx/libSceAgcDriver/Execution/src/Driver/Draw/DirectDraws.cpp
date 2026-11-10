@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <optional>
@@ -49,7 +50,7 @@ bool DirectShape(const LeanDrawJob& job) {
     const auto& decode = *job.shape->decode;
     const auto& state = decode.state;
     if (job.parameters.indirect || state.quadList || state.rectList || state.stages.path != Graphics::ShaderPath::Vertex || state.stages.mesh || state.stages.tessellation || state.stages.tessellationGeometry || state.tessellationCapture != nullptr || !Graphics::DrawsRecordable()) return false;
-    if (decode.programs.empty() || decode.roles.size() != decode.programs.size()) return false;
+    if (decode.programs.empty() || decode.programs.size() > DirectClassKey::MaxStages || decode.roles.size() != decode.programs.size()) return false;
     for (std::size_t i = 0; i < decode.programs.size(); ++i) {
         const auto& program = decode.programs[i];
         const auto stage = program.binary.stage;
@@ -169,6 +170,23 @@ struct StageFront {
 
 struct StageFrontStorage {};
 
+struct ClassFrontSlot {
+    std::uint64_t probe = 0;
+    std::uint64_t clears = 0;
+    std::shared_ptr<const DirectClass> entry;
+};
+
+struct ClassFront {
+    std::array<ClassFrontSlot, DirectClassStore::FrontSlots> slots;
+};
+
+struct ClassFrontStorage {};
+
+bool ExactClassKeys() {
+    static const bool exact = std::getenv("APS5_DIRECT_DRAWS_EXACT_KEY") != nullptr;
+    return exact;
+}
+
 }
 
 std::size_t DirectStageStore::KeyHash::operator()(const std::pair<std::uint64_t, std::uint64_t>& key) const {
@@ -214,6 +232,109 @@ std::size_t DirectStageStore::Size() const {
     return stages.size();
 }
 
+DirectClassKey DirectClassKey::For(const LeanDrawJob& job, const DirectStages& resolved) {
+    const auto& parameters = job.parameters;
+    DirectClassKey key;
+    key.shape = job.shapeKey;
+    const auto layout = HashDrawRecordWords(resolved.vertexLayout, {});
+    key.layout = layout[0] ^ (layout[1] * 0x9e3779b97f4a7c15ull);
+    key.indexSize = parameters.indexSize;
+    key.flags = parameters.flags;
+    key.indexed = parameters.indexed;
+    key.count = static_cast<std::uint32_t>(resolved.stages.size());
+    for (std::size_t i = 0; i < resolved.stages.size(); ++i) key.stages[i] = resolved.stages[i].shared.get();
+    if (!ExactClassKeys()) return key;
+    key.indexAddress = parameters.indexAddress;
+    key.indexCount = parameters.indexCount;
+    key.instanceCount = parameters.instanceCount;
+    key.firstVertex = parameters.firstVertex;
+    key.firstInstance = parameters.firstInstance;
+    return key;
+}
+
+std::uint64_t DirectClassKey::Probe() const {
+    std::uint64_t probe = 0xcbf29ce484222325ull;
+    const auto mix = [&](std::uint64_t value) { probe = (probe ^ value) * 0x100000001b3ull; };
+    mix(shape);
+    mix(layout);
+    mix(indexAddress);
+    mix((static_cast<std::uint64_t>(indexCount) << 32u) | indexSize);
+    mix((static_cast<std::uint64_t>(instanceCount) << 32u) | flags);
+    mix((static_cast<std::uint64_t>(firstVertex) << 32u) | firstInstance);
+    mix((static_cast<std::uint64_t>(count) << 1u) | (indexed ? 1u : 0u));
+    for (std::uint32_t i = 0; i < count && i < MaxStages; ++i) mix(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(stages[i])));
+    return probe ^ (probe >> 29u);
+}
+
+std::size_t DirectClass::Bytes() const {
+    return sizeof(DirectClass) + (record != nullptr ? record->Bytes() : 0);
+}
+
+std::shared_ptr<const DirectClass> DirectClassStore::Find(const DirectClassKey& key, std::uint64_t probe) const {
+    auto& slot = HostThreadLocal<ClassFront, ClassFrontStorage>().slots[static_cast<std::size_t>(probe % FrontSlots)];
+    if (slot.entry != nullptr && slot.probe == probe && slot.clears == clears.load(std::memory_order_acquire) && slot.entry->key == key) return slot.entry;
+    std::lock_guard lock(mutex);
+    const auto found = classes.find(key);
+    if (found == classes.end()) return nullptr;
+    slot = {probe, clears.load(std::memory_order_relaxed), found->second};
+    return found->second;
+}
+
+std::shared_ptr<const DirectClass> DirectClassStore::Install(std::shared_ptr<const DirectClass> entry, std::uint64_t tag, bool& installed) {
+    installed = false;
+    std::lock_guard lock(mutex);
+    if (!DirectStores::Get().Current(tag)) return entry;
+    if (const auto found = classes.find(entry->key); found != classes.end()) return found->second;
+    if (classes.size() >= Bound) {
+        DirectDraws::Add(Counter::ClassesEvicted, kept);
+        classes.clear();
+        kept = 0;
+        bytes = 0;
+        clears.fetch_add(1, std::memory_order_release);
+    }
+    if (entry->record != nullptr) ++kept;
+    bytes += entry->Bytes();
+    classes.emplace(entry->key, entry);
+    installed = true;
+    note();
+    return entry;
+}
+
+bool DirectClassStore::Refuse(const DirectClass& found, Counter reason) {
+    auto refused = std::make_shared<DirectClass>();
+    refused->key = found.key;
+    refused->probe = found.probe;
+    refused->stages = found.stages;
+    refused->refusal = reason;
+    std::lock_guard lock(mutex);
+    const auto held = classes.find(found.key);
+    if (held == classes.end() || held->second.get() != &found) return false;
+    if (found.record != nullptr) --kept;
+    bytes = bytes - found.Bytes() + refused->Bytes();
+    held->second = std::move(refused);
+    clears.fetch_add(1, std::memory_order_release);
+    note();
+    return true;
+}
+
+void DirectClassStore::Clear() {
+    std::lock_guard lock(mutex);
+    classes.clear();
+    kept = 0;
+    bytes = 0;
+    clears.fetch_add(1, std::memory_order_release);
+    note();
+}
+
+std::size_t DirectClassStore::Size() const {
+    std::lock_guard lock(mutex);
+    return classes.size();
+}
+
+void DirectClassStore::note() const {
+    DirectDraws::NoteClasses(kept, bytes);
+}
+
 DirectStores& DirectStores::Get() {
     static auto* stores = new DirectStores;
     return *stores;
@@ -239,6 +360,7 @@ std::uint64_t DirectStores::Follow(std::uint64_t serial) {
         switches = live;
         epoch.fetch_add(1, std::memory_order_acq_rel);
         stages.Clear();
+        classes.Clear();
     }
     seen = {generation, serial, epoch.load(std::memory_order_relaxed)};
     return seen.epoch;

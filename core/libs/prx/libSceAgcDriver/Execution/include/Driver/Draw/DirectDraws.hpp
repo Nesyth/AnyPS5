@@ -57,6 +57,77 @@ private:
     std::atomic<std::uint64_t> clears{1};
 };
 
+struct DirectStages;
+struct DrawRecord;
+struct LeanDrawJob;
+
+// What draws of one direct class share: the shape, the small draw classifiers, a hash of the live
+// vertex layout words and the shared stage of every program. Index address and count, instance
+// count, first vertex and first instance stay out unless APS5_DIRECT_DRAWS_EXACT_KEY is set, which
+// adds them as a draw record key holds them.
+struct DirectClassKey {
+    static constexpr std::size_t MaxStages = 4;
+
+    std::uint64_t shape = 0;
+    std::uint64_t layout = 0;
+    std::uint64_t indexAddress = 0;
+    std::uint32_t indexCount = 0;
+    std::uint32_t indexSize = 0;
+    std::uint32_t instanceCount = 0;
+    std::uint32_t flags = 0;
+    std::uint32_t firstVertex = 0;
+    std::uint32_t firstInstance = 0;
+    std::array<const DirectStage*, MaxStages> stages{};
+    std::uint32_t count = 0;
+    bool indexed = false;
+
+    static DirectClassKey For(const LeanDrawJob& job, const DirectStages& resolved);
+    std::uint64_t Probe() const;
+    bool operator==(const DirectClassKey&) const = default;
+};
+
+// A direct class: the draw record its draws commit through, or no record for a key refused with
+// `refusal`, and the stages whose pointers the key holds.
+struct DirectClass {
+    DirectClassKey key;
+    std::uint64_t probe = 0;
+    std::array<std::shared_ptr<const DirectStage>, DirectClassKey::MaxStages> stages;
+    std::shared_ptr<const DrawRecord> record;
+    DirectDraws::Counter refusal = DirectDraws::Counter::Count;
+
+    std::size_t Bytes() const;
+};
+
+// Shared by the finisher threads behind its mutex, with the same front cache rule as the stage store.
+class DirectClassStore {
+public:
+    static constexpr std::size_t Bound = 65536;
+    static constexpr std::size_t FrontSlots = 1024;
+
+    std::shared_ptr<const DirectClass> Find(const DirectClassKey& key, std::uint64_t probe) const;
+    // The entry kept for the key: the first install wins, and an entry built under a tag the
+    // stores no longer carry is handed back without being kept. A full store is cleared first,
+    // its classes counted as evicted.
+    std::shared_ptr<const DirectClass> Install(std::shared_ptr<const DirectClass> entry, std::uint64_t tag, bool& installed);
+    // Replaces `found`, while the store still holds it, by a refused entry of its key.
+    bool Refuse(const DirectClass& found, DirectDraws::Counter reason);
+    void Clear();
+    std::size_t Size() const;
+
+private:
+    struct KeyHash {
+        std::size_t operator()(const DirectClassKey& key) const { return static_cast<std::size_t>(key.Probe()); }
+    };
+
+    void note() const;
+
+    mutable std::mutex mutex;
+    std::unordered_map<DirectClassKey, std::shared_ptr<const DirectClass>, KeyHash> classes;
+    std::size_t kept = 0;
+    std::size_t bytes = 0;
+    std::atomic<std::uint64_t> clears{1};
+};
+
 // The stores of direct draws, tagged with the device serial and the switch copy without
 // APS5_DIRECT_DRAWS: a change of the tag clears every store, a flip of APS5_DIRECT_DRAWS alone
 // keeps them.
@@ -69,6 +140,7 @@ public:
     bool Current(std::uint64_t tag) const { return tag == epoch.load(std::memory_order_acquire); }
 
     DirectStageStore stages;
+    DirectClassStore classes;
 
 private:
     std::mutex mutex;
