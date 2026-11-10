@@ -327,6 +327,8 @@ public:
         // The depth guard generation taken before the guest bytes were read: a guard set up or
         // dropped since may have published depth samples into them.
         std::uint64_t depthGuards = 0;
+        // GuestMemory::ForgetSerial taken before the moved ranges were found accessible.
+        std::uint64_t forget = 0;
     };
     // The first difference between prepared buffers and today's way of the same draw, compared as
     // data (APS5_VERIFY_DIRECT_BUFFERS): `what` names the part and stays null where they agree;
@@ -401,8 +403,9 @@ public:
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr, MoveTicket* ticket = nullptr) const;
     // The tests MovedReadOnlyBuffers applies to each moved guest range after its classification,
     // with the same ticket use, for the moved list of buffers prepared from this object's plan
-    // (their memory was found accessible when they were prepared). True when every range is clear;
-    // the ticket is then left as MovedReadOnlyBuffers would leave it.
+    // (their memory was found accessible when they were prepared; it is tested again once a mapping
+    // changed since). True when every range is clear; the ticket is then left as
+    // MovedReadOnlyBuffers would leave it.
     bool PreparedMovesClear(const PreparedBuffers& prepared, Recorder& recorder, MoveTicket* ticket) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };

@@ -1309,6 +1309,16 @@ int PreparedBuffersMatch() {
             const auto difference = ShaderResources::ComparePreparedSelection(early, bindings.get(), selected);
             Require(difference.what != nullptr && difference.memoryChanged, "prepared buffers, hazards: a guest write between the finisher's read and today's was not told apart as memory changed (" + std::string(difference.what != nullptr ? difference.what : "no difference") + ")");
         }
+        // A mapping change since the finisher found the moved range accessible makes the committer
+        // test it again.
+        auto gone = prepared;
+        const auto movedEntry = std::ranges::find_if(gone.moved, [](const ShaderResources::MovedBuffer& entry) { return entry.address != 0; });
+        Require(movedEntry != gone.moved.end(), "prepared buffers, hazards: no moved guest buffer was prepared");
+        movedEntry->address = UnmappedAddress;
+        gone.forget = AgcDriver::GuestMemory::ForgetSerial();
+        Require(resources.PreparedMovesClear(gone, recorder, nullptr), "prepared buffers, hazards: a moved range the finisher found accessible was refused while no mapping changed");
+        gone.forget += 2;
+        Require(!resources.PreparedMovesClear(gone, recorder, nullptr), "prepared buffers, hazards: an unmapped moved range was taken after a mapping changed");
         recorder.NotePendingWrite(block.At(InPlaceBufferOffset), PlannedBufferBytes);
         Require(resources.PreparedMovesClear(prepared, recorder, nullptr), "prepared buffers, hazards: a pending write beside the moved range refused it");
         std::vector<std::size_t> selected;

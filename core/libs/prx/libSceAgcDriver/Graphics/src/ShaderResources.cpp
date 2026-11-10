@@ -7088,7 +7088,9 @@ bool ShaderResources::PreparedMovesClear(const PreparedBuffers& prepared, Record
         if (!item.guest) continue;
         ranges.emplace_back(entry.address - item.adjustment, static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment)));
     }
-    return movedRangesClear(recorder, ranges, ticket, true);
+    // The finisher's accessibility answers hold while no mapping changed since.
+    const bool accessible = (prepared.forget & 1u) == 0 && GuestMemory::ForgetSerial() == prepared.forget;
+    return movedRangesClear(recorder, ranges, ticket, accessible);
 }
 
 const char* ShaderResources::MoveRefusalName(MoveRefusal refusal) {
@@ -7877,6 +7879,7 @@ bool ShaderResources::PrepareDirectBuffers(const BufferPlan& plan, std::span<con
     out.blob.clear();
     out.refusal = Refusal::None;
     out.depthGuards = DepthGuardsGeneration_nid_no_patch();
+    out.forget = GuestMemory::ForgetSerial();
     const auto refuse = [&](Refusal why) {
         out.refusal = why;
         return false;
