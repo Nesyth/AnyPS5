@@ -1082,7 +1082,7 @@ void Direct(bool ring) {
     const auto used = now.Since(base, DirectCounter::BuffersUsed);
     const auto checked = now.Since(base, DirectCounter::BuffersVerifyChecked);
     std::cout << "direct draws: " << now.Since(base, DirectCounter::BuffersPrepared) << " hits prepared their buffers, " << used << " bound them, " << checked << " were verified\n";
-    Require(now.Since(base, DirectCounter::BuffersVerifyDiffering) == 0, "direct draws: the prepared buffers verify found differences" + DescribeDirect(now, base));
+    Require(now.Since(base, DirectCounter::BuffersVerifyDiffering) == 0 && now.Since(base, DirectCounter::BuffersUnwatched) == 0, "direct draws: the prepared buffers verify found differences" + DescribeDirect(now, base));
     if (DirectReport::BufferVerifyEvery() == 1) Require(used == 0 && checked != 0, "direct draws: with every prepared hit due for a verify, a commit bound prepared buffers or none was verified" + DescribeDirect(now, base));
     else Require(used != 0, "direct draws: no commit bound prepared buffers" + DescribeDirect(now, base));
     if (DirectReport::BufferVerifyEvery() > 1) Require(checked != 0, "direct draws: the prepared buffers verify checked no hit" + DescribeDirect(now, base));

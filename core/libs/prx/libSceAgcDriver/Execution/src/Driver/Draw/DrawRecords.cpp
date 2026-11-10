@@ -1562,6 +1562,11 @@ void NoteDirectBuffers(const DrawRecordCommit& commit) {
         DirectDraws::Add(Counter::BuffersVerifyChecked);
         DirectDraws::Add(Counter::BuffersMemoryChanged);
         break;
+    case DrawRecordBuffers::Unwatched:
+        DirectDraws::Add(Counter::BuffersVerifyChecked);
+        DirectDraws::Add(Counter::BuffersUnwatched);
+        DirectDraws::NoteBufferDifference(effects.bufferDifference.what, effects.bufferDifference.detail);
+        break;
     default: break;
     }
 }

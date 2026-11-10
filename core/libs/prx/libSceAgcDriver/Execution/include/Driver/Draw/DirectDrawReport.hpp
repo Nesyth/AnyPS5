@@ -76,6 +76,7 @@ enum class Counter : std::uint8_t {
     BuffersVerifyChecked,
     BuffersVerifyDiffering,
     BuffersMemoryChanged,
+    BuffersUnwatched,
     Count,
 };
 

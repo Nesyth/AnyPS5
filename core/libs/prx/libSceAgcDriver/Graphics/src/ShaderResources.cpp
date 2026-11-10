@@ -7999,12 +7999,13 @@ ShaderResources::PreparedDifference ShaderResources::ComparePreparedSelection(co
         std::size_t at = 0;
         while (at < item.bytes && held[at] == blob[at]) ++at;
         bool written = false;
-        if (item.begin != 0 && prepared.generation != 0) {
+        const bool unwatched = item.begin != 0 && !GuestMemory::Watched(item.begin, item.bytes);
+        if (item.begin != 0 && !unwatched && prepared.generation != 0) {
             GuestMemory::CollectWritesUncached(item.begin, item.bytes);
             written = GuestMemory::NewestStamp(item.begin, item.bytes) > prepared.generation;
         }
         const auto range = item.begin != 0 ? std::to_string(item.bytes) + " bytes at 0x" + HexText(item.begin) : std::to_string(item.bytes) + " data bytes";
-        return {"bytes", "allocation " + std::to_string(item.allocation) + ": " + range + " first differ at byte " + std::to_string(at) + (written ? ", written since the finisher read them" : ""), written};
+        return {"bytes", "allocation " + std::to_string(item.allocation) + ": " + range + " first differ at byte " + std::to_string(at) + (written ? ", written since the finisher read them" : unwatched ? ", in memory the write tracker does not watch" : ""), written, unwatched};
     }
     return {};
 }

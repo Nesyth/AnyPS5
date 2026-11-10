@@ -3061,10 +3061,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (record.preparedCheck != nullptr && record.buffers != nullptr && record.bufferDifference != nullptr) {
         auto& difference = *record.bufferDifference;
         difference = ShaderResources::ComparePreparedSelection(*record.preparedCheck, drawBindings.get(), viewSelected);
-        if (difference.what == nullptr || difference.memoryChanged) {
+        if (difference.what == nullptr || difference.memoryChanged || difference.unwatched) {
             if (auto bound = resources.ComparePreparedBinding(*recorder, record.moved, *record.preparedCheck, drawBindings.get(), viewSelected); bound.what != nullptr) difference = std::move(bound);
         }
-        *record.buffers = difference.what == nullptr ? DrawRecordBuffers::Checked : difference.memoryChanged ? DrawRecordBuffers::MemoryChanged : DrawRecordBuffers::Differs;
+        *record.buffers = difference.what == nullptr ? DrawRecordBuffers::Checked : difference.memoryChanged ? DrawRecordBuffers::MemoryChanged : difference.unwatched ? DrawRecordBuffers::Unwatched : DrawRecordBuffers::Differs;
     }
     if (record.view != nullptr && faultRecord == nullptr && !record.replay && !resources.HeapStage()) {
         resources.DescribeDrawBindings(drawBindings.get(), viewSelected, record.push, record.view->bindings);

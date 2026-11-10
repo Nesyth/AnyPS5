@@ -332,11 +332,14 @@ public:
     };
     // The first difference between prepared buffers and today's way of the same draw, compared as
     // data (APS5_VERIFY_DIRECT_BUFFERS): `what` names the part and stays null where they agree;
-    // `memoryChanged`: only bytes differ, in a guest range written after the finisher read it.
+    // `memoryChanged`: only bytes differ, in a guest range written after the finisher read it (a
+    // bound hit would draw the older bytes); `unwatched`: only bytes differ, in a guest range the
+    // write tracker does not watch, so a write after the read and a fault look the same.
     struct PreparedDifference {
         const char* what = nullptr;
         std::string detail;
         bool memoryChanged = false;
+        bool unwatched = false;
     };
     // Against today's MovedReadOnlyBuffers list: allocations, addresses, sizes and words.
     static PreparedDifference ComparePreparedMoves(const PreparedBuffers& prepared, std::span<const MovedBuffer> moved);
