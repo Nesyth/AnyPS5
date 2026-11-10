@@ -4288,6 +4288,56 @@ bool verifyCleanCurrency() {
 
 }
 
+namespace {
+
+// APS5_PIPELINE_STATS: which ranges keep templates from a clean proof. Every not-clean template
+// is counted by how many of its ranges are not clean, and each such range by address, so a line
+// every 10 s names the ranges most templates fail on.
+void noteUncleanRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!stats) return;
+    struct Census {
+        std::mutex mutex;
+        std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> byAddress;
+        std::uint64_t templates = 0;
+        std::uint64_t rangesSeen = 0;
+        std::uint64_t rangesUnclean = 0;
+        std::uint64_t oneUnclean = 0;
+        std::int64_t reportedAt = 0;
+    };
+    static auto* census = new Census;
+    std::lock_guard lock(census->mutex);
+    ++census->templates;
+    std::uint64_t unclean = 0;
+    for (const auto& range : ranges) {
+        ++census->rangesSeen;
+        if (GuestMemory::AllClean(std::span(&range, 1))) continue;
+        ++unclean;
+        auto& entry = census->byAddress[range.first];
+        ++entry.first;
+        entry.second = range.second - range.first;
+    }
+    census->rangesUnclean += unclean;
+    if (unclean == 1) ++census->oneUnclean;
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (census->reportedAt == 0) census->reportedAt = now;
+    if (now - census->reportedAt < 10) return;
+    census->reportedAt = now;
+    std::vector<std::pair<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>>> top(census->byAddress.begin(), census->byAddress.end());
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+    std::string text;
+    for (std::size_t index = 0; index < top.size() && index < 12; ++index) {
+        char item[96];
+        std::snprintf(item, sizeof(item), " 0x%llx+%llu x%llu", static_cast<unsigned long long>(top[index].first), static_cast<unsigned long long>(top[index].second.second), static_cast<unsigned long long>(top[index].second.first));
+        text += item;
+    }
+    std::fprintf(stderr, "[clean-ranges] %llu not-clean templates checked: %llu of %llu ranges not clean, %llu templates with exactly one; %llu distinct addresses; top:%s\n", static_cast<unsigned long long>(census->templates), static_cast<unsigned long long>(census->rangesUnclean), static_cast<unsigned long long>(census->rangesSeen), static_cast<unsigned long long>(census->oneUnclean), static_cast<unsigned long long>(census->byAddress.size()), text.c_str());
+    census->byAddress.clear();
+    census->templates = census->rangesSeen = census->rangesUnclean = census->oneUnclean = 0;
+}
+
+}
+
 ShaderResources::CleanStamp ShaderResources::cleanStampNow() const {
     return {GuestMemory::CleanForgetSerial(), TextureReleaseSerial().load(std::memory_order_acquire), StorageTexture::PendingSerial(), HostImportSetGeneration(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), GuestMemory::UnwatchSerial(), DepthSurfacesSerial()};
 }
@@ -4388,6 +4438,7 @@ void ShaderResources::recordClean(bool proved, const CleanStamp& stamp) {
     if (!GuestMemory::AllClean(cleanRangeList)) {
         if (cleanMisses == 0) cleanMisses = 1;
         noteClean(CleanEvent::NotClean);
+        noteUncleanRanges(cleanRangeList);
         cleanRefusal = CleanProof::NotClean;
         return;
     }
