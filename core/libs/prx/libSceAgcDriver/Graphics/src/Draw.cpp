@@ -5266,7 +5266,10 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     const auto proved = [&] {
         if (failed(DrawRecipeMiss::Proof)) return false;
         record.effects.proved = true;
-        if (RuntimeSwitches::Set(RuntimeSwitch::XpProofAsIs)) return resources->AsIsCurrent();
+        // A ceiling for the proof work of record draws, not a mode: the template is taken as it is
+        // (APS5_XP_PROOF_AS_IS), or with APS5_XP_PROOF_NONE also set, without any check at all.
+        static const bool none = std::getenv("APS5_XP_PROOF_NONE") != nullptr;
+        if (RuntimeSwitches::Set(RuntimeSwitch::XpProofAsIs)) return none || resources->AsIsCurrent();
         if (!record.cleanProofs) return resources->ProveCurrent(shaders, &result.proof);
         ShaderResources::CleanProof clean = ShaderResources::CleanProof::FirstProof;
         const bool ok = resources->ProveCurrent(shaders, &result.proof, &clean);
