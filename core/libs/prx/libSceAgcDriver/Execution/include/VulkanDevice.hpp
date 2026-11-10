@@ -368,8 +368,9 @@ public:
     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
     void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0, const std::vector<std::uint32_t>* contentKey = nullptr, const std::uint32_t* fragmentOutputs = nullptr, bool recordRecipe = false);
-    Graphics::DrawRecipeOutcome DrawFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace = nullptr, DrawCommitView* answer = nullptr, const Graphics::ShaderResources::PreparedBuffers* prepared = nullptr);
+    Graphics::DrawRecipeOutcome DrawFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace = nullptr, DrawCommitView* answer = nullptr, const Graphics::ShaderResources::PreparedBuffers* prepared = nullptr, Graphics::PreparedInputs* preparedInputs = nullptr);
     std::vector<std::uint32_t> DrawContentKey(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) const;
+    bool PrepareDrawInputs(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, Graphics::PreparedInputs& prepared) const;
     bool DrawInputsInPlace() const;
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders, std::optional<std::uint32_t>* fragmentOutputs = nullptr) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
