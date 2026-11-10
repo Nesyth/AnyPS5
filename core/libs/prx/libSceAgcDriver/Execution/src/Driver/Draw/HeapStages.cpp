@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/HeapStages.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/HeapWalkMemo.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/WalkRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -430,8 +431,6 @@ HeapWalkMemo& heapWalkMemo() {
 
 namespace {
 
-using AddressRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
-
 struct WalkReads {
     std::vector<std::uint64_t> words;
     std::uint64_t page = ~std::uint64_t{0};
@@ -489,19 +488,6 @@ void copyRangeValues(const AddressRanges& ranges, std::vector<std::uint32_t>& va
         values.resize(offset + static_cast<std::size_t>((end - begin) / WordBytes));
         std::memcpy(values.data() + offset, reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
     }
-}
-
-bool rangesSettled(const AddressRanges& ranges, const Graphics::Recorder::WriteRanges* before, std::uint64_t generation) {
-    const bool queuedWrite = DrawPipeline::Active() && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().OverlapsAny(ranges);
-    if (queuedWrite || !Graphics::Recorder::ReadsSettled(ranges, before)) return false;
-    for (const auto& [begin, end] : ranges) {
-        if (GuestMemory::NewestStamp(begin, static_cast<std::size_t>(end - begin)) > generation) return false;
-    }
-    return true;
-}
-
-void guardRanges(const AddressRanges& ranges) {
-    for (const auto& [begin, end] : ranges) GuestMemory::GuardRead(begin, static_cast<std::size_t>(end - begin));
 }
 
 std::uint64_t walkMemoKey(const ShaderRecompiler::PreparedShaderInvocation& invocation, std::span<const std::uint32_t> userData,
@@ -567,9 +553,9 @@ bool adoptWalk(std::uint64_t memoKey, const ShaderRecompiler::PreparedShaderInvo
     for (std::size_t way = 0; found != nullptr && way < found->size(); ++way) {
         auto& entry = (*found)[way];
         if (!sameWalkInputs(entry, invocation, userData, shaderBase)) continue;
-        if (!rangesSettled(entry.ranges, before, generation)) break;
+        if (!RangesSettled(entry.ranges, before, generation)) break;
         memo.touch(entry);
-        guardRanges(entry.ranges);
+        GuardRanges(entry.ranges);
         adopted.words = entry.words;
         adopted.reads = {entry.ranges, entry.values, entry.userDataUse, entry.capture, true};
         adopted.result = entry.result;
@@ -755,7 +741,7 @@ bool replayStageRecord(const ShaderRecompiler::PreparedShaderInvocation& invocat
             return false;
         }
     }
-    if (!rangesSettled(record.ranges, before, generation)) {
+    if (!RangesSettled(record.ranges, before, generation)) {
         noteStageRecord(StageRecordEvent::Memory);
         return false;
     }
@@ -764,7 +750,7 @@ bool replayStageRecord(const ShaderRecompiler::PreparedShaderInvocation& invocat
         noteStageRecord(StageRecordEvent::Shape);
         return false;
     }
-    guardRanges(record.ranges);
+    GuardRanges(record.ranges);
     record.userData.assign(userData.begin(), userData.end());
     record.words = words;
     adopted.result = record.result;
@@ -799,7 +785,7 @@ bool asIsStageRecord(const ShaderRecompiler::PreparedShaderInvocation& invocatio
         noteStageRecord(StageRecordEvent::Shape);
         return false;
     }
-    guardRanges(record.ranges);
+    GuardRanges(record.ranges);
     adopted.result = record.result;
     adopted.words = std::move(words);
     adopted.reads = {record.ranges, record.values, record.userDataUse, record.capture, true};
@@ -886,12 +872,12 @@ HeapStageMaterialized MaterializeHeapStage(const ShaderRecompiler::PreparedShade
     coalesceWords(reads.words, ranges);
     auto& values = HostThreadLocal<std::vector<std::uint32_t>, ValuesStorage>();
     if (!reads.failed) copyRangeValues(ranges, values);
-    const bool settled = rangesSettled(ranges, before.get(), generation);
+    const bool settled = RangesSettled(ranges, before.get(), generation);
     walkCost.Stop();
     if (!settled) return {};
 
     Graphics::HeapCostScope guardCost(Graphics::HeapCost::Guards);
-    guardRanges(ranges);
+    GuardRanges(ranges);
     guardCost.Stop();
     Graphics::HeapCostScope materializeCost(Graphics::HeapCost::Materialize);
     auto words = std::make_shared<ShaderRecompiler::HeapStageWords>();
