@@ -203,7 +203,8 @@ Counter BufferRefusal(Graphics::ShaderResources::PreparedBuffers::Refusal refusa
 // will draw with (commitRecordDraw hands the committer the job's decode state). The guest bytes
 // are read here, ahead of the commit, so they follow the walk's settled rule: a write queued or
 // pending before this draw may land before the commit, and once it retired no committer test
-// sees it.
+// sees it. The rule also covers the read itself: a write pending or queued when it began that
+// retired by the end.
 void prepareBuffers(const LeanDrawJob& job, const DirectStages& resolved, DrawRecordHit& hit) {
     auto plan = hit.record->commit->bufferPlan.load(std::memory_order_acquire);
     if (plan == nullptr) {
@@ -212,6 +213,9 @@ void prepareBuffers(const LeanDrawJob& job, const DirectStages& resolved, DrawRe
     }
     auto& prepared = hit.preparedBuffers.emplace();
     prepared.generation = resolved.generation;
+    const auto pending = Graphics::Recorder::PendingWriteSnapshot();
+    std::optional<DrawPipeline::Watch> queued;
+    if (DrawPipeline::Active()) queued = DrawPipeline::Queue0().WatchWrites();
     bool done = false;
     try {
         done = Graphics::ShaderResources::PrepareDirectBuffers(*plan, hit.stages, &job.shape->decode->state.color, prepared);
@@ -229,7 +233,7 @@ void prepareBuffers(const LeanDrawJob& job, const DirectStages& resolved, DrawRe
     for (const auto& item : prepared.selected) {
         if (item.begin != 0) read.emplace_back(item.begin, item.begin + item.bytes);
     }
-    if (!read.empty() && !RangesSettled(read, resolved.before.get(), resolved.generation)) {
+    if (!read.empty() && (!RangesSettled(read, resolved.before.get(), resolved.generation) || !Graphics::Recorder::ReadsSettled(read, pending.get()) || (queued.has_value() && DrawPipeline::Queue0().WrittenSince(*queued, read)))) {
         DirectDraws::Add(Counter::BuffersUnsettled);
         hit.preparedBuffers.reset();
         return;
