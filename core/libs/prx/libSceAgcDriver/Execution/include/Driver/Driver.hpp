@@ -61,6 +61,8 @@ inline std::uint32_t ThreadDimensionGroups(std::uint32_t threads, std::uint32_t 
 
 struct DrawTail;
 struct DirectStages;
+struct DirectClass;
+struct DirectClassKey;
 class DirectStepClock;
 
 struct DrawStageContext {
@@ -347,6 +349,7 @@ private:
     static void retireStagePlans(const std::byte* payload, std::shared_ptr<const void>&& answer);
     void finishDirectDraw(const LeanDrawJob& job);
     std::optional<DirectDraws::Counter> resolveDirectStages(const LeanDrawJob& job, const LeanAnchor& anchor, DirectStages& resolved, DirectStepClock* clock);
+    std::optional<DirectDraws::Counter> assembleDirectHit(const LeanDrawJob& job, DirectStages& resolved, DrawRecordHit& hit);
     void restartFinishedDraw(DrawTail& tail);
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();

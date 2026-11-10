@@ -980,7 +980,7 @@ void Direct(bool ring) {
     using DirectCounter = DirectReport::Counter;
     const auto fallbacks = [] {
         std::uint64_t total = 0;
-        for (auto index = static_cast<std::size_t>(DirectCounter::FallbackShape); index <= static_cast<std::size_t>(DirectCounter::FallbackPending); ++index) total += DirectReport::Total(static_cast<DirectCounter>(index));
+        for (auto index = static_cast<std::size_t>(DirectCounter::FallbackShape); index <= static_cast<std::size_t>(DirectCounter::FallbackVerify); ++index) total += DirectReport::Total(static_cast<DirectCounter>(index));
         return total;
     };
     const auto draws = DirectReport::Total(DirectCounter::Draws);

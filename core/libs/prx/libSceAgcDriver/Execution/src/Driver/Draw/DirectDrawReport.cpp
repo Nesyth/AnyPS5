@@ -30,8 +30,8 @@ constexpr std::int64_t WindowMs = 10000;
 
 constexpr std::array<const char*, CounterCount> CounterNames{
     "draws", "direct",
-    "shape", "heap", "invocation", "sample retry", "walk", "torn reads", "tables", "poisoned", "no patch", "addressed", "side", "push constants", "unsettled", "views not current", "memory changed", "labels", "parameter overflow", "class new", "class refused", "verify", "no direct commit yet",
-    "classes built", "not queued", "writes differ", "build differs", "classes evicted", "stages built", "stages evicted", "invocations rebuilt", "verify checked", "verify differing",
+    "shape", "heap", "invocation", "sample retry", "walk", "torn reads", "tables", "poisoned", "no patch", "addressed", "side", "push constants", "unsettled", "views not current", "memory changed", "labels", "parameter overflow", "class new", "class refused", "verify",
+    "classes built", "not queued", "writes differ", "verify differs", "build differs", "classes evicted", "stages built", "stages evicted", "invocations rebuilt", "verify checked", "verify differing",
 };
 
 constexpr std::array<const char*, StepCount> StepNames{"request", "invocation", "walk", "key", "side", "class", "checks", "hand-off"};
@@ -218,7 +218,7 @@ void Report(bool force) {
     const auto at = [&](Counter counter) { return counts[static_cast<std::size_t>(counter)]; };
     const auto draws = at(Counter::Draws);
     std::uint64_t fallbacks = 0;
-    for (auto index = static_cast<std::size_t>(Counter::FallbackShape); index <= static_cast<std::size_t>(Counter::FallbackPending); ++index) fallbacks += counts[index];
+    for (auto index = static_cast<std::size_t>(Counter::FallbackShape); index <= static_cast<std::size_t>(Counter::FallbackVerify); ++index) fallbacks += counts[index];
     std::uint64_t refused = 0;
     for (auto index = static_cast<std::size_t>(Counter::RefusedNotQueued); index <= static_cast<std::size_t>(Counter::RefusedDiffers); ++index) refused += counts[index];
     if (!Printed() || (draws == 0 && at(Counter::ClassesBuilt) == 0 && at(Counter::ClassesEvicted) == 0 && at(Counter::StagesBuilt) == 0 && at(Counter::StagesEvicted) == 0)) return;
@@ -229,7 +229,7 @@ void Report(bool force) {
     const auto direct = at(Counter::Direct);
     AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] %llu draws: %llu direct (%.1f%%), %llu fallback%s; classes %llu known, %llu built, %llu refused%s, %llu evicted, %.1f KiB; stages %llu known, %llu built; invocations %llu rebuilt; verify %llu checked, %llu differing; us per direct draw: request %.2f, invocation %.2f, walk %.2f, key %.2f, side %.2f, class %.2f, checks %.2f, hand-off %.2f\n",
         static_cast<unsigned long long>(draws), static_cast<unsigned long long>(direct), draws != 0 ? 100.0 * static_cast<double>(direct) / static_cast<double>(draws) : 0.0,
-        static_cast<unsigned long long>(fallbacks), reasons(counts, Counter::FallbackShape, Counter::FallbackPending).c_str(),
+        static_cast<unsigned long long>(fallbacks), reasons(counts, Counter::FallbackShape, Counter::FallbackVerify).c_str(),
         static_cast<unsigned long long>(classesKnown.load(std::memory_order_relaxed)), static_cast<unsigned long long>(at(Counter::ClassesBuilt)), static_cast<unsigned long long>(refused), reasons(counts, Counter::RefusedNotQueued, Counter::RefusedDiffers).c_str(),
         static_cast<unsigned long long>(at(Counter::ClassesEvicted)), static_cast<double>(classBytes.load(std::memory_order_relaxed)) / 1024.0,
         static_cast<unsigned long long>(stagesKnown.load(std::memory_order_relaxed)), static_cast<unsigned long long>(at(Counter::StagesBuilt)),

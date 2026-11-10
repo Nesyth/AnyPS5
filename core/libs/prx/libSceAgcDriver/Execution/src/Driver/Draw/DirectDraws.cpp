@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/LeanDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
@@ -24,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <optional>
 #include <span>
 #include <utility>
@@ -547,6 +549,44 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
     return std::nullopt;
 }
 
+std::optional<Counter> Driver::assembleDirectHit(const LeanDrawJob& job, DirectStages& resolved, DrawRecordHit& hit) {
+    const auto count = resolved.stages.size();
+    hit.sides.resize(count);
+    hit.captures.resize(count);
+    hit.stages.clear();
+    hit.stages.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        auto& stage = resolved.stages[i];
+        hit.sides[i] = std::move(stage.side);
+        hit.captures[i] = stage.capture;
+        hit.stages.push_back({stage.stage, stage.shared->donor.get(), stage.pushOffset, &hit.captures[i]->snapshot.registeredImages, &hit.sides[i]});
+    }
+    hit.parameters = job.parameters;
+    const auto& front = *resolved.stages.front().shared->donor;
+    const auto& program = resolved.decode->programs.front();
+    const auto userWord = [&](std::int32_t sgpr, std::uint32_t& value) {
+        if (sgpr < 0 || static_cast<std::uint32_t>(sgpr) < program.firstUserSgpr) return false;
+        const auto index = static_cast<std::uint32_t>(sgpr) - program.firstUserSgpr;
+        if (index >= program.userData.size()) return false;
+        value = program.userData[index];
+        return true;
+    };
+    std::uint32_t offset = 0;
+    if (front.vertexOffsetSgpr >= 0) {
+        if (!userWord(front.vertexOffsetSgpr, offset) || offset > std::numeric_limits<std::uint32_t>::max() - hit.parameters.firstVertex) return Counter::FallbackOverflow;
+        hit.parameters.firstVertex += offset;
+    }
+    if (front.instanceOffsetSgpr >= 0) {
+        if (!userWord(front.instanceOffsetSgpr, offset)) return Counter::FallbackOverflow;
+        hit.parameters.firstInstance = offset;
+    }
+    hit.reads = QueuedDrawReadRanges(hit.parameters, hit.stages);
+    runCaptureCheckHook();
+    if (capturedMemoryChanged(resolved.regions)) return Counter::FallbackMemoryChanged;
+    if (recordQueuedLabelsAfterCapture(job.queue, resolved.regions)) return Counter::FallbackLabels;
+    return std::nullopt;
+}
+
 void Driver::finishDirectDraw(const LeanDrawJob& job) {
     const auto& anchor = leanDraws.AnchorAt(job.anchor);
     DirectDraws::Add(Counter::Draws);
@@ -556,17 +596,47 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
     auto& sampled = HostThreadLocal<std::uint64_t, SampleStorage>();
     std::optional<DirectStepClock> clock;
     if (sampled++ % DirectDraws::StepSampleEvery == 0) clock.emplace();
+    auto* timer = clock.has_value() ? &*clock : nullptr;
+    const auto lap = [&](Step step) {
+        if (timer != nullptr) timer->Lap(step);
+    };
     std::optional<Counter> reason;
+    std::shared_ptr<const DirectClass> found;
+    std::shared_ptr<DrawRecordHit> hit;
     try {
-        reason = resolveDirectStages(job, anchor, resolved, clock.has_value() ? &*clock : nullptr);
+        reason = resolveDirectStages(job, anchor, resolved, timer);
+        if (!reason) {
+            const auto key = DirectClassKey::For(job, resolved);
+            found = DirectStores::Get().classes.Find(key, key.Probe());
+            if (found != nullptr && found->record == nullptr) reason = Counter::FallbackClassRefused;
+            else if (found != nullptr && found->record->vertexLayout != resolved.vertexLayout) found = nullptr;
+            lap(Step::Class);
+        }
+        if (!reason) {
+            hit = std::make_shared<DrawRecordHit>();
+            reason = assembleDirectHit(job, resolved, *hit);
+            lap(Step::Checks);
+        }
+        if (!reason && found == nullptr) reason = Counter::FallbackClassNew;
     } catch (const std::exception&) {
         reason = Counter::FallbackWalk;
     }
-    if (clock.has_value()) clock->Report();
+    if (!reason) {
+        hit->record = found->record;
+        hit->owner = found;
+        hit->direct = true;
+        commitRecordDraw(job, anchor, std::move(hit));
+        lap(Step::HandOff);
+        if (timer != nullptr) timer->Report();
+        DirectDraws::Add(Counter::Direct);
+        ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
+        return;
+    }
+    if (timer != nullptr) timer->Report();
     struct FallbackMark {
         ~FallbackMark() { ThreadReport::MarkItem(ThreadReport::ItemMark::PlanFallback); }
     } fallbackMark;
-    DirectDraws::Add(reason.value_or(Counter::FallbackPending));
+    DirectDraws::Add(*reason);
     finishLeanDraw(job, anchor);
 }
 
