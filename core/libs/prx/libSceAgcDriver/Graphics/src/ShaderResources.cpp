@@ -6988,16 +6988,9 @@ ShaderResources::DrawBindings::~DrawBindings() {
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData, MoveTicket* ticket) const {
     std::vector<MovedBuffer> moved;
     std::size_t movedBytes = 0;
-    const bool ticketed = ticket != nullptr && ticket->ranges != nullptr;
-    const bool stamped = ticketed && ticket->valid && ticket->recorder == recorder.Id() && ticket->pending == StorageTexture::PendingSerial() && ticket->allocations == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && ticket->epoch == GuestMemory::CollectEpoch();
-    struct FreshStorage {};
-    auto& fresh = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, FreshStorage>();
-    fresh.clear();
-    const auto trusted = [&](std::uint64_t begin, std::size_t bytes) {
-        if (!stamped) return false;
-        const auto range = std::pair<std::uint64_t, std::uint64_t>{begin, begin + bytes};
-        return std::find(ticket->ranges->begin(), ticket->ranges->end(), range) != ticket->ranges->end() && !recorder.WriteNotedSince(ticket->note, begin, bytes);
-    };
+    struct RangesStorage {};
+    auto& ranges = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::size_t>>, RangesStorage>();
+    ranges.clear();
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE && !heapStage) || (usesBda && !spaceReuse)) return moved;
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return std::nullopt;
@@ -7015,7 +7008,8 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const bool same = !item.dataWords.empty() ? item.dataWords == guestWords : !patched && std::memcmp(item.buffer->Bytes().data(), guestWords.data(), item.size) == 0;
                 if (same) continue;
                 if (item.dataWords.empty() && patched) {
-                    if (patchedData != nullptr) *patchedData = true;
+                    // A moved range walked before the patch that is not clear refuses the draw first.
+                    if (patchedData != nullptr && movedRangesClear(recorder, ranges, nullptr, false)) *patchedData = true;
                     return std::nullopt;
                 }
                 if (moved.empty()) moved.reserve(allocations.size());
@@ -7044,20 +7038,34 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
                 if (bytes > maxDrawSnapshotBytes - movedBytes) return std::nullopt;
-                if (ticketed) ++ticket->checked;
-                if (trusted(begin, bytes)) {
-                    ++ticket->trusted;
-                    if (AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
-                } else {
-                    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
-                    if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
-                }
-                if (ticketed) fresh.emplace_back(begin, begin + bytes);
+                ranges.emplace_back(begin, bytes);
                 if (moved.empty()) moved.reserve(allocations.size());
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
                 movedBytes += bytes;
             }
         }
+    }
+    if (!movedRangesClear(recorder, ranges, ticket, false)) return std::nullopt;
+    return moved;
+}
+
+bool ShaderResources::movedRangesClear(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::size_t>> ranges, MoveTicket* ticket, bool accessible) const {
+    const bool ticketed = ticket != nullptr && ticket->ranges != nullptr;
+    const bool stamped = ticketed && ticket->valid && ticket->recorder == recorder.Id() && ticket->pending == StorageTexture::PendingSerial() && ticket->allocations == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && ticket->epoch == GuestMemory::CollectEpoch();
+    struct FreshStorage {};
+    auto& fresh = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, FreshStorage>();
+    fresh.clear();
+    for (const auto& [begin, bytes] : ranges) {
+        const auto range = std::pair<std::uint64_t, std::uint64_t>{begin, begin + bytes};
+        if (ticketed) ++ticket->checked;
+        if (stamped && std::find(ticket->ranges->begin(), ticket->ranges->end(), range) != ticket->ranges->end() && !recorder.WriteNotedSince(ticket->note, begin, bytes)) {
+            ++ticket->trusted;
+            if (AnyShadowedOverlaps(begin, bytes)) return false;
+        } else {
+            if (!accessible && !GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return false;
+            if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return false;
+        }
+        if (ticketed) fresh.push_back(range);
     }
     if (ticketed) {
         ticket->ranges->assign(fresh.begin(), fresh.end());
@@ -7068,7 +7076,19 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
         ticket->allocations = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         ticket->epoch = GuestMemory::CollectEpoch();
     }
-    return moved;
+    return true;
+}
+
+bool ShaderResources::PreparedMovesClear(const PreparedBuffers& prepared, Recorder& recorder, MoveTicket* ticket) const {
+    struct RangesStorage {};
+    auto& ranges = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::size_t>>, RangesStorage>();
+    ranges.clear();
+    for (const auto& entry : prepared.moved) {
+        const auto& item = allocations[entry.allocation];
+        if (!item.guest) continue;
+        ranges.emplace_back(entry.address - item.adjustment, static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment)));
+    }
+    return movedRangesClear(recorder, ranges, ticket, true);
 }
 
 const char* ShaderResources::MoveRefusalName(MoveRefusal refusal) {

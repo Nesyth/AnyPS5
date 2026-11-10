@@ -377,6 +377,11 @@ public:
         std::size_t trusted = 0;
     };
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr, MoveTicket* ticket = nullptr) const;
+    // The tests MovedReadOnlyBuffers applies to each moved guest range after its classification,
+    // with the same ticket use, for the moved list of buffers prepared from this object's plan
+    // (their memory was found accessible when they were prepared). True when every range is clear;
+    // the ticket is then left as MovedReadOnlyBuffers would leave it.
+    bool PreparedMovesClear(const PreparedBuffers& prepared, Recorder& recorder, MoveTicket* ticket) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
     struct MoveProof {
@@ -900,6 +905,9 @@ private:
     void noteHeapStageCensus(const CompiledShader& shader, bool current) const;
     void buildHeapStageWords(const CompiledShader& shader, const HeapStageState& state, std::span<const std::uint32_t> words, std::span<const std::uint32_t> userData, std::vector<std::uint32_t>& patched) const;
     void verifyHeapReplay(Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& bindings, const HeapReplayProof& proof, bool overlaid);
+    // The hazard tests of moved read-only (begin, bytes) ranges and the ticket's use of them (a range
+    // the ticket trusts needs only the shadow test); `accessible`: the caller found every range mapped.
+    bool movedRangesClear(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::size_t>> ranges, MoveTicket* ticket, bool accessible) const;
     std::shared_ptr<DrawBindings> selectDrawSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, std::vector<std::size_t>& selected, bool census) const;
     std::shared_ptr<DrawBindings> finishDrawBindings(Recorder& recorder, std::shared_ptr<DrawBindings> result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     bool ownsHeapBinding(const Binding& binding, VkShaderStageFlags stageBit) const;

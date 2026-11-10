@@ -116,6 +116,10 @@ struct DrawRecordKeep {
 
 enum class DrawRecordHold : std::uint8_t { Held, First, Pass, Epoch, Proof, Pending, Depth, Target, Count };
 
+// What a record commit did with a direct hit's prepared buffers (APS5_DIRECT_BUFFERS): bound them,
+// or why it took today's way instead.
+enum class DrawRecordBuffers : std::uint8_t { None, Used, PlanDiffers, MovedHazard, UnmovedHazard, Count };
+
 struct DrawRecordEffects {
     bool pushed = false;
     bool unpushed = false;
@@ -128,6 +132,7 @@ struct DrawRecordEffects {
     bool sharedHold = false;
     bool proved = false;
     std::optional<Graphics::ShaderResources::CleanProof> cleanProof;
+    DrawRecordBuffers buffers = DrawRecordBuffers::None;
 };
 
 struct DrawRecordAccess {

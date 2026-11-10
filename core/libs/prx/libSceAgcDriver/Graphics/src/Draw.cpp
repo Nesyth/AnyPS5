@@ -5287,6 +5287,12 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         timer.phase(PhaseLookup);
         return miss(DrawRecipeMiss::Proof);
     }
+    // Prepared buffers count only for the template whose plan they were prepared from.
+    const ShaderResources::PreparedBuffers* bound = nullptr;
+    if (recording && prepared != nullptr && RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers)) {
+        if (prepared->plan == resources->DirectBufferPlan(shaders)) bound = prepared;
+        else record.effects.buffers = DrawRecordBuffers::PlanDiffers;
+    }
     std::vector<ShaderResources::MovedBuffer> moved;
     {
         bool patched = false;
@@ -5300,7 +5306,18 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         }
         ticket.checked = 0;
         ticket.trusted = 0;
-        auto found = resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched, &ticket);
+        std::optional<std::vector<ShaderResources::MovedBuffer>> found;
+        if (bound != nullptr) {
+            if (resources->PreparedMovesClear(*bound, *recorder, &ticket)) {
+                found.emplace(bound->moved.begin(), bound->moved.end());
+            } else {
+                record.effects.buffers = DrawRecordBuffers::MovedHazard;
+                bound = nullptr;
+                ticket.checked = 0;
+                ticket.trusted = 0;
+            }
+        }
+        if (!found.has_value()) found = resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched, &ticket);
         if (!found.has_value() || failed(DrawRecipeMiss::Moved)) {
             if (recording) record.ticket.valid = false;
             timer.phase(PhaseLookup);
@@ -5429,7 +5446,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     drawn.pushPipeline = std::move(pushPipeline);
     drawn.pushFramebuffer = std::move(pushFramebuffer);
     drawn.pushed = &record.effects.pushed;
-    drawn.prepared = prepared;
+    drawn.prepared = bound;
     recordDraw(context, state, draw, shaders, inputs, drawn, outcome, timer, ownWaitedMs, trace);
     record.effects.passHeld = held;
     if (recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {
