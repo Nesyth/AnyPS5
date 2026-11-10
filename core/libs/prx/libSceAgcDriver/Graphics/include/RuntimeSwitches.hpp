@@ -95,6 +95,7 @@ enum class RuntimeSwitch : std::size_t {
     TemplateTouch,
     NoPlanCleanProofs,
     DeferredEncode,
+    NoOwnedDrawInputs,
     Count,
 };
 

@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
@@ -33,8 +34,15 @@ namespace {
 
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainNames{"packet", "flush", "labels", "capture", "indirect", "submission"};
 
+constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)> KindNames{"other", "draw", "indirect", "colormeta", "dispatch", "sampledump", "dmafill", "dmawrite", "dmacopy", "store", "endofpipe", "seal", "submitend", "completion", "bufferfill"};
+
 std::atomic<unsigned> runningCommitters{0};
 std::atomic<unsigned> runningFinishers{0};
+std::atomic<std::uint64_t> drawKeys{0};
+std::atomic<std::uint64_t> drawKeysSameAsPrevious{0};
+std::atomic<std::uint64_t> drawKeysSeenRecently{0};
+std::atomic<std::uint64_t> drawShapesSameAsPrevious{0};
+std::atomic<std::uint64_t> drawShapesSeenRecently{0};
 
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
@@ -1044,12 +1052,35 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
 }
 
 void DrawPipeline::EnqueueQuiet(Commit commit) {
-    enqueue({std::move(commit), {}, 0, {}, {}, false, false, true});
+    enqueue({std::move(commit), {}, 0, {}, {}, false, false, CommitKind::Other, true});
+}
+
+void DrawPipeline::Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw) {
+    enqueue({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, false, kind});
+}
+
+void DrawPipeline::NoteDrawKey(std::uint64_t key, std::uint64_t shape) {
+    constexpr std::size_t RecentSlots = 4096;
+    thread_local std::array<std::uint64_t, RecentSlots> recent{};
+    thread_local std::uint64_t previous = 0;
+    thread_local std::array<std::uint64_t, RecentSlots> recentShapes{};
+    thread_local std::uint64_t previousShape = 0;
+    const auto shapeSlot = static_cast<std::size_t>((shape ^ (shape >> 29u)) % RecentSlots);
+    const auto slot = static_cast<std::size_t>((key ^ (key >> 29u)) % RecentSlots);
+    drawKeys.fetch_add(1, std::memory_order_relaxed);
+    if (key == previous) drawKeysSameAsPrevious.fetch_add(1, std::memory_order_relaxed);
+    if (recent[slot] == key) drawKeysSeenRecently.fetch_add(1, std::memory_order_relaxed);
+    if (shape == previousShape) drawShapesSameAsPrevious.fetch_add(1, std::memory_order_relaxed);
+    if (recentShapes[shapeSlot] == shape) drawShapesSeenRecently.fetch_add(1, std::memory_order_relaxed);
+    recent[slot] = key;
+    previous = key;
+    recentShapes[shapeSlot] = shape;
+    previousShape = shape;
 }
 
 void DrawPipeline::EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes) {
     const auto end = address + bytes.size();
-    enqueue({std::move(commit), {{address, end}}, address, std::move(bytes), {}, false, true});
+    enqueue({std::move(commit), {{address, end}}, address, std::move(bytes), {}, false, true, CommitKind::Store});
 }
 
 void DrawPipeline::enqueue(Item item) {
@@ -1147,6 +1178,18 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     // the epoch shortcut missed, and the objects taken from another template's proof.
     static const bool census = std::getenv("APS5_STAGE_STATS") != nullptr;
     if (census) AgcDriver::ProfilePrint_nid_no_patch("[proof-breaks] 10 s: BreakProofs by site:%s; epoch shortcut misses: %s; fast-proof stamps taken so far %llu; %s\n", GuestMemory::TakeProofBreakReport().c_str(), Graphics::ShaderResources::TakeEpochMissReport().c_str(), static_cast<unsigned long long>(Graphics::ShaderResources::FastProofStampsTaken()), GuestMemory::SweepCostReport().c_str());
+    std::string kindText;
+    for (std::size_t i = 0; i < kindCommits.size(); ++i) {
+        const auto count = kindCommits[i].exchange(0, std::memory_order_relaxed);
+        const auto ns = kindNs[i].exchange(0, std::memory_order_relaxed);
+        if (count == 0) continue;
+        char item[64];
+        std::snprintf(item, sizeof(item), " %s %llu (%.1f us)", KindNames[i], static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e3 / static_cast<double>(count));
+        kindText += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[commits] by kind (10 s):%s\n", kindText.c_str());
+    const auto vk = Graphics::TakeVkDrawCounts();
+    AgcDriver::ProfilePrint_nid_no_patch("[vkdraw] (10 s): %llu vkCmdDraw, %llu vkCmdDrawIndexed, %llu vkCmdDrawIndirect calls, %llu mesh; draw keys %llu, same as the previous draw %llu, seen within the last 4096 draws %llu; draw shapes (state without per-draw user words) same as the previous %llu, seen within the last 4096 %llu\n", static_cast<unsigned long long>(vk.direct), static_cast<unsigned long long>(vk.indexed), static_cast<unsigned long long>(vk.indirect), static_cast<unsigned long long>(vk.mesh), static_cast<unsigned long long>(drawKeys.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSeenRecently.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSeenRecently.exchange(0, std::memory_order_relaxed)));
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     drains = {};
     drainWaitNs = {};
@@ -1241,6 +1284,9 @@ void DrawPipeline::run() {
             const auto lock = lockFor(mutex);
             retiredItems.fetch_add(1, std::memory_order_release);
             countWrites(items.front().writes, false);
+            const auto kindIndex = static_cast<std::size_t>(items.front().kind);
+            kindCommits[kindIndex].fetch_add(1, std::memory_order_relaxed);
+            kindNs[kindIndex].fetch_add(spent, std::memory_order_relaxed);
             retired.push_back(std::move(items.front()));
             items.pop_front();
             ++commits;

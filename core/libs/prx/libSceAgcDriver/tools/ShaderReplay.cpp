@@ -17,10 +17,12 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <sstream>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -89,6 +91,36 @@ HeapProfileSelection SelectHeapProfile(ShaderRecompiler::SpirvTarget& target) {
     return selection;
 }
 bool g_code = false;
+bool g_float16WidenNans = false;
+bool g_float16NarrowNans = false;
+
+bool OutputSpirv(const char* path, std::span<const std::uint32_t> spirv) {
+    if (g_spirv) {
+        std::string name(path);
+        name = name.substr(name.find_last_of("/\\") + 1) + ".spv";
+        std::ofstream file(name, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(spirv.data()), static_cast<std::streamsize>(spirv.size_bytes()));
+        file.close();
+        if (!file) {
+            std::printf("  could not write %s\n", name.c_str());
+            return false;
+        }
+    }
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    if (g_disassemble) {
+        spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+        std::string text;
+        if (!tools.Disassemble(spirv.data(), spirv.size(), &text, SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES)) {
+            std::printf("  could not disassemble SPIR-V\n");
+            return false;
+        }
+        std::printf("%s\n", text.c_str());
+    }
+#else
+    if (g_disassemble) std::printf("  (--dis needs ANYPS5_ENABLE_SPIRV_TOOLS=ON)\n");
+#endif
+    return true;
+}
 
 bool ParseHeapDataUniformDwords(int index, int argc, char** argv, std::uint32_t& result) {
     char* end = nullptr;
@@ -141,6 +173,8 @@ bool Replay(const char* path) {
         request.request.target.supportedExtensions = request.supportedExtensions;
     }
     const auto heapProfile = SelectHeapProfile(request.request.target);
+    if (g_float16WidenNans) request.request.target.float16WidenNans = true;
+    if (g_float16NarrowNans) request.request.target.float16NarrowNans = true;
     std::printf("%s: %zu code words, %zu user data, %zu memory regions, wave%u\n", path, request.request.shader.code.size(), request.request.context.userData.size(), request.request.context.memory.size(), request.request.context.waveSize);
     std::printf("  heap profile (%s): %s, gpuResolvedImages %d, descriptorMemory %d, data uniform dwords %u\n", heapProfile.source, heapProfile.heap ? "heap" : "no heap", request.request.target.gpuResolvedImages, request.request.target.descriptorMemory, request.request.target.heapDataUniformDwords);
     if (!forced.empty()) std::printf("  target flags forced on: %s\n", forced.c_str());
@@ -162,6 +196,13 @@ bool Replay(const char* path) {
         // mem_<code address>_<guest address>.bin next to the request for inspection with other tools.
         const auto& context = request.request.context;
         for (std::size_t i = 0; i < context.userData.size(); ++i) std::printf("  user[%zu] = 0x%08x\n", i, context.userData[i]);
+        if (request.request.graphics.has_value()) {
+            const auto& linked = request.request.graphics->linkedPrograms;
+            for (std::size_t index = 0; index < linked.size(); ++index) {
+                std::printf("  linked program %zu (stage %u, 0x%llx): user data base register %u, first user SGPR %u\n", index, static_cast<unsigned>(linked[index].binary.stage), static_cast<unsigned long long>(linked[index].binary.codeAddress), linked[index].userDataBaseRegister, linked[index].firstUserSgpr);
+                for (std::size_t i = 0; i < linked[index].userData.size(); ++i) std::printf("    user[%zu] = 0x%08x\n", i, linked[index].userData[i]);
+            }
+        }
         for (const auto& region : context.memory) {
             char name[96];
             std::snprintf(name, sizeof(name), "mem_%llx_%llx.bin", static_cast<unsigned long long>(request.request.shader.codeAddress), static_cast<unsigned long long>(region.guestAddress));
@@ -183,6 +224,20 @@ bool Replay(const char* path) {
             return false;
         }
         std::printf("  code -> %s\n", name.c_str());
+        if (request.request.graphics.has_value()) {
+            const auto& linked = request.request.graphics->linkedPrograms;
+            for (std::size_t index = 0; index < linked.size(); ++index) {
+                const auto linkedName = name + ".linked" + std::to_string(index);
+                const auto& linkedCode = linked[index].binary.code;
+                std::ofstream linkedFile(linkedName, std::ios::binary);
+                linkedFile.write(reinterpret_cast<const char*>(linkedCode.data()), static_cast<std::streamsize>(linkedCode.size() * sizeof(linkedCode[0])));
+                if (!linkedFile) {
+                    std::printf("  could not write %s\n", linkedName.c_str());
+                    return false;
+                }
+                std::printf("  linked program %zu (stage %u, 0x%llx) -> %s\n", index, static_cast<unsigned>(linked[index].binary.stage), static_cast<unsigned long long>(linked[index].binary.codeAddress), linkedName.c_str());
+            }
+        }
     }
     if (g_assembly) {
         const auto program = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(request.request.shader.code);
@@ -227,8 +282,9 @@ bool Replay(const char* path) {
                 phase = "materialize";
                 const auto result = invocation->Materialize(*capture);
                 std::printf("  materialized: %zu SPIR-V words\n", result->spirv.size());
+                return OutputSpirv(path, result->spirv);
             }
-            return true;
+            return OutputSpirv(path, ShaderRecompiler::GetPreparedArtifact(*handle).spirv);
         } catch (const std::exception& error) {
             std::printf("  %s failed: %s\n", phase, FirstLine(error.what()).c_str());
             return false;
@@ -237,11 +293,6 @@ bool Replay(const char* path) {
     try {
         const auto result = ShaderRecompiler::Recompile(request.request);
         std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
-        if (g_spirv) {
-            std::string name(path);
-            name = name.substr(name.find_last_of("/\\") + 1) + ".spv";
-            std::ofstream(name, std::ios::binary).write(reinterpret_cast<const char*>(result.spirv.data()), static_cast<std::streamsize>(result.spirv.size() * sizeof(result.spirv[0])));
-        }
         if (g_memory) {
             for (const auto& binding : result.bindings) {
                 if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
@@ -252,16 +303,7 @@ bool Replay(const char* path) {
                 }
             }
         }
-#if ANYPS5_ENABLE_SPIRV_TOOLS
-        if (g_disassemble) {
-            spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
-            std::string text;
-            if (tools.Disassemble(result.spirv.data(), result.spirv.size(), &text, SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES)) std::printf("%s\n", text.c_str());
-        }
-#else
-        if (g_disassemble) std::printf("  (--dis needs ANYPS5_ENABLE_SPIRV_TOOLS=ON)\n");
-#endif
-        return true;
+        return OutputSpirv(path, result.spirv);
     } catch (const std::exception& error) {
         std::printf("  recompile failed: %s\n", FirstLine(error.what()).c_str());
         return false;
@@ -272,7 +314,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--lds-lock-fences] [--shader-fma] [--gpu-heap] [--no-gpu-heap] [--heap-data-uniform-dwords N] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n  a request replays with the heap profile it was captured with; --gpu-heap forces the heap profile (gpuResolvedImages, descriptorMemory, and 16384 data uniform dwords unless --heap-data-uniform-dwords is given, replacing a captured limit), --no-gpu-heap forces it off, --heap-data-uniform-dwords N forces the limit (0 selects ring-address reads); --gpu-heap with --no-gpu-heap, and --no-gpu-heap with a nonzero limit, exit 2\n  --maintenance8, --robust2, --wave-lds-memory-barriers, --device-scope-lds-memory-barriers and --lds-lock-fences force their target flag on over the captured value and are listed on a 'target flags forced on' line\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--lds-lock-fences] [--shader-fma] [--f16-widen-nans] [--f16-narrow-nans] [--gpu-heap] [--no-gpu-heap] [--heap-data-uniform-dwords N] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n  a request replays with the heap profile it was captured with; --gpu-heap forces the heap profile (gpuResolvedImages, descriptorMemory, and 16384 data uniform dwords unless --heap-data-uniform-dwords is given, replacing a captured limit), --no-gpu-heap forces it off, --heap-data-uniform-dwords N forces the limit (0 selects ring-address reads); --gpu-heap with --no-gpu-heap, and --no-gpu-heap with a nonzero limit, exit 2\n  --maintenance8, --robust2, --wave-lds-memory-barriers, --device-scope-lds-memory-barriers and --lds-lock-fences force their target flag on over the captured value and are listed on a 'target flags forced on' line\n");
         return 2;
     }
     if (HeapFlagsConflict(argc, argv)) return 2;
@@ -333,6 +375,14 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--shader-fma") {
             g_shaderFma = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--f16-widen-nans") {
+            g_float16WidenNans = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--f16-narrow-nans") {
+            g_float16NarrowNans = true;
             continue;
         }
         if (std::string(argv[i]) == "--mem") {

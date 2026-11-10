@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -20,7 +21,8 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
         work();
         return;
     }
-    static thread_local WorkerProfile profile;
+    struct Slot {};
+    auto& profile = ThreadScratch<WorkerProfile, Slot>();
     const auto begin = std::chrono::steady_clock::now();
     work();
     const auto end = std::chrono::steady_clock::now();

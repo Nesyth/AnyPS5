@@ -42,6 +42,14 @@ bool StorageFormatAvailable(const Context& context, std::uint32_t guestFormat);
 VkFormat HostStorageFormat(const Context& context, VkFormat format);
 bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, DccKeys keys);
 std::uint64_t SampledTextureMemory();
+
+struct SparseLevelBinds {
+    std::vector<VkSparseImageMemoryBind> levels;
+    std::vector<VkSparseMemoryBind> tails;
+    VkDeviceSize bytes = 0;
+};
+
+std::optional<SparseLevelBinds> PlanSparseLevels(VkExtent3D extent, std::uint32_t mipLevels, std::uint32_t arrayLayers, VkDeviceSize alignment, std::span<const VkSparseImageMemoryRequirements> requirements, std::uint32_t firstLevel);
 bool ClearKeepsDenormals(const Context& context, VkFormat format);
 bool ClearColorForTexel(VkFormat format, std::uint32_t elementBytes, std::span<const std::uint32_t, 4> pattern, VkClearColorValue& clear);
 
@@ -337,7 +345,7 @@ public:
     std::uint32_t TrackedUnits() const { return trackedLayers; }
     void MarkSliceDirty(std::uint32_t slice, std::uint32_t count = 1);
     bool MarkDrawn(std::uint32_t slice, std::uint32_t count, VkRect2D scissor);
-    void Flush();
+    void Flush(const char* reason = "cache eviction");
     void Detach();
     bool Dirty() const;
     // Stores every pending image overlapping the range, except `except`; returns whether any was.
@@ -372,6 +380,7 @@ public:
     // Whether an image with results pending, or one a FlushPending is storing right now, overlaps
     // any of the [begin, end) ranges: one acquisition of the registry's mutex.
     static bool AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+    static bool AnyPendingUnitsOverlap(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     static bool AnyLiveOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     static std::uint64_t StampKeepingNewerResults(std::uint64_t address, std::size_t bytes, std::uint64_t recorded, const std::function<std::uint64_t()>& stamp);
     // Moves with every change of the pending registry (an image marked dirty, stored, flushed or
@@ -430,6 +439,14 @@ public:
         std::uint64_t flushedAfterSkipSameSite;
     };
     static HookSkipCounts TakeHookSkipCounts();
+    struct OrderedSkipCounts {
+        std::uint64_t flushes;
+        std::uint64_t refreshes;
+    };
+    static OrderedSkipCounts TakeOrderedSkipCounts();
+    static void SetFlushFailureForTest(bool fail);
+    static int TakeFlushFailureForTest();
+    static bool OrderedFlushArmedForTest();
     // A consumer found the image current and used it (Refresh, the fast revalidation).
     void NoteProved() const;
     // Whether the storage cache holds this image (set and cleared by the cache under its mutex, the
@@ -535,6 +552,7 @@ public:
     static std::uint64_t SinglePassMoves();
     static std::uint64_t SlabRetiles();
     static std::uint64_t PaddingSeedCopies();
+    static std::uint64_t LinearImportRetiles();
     static std::uint64_t RefreshesProved();
     static std::uint64_t ClearHandOvers();
     static std::uint64_t CreationHandOvers();
@@ -706,6 +724,7 @@ private:
     void refreshGeneration();
     std::uint64_t collectedLayerGeneration(std::uint32_t layer, std::uint64_t whole, bool uncached = false) const;
     bool refreshProved();
+    bool keysReplacedByClear() const;
     void takeRefreshProof(bool aliased);
     bool otherPendingOverlaps() const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's

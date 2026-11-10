@@ -121,7 +121,7 @@ bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t head
     if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
     if (Pm4::DrawOpcode(opcode)) return true;
     switch (opcode) {
-        case 0x11: case 0x12: case 0x13: case 0x20: case 0x26: case 0x2a: case 0x2f: case 0x42: case 0x58: case 0x59: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81: return true;
+        case 0x11: case 0x12: case 0x13: case 0x20: case 0x26: case 0x2a: case 0x2f: case 0x3f: case 0x42: case 0x58: case 0x59: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81: return true;
         case 0x46: return packet.size() >= 2 && (packet[1] & 0x3fu) != 0x39u;
         case 0x15: return orderedFills();
         case 0x63: case 0x64: case 0x9f:
@@ -257,7 +257,7 @@ bool Driver::endSegment(const Submission& submission, FlipHold& flipHold, bool p
         }
         if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0) {
             const bool holdsFlip = std::exchange(flipHold.working, false);
-            DrawPipeline::Queue0().Enqueue([this, holdsFlip, progress = submission.progress] {
+            DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::SubmitEnd, [this, holdsFlip, progress = submission.progress] {
                 if (holdsFlip) finishFlipWork(submitFlipWork(0));
                 else submitOpenWork(progress);
                 wakeQueueZeroForCompletions();
@@ -406,6 +406,7 @@ void Driver::execute(const Submission& submission) {
         }
     } settleFinisher{submission.queue == 0};
     std::size_t listHint = 0;
+    auto* const executingPacket = workerPacket();
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
@@ -414,6 +415,7 @@ void Driver::execute(const Submission& submission) {
         const auto count = Pm4::PacketWords(header);
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
+        if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
         if (submission.queue == 0 && Pm4::DrawOpcode(opcode) && !Pm4::IndirectDrawOpcode(opcode) && !predicated && switchSet(Graphics::RuntimeSwitch::XpKeepDraws) && deferredLabels().labels.empty() && xpDropsDraw()) {
@@ -705,7 +707,7 @@ void Driver::execute(const Submission& submission) {
                     DrawPipeline::Queue0().EnqueueQuiet(seal);
                     noteXpStream(true);
                 } else if (pipelined && DrawPipeline::Queue0().Busy()) {
-                    DrawPipeline::Queue0().Enqueue(seal, {});
+                    DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Seal, seal, {});
                 } else {
                     seal();
                 }
