@@ -19,6 +19,8 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
+#include <cstdio>
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -46,6 +48,19 @@ std::size_t mixedSlot(std::uint64_t first, std::uint64_t second, std::size_t slo
     auto mixed = first * 0x9e3779b97f4a7c15ull ^ second;
     mixed ^= mixed >> 29u;
     return static_cast<std::size_t>(mixed % slots);
+}
+
+// Why a direct draw's read ranges were not settled (the three tests of RangesSettled, in its order), counted
+// when the pipeline statistics are on: one line per 4096 such draws.
+void noteUnsettled(const AddressRanges& ranges, const Graphics::Recorder::WriteRanges* before, std::uint64_t generation) {
+    static const bool on = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!on) return;
+    static std::atomic<std::uint64_t> queued{0}, recorded{0}, stamped{0}, total{0};
+    if (DrawPipeline::Active() && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().OverlapsAny(ranges)) queued.fetch_add(1, std::memory_order_relaxed);
+    else if (!Graphics::Recorder::ReadsSettled(ranges, before)) recorded.fetch_add(1, std::memory_order_relaxed);
+    else stamped.fetch_add(1, std::memory_order_relaxed);
+    static_cast<void>(generation);
+    if ((total.fetch_add(1, std::memory_order_relaxed) + 1u) % 4096u == 0u) std::fprintf(stderr, "[direct-unsettled] cumulative: %llu over a write queued in the draw pipeline, %llu over a recorder write not settled, %llu with a newer memory stamp\n", static_cast<unsigned long long>(queued.load(std::memory_order_relaxed)), static_cast<unsigned long long>(recorded.load(std::memory_order_relaxed)), static_cast<unsigned long long>(stamped.load(std::memory_order_relaxed)));
 }
 
 bool DirectShape(const LeanDrawJob& job) {
@@ -570,7 +585,10 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
         if (imageTables(snapshot)) return Counter::FallbackTables;
         if (!readRanges(reads, stage.ranges, stage.values)) return Counter::FallbackTornReads;
         if (!CaptureRegisteredViewsCurrent(snapshot.registeredImages)) return Counter::FallbackViews;
-        if (!RangesSettled(stage.ranges, resolved.before.get(), resolved.generation)) return Counter::FallbackUnsettled;
+        if (!RangesSettled(stage.ranges, resolved.before.get(), resolved.generation)) {
+            noteUnsettled(stage.ranges, resolved.before.get(), resolved.generation);
+            return Counter::FallbackUnsettled;
+        }
         GuardRanges(stage.ranges);
         lap(Step::Walk);
 
