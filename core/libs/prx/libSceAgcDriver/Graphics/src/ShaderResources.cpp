@@ -4348,6 +4348,12 @@ namespace {
 
 // APS5_PIPELINE_STATS: which serial of the clean stamp moved when a kept clean proof is dropped
 // (several can move at once), and how often only the pending-store serial did.
+std::atomic<std::uint64_t> cleanSerialsKept{0};
+
+void noteCleanSerialsKept() {
+    cleanSerialsKept.fetch_add(1, std::memory_order_relaxed);
+}
+
 void noteCleanSerials(std::array<bool, 6> moved) {
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (!stats) return;
@@ -4361,7 +4367,7 @@ void noteCleanSerials(std::array<bool, 6> moved) {
     if (moved[1] && !moved[0] && !moved[2] && !moved[3] && !moved[4] && !moved[5]) pendingOnly.fetch_add(1, std::memory_order_relaxed);
     const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
     if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
-    std::fprintf(stderr, "[clean-serials] %llu kept clean proofs dropped for a moved serial: release %llu, pending %llu (pending only %llu), imports %llu, allocations %llu, unwatched %llu, depth surfaces %llu\n", static_cast<unsigned long long>(drops.exchange(0)), static_cast<unsigned long long>(counts[0].exchange(0)), static_cast<unsigned long long>(counts[1].exchange(0)), static_cast<unsigned long long>(pendingOnly.exchange(0)), static_cast<unsigned long long>(counts[2].exchange(0)), static_cast<unsigned long long>(counts[3].exchange(0)), static_cast<unsigned long long>(counts[4].exchange(0)), static_cast<unsigned long long>(counts[5].exchange(0)));
+    std::fprintf(stderr, "[clean-serials] %llu kept clean proofs dropped for a moved serial: release %llu, pending %llu (pending only %llu), imports %llu, allocations %llu, unwatched %llu, depth surfaces %llu; kept through a release or pending change elsewhere so far %llu\n", static_cast<unsigned long long>(drops.exchange(0)), static_cast<unsigned long long>(counts[0].exchange(0)), static_cast<unsigned long long>(counts[1].exchange(0)), static_cast<unsigned long long>(pendingOnly.exchange(0)), static_cast<unsigned long long>(counts[2].exchange(0)), static_cast<unsigned long long>(counts[3].exchange(0)), static_cast<unsigned long long>(counts[4].exchange(0)), static_cast<unsigned long long>(counts[5].exchange(0)), static_cast<unsigned long long>(cleanSerialsKept.load(std::memory_order_relaxed)));
 }
 
 }
@@ -4416,6 +4422,20 @@ bool ShaderResources::cleanCurrent(const CleanStamp& stamp, CleanProof& outcome)
         return false;
     }
     if (!registeredImageViewsCurrent(registeredImageViews)) return refuse(CleanEvent::Views, CleanProof::Views);
+    // APS5_CLEAN_PRECISE_SERIALS: the release and pending-store serials are global, and one of them
+    // moves between most uses of a template. What they stand for here is narrower: one of this
+    // template's own textures was released, or a pending surface now lies over one of its ranges
+    // (its snapshot texture would be stale against it). When only those two moved and neither is
+    // the case, the kept proof stays and adopts the new serials.
+    static const bool preciseSerials = std::getenv("APS5_CLEAN_PRECISE_SERIALS") != nullptr;
+    if (preciseSerials && (stamp.release != cleanAt.release || stamp.pending != cleanAt.pending) && stamp.imports == cleanAt.imports && stamp.allocations == cleanAt.allocations && stamp.unwatched == cleanAt.unwatched && stamp.depthSurfaces == cleanAt.depthSurfaces) {
+        const bool released = std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->Released(); });
+        if (!released && !StorageTexture::AnyPendingOverlaps(cleanRangeList)) {
+            cleanAt.release = stamp.release;
+            cleanAt.pending = stamp.pending;
+            noteCleanSerialsKept();
+        }
+    }
     if (stamp.release != cleanAt.release || stamp.pending != cleanAt.pending || stamp.imports != cleanAt.imports || stamp.allocations != cleanAt.allocations || stamp.unwatched != cleanAt.unwatched || stamp.depthSurfaces != cleanAt.depthSurfaces) {
         noteCleanSerials({stamp.release != cleanAt.release, stamp.pending != cleanAt.pending, stamp.imports != cleanAt.imports, stamp.allocations != cleanAt.allocations, stamp.unwatched != cleanAt.unwatched, stamp.depthSurfaces != cleanAt.depthSurfaces});
         return refuse(CleanEvent::Serials, CleanProof::Serials);
