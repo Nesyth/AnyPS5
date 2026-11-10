@@ -207,16 +207,16 @@ void ExpectNear(std::uint32_t tid, std::uint32_t index, std::uint32_t actual, st
     const double x = half ? Half((Rows[tid][2] >> (index % 2u ? 16u : 0u)) & 0xffffu) : std::bit_cast<float>(Rows[tid][index % 2u]);
     const double error = std::abs(a - e);
     const double relative = error / std::abs(e);
-    bool near = false;
+    bool within = false;
     switch (Tolerance[index]) {
-    case 1u: near = relative <= 0x1p-20; break;
-    case 2u: near = error <= 0x1p-21 || relative <= 0x1p-20; break;
-    case 3u: near = relative <= (4.0 + 2.0 * std::abs(x)) * 0x1p-23; break;
-    case 4u: near = error <= 0x1p-11; break;
-    case 5u: near = relative <= 0x1p-9; break;
-    default: near = error <= 0x1p-10; break;
+    case 1u: within = relative <= 0x1p-20; break;
+    case 2u: within = error <= 0x1p-21 || relative <= 0x1p-20; break;
+    case 3u: within = relative <= (4.0 + 2.0 * std::abs(x)) * 0x1p-23; break;
+    case 4u: within = error <= 0x1p-11; break;
+    case 5u: within = relative <= 0x1p-9; break;
+    default: within = error <= 0x1p-10; break;
     }
-    Require(near, std::string("vop1 float unary: lane ") + std::to_string(tid) + " " + Names[index] + " is " + Hex(actual) + ", expected near " + Hex(expected));
+    Require(within, std::string("vop1 float unary: lane ") + std::to_string(tid) + " " + Names[index] + " is " + Hex(actual) + ", expected near " + Hex(expected));
 }
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
