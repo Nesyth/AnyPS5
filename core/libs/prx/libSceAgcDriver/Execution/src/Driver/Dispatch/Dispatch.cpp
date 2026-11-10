@@ -40,6 +40,7 @@ std::atomic<std::uint64_t> itemCommits{0};
 std::atomic<std::uint64_t> itemRebuilds{0};
 std::atomic<std::uint64_t> itemMisses{0};
 std::atomic<std::uint64_t> itemRecipeLess{0};
+std::atomic<std::uint64_t> itemNotPlain{0};
 
 bool DispatchMissItemsEnabled() {
     return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelineDispatchMisses);
@@ -62,7 +63,7 @@ void ReportDispatchItems(bool profile) {
         std::snprintf(item, sizeof(item), " %s %llu", ItemFallbackNames[i], static_cast<unsigned long long>(itemFallbacks[i].load(std::memory_order_relaxed)));
         drained += item;
     }
-    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer, %llu queued after a cache miss, %llu queued without a recipe); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemMisses.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRecipeLess.load(std::memory_order_relaxed)), drained.c_str());
+    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer, %llu queued after a cache miss, %llu queued without a recipe, %llu cached ones kept off the queue as not plain); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemMisses.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRecipeLess.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemNotPlain.load(std::memory_order_relaxed)), drained.c_str());
 }
 
 bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code) {
@@ -567,10 +568,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     };
     phaseTiming.Phase(PhaseSnapshots);
 
-    if (lateItem || recipeLess) {
-        // The commit item serves plain dispatches only: the HTILE clears and fix-ups, key fills and
-        // depth plane clears keep their handling on this thread.
-        bool plain = compiledResult != nullptr && !htileClearCompletion.has_value() && htileMask.bytes == 0u && !htileFixup.has_value();
+    // The commit item serves plain dispatches only. An HTILE clear or fix-up, a key fill and a depth
+    // plane clear are noted to the device by this thread's dispatch (NoteHtileZmaskFixup and the
+    // like); queued as an item they are not, and the next draw's depth view then reads the HTILE
+    // back through a GPU sync. With APS5_PIPELINE_DISPATCH_MISSES every queued dispatch has to be
+    // plain, the ones the cache already serves with a recipe included.
+    bool plain = false;
+    if ((pipelined && DispatchMissItemsEnabled()) || lateItem || recipeLess) {
+        plain = compiledResult != nullptr && !htileClearCompletion.has_value() && htileMask.bytes == 0u && !htileFixup.has_value();
         if (plain && !partialLastGroup && MatchSgprPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute)) plain = false;
         if (plain && !partialLastGroup) {
             if (const auto clear = Graphics::MatchStorageImageClear(std::span(snapshot.code).subspan(codeOffset), userData, compute, groups)) {
@@ -578,6 +583,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 if (clearAddress != 0 && Graphics::DepthSurfaceAt(clearAddress)) plain = false;
             }
         }
+    }
+    if (pipelined && DispatchMissItemsEnabled() && !plain) {
+        pipelined = false;
+        itemWrites.clear();
+        itemNotPlain.fetch_add(1, std::memory_order_relaxed);
+        if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+    }
+    if (lateItem || recipeLess) {
         bool queued = plain;
         if (queued && lateItem) {
             queued = std::none_of(captured.begin(), captured.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
