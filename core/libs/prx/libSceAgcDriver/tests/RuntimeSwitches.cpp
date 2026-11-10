@@ -66,6 +66,7 @@ void registry() {
     Require(RuntimeSwitches::Find("APS5_DIRECT_PASS_TARGETS") == RuntimeSwitch::DirectPassTargets && !RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets), "APS5_DIRECT_PASS_TARGETS is not a runtime switch that starts unset");
     Require(RuntimeSwitches::Find("APS5_CLEAN_COLLECTS") == RuntimeSwitch::CleanCollects && !RuntimeSwitches::Set(RuntimeSwitch::CleanCollects), "APS5_CLEAN_COLLECTS is not a runtime switch that starts unset");
     Require(RuntimeSwitches::Find("APS5_DIRECT_BUFFERS") == RuntimeSwitch::DirectBuffers && !RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers), "APS5_DIRECT_BUFFERS is not a runtime switch that starts unset");
+    Require(RuntimeSwitches::Find("APS5_DIRECT_INPUTS") == RuntimeSwitch::DirectInputs && !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs), "APS5_DIRECT_INPUTS is not a runtime switch that starts unset");
 }
 
 void snapshot() {
@@ -103,6 +104,8 @@ void parse() {
     Require(plans.switches.size() == 2 && plans.switches[0] == RuntimeSwitch::StagePlans && plans.switches[1] == RuntimeSwitch::NoPlanCleanProofs, "APS5_AB does not accept APS5_STAGE_PLANS and APS5_NO_PLAN_CLEAN_PROOFS");
     const auto direct = AbSchedule::Parse("30:APS5_DIRECT_DRAWS", "", "");
     Require(direct.switches.size() == 1 && direct.switches[0] == RuntimeSwitch::DirectDraws, "APS5_AB does not accept APS5_DIRECT_DRAWS");
+    const auto inputs = AbSchedule::Parse("30:APS5_DIRECT_INPUTS", "", "");
+    Require(inputs.switches.size() == 1 && inputs.switches[0] == RuntimeSwitch::DirectInputs, "APS5_AB does not accept APS5_DIRECT_INPUTS");
     Require(Refusal("60:APS5_FULL_BARRIERS").find("APS5_FULL_BARRIERS cannot change while the title runs; switches the A/B can change: APS5_NO_BARRIER_BATCH") != std::string::npos, "a startup-only variable was not refused with the list of switches");
     Require(Refusal("60:APS5_NO_BARRIER_BATCH+APS5_NO_BARRIER_BATCH").find("listed twice") != std::string::npos, "a duplicate switch was not refused");
     Require(Refusal("60:+APS5_NO_BARRIER_BATCH").find("empty switch name") != std::string::npos && Refusal("60:APS5_NO_BARRIER_BATCH+").find("empty switch name") != std::string::npos, "an empty switch name was not refused");
