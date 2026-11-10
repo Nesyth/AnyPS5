@@ -92,6 +92,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_DIRECT_PASS_TARGETS",
     "APS5_CLEAN_COLLECTS",
     "APS5_DIRECT_BUFFERS",
+    "APS5_PIPELINE_DISPATCH_MISSES",
     "APS5_NO_PLAN_CLEAN_PROOFS",
     "APS5_DEFERRED_ENCODE",
 };
@@ -186,6 +187,7 @@ struct SwitchValues {
             std::getenv("APS5_DIRECT_PASS_TARGETS") != nullptr,
             std::getenv("APS5_CLEAN_COLLECTS") != nullptr,
             std::getenv("APS5_DIRECT_BUFFERS") != nullptr,
+            std::getenv("APS5_PIPELINE_DISPATCH_MISSES") != nullptr,
             std::getenv("APS5_NO_PLAN_CLEAN_PROOFS") != nullptr,
             std::getenv("APS5_DEFERRED_ENCODE") != nullptr,
         };
