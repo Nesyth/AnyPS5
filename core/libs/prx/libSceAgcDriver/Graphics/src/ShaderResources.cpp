@@ -4327,8 +4327,14 @@ void noteUncleanRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> 
     std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
     std::string text;
     for (std::size_t index = 0; index < top.size() && index < 12; ++index) {
-        char item[96];
-        std::snprintf(item, sizeof(item), " 0x%llx+%llu x%llu", static_cast<unsigned long long>(top[index].first), static_cast<unsigned long long>(top[index].second.second), static_cast<unsigned long long>(top[index].second.first));
+        char item[160];
+        const auto address = top[index].first;
+        const auto bytes = static_cast<std::size_t>(top[index].second.second);
+        // What lives there: a live resident surface (L), a pending one (P), a depth surface (D), and
+        // how many tracker generations ago the range was last stamped as written.
+        const auto newest = GuestMemory::NewestStamp(address, bytes);
+        const auto generation = GuestMemory::TrackerGeneration();
+        std::snprintf(item, sizeof(item), " 0x%llx+%llu x%llu %s%s%s age %llu", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(top[index].second.first), StorageTexture::FindLive(address, bytes) != nullptr ? "L" : "-", StorageTexture::FindPending(address, bytes) != nullptr ? "P" : "-", DepthSurfaceAt(address) ? "D" : "-", static_cast<unsigned long long>(generation >= newest ? generation - newest : 0));
         text += item;
     }
     std::fprintf(stderr, "[clean-ranges] %llu not-clean templates checked: %llu of %llu ranges not clean, %llu templates with exactly one; %llu distinct addresses; top:%s\n", static_cast<unsigned long long>(census->templates), static_cast<unsigned long long>(census->rangesUnclean), static_cast<unsigned long long>(census->rangesSeen), static_cast<unsigned long long>(census->oneUnclean), static_cast<unsigned long long>(census->byAddress.size()), text.c_str());
