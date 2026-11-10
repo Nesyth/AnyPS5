@@ -208,6 +208,11 @@ struct DrawRecordHit {
     bool buffersPatched = false;
     bool relocated = false;
     bool planned = false;
+    bool direct = false;
+    // A direct hit's class, which keeps the record and the stages' donors alive, and the captures
+    // whose registered image views the hit's stages point into.
+    std::shared_ptr<const void> owner;
+    std::vector<std::shared_ptr<const ShaderRecompiler::ResourceCapture>> captures;
 };
 
 namespace DrawRecordFlags {

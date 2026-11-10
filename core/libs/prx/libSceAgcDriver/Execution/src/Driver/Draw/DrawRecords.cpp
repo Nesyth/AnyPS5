@@ -1570,7 +1570,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         const auto outcome = localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr);
         if (hit.planned) NotePlannedCommit(commit);
         if (outcome.recorded) {
-            if (hit.planned) ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
+            if (hit.planned || hit.direct) ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
             const auto& effects = commit.effects;
             DrawRecords::AddOnCommitter(Counter::CommitHits);
             if (effects.pushed) DrawRecords::AddOnCommitter(Counter::CommitPushed);
@@ -1583,7 +1583,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         }
         DrawRecords::AddOnCommitter(CommitMiss(outcome.miss));
     }
-    if (hit.planned) ThreadReport::MarkItem(ThreadReport::ItemMark::PlanFallback);
+    if (hit.planned || hit.direct) ThreadReport::MarkItem(ThreadReport::ItemMark::PlanFallback);
     DrawCommitView answer;
     if (verify) static_cast<void>(localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, &answer));
     if (verify && DrawRecords::CorruptingCommits() && !answer.bindings.empty()) {
@@ -1791,7 +1791,7 @@ bool Driver::compareRecordAnswer(const LeanDrawJob& job, const DrawRecord& recor
     if (answer.writes != today.writes) note(Field::WriteTemplates, "the record holds " + std::to_string(answer.writes.size()) + " write ranges, today's draw writes " + std::to_string(today.writes.size()));
     if (answer.contentKey != today.contentKey) note(Field::ContentKeys, firstDifference(answer.contentKey, today.contentKey));
     if (record.vertexLayout != sink.vertexLayout) note(Field::VertexLayouts, firstDifference(record.vertexLayout, sink.vertexLayout));
-    if (record.plan->addressed && answer.snapshotWords != today.snapshotWords) note(Field::Snapshots, "the record's snapshots cover " + std::to_string(answer.snapshotWords.size()) + " words, today's " + std::to_string(today.snapshotWords.size()) + "; " + firstDifference(answer.snapshotWords, today.snapshotWords));
+    if (record.plan != nullptr && record.plan->addressed && answer.snapshotWords != today.snapshotWords) note(Field::Snapshots, "the record's snapshots cover " + std::to_string(answer.snapshotWords.size()) + " words, today's " + std::to_string(today.snapshotWords.size()) + "; " + firstDifference(answer.snapshotWords, today.snapshotWords));
     if (!today.snapshotWords.empty()) {
         const auto unread = [&](std::uint64_t address) {
             const auto found = std::lower_bound(today.snapshotWords.begin(), today.snapshotWords.end(), std::pair<std::uint64_t, std::uint32_t>{address, 0u});
