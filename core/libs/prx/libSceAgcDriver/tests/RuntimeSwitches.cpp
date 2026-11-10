@@ -65,6 +65,7 @@ void registry() {
     Require(RuntimeSwitches::Find("APS5_DIRECT_CLEAN_PROOFS") == RuntimeSwitch::DirectCleanProofs && !RuntimeSwitches::Set(RuntimeSwitch::DirectCleanProofs), "APS5_DIRECT_CLEAN_PROOFS is not a runtime switch that starts unset");
     Require(RuntimeSwitches::Find("APS5_DIRECT_PASS_TARGETS") == RuntimeSwitch::DirectPassTargets && !RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets), "APS5_DIRECT_PASS_TARGETS is not a runtime switch that starts unset");
     Require(RuntimeSwitches::Find("APS5_CLEAN_COLLECTS") == RuntimeSwitch::CleanCollects && !RuntimeSwitches::Set(RuntimeSwitch::CleanCollects), "APS5_CLEAN_COLLECTS is not a runtime switch that starts unset");
+    Require(RuntimeSwitches::Find("APS5_DIRECT_BUFFERS") == RuntimeSwitch::DirectBuffers && !RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers), "APS5_DIRECT_BUFFERS is not a runtime switch that starts unset");
 }
 
 void snapshot() {

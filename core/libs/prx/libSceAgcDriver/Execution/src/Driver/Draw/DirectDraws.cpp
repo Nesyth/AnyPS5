@@ -380,7 +380,7 @@ std::uint64_t DirectStores::Follow(std::uint64_t serial) {
     auto live = Graphics::RuntimeSwitches::Snapshot();
     // Switches that change only what the committer does with a hit, or only dispatch packets,
     // leave the stages and classes as they are, so an in-run A/B of one keeps the stores.
-    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs}) live.Assign(id, false);
+    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs}) live.Assign(id, false);
     if (!tagged || deviceSerial != serial || !(live == switches)) {
         tagged = true;
         deviceSerial = serial;
