@@ -265,13 +265,19 @@ void Report(bool force) {
             static_cast<unsigned long long>(at(Counter::HoldOwn)), static_cast<unsigned long long>(at(Counter::HoldShared)), static_cast<unsigned long long>(refreshed), reasons(counts, Counter::HoldFirst, Counter::HoldTarget).c_str(),
             static_cast<unsigned long long>(at(Counter::StagesEvicted)));
     }
-    std::uint64_t unprepared = 0;
-    for (auto index = static_cast<std::size_t>(Counter::BuffersNoPlan); index <= static_cast<std::size_t>(Counter::BuffersBudget); ++index) unprepared += counts[index];
-    const auto prepared = at(Counter::BuffersPrepared);
-    if (prepared + unprepared != 0) {
-        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] buffers: %llu hits prepared, %llu not prepared%s; %.1f blob bytes per prepared hit\n",
-            static_cast<unsigned long long>(prepared), static_cast<unsigned long long>(unprepared), reasons(counts, Counter::BuffersNoPlan, Counter::BuffersBudget).c_str(),
-            prepared != 0 ? static_cast<double>(at(Counter::BuffersBlobBytes)) / static_cast<double>(prepared) : 0.0);
+    const auto sum = [&](Counter first, Counter last) {
+        std::uint64_t total = 0;
+        for (auto index = static_cast<std::size_t>(first); index <= static_cast<std::size_t>(last); ++index) total += counts[index];
+        return total;
+    };
+    if (sum(Counter::BuffersPrepared, Counter::BuffersMemoryChanged) != 0) {
+        const auto prepared = at(Counter::BuffersPrepared);
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] buffers: %llu hits prepared, %llu used, %llu not prepared%s, %llu not used%s; %.1f blob bytes per prepared hit; verify %llu checked, %llu differing, %llu memory changed\n",
+            static_cast<unsigned long long>(prepared), static_cast<unsigned long long>(at(Counter::BuffersUsed)),
+            static_cast<unsigned long long>(sum(Counter::BuffersNoPlan, Counter::BuffersUnsettled)), reasons(counts, Counter::BuffersNoPlan, Counter::BuffersUnsettled).c_str(),
+            static_cast<unsigned long long>(sum(Counter::BuffersPlanDiffers, Counter::BuffersUnmovedHazard)), reasons(counts, Counter::BuffersPlanDiffers, Counter::BuffersUnmovedHazard).c_str(),
+            prepared != 0 ? static_cast<double>(at(Counter::BuffersBlobBytes)) / static_cast<double>(prepared) : 0.0,
+            static_cast<unsigned long long>(at(Counter::BuffersVerifyChecked)), static_cast<unsigned long long>(at(Counter::BuffersVerifyDiffering)), static_cast<unsigned long long>(at(Counter::BuffersMemoryChanged)));
     }
     if (commits == 0) return;
     static std::array<std::uint64_t, static_cast<std::size_t>(Graphics::RecipeRefusal::Count)> refusalsReported{};
