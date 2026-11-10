@@ -1083,6 +1083,7 @@ void Direct(bool ring) {
     const auto checked = now.Since(base, DirectCounter::BuffersVerifyChecked);
     std::cout << "direct draws: " << now.Since(base, DirectCounter::BuffersPrepared) << " hits prepared their buffers, " << used << " bound them, " << checked << " were verified\n";
     Require(now.Since(base, DirectCounter::BuffersVerifyDiffering) == 0 && now.Since(base, DirectCounter::BuffersUnwatched) == 0, "direct draws: the prepared buffers verify found differences" + DescribeDirect(now, base));
+    Require(now.Since(base, DirectCounter::BuffersPrepared) == used + now.Since(base, DirectCounter::BuffersPlanDiffers, DirectCounter::BuffersDropped) + checked, "direct draws: the prepared hits do not add up to the hits that bound, did not bind and were verified" + DescribeDirect(now, base));
     if (DirectReport::BufferVerifyEvery() == 1) Require(used == 0 && checked != 0, "direct draws: with every prepared hit due for a verify, a commit bound prepared buffers or none was verified" + DescribeDirect(now, base));
     else Require(used != 0, "direct draws: no commit bound prepared buffers" + DescribeDirect(now, base));
     if (DirectReport::BufferVerifyEvery() > 1) Require(checked != 0, "direct draws: the prepared buffers verify checked no hit" + DescribeDirect(now, base));
@@ -1252,9 +1253,9 @@ int PreparedBuffersMatch() {
                 Require(shorter.what != nullptr && std::string_view(shorter.what) == "bound selection", "prepared buffers, " + what + ": the verify did not find a bound selection of another length");
             }
             std::vector<std::size_t> taken;
-            bool used = false;
+            auto used = ShaderResources::PreparedBuffers::Selection::Hazard;
             const auto bound = resources.PrepareDrawBindings(recorder, prepared.moved, false, nullptr, false, &taken, &prepared, &used);
-            Require(used && bound != nullptr && taken == selected && bound->snapshots.size() == bindings->snapshots.size(), "prepared buffers, " + what + ": the prepared selection was not bound, or bound other allocations");
+            Require(used == ShaderResources::PreparedBuffers::Selection::Taken && bound != nullptr && taken == selected && bound->snapshots.size() == bindings->snapshots.size(), "prepared buffers, " + what + ": the prepared selection was not bound, or bound other allocations");
             const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 1);
             for (std::size_t index = 0; index < taken.size(); ++index) {
                 const auto& mine = bound->snapshots[index];
@@ -1330,17 +1331,24 @@ int PreparedBuffersMatch() {
         Require(resources.PreparedMovesClear(gone, recorder, nullptr), "prepared buffers, hazards: a moved range the finisher found accessible was refused while no mapping changed");
         gone.forget += 2;
         Require(!resources.PreparedMovesClear(gone, recorder, nullptr), "prepared buffers, hazards: an unmapped moved range was taken after a mapping changed");
+        // A depth guard set up or dropped since the finisher's read sends the selection to today's way.
+        using Selection = ShaderResources::PreparedBuffers::Selection;
+        auto guarded = prepared;
+        ++guarded.depthGuards;
+        std::vector<std::size_t> selected;
+        auto used = Selection::Taken;
+        static_cast<void>(resources.PrepareDrawBindings(recorder, guarded.moved, false, nullptr, false, &selected, &guarded, &used));
+        Require(used == Selection::DepthGuards, "prepared buffers, hazards: a depth guard change since the finisher's read did not send the selection to today's way");
         recorder.NotePendingWrite(block.At(InPlaceBufferOffset), PlannedBufferBytes);
         Require(resources.PreparedMovesClear(prepared, recorder, nullptr), "prepared buffers, hazards: a pending write beside the moved range refused it");
-        std::vector<std::size_t> selected;
-        bool used = true;
+        used = Selection::Taken;
         static_cast<void>(resources.PrepareDrawBindings(recorder, prepared.moved, false, nullptr, false, &selected, &prepared, &used));
-        Require(!used && std::ranges::find(selected, inPlace->allocation) == selected.end(), "prepared buffers, hazards: a pending write over the in-place range did not send the selection to today's way, which leaves the range out");
+        Require(used == Selection::Hazard && std::ranges::find(selected, inPlace->allocation) == selected.end(), "prepared buffers, hazards: a pending write over the in-place range did not send the selection to today's way, which leaves the range out");
         recorder.NotePendingWrite(block.At(MovedBufferOffset), PlannedBufferBytes);
         Require(!resources.PreparedMovesClear(prepared, recorder, nullptr), "prepared buffers, hazards: a pending write over the moved range did not refuse it");
         recorder.Sync();
     }
-    std::cout << "prepared buffers match today's moved buffers and snapshot selection for a moved buffer, an in-place buffer and changed shader data, and are refused for shader data of another size, unmapped memory, a range over the upload limit and the snapshot budget; on the committer they leave the ticket as today's check does, bind today's bytes from one aligned upload slice, and give way to today's check and selection under pending writes; the verify tells a changed byte, a resized moved buffer and a guest write after the read apart\n";
+    std::cout << "prepared buffers match today's moved buffers and snapshot selection for a moved buffer, an in-place buffer and changed shader data, and are refused for shader data of another size, unmapped memory, a range over the upload limit and the snapshot budget; on the committer they leave the ticket as today's check does, bind today's bytes from one aligned upload slice, and give way to today's check and selection under pending writes, a depth guard change since the read, and an unmapped moved range after a mapping change; the verify tells a changed byte, a resized moved buffer, another ticket, another bound selection and a guest write after the read apart\n";
     return 0;
 }
 

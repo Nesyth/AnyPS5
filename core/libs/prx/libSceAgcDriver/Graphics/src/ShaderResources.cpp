@@ -7203,11 +7203,12 @@ ShaderResources::MovedSnapshotCounts ShaderResources::TakeMovedSnapshotCounts() 
     return {tally.cached.exchange(0, std::memory_order_relaxed), tally.reused.exchange(0, std::memory_order_relaxed), tally.cachedBytes.exchange(0, std::memory_order_relaxed), tally.uploaded.exchange(0, std::memory_order_relaxed), tally.uploadedBytes.exchange(0, std::memory_order_relaxed)};
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord, bool census, std::vector<std::size_t>* selectedOut, const PreparedBuffers* prepared, bool* preparedTaken) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord, bool census, std::vector<std::size_t>* selectedOut, const PreparedBuffers* prepared, PreparedBuffers::Selection* preparedSelection) const {
     struct SelectedStorage {};
     auto& selected = HostThreadLocal<std::vector<std::size_t>, SelectedStorage>();
-    auto result = prepared != nullptr && !movedOnly ? selectPreparedSnapshots(recorder, moved, *prepared, selected, true) : nullptr;
-    if (preparedTaken != nullptr) *preparedTaken = result != nullptr;
+    auto selection = PreparedBuffers::Selection::Hazard;
+    auto result = prepared != nullptr && !movedOnly ? selectPreparedSnapshots(recorder, moved, *prepared, selected, true, selection) : nullptr;
+    if (preparedSelection != nullptr) *preparedSelection = selection;
     if (result == nullptr) result = selectDrawSnapshots(recorder, moved, movedOnly, selected, census);
     if (selectedOut != nullptr) selectedOut->assign(selected.begin(), selected.end());
     return finishDrawBindings(recorder, std::move(result), selected, faultRecord);
@@ -7370,8 +7371,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
     return result;
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, std::vector<std::size_t>& selected, bool binds) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, std::vector<std::size_t>& selected, bool binds, PreparedBuffers::Selection& selection) const {
+    using Selection = PreparedBuffers::Selection;
     selected.clear();
+    selection = Selection::Hazard;
     const auto& plan = *prepared.plan;
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
     if (alignment != 0 && plan.alignment % alignment != 0) return {};
@@ -7379,7 +7382,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSn
     // memory it overlaps, after the finisher read that memory; a guard set up or dropped since the
     // read may have published them already.
     const bool guardsMoved = DepthGuardsGeneration_nid_no_patch() != prepared.depthGuards;
-    if ((guardsMoved || HasResidentDepthGuards_nid_no_patch()) && std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && (guardsMoved || MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes)); })) return {};
+    if ((guardsMoved || HasResidentDepthGuards_nid_no_patch()) && std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && (guardsMoved || MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes)); })) {
+        selection = Selection::DepthGuards;
+        return {};
+    }
     requireGuestBuffers(moved);
     prepareFaultSlot();
     bindingsChecked = heapStage && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind);
@@ -7388,6 +7394,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSn
         const auto& allocation = allocations[item.allocation];
         if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return {};
     }
+    selection = Selection::Taken;
     auto result = std::make_shared<DrawBindings>();
     if (prepared.selected.empty()) return result;
     auto slice = recorder.DrawUpload(prepared.blob.size());
@@ -8022,7 +8029,8 @@ ShaderResources::PreparedDifference ShaderResources::ComparePreparedTickets(cons
 
 ShaderResources::PreparedDifference ShaderResources::ComparePreparedBinding(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, const DrawBindings* bindings, std::span<const std::size_t> selected) const {
     std::vector<std::size_t> taken;
-    const auto bound = selectPreparedSnapshots(recorder, moved, prepared, taken, false);
+    auto selection = PreparedBuffers::Selection::Hazard;
+    const auto bound = selectPreparedSnapshots(recorder, moved, prepared, taken, false, selection);
     if (bound == nullptr) return {};
     const auto snapshots = bindings != nullptr ? std::span<const DrawBindings::Snapshot>(bindings->snapshots) : std::span<const DrawBindings::Snapshot>{};
     const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 1);
@@ -8047,11 +8055,12 @@ ShaderResources::PreparedDifference ShaderResources::ComparePreparedBinding(Reco
     return {};
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut, const PreparedBuffers* prepared, bool* preparedTaken) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut, const PreparedBuffers* prepared, PreparedBuffers::Selection* preparedSelection) const {
     struct SelectedStorage {};
     auto& selected = HostThreadLocal<std::vector<std::size_t>, SelectedStorage>();
-    auto result = prepared != nullptr ? selectPreparedSnapshots(recorder, moved, *prepared, selected, true) : nullptr;
-    if (preparedTaken != nullptr) *preparedTaken = result != nullptr;
+    auto selection = PreparedBuffers::Selection::Hazard;
+    auto result = prepared != nullptr ? selectPreparedSnapshots(recorder, moved, *prepared, selected, true, selection) : nullptr;
+    if (preparedSelection != nullptr) *preparedSelection = selection;
     if (result == nullptr) result = selectDrawSnapshots(recorder, moved, false, selected, false);
     if (selectedOut != nullptr) selectedOut->assign(selected.begin(), selected.end());
     if (result == nullptr || selected.empty()) return {};

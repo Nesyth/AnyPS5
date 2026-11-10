@@ -310,6 +310,10 @@ public:
     // Recorder::DrawUpload aligns its slices. `plan` is the plan it was prepared from.
     struct PreparedBuffers {
         enum class Refusal : std::uint8_t { None, Classification, Inaccessible, UploadLimit, Budget, Count };
+        // Whether the committer's selection took them, or today's selection ran instead: an
+        // unmoved range no longer clear (or slices the device would not align), or a depth guard
+        // that may have published samples into a selected range.
+        enum class Selection : std::uint8_t { Taken, Hazard, DepthGuards };
         struct Selected {
             std::size_t allocation = 0;
             std::uint64_t begin = 0;
@@ -358,8 +362,8 @@ public:
     const PushPlan* PushLayouts() const;
     // `prepared` (buffers prepared from this object's plan, with `moved` their moved list) takes
     // the place of today's snapshot selection while its unmoved ranges are still clear;
-    // `preparedTaken` tells whether it did.
-    std::shared_ptr<DrawBindings> PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut = nullptr, const PreparedBuffers* prepared = nullptr, bool* preparedTaken = nullptr) const;
+    // `preparedSelection` tells whether it did.
+    std::shared_ptr<DrawBindings> PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut = nullptr, const PreparedBuffers* prepared = nullptr, PreparedBuffers::Selection* preparedSelection = nullptr) const;
     void PushDrawBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
     struct BoundBuffer {
         std::uint32_t set = 0;
@@ -385,8 +389,8 @@ public:
     std::shared_ptr<DrawUse> BeginDrawUse(Recorder& recorder) const;
     void CompleteDrawUse(const DrawUse& use) const;
     void BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const;
-    // `prepared` and `preparedTaken` as for PreparePushedDrawBindings (not with `movedOnly`).
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr, bool census = false, std::vector<std::size_t>* selectedOut = nullptr, const PreparedBuffers* prepared = nullptr, bool* preparedTaken = nullptr) const;
+    // `prepared` and `preparedSelection` as for PreparePushedDrawBindings (not with `movedOnly`).
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr, bool census = false, std::vector<std::size_t>* selectedOut = nullptr, const PreparedBuffers* prepared = nullptr, PreparedBuffers::Selection* preparedSelection = nullptr) const;
     ReplayReason HeapReplayRefusal(std::span<const CompiledShader> shaders) const;
     void NoteHeapReplayCensus();
     struct HeapReplayProof {
@@ -947,9 +951,9 @@ private:
     std::shared_ptr<DrawBindings> selectDrawSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, std::vector<std::size_t>& selected, bool census) const;
     // The selection of prepared buffers, their blob in one upload slice; null, before any upload,
     // when an unmoved range is no longer clear or a resident depth surface may hold a selected
-    // range's bytes (selectDrawSnapshots then selects). `binds`: the draw binds it, so its
-    // snapshots count in the moved-upload tally and the capture trace.
-    std::shared_ptr<DrawBindings> selectPreparedSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, std::vector<std::size_t>& selected, bool binds) const;
+    // range's bytes (selectDrawSnapshots then selects), with the reason in `selection`. `binds`:
+    // the draw binds it, so its snapshots count in the moved-upload tally and the capture trace.
+    std::shared_ptr<DrawBindings> selectPreparedSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, std::vector<std::size_t>& selected, bool binds, PreparedBuffers::Selection& selection) const;
     std::shared_ptr<DrawBindings> finishDrawBindings(Recorder& recorder, std::shared_ptr<DrawBindings> result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     bool ownsHeapBinding(const Binding& binding, VkShaderStageFlags stageBit) const;
     VkImageView heapPlaceholderView(std::uint32_t kind) const;

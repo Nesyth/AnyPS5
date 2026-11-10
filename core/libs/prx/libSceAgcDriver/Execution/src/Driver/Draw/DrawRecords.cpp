@@ -1544,14 +1544,20 @@ void NoteDirectCommit(const DrawRecordCommit& commit, bool recorded) {
     else if (effects.hold != DrawRecordHold::Count) DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::HoldFirst) + static_cast<std::size_t>(effects.hold) - static_cast<std::size_t>(DrawRecordHold::First)));
 }
 
-void NoteDirectBuffers(const DrawRecordCommit& commit) {
+// A hit that carries prepared buffers counts once: used, not used by reason (dropped when its
+// commit did not get as far as the prepared buffers), or verified.
+void NoteDirectBuffers(const DrawRecordCommit& commit, bool prepared) {
     using DirectDraws::Counter;
     const auto& effects = commit.effects;
     switch (effects.buffers) {
+    case DrawRecordBuffers::None:
+        if (prepared) DirectDraws::Add(Counter::BuffersDropped);
+        break;
     case DrawRecordBuffers::Used: DirectDraws::Add(Counter::BuffersUsed); break;
     case DrawRecordBuffers::PlanDiffers: DirectDraws::Add(Counter::BuffersPlanDiffers); break;
     case DrawRecordBuffers::MovedHazard: DirectDraws::Add(Counter::BuffersMovedHazard); break;
     case DrawRecordBuffers::UnmovedHazard: DirectDraws::Add(Counter::BuffersUnmovedHazard); break;
+    case DrawRecordBuffers::DepthGuards: DirectDraws::Add(Counter::BuffersDepthGuards); break;
     case DrawRecordBuffers::Checked: DirectDraws::Add(Counter::BuffersVerifyChecked); break;
     case DrawRecordBuffers::Differs:
         DirectDraws::Add(Counter::BuffersVerifyChecked);
@@ -1623,7 +1629,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         if (hit.planned) NotePlannedCommit(commit);
         if (hit.direct) {
             NoteDirectCommit(commit, outcome.recorded);
-            NoteDirectBuffers(commit);
+            NoteDirectBuffers(commit, prepared != nullptr);
         }
         if (outcome.recorded) {
             if (hit.direct) PublishBufferPlan(commit, hit.stages);
@@ -1640,6 +1646,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         }
         DrawRecords::AddOnCommitter(CommitMiss(outcome.miss));
     }
+    if ((commit.recipe == nullptr || verify) && hit.preparedBuffers.has_value()) DirectDraws::Add(DirectDraws::Counter::BuffersDropped);
     if (hit.planned || hit.direct) ThreadReport::MarkItem(ThreadReport::ItemMark::PlanFallback);
     DrawCommitView answer;
     if (verify) static_cast<void>(localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, &answer));

@@ -36,7 +36,7 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "commit hits", "first commits", "commit misses", "commits demoted", "proofs skipped", "proofs not skipped", "full proofs",
     "held by the record", "held by the pass", "first use", "new pass", "collect epoch", "proof serial", "pending stores", "depth surfaces", "target changed",
     "buffers prepared", "no plan", "classification", "not accessible", "over the upload limit", "size budget", "not settled", "blob bytes",
-    "buffers used", "plan differs", "moved-range hazard", "unmoved-range hazard", "buffers verified", "buffers differing", "buffer memory changed", "buffers differing unwatched",
+    "buffers used", "plan differs", "moved-range hazard", "unmoved-range hazard", "depth guards", "dropped", "buffers verified", "buffers differing", "buffer memory changed", "buffers differing unwatched",
 };
 
 constexpr std::array<const char*, StepCount> StepNames{"request", "invocation", "walk", "key", "side", "class", "checks", "buffers", "hand-off"};
@@ -275,7 +275,7 @@ void Report(bool force) {
         AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] buffers: %llu hits prepared, %llu used, %llu not prepared%s, %llu not used%s; %.1f blob bytes per prepared hit; verify %llu checked, %llu differing, %llu memory changed, %llu differing in unwatched memory\n",
             static_cast<unsigned long long>(prepared), static_cast<unsigned long long>(at(Counter::BuffersUsed)),
             static_cast<unsigned long long>(sum(Counter::BuffersNoPlan, Counter::BuffersUnsettled)), reasons(counts, Counter::BuffersNoPlan, Counter::BuffersUnsettled).c_str(),
-            static_cast<unsigned long long>(sum(Counter::BuffersPlanDiffers, Counter::BuffersUnmovedHazard)), reasons(counts, Counter::BuffersPlanDiffers, Counter::BuffersUnmovedHazard).c_str(),
+            static_cast<unsigned long long>(sum(Counter::BuffersPlanDiffers, Counter::BuffersDropped)), reasons(counts, Counter::BuffersPlanDiffers, Counter::BuffersDropped).c_str(),
             prepared != 0 ? static_cast<double>(at(Counter::BuffersBlobBytes)) / static_cast<double>(prepared) : 0.0,
             static_cast<unsigned long long>(at(Counter::BuffersVerifyChecked)), static_cast<unsigned long long>(at(Counter::BuffersVerifyDiffering)), static_cast<unsigned long long>(at(Counter::BuffersMemoryChanged)), static_cast<unsigned long long>(at(Counter::BuffersUnwatched)));
     }

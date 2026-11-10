@@ -118,7 +118,7 @@ enum class DrawRecordHold : std::uint8_t { Held, First, Pass, Epoch, Proof, Pend
 
 // What a record commit did with a direct hit's prepared buffers (APS5_DIRECT_BUFFERS): bound them,
 // why it took today's way instead, or how a verify compared them with today's way.
-enum class DrawRecordBuffers : std::uint8_t { None, Used, PlanDiffers, MovedHazard, UnmovedHazard, Checked, Differs, MemoryChanged, Unwatched, Count };
+enum class DrawRecordBuffers : std::uint8_t { None, Used, PlanDiffers, MovedHazard, UnmovedHazard, DepthGuards, Checked, Differs, MemoryChanged, Unwatched, Count };
 
 struct DrawRecordEffects {
     bool pushed = false;

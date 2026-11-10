@@ -73,6 +73,8 @@ enum class Counter : std::uint8_t {
     BuffersPlanDiffers,
     BuffersMovedHazard,
     BuffersUnmovedHazard,
+    BuffersDepthGuards,
+    BuffersDropped,
     BuffersVerifyChecked,
     BuffersVerifyDiffering,
     BuffersMemoryChanged,

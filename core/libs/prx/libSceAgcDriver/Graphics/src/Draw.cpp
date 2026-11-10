@@ -3055,9 +3055,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const auto* faultRecord = drawUse != nullptr ? drawUse->record.get() : nullptr;
     std::vector<std::size_t> viewSelected;
     auto* selectedOut = record.view != nullptr || record.preparedCheck != nullptr ? &viewSelected : nullptr;
-    bool preparedTaken = false;
-    const auto drawBindings = record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, selectedOut, record.prepared, &preparedTaken) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus, selectedOut, record.prepared, &preparedTaken);
-    if (record.prepared != nullptr && record.buffers != nullptr) *record.buffers = preparedTaken ? DrawRecordBuffers::Used : DrawRecordBuffers::UnmovedHazard;
+    using PreparedSelection = ShaderResources::PreparedBuffers::Selection;
+    auto preparedSelection = PreparedSelection::Hazard;
+    const auto drawBindings = record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, selectedOut, record.prepared, &preparedSelection) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus, selectedOut, record.prepared, &preparedSelection);
+    if (record.prepared != nullptr && record.buffers != nullptr) *record.buffers = preparedSelection == PreparedSelection::Taken ? DrawRecordBuffers::Used : preparedSelection == PreparedSelection::DepthGuards ? DrawRecordBuffers::DepthGuards : DrawRecordBuffers::UnmovedHazard;
     if (record.preparedCheck != nullptr && record.buffers != nullptr && record.bufferDifference != nullptr) {
         auto& difference = *record.bufferDifference;
         difference = ShaderResources::ComparePreparedSelection(*record.preparedCheck, drawBindings.get(), viewSelected);
@@ -5350,6 +5351,8 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
                 if (difference.what == nullptr) difference = ShaderResources::ComparePreparedTickets(preparedClear ? &preparedTicket : nullptr, ticket);
             } else if (preparedClear) {
                 difference = {"moved buffers", "today's way refuses the draw's moved buffers, which the finisher prepared and the committer's tests find clear"};
+            } else {
+                record.effects.buffers = DrawRecordBuffers::Checked;
             }
             if (difference.what != nullptr) {
                 record.effects.buffers = DrawRecordBuffers::Differs;
