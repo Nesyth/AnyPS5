@@ -343,6 +343,11 @@ public:
     // Against today's selection and the snapshots `bindings` holds for it: allocations in order,
     // guest ranges, then bytes.
     static PreparedDifference ComparePreparedSelection(const PreparedBuffers& prepared, const DrawBindings* bindings, std::span<const std::size_t> selected);
+    // The selection the committer binds for `prepared` (one upload slice, built and dropped here)
+    // against today's selection and the snapshots `bindings` holds for it: allocations in order,
+    // guest ranges, aligned offsets, and the slice's bytes against the prepared blob. No difference
+    // where the committer would take today's selection instead.
+    PreparedDifference ComparePreparedBinding(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, const DrawBindings* bindings, std::span<const std::size_t> selected) const;
     // Prepares the buffers of a draw with `shaders` from the plan, its stages' words and guest
     // memory alone, on any thread; `target` is the colour target MovedReadOnlyBuffers would get.
     // False, with the reason in `out.refusal`, where the draw's buffers cannot be prepared.
@@ -407,6 +412,9 @@ public:
     // changed since). True when every range is clear; the ticket is then left as
     // MovedReadOnlyBuffers would leave it.
     bool PreparedMovesClear(const PreparedBuffers& prepared, Recorder& recorder, MoveTicket* ticket) const;
+    // The ticket PreparedMovesClear left (null: it refused the ranges) against the one today's
+    // MovedReadOnlyBuffers left from the same ticket.
+    static PreparedDifference ComparePreparedTickets(const MoveTicket* prepared, const MoveTicket& today);
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
     struct MoveProof {
@@ -936,8 +944,9 @@ private:
     std::shared_ptr<DrawBindings> selectDrawSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, std::vector<std::size_t>& selected, bool census) const;
     // The selection of prepared buffers, their blob in one upload slice; null, before any upload,
     // when an unmoved range is no longer clear or a resident depth surface may hold a selected
-    // range's bytes (selectDrawSnapshots then selects).
-    std::shared_ptr<DrawBindings> selectPreparedSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, std::vector<std::size_t>& selected) const;
+    // range's bytes (selectDrawSnapshots then selects). `binds`: the draw binds it, so its
+    // snapshots count in the moved-upload tally and the capture trace.
+    std::shared_ptr<DrawBindings> selectPreparedSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, std::vector<std::size_t>& selected, bool binds) const;
     std::shared_ptr<DrawBindings> finishDrawBindings(Recorder& recorder, std::shared_ptr<DrawBindings> result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     bool ownsHeapBinding(const Binding& binding, VkShaderStageFlags stageBit) const;
     VkImageView heapPlaceholderView(std::uint32_t kind) const;

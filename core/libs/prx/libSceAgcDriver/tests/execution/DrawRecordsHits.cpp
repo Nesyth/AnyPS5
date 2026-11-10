@@ -1226,7 +1226,11 @@ int PreparedBuffersMatch() {
                 Require(today.has_value() && resources.PreparedMovesClear(prepared, recorder, &preparedTicket), "prepared buffers, " + what + ": a moved range was refused");
                 const bool same = todayTicket.valid == preparedTicket.valid && todayTicket.recorder == preparedTicket.recorder && todayTicket.note == preparedTicket.note && todayTicket.pending == preparedTicket.pending && todayTicket.allocations == preparedTicket.allocations && todayTicket.epoch == preparedTicket.epoch && todayTicket.checked == preparedTicket.checked && todayTicket.trusted == preparedTicket.trusted && todayRanges == preparedRanges;
                 Require(same && preparedTicket.checked == movedRanges && preparedTicket.trusted == (round == 0 ? 0 : movedRanges), "prepared buffers, " + what + ": round " + std::to_string(round) + " of the prepared moved-range check left the ticket otherwise than today's check");
+                Require(ShaderResources::ComparePreparedTickets(&preparedTicket, todayTicket).what == nullptr, "prepared buffers, " + what + ": round " + std::to_string(round) + ": the verify found the tickets different");
             }
+            auto otherTicket = preparedTicket;
+            ++otherTicket.checked;
+            Require(ShaderResources::ComparePreparedTickets(&otherTicket, todayTicket).what != nullptr && ShaderResources::ComparePreparedTickets(nullptr, todayTicket).what != nullptr, "prepared buffers, " + what + ": the verify did not find a ticket of another count, or a refused prepared check");
             Require(ShaderResources::ComparePreparedMoves(prepared, *today).what == nullptr, "prepared buffers, " + what + ": the verify found the moved lists different");
             std::vector<std::size_t> selected;
             const auto bindings = resources.PrepareDrawBindings(recorder, *today, false, nullptr, false, &selected);
@@ -1235,10 +1239,17 @@ int PreparedBuffersMatch() {
             corrupted.blob[corrupted.selected.back().offset] ^= std::byte{0xff};
             const auto changed = ShaderResources::ComparePreparedSelection(corrupted, bindings.get(), selected);
             Require(changed.what != nullptr && std::string_view(changed.what) == "bytes" && !changed.memoryChanged, "prepared buffers, " + what + ": the verify did not find a changed byte");
+            if (movedRanges != 0) DirectReport::NoteBufferDifference(changed.what, changed.detail);
             if (!prepared.moved.empty()) {
                 auto resized = prepared;
                 resized.moved.front().size += 4;
                 Require(ShaderResources::ComparePreparedMoves(resized, *today).what != nullptr, "prepared buffers, " + what + ": the verify did not find a moved buffer of another size");
+            }
+            Require(resources.ComparePreparedBinding(recorder, *today, prepared, bindings.get(), selected).what == nullptr, "prepared buffers, " + what + ": the verify found the bound selection different from today's");
+            if (!selected.empty()) {
+                const std::vector<std::size_t> fewer(selected.begin(), selected.end() - 1);
+                const auto shorter = resources.ComparePreparedBinding(recorder, *today, prepared, bindings.get(), fewer);
+                Require(shorter.what != nullptr && std::string_view(shorter.what) == "bound selection", "prepared buffers, " + what + ": the verify did not find a bound selection of another length");
             }
             std::vector<std::size_t> taken;
             bool used = false;

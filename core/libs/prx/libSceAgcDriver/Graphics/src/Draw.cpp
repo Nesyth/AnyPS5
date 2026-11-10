@@ -3061,6 +3061,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (record.preparedCheck != nullptr && record.buffers != nullptr && record.bufferDifference != nullptr) {
         auto& difference = *record.bufferDifference;
         difference = ShaderResources::ComparePreparedSelection(*record.preparedCheck, drawBindings.get(), viewSelected);
+        if (difference.what == nullptr || difference.memoryChanged) {
+            if (auto bound = resources.ComparePreparedBinding(*recorder, record.moved, *record.preparedCheck, drawBindings.get(), viewSelected); bound.what != nullptr) difference = std::move(bound);
+        }
         *record.buffers = difference.what == nullptr ? DrawRecordBuffers::Checked : difference.memoryChanged ? DrawRecordBuffers::MemoryChanged : DrawRecordBuffers::Differs;
     }
     if (record.view != nullptr && faultRecord == nullptr && !record.replay && !resources.HeapStage()) {
@@ -5320,6 +5323,15 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         ticket.checked = 0;
         ticket.trusted = 0;
         std::optional<std::vector<ShaderResources::MovedBuffer>> found;
+        // A verify runs the prepared moved-range check first, on a copy of the ticket.
+        auto preparedTicket = ticket;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> preparedRanges;
+        bool preparedClear = false;
+        if (checked != nullptr) {
+            preparedRanges = *ticket.ranges;
+            preparedTicket.ranges = &preparedRanges;
+            preparedClear = resources->PreparedMovesClear(*checked, *recorder, &preparedTicket);
+        }
         if (bound != nullptr) {
             if (resources->PreparedMovesClear(*bound, *recorder, &ticket)) {
                 found.emplace(bound->moved.begin(), bound->moved.end());
@@ -5333,8 +5345,12 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         if (!found.has_value()) found = resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched, &ticket);
         if (checked != nullptr) {
             auto& difference = record.effects.bufferDifference;
-            if (found.has_value()) difference = ShaderResources::ComparePreparedMoves(*checked, *found);
-            else if (resources->PreparedMovesClear(*checked, *recorder, nullptr)) difference = {"moved buffers", "today's way refuses the draw's moved buffers, which the finisher prepared and the committer's tests find clear"};
+            if (found.has_value()) {
+                difference = ShaderResources::ComparePreparedMoves(*checked, *found);
+                if (difference.what == nullptr) difference = ShaderResources::ComparePreparedTickets(preparedClear ? &preparedTicket : nullptr, ticket);
+            } else if (preparedClear) {
+                difference = {"moved buffers", "today's way refuses the draw's moved buffers, which the finisher prepared and the committer's tests find clear"};
+            }
             if (difference.what != nullptr) {
                 record.effects.buffers = DrawRecordBuffers::Differs;
                 checked = nullptr;

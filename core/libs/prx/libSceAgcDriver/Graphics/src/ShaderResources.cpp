@@ -7206,7 +7206,7 @@ ShaderResources::MovedSnapshotCounts ShaderResources::TakeMovedSnapshotCounts() 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord, bool census, std::vector<std::size_t>* selectedOut, const PreparedBuffers* prepared, bool* preparedTaken) const {
     struct SelectedStorage {};
     auto& selected = HostThreadLocal<std::vector<std::size_t>, SelectedStorage>();
-    auto result = prepared != nullptr && !movedOnly ? selectPreparedSnapshots(recorder, moved, *prepared, selected) : nullptr;
+    auto result = prepared != nullptr && !movedOnly ? selectPreparedSnapshots(recorder, moved, *prepared, selected, true) : nullptr;
     if (preparedTaken != nullptr) *preparedTaken = result != nullptr;
     if (result == nullptr) result = selectDrawSnapshots(recorder, moved, movedOnly, selected, census);
     if (selectedOut != nullptr) selectedOut->assign(selected.begin(), selected.end());
@@ -7370,7 +7370,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
     return result;
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, std::vector<std::size_t>& selected) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, std::vector<std::size_t>& selected, bool binds) const {
     selected.clear();
     const auto& plan = *prepared.plan;
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
@@ -7396,7 +7396,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSn
     for (const auto& item : prepared.selected) {
         selected.push_back(item.allocation);
         result->snapshots.push_back({item.begin, slice.buffer, slice.offset + item.offset, item.bytes});
-        if (item.begin == 0) continue;
+        if (!binds || item.begin == 0) continue;
         if (item.moved && item.bytes > plan.uploadLimit && MovedSnapshotStats()) {
             movedSnapshotTally().uploaded.fetch_add(1, std::memory_order_relaxed);
             movedSnapshotTally().uploadedBytes.fetch_add(item.bytes, std::memory_order_relaxed);
@@ -8009,10 +8009,47 @@ ShaderResources::PreparedDifference ShaderResources::ComparePreparedSelection(co
     return {};
 }
 
+ShaderResources::PreparedDifference ShaderResources::ComparePreparedTickets(const MoveTicket* prepared, const MoveTicket& today) {
+    if (prepared == nullptr) return {"moved buffers", "the committer's tests refuse the prepared moved ranges, which today's way takes"};
+    const auto ranges = [](const MoveTicket& ticket) { return ticket.ranges != nullptr ? ticket.ranges->size() : std::size_t{0}; };
+    const bool stamps = prepared->valid == today.valid && prepared->recorder == today.recorder && prepared->note == today.note && prepared->pending == today.pending && prepared->allocations == today.allocations && prepared->epoch == today.epoch;
+    const bool sameRanges = (prepared->ranges == nullptr) == (today.ranges == nullptr) && (today.ranges == nullptr || *prepared->ranges == *today.ranges);
+    if (stamps && sameRanges && prepared->checked == today.checked && prepared->trusted == today.trusted) return {};
+    const auto describe = [&](const MoveTicket& ticket) { return std::string(ticket.valid ? "a valid" : "an invalid") + " ticket of " + std::to_string(ranges(ticket)) + " ranges, " + std::to_string(ticket.checked) + " checked, " + std::to_string(ticket.trusted) + " trusted"; };
+    return {"ticket", "the prepared moved-range check leaves " + describe(*prepared) + (stamps ? "" : " with other stamps") + (sameRanges ? "" : " with other ranges") + ", today's check " + describe(today)};
+}
+
+ShaderResources::PreparedDifference ShaderResources::ComparePreparedBinding(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, const DrawBindings* bindings, std::span<const std::size_t> selected) const {
+    std::vector<std::size_t> taken;
+    const auto bound = selectPreparedSnapshots(recorder, moved, prepared, taken, false);
+    if (bound == nullptr) return {};
+    const auto snapshots = bindings != nullptr ? std::span<const DrawBindings::Snapshot>(bindings->snapshots) : std::span<const DrawBindings::Snapshot>{};
+    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 1);
+    const bool sized = taken.size() == selected.size() && bound->snapshots.size() == taken.size() && snapshots.size() >= taken.size() && prepared.selected.size() == taken.size();
+    const auto same = [&](std::size_t index) {
+        const auto& mine = bound->snapshots[index];
+        const auto& theirs = snapshots[index];
+        return taken[index] == selected[index] && mine.address == theirs.address && mine.bytes == theirs.bytes && mine.offset % alignment == 0;
+    };
+    std::size_t index = 0;
+    while (sized && index < taken.size() && same(index)) ++index;
+    if (!sized || index != taken.size()) {
+        const auto at = !sized ? std::string() : "; at " + std::to_string(index) + " the committer binds allocation " + std::to_string(taken[index]) + " (" + std::to_string(bound->snapshots[index].bytes) + " bytes at 0x" + HexText(bound->snapshots[index].address) + ", slice offset " + std::to_string(bound->snapshots[index].offset) + "), today's way allocation " + std::to_string(selected[index]) + " (" + std::to_string(snapshots[index].bytes) + " bytes at 0x" + HexText(snapshots[index].address) + ")";
+        return {"bound selection", "the committer binds " + std::to_string(taken.size()) + " prepared allocations with " + std::to_string(bound->snapshots.size()) + " snapshots, today's way " + std::to_string(selected.size()) + " with " + std::to_string(snapshots.size()) + at};
+    }
+    for (index = 0; index < taken.size(); ++index) {
+        const auto& item = prepared.selected[index];
+        const auto held = bound->snapshots[index].Bytes();
+        if (held.size() == item.bytes && std::memcmp(held.data(), prepared.blob.data() + item.offset, item.bytes) == 0) continue;
+        return {"bound bytes", "allocation " + std::to_string(item.allocation) + ": the committer's slice holds other bytes than the finisher's block at offset " + std::to_string(item.offset)};
+    }
+    return {};
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut, const PreparedBuffers* prepared, bool* preparedTaken) const {
     struct SelectedStorage {};
     auto& selected = HostThreadLocal<std::vector<std::size_t>, SelectedStorage>();
-    auto result = prepared != nullptr ? selectPreparedSnapshots(recorder, moved, *prepared, selected) : nullptr;
+    auto result = prepared != nullptr ? selectPreparedSnapshots(recorder, moved, *prepared, selected, true) : nullptr;
     if (preparedTaken != nullptr) *preparedTaken = result != nullptr;
     if (result == nullptr) result = selectDrawSnapshots(recorder, moved, false, selected, false);
     if (selectedOut != nullptr) selectedOut->assign(selected.begin(), selected.end());
