@@ -3751,7 +3751,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         now.stalePlanes = StaleDepthPlanesSerial();
     }
     const auto stamped = [&](const FastProofStamp& stamp, std::uint64_t address, std::uint64_t bytes, const void* source) {
-        return stamps && now.epoch != 0 && stamp.epoch == now.epoch && stamp.proof == now.proof && stamp.pending == now.pending && stamp.release == now.release && stamp.unwatched == now.unwatched && stamp.mapping == now.mapping && stamp.depthSurfaces == now.depthSurfaces && stamp.depthReleased == now.depthReleased && stamp.stalePlanes == now.stalePlanes && stamp.address == address && stamp.bytes == bytes && stamp.source == source;
+        return stamps && now.epoch != 0 && stamp.epoch == now.epoch && (RuntimeSwitches::Set(RuntimeSwitch::XpStampsByEpoch) || (stamp.proof == now.proof && stamp.pending == now.pending)) && stamp.release == now.release && stamp.unwatched == now.unwatched && stamp.mapping == now.mapping && stamp.depthSurfaces == now.depthSurfaces && stamp.depthReleased == now.depthReleased && stamp.stalePlanes == now.stalePlanes && stamp.address == address && stamp.bytes == bytes && stamp.source == source;
     };
     // Per texture, then per storage image: 0 proved here, 1 taken from a stamp, 2 untracked.
     struct TakenStorage {};
@@ -4562,7 +4562,7 @@ bool ShaderResources::revalidateProof(std::span<const CompiledShader> shaders, P
             const auto* ranges = rangedProofRanges();
             return ranges != nullptr && GuestMemory::RangeProofHolds(provedProof, *ranges);
         };
-        if (epoch != 0 && provedEpoch == epoch && provedPending == pending && (provedProof == proof || ranged())) {
+        if (epoch != 0 && provedEpoch == epoch && (RuntimeSwitches::Set(RuntimeSwitch::XpStampsByEpoch) || (provedPending == pending && (provedProof == proof || ranged())))) {
             const bool throughRanges = provedProof != proof;
             provedProof = proof;
             for (const auto& texture : textures) {
