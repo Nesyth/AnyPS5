@@ -324,6 +324,9 @@ public:
         Refusal refusal = Refusal::None;
         // The tracker generation taken before the guest bytes were read.
         std::uint64_t generation = 0;
+        // The depth guard generation taken before the guest bytes were read: a guard set up or
+        // dropped since may have published depth samples into them.
+        std::uint64_t depthGuards = 0;
     };
     // The first difference between prepared buffers and today's way of the same draw, compared as
     // data (APS5_VERIFY_DIRECT_BUFFERS): `what` names the part and stays null where they agree;

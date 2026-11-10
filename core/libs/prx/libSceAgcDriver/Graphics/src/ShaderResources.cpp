@@ -7374,8 +7374,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSn
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
     if (alignment != 0 && plan.alignment % alignment != 0) return {};
     // requireGuestBuffers publishes the host-written samples of a resident depth surface into the
-    // memory it overlaps, after the finisher read that memory.
-    if (HasResidentDepthGuards_nid_no_patch() && std::ranges::any_of(prepared.selected, [](const PreparedBuffers::Selected& item) { return item.begin != 0 && MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes); })) return {};
+    // memory it overlaps, after the finisher read that memory; a guard set up or dropped since the
+    // read may have published them already.
+    const bool guardsMoved = DepthGuardsGeneration_nid_no_patch() != prepared.depthGuards;
+    if ((guardsMoved || HasResidentDepthGuards_nid_no_patch()) && std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && (guardsMoved || MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes)); })) return {};
     requireGuestBuffers(moved);
     prepareFaultSlot();
     bindingsChecked = heapStage && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind);
@@ -7874,6 +7876,7 @@ bool ShaderResources::PrepareDirectBuffers(const BufferPlan& plan, std::span<con
     out.selected.clear();
     out.blob.clear();
     out.refusal = Refusal::None;
+    out.depthGuards = DepthGuardsGeneration_nid_no_patch();
     const auto refuse = [&](Refusal why) {
         out.refusal = why;
         return false;
