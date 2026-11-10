@@ -13,6 +13,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "RuntimeAbi.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -34,11 +35,20 @@
 #include <initializer_list>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
+
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
 
 namespace {
 
@@ -1061,10 +1071,152 @@ void Direct(bool ring) {
     if (DirectReport::VerifyEvery() != 1 && DrawRecords::VerifyEvery() > 1) Require(now.commitChecks > base.commitChecks, "direct draws: the committer verify checked no direct hit" + DescribeDirect(now, base));
 }
 
+constexpr std::uint32_t PlannedBufferBytes = 256;
+constexpr std::uint32_t LargeBufferBytes = 8192;
+constexpr std::size_t KeptBufferOffset = 0x1000;
+constexpr std::size_t InPlaceBufferOffset = 0x2000;
+constexpr std::size_t MovedBufferOffset = 0x3000;
+constexpr std::size_t LargeBufferOffset = 0x4000;
+constexpr std::uint64_t UnmappedAddress = 0x1000;
+
+// Two read-only guest buffers in one binding: the first at `first`, the second always in place.
+ShaderRecompiler::DescriptorBinding PlannedBuffers(const GuestBlock& block, std::uint64_t first, std::uint32_t firstBytes) {
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 2;
+    const auto moving = RawDescriptor(first, firstBytes);
+    const auto still = RawDescriptor(block.At(InPlaceBufferOffset), PlannedBufferBytes);
+    binding.guestDescriptor.assign(moving.begin(), moving.end());
+    binding.guestDescriptor.insert(binding.guestDescriptor.end(), still.begin(), still.end());
+    binding.bufferWritten = {false, false};
+    return binding;
+}
+
+ShaderRecompiler::DescriptorBinding PlannedData(std::uint32_t value) {
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::ShaderData;
+    binding.descriptorSet = 0;
+    binding.binding = 5;
+    binding.count = 1;
+    binding.guestDescriptor.assign(ShaderRecompiler::RuntimeAbi::ShaderDataDwords, 0u);
+    binding.guestDescriptor[0] = ShaderRecompiler::RuntimeAbi::Version;
+    binding.guestDescriptor[ShaderRecompiler::RuntimeAbi::UserDataDword] = value;
+    return binding;
+}
+
+// PrepareDirectBuffers against today's MovedReadOnlyBuffers and selectDrawSnapshots (through
+// PrepareDrawBindings) on one template and the same stages.
+int PreparedBuffersMatch() {
+    using AgcDriver::Graphics::CompiledShader;
+    using AgcDriver::Graphics::ShaderResources;
+    using Refusal = ShaderResources::PreparedBuffers::Refusal;
+    using ShaderRecompiler::ShaderStage;
+    const auto device = OpenVulkanTestDevice();
+    if (!device) return VulkanTestSkipped;
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+    Require(context.recorder != nullptr && context.descriptorCache != nullptr, "prepared buffers: the device has no recorder or descriptor cache");
+    Require(ShaderResources::DrawUploadLimit() < LargeBufferBytes, "prepared buffers: the draw upload limit does not leave the large buffer over it");
+    RuntimeSwitches::Assign(RuntimeSwitch::MovedLargeUploads, false);
+    GuestBlock block;
+    std::memset(block.Bytes(KeptBufferOffset), 0x11, PlannedBufferBytes);
+    std::memset(block.Bytes(InPlaceBufferOffset), 0x22, PlannedBufferBytes);
+    std::memset(block.Bytes(MovedBufferOffset), 0x33, PlannedBufferBytes);
+    std::memset(block.Bytes(LargeBufferOffset), 0x44, LargeBufferBytes);
+    AgcDriver::GuestMemory::CollectWritesUncached(block.At(0), BlockBytes);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    auto& recorder = *context.recorder;
+    ShaderRecompiler::RecompileResult vertex;
+    vertex.bindings = {PlannedBuffers(block, block.At(KeptBufferOffset), PlannedBufferBytes), PlannedData(7)};
+    vertex.shaderDataDwords = ShaderRecompiler::RuntimeAbi::ShaderDataDwords;
+    const ShaderRecompiler::RecompileResult fragment{};
+    const AgcDriver::Graphics::ColorTarget target{};
+    const auto stagesOf = [&](const ShaderRecompiler::RecompileResult& program) { return std::array<CompiledShader, 2>{{{ShaderStage::Vertex, &program, 0}, {ShaderStage::Fragment, &fragment, 0}}}; };
+    const auto expectRefused = [&](const ShaderResources& owner, const ShaderResources::BufferPlan& plan, const ShaderRecompiler::RecompileResult& program, Refusal reason, bool todayMoves, const std::string& what) {
+        const auto stages = stagesOf(program);
+        const auto moved = owner.MovedReadOnlyBuffers(stages, recorder, &target);
+        Require(moved.has_value() == todayMoves, "prepared buffers: today's check " + std::string(todayMoves ? "refused " : "took ") + what);
+        ShaderResources::PreparedBuffers prepared;
+        Require(!ShaderResources::PrepareDirectBuffers(plan, stages, &target, prepared) && prepared.refusal == reason, "prepared buffers: " + what + " was prepared, or refused for another reason (" + std::to_string(static_cast<int>(prepared.refusal)) + ")");
+    };
+    {
+        ShaderResources resources(context, vertex, fragment, target, 0, 0);
+        const auto reads = resources.InPlaceReads();
+        const bool inPlace = std::ranges::any_of(reads, [&](const auto& range) { return range.first <= block.At(InPlaceBufferOffset) && block.At(InPlaceBufferOffset) + PlannedBufferBytes <= range.second; });
+        if (!resources.Reusable() || !inPlace) {
+            std::cout << "skipped, the template reads the guest block through no host import, so no buffer is read in place\n";
+            return VulkanTestSkipped;
+        }
+        const auto plan = resources.DirectBufferPlan(stagesOf(vertex));
+        Require(plan != nullptr, "prepared buffers: a reusable template with guest buffers and shader data has no buffer plan");
+        Require(resources.DirectBufferPlan(stagesOf(vertex)) == plan, "prepared buffers: the buffer plan was built again");
+        const auto expectSame = [&](const ShaderRecompiler::RecompileResult& program, std::size_t movedCount, std::size_t selectedCount, const std::string& what) {
+            const auto stages = stagesOf(program);
+            const auto today = resources.MovedReadOnlyBuffers(stages, recorder, &target);
+            Require(today.has_value() && today->size() == movedCount, "prepared buffers, " + what + ": today's check did not move " + std::to_string(movedCount) + " buffers");
+            std::vector<std::size_t> selected;
+            const auto bindings = resources.PrepareDrawBindings(recorder, *today, false, nullptr, false, &selected);
+            Require(bindings != nullptr && bindings->snapshots.size() == selected.size() && selected.size() == selectedCount, "prepared buffers, " + what + ": today's selection did not snapshot " + std::to_string(selectedCount) + " allocations");
+            ShaderResources::PreparedBuffers prepared;
+            Require(ShaderResources::PrepareDirectBuffers(*plan, stages, &target, prepared) && prepared.refusal == Refusal::None, "prepared buffers, " + what + ": the draw's buffers were not prepared (" + std::to_string(static_cast<int>(prepared.refusal)) + ")");
+            Require(prepared.moved.size() == today->size(), "prepared buffers, " + what + ": the moved lists differ in length");
+            for (std::size_t index = 0; index < today->size(); ++index) {
+                const auto& mine = prepared.moved[index];
+                const auto& theirs = (*today)[index];
+                Require(mine.allocation == theirs.allocation && mine.address == theirs.address && mine.size == theirs.size && std::ranges::equal(mine.words, theirs.words), "prepared buffers, " + what + ": moved entry " + std::to_string(index) + " differs");
+            }
+            Require(prepared.selected.size() == selected.size(), "prepared buffers, " + what + ": the selections differ in length");
+            std::array<std::size_t, 3> kinds{};
+            for (std::size_t index = 0; index < selected.size(); ++index) {
+                const auto& mine = prepared.selected[index];
+                const auto& snapshot = bindings->snapshots[index];
+                Require(mine.allocation == selected[index] && mine.begin == snapshot.address && mine.bytes == snapshot.bytes, "prepared buffers, " + what + ": selected allocation " + std::to_string(index) + " has another index or guest range");
+                Require(mine.offset % plan->alignment == 0 && mine.offset + mine.bytes <= prepared.blob.size(), "prepared buffers, " + what + ": selected allocation " + std::to_string(index) + " has an unaligned or outlying slice");
+                const auto bytes = snapshot.Bytes();
+                Require(bytes.size() == mine.bytes && std::memcmp(bytes.data(), prepared.blob.data() + mine.offset, mine.bytes) == 0, "prepared buffers, " + what + ": selected allocation " + std::to_string(index) + " holds other bytes");
+                ++kinds[!mine.moved ? 0 : mine.begin == 0 ? 1 : 2];
+            }
+            return kinds;
+        };
+        auto drawn = vertex;
+        drawn.bindings[0] = PlannedBuffers(block, block.At(MovedBufferOffset), PlannedBufferBytes);
+        drawn.bindings[1] = PlannedData(9);
+        const auto kinds = expectSame(drawn, 2, 3, "a moved buffer, an in-place buffer and changed shader data");
+        Require(kinds == std::array<std::size_t, 3>{1, 1, 1}, "prepared buffers: the draw did not select one in-place buffer, one moved data block and one moved guest buffer");
+        const auto still = expectSame(vertex, 0, 2, "the template's own stages");
+        Require(still == std::array<std::size_t, 3>{2, 0, 0}, "prepared buffers: the template's own draw did not select its two in-place buffers");
+        auto longer = vertex;
+        longer.bindings[1].guestDescriptor.push_back(0u);
+        expectRefused(resources, *plan, longer, Refusal::Classification, false, "shader data of another size");
+        auto unmapped = vertex;
+        unmapped.bindings[0] = PlannedBuffers(block, UnmappedAddress, PlannedBufferBytes);
+        expectRefused(resources, *plan, unmapped, Refusal::Inaccessible, false, "a buffer moved to unmapped memory");
+        auto large = vertex;
+        large.bindings[0] = PlannedBuffers(block, block.At(LargeBufferOffset), LargeBufferBytes);
+        expectRefused(resources, *plan, large, Refusal::UploadLimit, true, "a buffer moved to a range over the upload limit");
+    }
+    SetTestEnvironment("APS5_DRAW_SNAPSHOT_MAX_MIB", "0");
+    {
+        ShaderResources capped(context, vertex, fragment, target, 0, 0);
+        SetTestEnvironment("APS5_DRAW_SNAPSHOT_MAX_MIB", "64");
+        const auto plan = capped.DirectBufferPlan(stagesOf(vertex));
+        Require(plan != nullptr, "prepared buffers: a template with no snapshot budget has no buffer plan");
+        auto moving = vertex;
+        moving.bindings[0] = PlannedBuffers(block, block.At(MovedBufferOffset), PlannedBufferBytes);
+        expectRefused(capped, *plan, moving, Refusal::Budget, false, "a moved buffer over the snapshot budget");
+    }
+    std::cout << "prepared buffers match today's moved buffers and snapshot selection for a moved buffer, an in-place buffer and changed shader data, and are refused for shader data of another size, unmapped memory, a range over the upload limit and the snapshot budget\n";
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
+        if (argc > 1 && std::string_view(argv[1]) == "--direct-buffers") return PreparedBuffersMatch();
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
