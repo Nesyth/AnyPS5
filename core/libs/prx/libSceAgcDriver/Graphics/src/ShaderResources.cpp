@@ -4430,9 +4430,12 @@ bool ShaderResources::cleanCurrent(const CleanStamp& stamp, CleanProof& outcome)
     static const bool preciseSerials = std::getenv("APS5_CLEAN_PRECISE_SERIALS") != nullptr;
     if (preciseSerials && (stamp.release != cleanAt.release || stamp.pending != cleanAt.pending) && stamp.imports == cleanAt.imports && stamp.allocations == cleanAt.allocations && stamp.unwatched == cleanAt.unwatched && stamp.depthSurfaces == cleanAt.depthSurfaces) {
         const bool released = std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->Released(); });
+        // A view of a resident image follows that image's own state (its keys and pending results),
+        // which these checks do not see: a template with such a view keeps the plain serial rule.
+        const bool sourced = std::any_of(validatedTextures.begin(), validatedTextures.end(), [](const auto& surface) { return surface.source != nullptr; });
         // A surface that was pending over a range and has stored since is gone from the registry
         // but stamped the range as written, so the ranges must also be unwritten since the proof.
-        if (!released && !StorageTexture::AnyPendingOverlaps(cleanRangeList) && cleanUnchangedSince(cleanAt.generation)) {
+        if (!released && !sourced && !StorageTexture::AnyPendingOverlaps(cleanRangeList) && cleanUnchangedSince(cleanAt.generation)) {
             cleanAt.release = stamp.release;
             cleanAt.pending = stamp.pending;
             noteCleanSerialsKept();
