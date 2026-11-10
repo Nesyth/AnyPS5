@@ -2767,6 +2767,7 @@ struct RecordedDraw {
     bool* pushed = nullptr;
     DrawCommitView* view = nullptr;
     const ShaderResources::PreparedBuffers* prepared = nullptr;
+    DrawRecordBuffers* buffers = nullptr;
 };
 
 // A remapped viewport depth range reads its scale and offset from the draw's push block (the vertex shader's
@@ -3052,7 +3053,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const auto* faultRecord = drawUse != nullptr ? drawUse->record.get() : nullptr;
     std::vector<std::size_t> viewSelected;
     auto* selectedOut = record.view != nullptr ? &viewSelected : nullptr;
-    const auto drawBindings = record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, selectedOut) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus, selectedOut);
+    bool preparedTaken = false;
+    const auto drawBindings = record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, selectedOut, record.prepared, &preparedTaken) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus, selectedOut, record.prepared, &preparedTaken);
+    if (record.prepared != nullptr && record.buffers != nullptr) *record.buffers = preparedTaken ? DrawRecordBuffers::Used : DrawRecordBuffers::UnmovedHazard;
     if (record.view != nullptr && faultRecord == nullptr && !record.replay && !resources.HeapStage()) {
         resources.DescribeDrawBindings(drawBindings.get(), viewSelected, record.push, record.view->bindings);
         record.view->bound = true;
@@ -5290,7 +5293,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     // Prepared buffers count only for the template whose plan they were prepared from.
     const ShaderResources::PreparedBuffers* bound = nullptr;
     if (recording && prepared != nullptr && RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers)) {
-        if (prepared->plan == resources->DirectBufferPlan(shaders)) bound = prepared;
+        if (prepared->plan != nullptr && prepared->plan == resources->DirectBufferPlan(shaders)) bound = prepared;
         else record.effects.buffers = DrawRecordBuffers::PlanDiffers;
     }
     std::vector<ShaderResources::MovedBuffer> moved;
@@ -5447,6 +5450,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     drawn.pushFramebuffer = std::move(pushFramebuffer);
     drawn.pushed = &record.effects.pushed;
     drawn.prepared = bound;
+    drawn.buffers = &record.effects.buffers;
     recordDraw(context, state, draw, shaders, inputs, drawn, outcome, timer, ownWaitedMs, trace);
     record.effects.passHeld = held;
     if (recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {

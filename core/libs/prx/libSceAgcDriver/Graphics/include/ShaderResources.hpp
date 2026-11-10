@@ -328,7 +328,10 @@ public:
     // False, with the reason in `out.refusal`, where the draw's buffers cannot be prepared.
     static bool PrepareDirectBuffers(const BufferPlan& plan, std::span<const CompiledShader> shaders, const ColorTarget* target, PreparedBuffers& out);
     const PushPlan* PushLayouts() const;
-    std::shared_ptr<DrawBindings> PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut = nullptr) const;
+    // `prepared` (buffers prepared from this object's plan, with `moved` their moved list) takes
+    // the place of today's snapshot selection while its unmoved ranges are still clear;
+    // `preparedTaken` tells whether it did.
+    std::shared_ptr<DrawBindings> PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut = nullptr, const PreparedBuffers* prepared = nullptr, bool* preparedTaken = nullptr) const;
     void PushDrawBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
     struct BoundBuffer {
         std::uint32_t set = 0;
@@ -354,7 +357,8 @@ public:
     std::shared_ptr<DrawUse> BeginDrawUse(Recorder& recorder) const;
     void CompleteDrawUse(const DrawUse& use) const;
     void BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const;
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr, bool census = false, std::vector<std::size_t>* selectedOut = nullptr) const;
+    // `prepared` and `preparedTaken` as for PreparePushedDrawBindings (not with `movedOnly`).
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr, bool census = false, std::vector<std::size_t>* selectedOut = nullptr, const PreparedBuffers* prepared = nullptr, bool* preparedTaken = nullptr) const;
     ReplayReason HeapReplayRefusal(std::span<const CompiledShader> shaders) const;
     void NoteHeapReplayCensus();
     struct HeapReplayProof {
@@ -909,6 +913,10 @@ private:
     // the ticket trusts needs only the shadow test); `accessible`: the caller found every range mapped.
     bool movedRangesClear(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::size_t>> ranges, MoveTicket* ticket, bool accessible) const;
     std::shared_ptr<DrawBindings> selectDrawSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, std::vector<std::size_t>& selected, bool census) const;
+    // The selection of prepared buffers, their blob in one upload slice; null, before any upload,
+    // when an unmoved range is no longer clear or a resident depth surface may hold a selected
+    // range's bytes (selectDrawSnapshots then selects).
+    std::shared_ptr<DrawBindings> selectPreparedSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, std::vector<std::size_t>& selected) const;
     std::shared_ptr<DrawBindings> finishDrawBindings(Recorder& recorder, std::shared_ptr<DrawBindings> result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     bool ownsHeapBinding(const Binding& binding, VkShaderStageFlags stageBit) const;
     VkImageView heapPlaceholderView(std::uint32_t kind) const;

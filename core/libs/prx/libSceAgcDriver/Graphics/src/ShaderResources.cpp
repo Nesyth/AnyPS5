@@ -7201,10 +7201,12 @@ ShaderResources::MovedSnapshotCounts ShaderResources::TakeMovedSnapshotCounts() 
     return {tally.cached.exchange(0, std::memory_order_relaxed), tally.reused.exchange(0, std::memory_order_relaxed), tally.cachedBytes.exchange(0, std::memory_order_relaxed), tally.uploaded.exchange(0, std::memory_order_relaxed), tally.uploadedBytes.exchange(0, std::memory_order_relaxed)};
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord, bool census, std::vector<std::size_t>* selectedOut) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord, bool census, std::vector<std::size_t>* selectedOut, const PreparedBuffers* prepared, bool* preparedTaken) const {
     struct SelectedStorage {};
     auto& selected = HostThreadLocal<std::vector<std::size_t>, SelectedStorage>();
-    auto result = selectDrawSnapshots(recorder, moved, movedOnly, selected, census);
+    auto result = prepared != nullptr && !movedOnly ? selectPreparedSnapshots(recorder, moved, *prepared, selected) : nullptr;
+    if (preparedTaken != nullptr) *preparedTaken = result != nullptr;
+    if (result == nullptr) result = selectDrawSnapshots(recorder, moved, movedOnly, selected, census);
     if (selectedOut != nullptr) selectedOut->assign(selected.begin(), selected.end());
     return finishDrawBindings(recorder, std::move(result), selected, faultRecord);
 }
@@ -7363,6 +7365,40 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (census) NoteReplaySnapshots(counted.moved, counted.unmoved, counted.bytes, counted.memoHits, counted.uploads, counted.large);
+    return result;
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, std::vector<std::size_t>& selected) const {
+    selected.clear();
+    const auto& plan = *prepared.plan;
+    const auto alignment = context.limits.minStorageBufferOffsetAlignment;
+    if (alignment != 0 && plan.alignment % alignment != 0) return {};
+    // requireGuestBuffers publishes the host-written samples of a resident depth surface into the
+    // memory it overlaps, after the finisher read that memory.
+    if (HasResidentDepthGuards_nid_no_patch() && std::ranges::any_of(prepared.selected, [](const PreparedBuffers::Selected& item) { return item.begin != 0 && MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes); })) return {};
+    requireGuestBuffers(moved);
+    prepareFaultSlot();
+    bindingsChecked = heapStage && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind);
+    for (const auto& item : prepared.selected) {
+        if (item.moved) continue;
+        const auto& allocation = allocations[item.allocation];
+        if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return {};
+    }
+    auto result = std::make_shared<DrawBindings>();
+    if (prepared.selected.empty()) return result;
+    auto slice = recorder.DrawUpload(prepared.blob.size());
+    std::memcpy(slice.bytes, prepared.blob.data(), prepared.blob.size());
+    result->snapshots.reserve(prepared.selected.size());
+    for (const auto& item : prepared.selected) {
+        selected.push_back(item.allocation);
+        result->snapshots.push_back({item.begin, slice.buffer, slice.offset + item.offset, item.bytes});
+        if (item.begin == 0) continue;
+        if (item.moved && item.bytes > plan.uploadLimit && MovedSnapshotStats()) {
+            movedSnapshotTally().uploaded.fetch_add(1, std::memory_order_relaxed);
+            movedSnapshotTally().uploadedBytes.fetch_add(item.bytes, std::memory_order_relaxed);
+        }
+        CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(item.begin), item.bytes);
+    }
     return result;
 }
 
@@ -7930,10 +7966,12 @@ bool ShaderResources::PrepareDirectBuffers(const BufferPlan& plan, std::span<con
     return true;
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut, const PreparedBuffers* prepared, bool* preparedTaken) const {
     struct SelectedStorage {};
     auto& selected = HostThreadLocal<std::vector<std::size_t>, SelectedStorage>();
-    auto result = selectDrawSnapshots(recorder, moved, false, selected, false);
+    auto result = prepared != nullptr ? selectPreparedSnapshots(recorder, moved, *prepared, selected) : nullptr;
+    if (preparedTaken != nullptr) *preparedTaken = result != nullptr;
+    if (result == nullptr) result = selectDrawSnapshots(recorder, moved, false, selected, false);
     if (selectedOut != nullptr) selectedOut->assign(selected.begin(), selected.end());
     if (result == nullptr || selected.empty()) return {};
     const bool pushes = std::ranges::any_of(selected, [&](std::size_t index) { return index < plan.allocationSets.size() && plan.allocationSets[index] == plan.set; });
