@@ -5182,6 +5182,58 @@ SharedRecordPass& sharedRecordPass() {
     return HostThreadLocal<SharedRecordPass, SharedRecordPassStorage>();
 }
 
+// APS5_XP_INPUTS_AS_IS (experiment, a ceiling only): the draw inputs of a record's last commit, taken again
+// while the draw names the same index range and counts, the record holds the same recipe and no mapping was
+// forgotten. Only inputs read in place are kept. A changed import, highest index or GPU write hazard is not seen.
+struct InputsAsIs {
+    const DrawRecipe* recipe = nullptr;
+    std::uint64_t indexAddress = 0;
+    std::uint32_t indexCount = 0;
+    std::uint32_t indexSize = 0;
+    std::uint32_t instanceCount = 0;
+    std::uint32_t firstVertex = 0;
+    std::uint32_t firstInstance = 0;
+    bool indexed = false;
+    std::uint64_t forget = 0;
+    DrawInputs inputs;
+};
+
+std::unordered_map<const DrawRecordCommit*, InputsAsIs>& inputsAsIs() {
+    thread_local std::unordered_map<const DrawRecordCommit*, InputsAsIs> kept;
+    return kept;
+}
+
+bool takeInputsAsIs(const Context& context, const DrawRecordCommit& record, const Pm4::DrawParameters& draw, DrawInputs& inputs) {
+    auto& all = inputsAsIs();
+    const auto found = all.find(&record);
+    if (found == all.end()) return false;
+    const auto& kept = found->second;
+    if (kept.recipe != record.recipe.get() || kept.indexAddress != draw.indexAddress || kept.indexCount != draw.indexCount || kept.indexSize != draw.indexSize || kept.instanceCount != draw.instanceCount || kept.firstVertex != draw.firstVertex || kept.firstInstance != draw.firstInstance || kept.indexed != draw.indexed || kept.forget != GuestMemory::ForgetSerial()) return false;
+    inputs = kept.inputs;
+    for (const auto& [begin, end] : inputs.inPlaceReads) context.recorder->NotePendingRead(begin, static_cast<std::size_t>(end - begin), Recorder::ReadKind::DrawInput);
+    return true;
+}
+
+void keepInputsAsIs(const DrawRecordCommit& record, const Pm4::DrawParameters& draw, const DrawInputs& inputs) {
+    auto& all = inputsAsIs();
+    if (inputs.nothing || inputs.indices != nullptr || !inputs.restartTable.empty() || std::ranges::any_of(inputs.vertexBuffers, [](const std::shared_ptr<Buffer>& buffer) { return buffer != nullptr; })) {
+        all.erase(&record);
+        return;
+    }
+    auto& kept = all[&record];
+    kept.recipe = record.recipe.get();
+    kept.indexAddress = draw.indexAddress;
+    kept.indexCount = draw.indexCount;
+    kept.indexSize = draw.indexSize;
+    kept.instanceCount = draw.instanceCount;
+    kept.firstVertex = draw.firstVertex;
+    kept.firstInstance = draw.firstInstance;
+    kept.indexed = draw.indexed;
+    kept.forget = GuestMemory::ForgetSerial();
+    kept.inputs = inputs;
+    kept.inputs.recycled = false;
+}
+
 bool sharedRecordPassServes(const SharedRecordPass& shared, const State& state, const DrawRecipe& recipe) {
     if (!shared.pass.valid || shared.views != recipe.targetViews || shared.colors.size() != state.colors.size() || shared.targets.size() != recipe.targets.size() || shared.depth.has_value() != state.depth.has_value() || shared.depthCopySource != state.depthCopySource) return false;
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
@@ -5235,7 +5287,12 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     const bool lean = resources->RecordLean();
     DrawInputs inputs;
     if (recording) {
-        inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, timing, &recipe);
+        const bool inputsKept = RuntimeSwitches::Set(RuntimeSwitch::XpInputsAsIs);
+        if (!inputsKept && !inputsAsIs().empty()) inputsAsIs().clear();
+        if (!inputsKept || !takeInputsAsIs(context, record, draw, inputs)) {
+            inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, timing, &recipe);
+            if (inputsKept) keepInputsAsIs(record, draw, inputs);
+        }
         if (inputs.nothing) {
             result.recorded = true;
             return result;
