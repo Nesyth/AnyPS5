@@ -1544,6 +1544,12 @@ void NoteDirectCommit(const DrawRecordCommit& commit, bool recorded) {
     else if (effects.hold != DrawRecordHold::Count) DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::HoldFirst) + static_cast<std::size_t>(effects.hold) - static_cast<std::size_t>(DrawRecordHold::First)));
 }
 
+void PublishBufferPlan(DrawRecordCommit& commit, std::span<const Graphics::CompiledShader> stages) {
+    if (commit.bufferPlanAsked || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectBuffers)) return;
+    commit.bufferPlanAsked = true;
+    if (const auto resources = commit.recipe->templateRef.lock(); resources != nullptr) commit.bufferPlan.store(resources->DirectBufferPlan(stages));
+}
+
 bool SameVertexInput(const Graphics::VertexInputLayout& a, const Graphics::VertexInputLayout& b) {
     const auto sameBinding = [](const VkVertexInputBindingDescription& x, const VkVertexInputBindingDescription& y) { return x.binding == y.binding && x.stride == y.stride && x.inputRate == y.inputRate; };
     const auto sameAttribute = [](const VkVertexInputAttributeDescription& x, const VkVertexInputAttributeDescription& y) { return x.location == y.location && x.binding == y.binding && x.format == y.format && x.offset == y.offset; };
@@ -1584,6 +1590,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         if (hit.planned) NotePlannedCommit(commit);
         if (hit.direct) NoteDirectCommit(commit, outcome.recorded);
         if (outcome.recorded) {
+            if (hit.direct) PublishBufferPlan(commit, hit.stages);
             if (hit.planned || hit.direct) ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
             const auto& effects = commit.effects;
             DrawRecords::AddOnCommitter(Counter::CommitHits);

@@ -254,6 +254,55 @@ public:
         std::size_t size;
         std::span<const std::uint32_t> words;
     };
+    // What MovedReadOnlyBuffers and selectDrawSnapshots read from this object to decide a draw's
+    // buffers, copied by value once so a finisher thread can make that decision from the plan, the
+    // draw's stages and guest memory alone (PrepareDirectBuffers). Immutable once built; it points
+    // into nothing, so it may outlive the object.
+    struct BufferPlan {
+        // One buffer binding element, in the order MovedReadOnlyBuffers walks them, with the shape
+        // the draw's binding must still have (stage, index in the program, slot, role, count, and
+        // whether the shader writes the element).
+        struct Element {
+            std::uint32_t stage = 0;
+            std::uint32_t binding = 0;
+            std::uint32_t slot = 0;
+            std::uint32_t count = 0;
+            std::uint32_t element = 0;
+            ShaderRecompiler::DescriptorRole role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+            bool written = false;
+            std::size_t allocation = 0;
+            // Data roles: the words the allocation's buffer holds.
+            std::vector<std::uint32_t> dataWords;
+        };
+        struct Allocation {
+            std::uint64_t address = 0;
+            std::size_t size = 0;
+            std::uint32_t adjustment = 0;
+            bool guest = false;
+            bool written = false;
+            // The range lies inside one of the object's in-place reads.
+            bool inPlace = false;
+        };
+        struct Patch {
+            std::size_t allocation = 0;
+            std::uint32_t byte = 0;
+            std::uint32_t adjustment = 0;
+        };
+        std::uint32_t stages = 0;
+        std::vector<Element> elements;
+        std::vector<Allocation> allocations;
+        std::vector<Patch> patches;
+        std::uint64_t maxStorageBufferRange = 0;
+        std::size_t maxDrawSnapshotBytes = 0;
+        std::size_t uploadLimit = 0;
+        std::size_t movedUploadBytes = 0;
+        std::size_t alignment = 16;
+    };
+    // Built on the first call from the stages drawn with, on the committer under the GPU mutex,
+    // and never rebuilt; null when no draw's buffers can be decided from a plan (no set, a heap
+    // stage, an address table, an object that is not reusable, or bindings MovedReadOnlyBuffers
+    // refuses whatever the draw).
+    const std::shared_ptr<const BufferPlan>& DirectBufferPlan(std::span<const CompiledShader> shaders) const;
     const PushPlan* PushLayouts() const;
     std::shared_ptr<DrawBindings> PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut = nullptr) const;
     void PushDrawBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
@@ -891,6 +940,8 @@ private:
     mutable std::unique_ptr<PushPlan> pushPlan;
     void overlayPushedBuffers(const DrawBindings& result, const PushPlan& plan, std::span<VkDescriptorBufferInfo> buffers, std::span<std::size_t> owners = {}) const;
     mutable bool pushPlanBuilt = false;
+    mutable std::shared_ptr<const BufferPlan> bufferPlan;
+    mutable bool bufferPlanBuilt = false;
     std::shared_ptr<OwnDrawSets> makeOwnDrawSets() const;
     mutable std::shared_ptr<OwnDrawSets> ownDrawSets;
     void writeAddressedOverlay(DrawBindings& result, std::span<const std::size_t> selected) const;

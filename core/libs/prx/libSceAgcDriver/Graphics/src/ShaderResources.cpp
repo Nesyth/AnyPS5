@@ -7746,6 +7746,72 @@ const ShaderResources::PushPlan* ShaderResources::PushLayouts() const {
     return pushPlan.get();
 }
 
+const std::shared_ptr<const ShaderResources::BufferPlan>& ShaderResources::DirectBufferPlan(std::span<const CompiledShader> shaders) const {
+    if (bufferPlanBuilt) return bufferPlan;
+    bufferPlanBuilt = true;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || heapStage || usesBda || !reusable) return bufferPlan;
+    auto plan = std::make_shared<BufferPlan>();
+    plan->stages = static_cast<std::uint32_t>(shaders.size());
+    for (std::size_t stage = 0; stage < shaders.size(); ++stage) {
+        const auto& shader = shaders[stage];
+        if (shader.program == nullptr || HeapShader(shader)) return bufferPlan;
+        const auto& programBindings = shader.program->bindings;
+        for (std::size_t index = 0; index < programBindings.size(); ++index) {
+            const auto& binding = programBindings[index];
+            const bool data = DataRole(binding.role);
+            if (!data && binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+            const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+            if (kept == bindings.end()) return bufferPlan;
+            BufferPlan::Element entry;
+            entry.stage = static_cast<std::uint32_t>(stage);
+            entry.binding = static_cast<std::uint32_t>(index);
+            entry.slot = binding.binding;
+            entry.count = binding.count;
+            entry.role = binding.role;
+            if (data) {
+                if (kept->allocations.size() != 1) return bufferPlan;
+                entry.allocation = kept->allocations.front();
+                const auto& item = allocations[entry.allocation];
+                if (item.guest || item.buffer == nullptr) return bufferPlan;
+                if (!item.dataWords.empty()) {
+                    entry.dataWords = item.dataWords;
+                } else {
+                    const bool patched = std::any_of(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& patch) { return patch.allocation == entry.allocation; });
+                    const auto bytes = item.buffer->Bytes();
+                    if (patched || item.size % sizeof(std::uint32_t) != 0 || bytes.size() < item.size) return bufferPlan;
+                    entry.dataWords.resize(item.size / sizeof(std::uint32_t));
+                    std::memcpy(entry.dataWords.data(), bytes.data(), item.size);
+                }
+                plan->elements.push_back(std::move(entry));
+                continue;
+            }
+            if (kept->allocations.size() != binding.count) return bufferPlan;
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                entry.element = element;
+                entry.written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                entry.allocation = kept->allocations[element];
+                plan->elements.push_back(entry);
+            }
+        }
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    guestMemory.InPlaceReads(reads);
+    plan->allocations.reserve(allocations.size());
+    for (const auto& item : allocations) {
+        const bool inPlace = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
+        plan->allocations.push_back({item.address, item.size, item.adjustment, item.guest, item.written, inPlace});
+    }
+    plan->patches.reserve(dataPatches.size());
+    for (const auto& patch : dataPatches) plan->patches.push_back({patch.allocation, patch.byte, patch.adjustment});
+    plan->maxStorageBufferRange = context.limits.maxStorageBufferRange;
+    plan->maxDrawSnapshotBytes = maxDrawSnapshotBytes;
+    plan->uploadLimit = DrawUploadLimit();
+    plan->movedUploadBytes = MovedUploadBytes;
+    plan->alignment = static_cast<std::size_t>(std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16));
+    bufferPlan = std::move(plan);
+    return bufferPlan;
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut) const {
     struct SelectedStorage {};
     auto& selected = HostThreadLocal<std::vector<std::size_t>, SelectedStorage>();

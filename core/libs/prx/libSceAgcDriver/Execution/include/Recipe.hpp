@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
+#include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -206,9 +207,15 @@ struct DrawRecordCommit {
     std::uint64_t touchedPresent = ~std::uint64_t{0};
     std::uint64_t builds = 0;
     bool cleanProofs = false;
+    // The buffer plan of the recipe's template while APS5_DIRECT_BUFFERS is set, published by the
+    // committer after a recorded commit: the only member a finisher thread reads. It owns the plan,
+    // because the recipe holds its template weakly.
+    AtomicSharedPtr<const Graphics::ShaderResources::BufferPlan> bufferPlan;
+    bool bufferPlanAsked = false;
 
     void Adopt(std::shared_ptr<const DrawRecipe> built) {
         recipe = std::move(built);
+        if (std::exchange(bufferPlanAsked, false)) bufferPlan.store(nullptr);
         pass = {};
         keep = {};
         ticket = {};
