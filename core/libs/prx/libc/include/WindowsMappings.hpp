@@ -290,6 +290,8 @@ public:
         for (std::size_t index = 4; index < 7; ++index) out[index + 2] = armingCounters()[index].exchange(0, std::memory_order_relaxed);
         for (std::size_t index = 0; index < 8; ++index) out[9 + index] = armDecisions()[index].exchange(0, std::memory_order_relaxed);
         out[17] = armingCounters()[7].exchange(0, std::memory_order_relaxed);
+        for (std::size_t index = 0; index < 8; ++index) out[18 + index] = armRefusals()[index].exchange(0, std::memory_order_relaxed);
+        armRefusalCensus().store(true, std::memory_order_relaxed);
     }
 
     // APS5_REARM_QUIET as a runtime switch: a resident run the guest wrote after it was armed is armed again once 8
@@ -1025,6 +1027,55 @@ private:
         return decisions;
     }
 
+    // Refused arming attempts by first reason (see noteArmRefusal), counted once a report was asked for.
+    static std::array<std::atomic<std::uint64_t>, 8>& armRefusals() {
+        static std::array<std::atomic<std::uint64_t>, 8> counts{};
+        return counts;
+    }
+
+    static std::atomic<bool>& armRefusalCensus() {
+        static std::atomic<bool> on{false};
+        return on;
+    }
+
+    void noteArmRefusal(std::uintptr_t from, std::uintptr_t stop) {
+        if (!armRefusalCensus().load(std::memory_order_relaxed)) return;
+        auto& counts = armRefusals();
+        const auto first = views.lower_bound(from & ~(pageBytes - 1));
+        if (first == views.end() || first->first > from) {
+            counts[0].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (!writable(first->second.protection)) {
+            counts[1].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        const auto protection = first->second.protection;
+        auto expected = first->first;
+        bool gap = false;
+        bool foreign = false;
+        bool mixed = false;
+        bool writes = false;
+        bool imports = false;
+        bool pinned = false;
+        for (auto it = first; it != views.end() && it->first < stop; ++it) {
+            const auto& view = it->second;
+            if (it->first != expected) {
+                gap = true;
+                break;
+            }
+            foreign = foreign || !view.resident;
+            mixed = mixed || view.protection != protection;
+            writes = writes || view.hostWrites != 0;
+            imports = imports || view.hostImports != 0;
+            pinned = pinned || view.pins != 0;
+            expected = it->first + pageBytes;
+        }
+        if (!gap && expected < stop) gap = true;
+        const std::size_t reason = gap ? 2 : foreign ? 3 : mixed ? 4 : writes ? 5 : pinned ? 6 : imports ? 7 : 0;
+        counts[reason].fetch_add(1, std::memory_order_relaxed);
+    }
+
     static std::atomic<std::uint64_t>& cleanForgetSerial() {
         static std::atomic<std::uint64_t> serial{1};
         return serial;
@@ -1037,12 +1088,18 @@ private:
 
     bool armResident(std::uintptr_t from, std::uintptr_t stop) {
         const auto first = views.lower_bound(from & ~(pageBytes - 1));
-        if (first == views.end() || first->first > from || !writable(first->second.protection)) return false;
+        if (first == views.end() || first->first > from || !writable(first->second.protection)) {
+            noteArmRefusal(from, stop);
+            return false;
+        }
         const auto protection = first->second.protection;
         auto expected = first->first;
         for (auto it = first; it != views.end() && it->first < stop; ++it) {
             const auto& view = it->second;
-            if (it->first != expected || !view.resident || view.protection != protection || view.hostWrites != 0 || view.hostImports != 0 || view.pins != 0) return false;
+            if (it->first != expected || !view.resident || view.protection != protection || view.hostWrites != 0 || view.hostImports != 0 || view.pins != 0) {
+                noteArmRefusal(from, stop);
+                return false;
+            }
             expected = it->first + pageBytes;
         }
         if (expected < stop) return false;
@@ -1059,12 +1116,18 @@ private:
     bool armResidentSpans(std::uintptr_t from, std::uintptr_t stop, std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& armedSpans) {
         armedSpans.clear();
         const auto first = views.lower_bound(from & ~(pageBytes - 1));
-        if (first == views.end() || first->first > from || !writable(first->second.protection)) return false;
+        if (first == views.end() || first->first > from || !writable(first->second.protection)) {
+            noteArmRefusal(from, stop);
+            return false;
+        }
         const auto protection = first->second.protection;
         auto expected = first->first;
         for (auto it = first; it != views.end() && it->first < stop; ++it) {
             const auto& view = it->second;
-            if (it->first != expected || !view.resident || view.protection != protection || view.hostWrites != 0 || view.hostImports != 0 || view.pins != 0) return false;
+            if (it->first != expected || !view.resident || view.protection != protection || view.hostWrites != 0 || view.hostImports != 0 || view.pins != 0) {
+                noteArmRefusal(from, stop);
+                return false;
+            }
             expected = it->first + pageBytes;
         }
         if (expected < stop) return false;
