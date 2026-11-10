@@ -91,6 +91,8 @@ enum class RuntimeSwitch : std::size_t {
     MsaaRecords,
     XpInputsAsIs,
     XpStampsByEpoch,
+    MsaaRecordHold,
+    TemplateTouch,
     NoPlanCleanProofs,
     DeferredEncode,
     Count,

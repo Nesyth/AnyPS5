@@ -5319,13 +5319,26 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     const auto* pass = &record.pass;
     auto hold = holdUnder(*pass);
     const SharedRecordPass* shared = nullptr;
-    if (hold != DrawRecordHold::Held && RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets)) {
+    if (hold != DrawRecordHold::Held && RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets) && !multisampleRecipe) {
         const auto& kept = sharedRecordPass();
         if (sharedRecordPassServes(kept, state, recipe) && holdUnder(kept.pass) == DrawRecordHold::Held) shared = &kept;
     }
     if (shared != nullptr) pass = &shared->pass;
     bool held = hold == DrawRecordHold::Held || shared != nullptr;
+    if (multisampleRecipe && !RuntimeSwitches::Set(RuntimeSwitch::MsaaRecordHold)) held = false;
     for (std::size_t index = 0; held && index < recipe.targets.size(); ++index) {
+        if (multisampleRecipe && recipe.multisampled[index] != 0u) {
+            VkImage image = VK_NULL_HANDLE;
+            const auto view = MultisampleTargetView(context, state.colors[index], multisampleOwners[index], &image);
+            if (view != recipe.targetViews[index] || multisampleOwners[index] == nullptr) {
+                held = false;
+                hold = DrawRecordHold::Target;
+                break;
+            }
+            multisampleImages.push_back(image);
+            targets.push_back(nullptr);
+            continue;
+        }
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr || (shared != nullptr && stored.get() != shared->targets[index]) || stored->UploadVersion() != pass->versions[index] || !stored->Cached() || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) {
             held = false;
@@ -5339,6 +5352,8 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     record.effects.sharedHold = held && shared != nullptr;
     if (!held) {
         targets.clear();
+        multisampleImages.clear();
+        for (auto& owner : multisampleOwners) owner.reset();
         if (failed(DrawRecipeMiss::TargetGone)) return miss(DrawRecipeMiss::TargetGone);
         for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
             timer.phase(PhaseSetup);
@@ -5470,7 +5485,10 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
         if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
         if (const auto present = Recorder::Presents(); record.touchedPresent != present && !RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) {
-            SharedResourceCache().Touch(recipe.key);
+            if (!RuntimeSwitches::Set(RuntimeSwitch::TemplateTouch) || resources->TouchedPresent() != present) {
+                SharedResourceCache().Touch(recipe.key);
+                resources->NoteTouchedPresent(present);
+            }
             record.touchedPresent = present;
         }
         countCache(&DrawProfile::cacheHits);
@@ -5594,7 +5612,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     }
     recordDraw(context, state, draw, shaders, inputs, drawn, outcome, timer, ownWaitedMs, trace);
     record.effects.passHeld = held;
-    if (!multisampleRecipe && recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {
+    if ((!multisampleRecipe || RuntimeSwitches::Set(RuntimeSwitch::MsaaRecordHold)) && recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {
         auto& remembered = record.pass;
         remembered.valid = true;
         remembered.recorder = recorder->Id();
@@ -5606,7 +5624,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         remembered.depthReleased = DepthSurfacesReleased();
         remembered.versions.clear();
         for (const auto* target : residents) remembered.versions.push_back(target != nullptr ? target->UploadVersion() : 0u);
-        if (!record.effects.sharedHold && RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets)) {
+        if (!record.effects.sharedHold && RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets) && !multisampleRecipe) {
             auto& kept = sharedRecordPass();
             kept.pass = remembered;
             kept.colors.assign(state.colors.begin(), state.colors.end());

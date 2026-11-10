@@ -517,6 +517,9 @@ public:
     bool Reusable() const { return reusable; }
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
+    // The present in which a record commit last touched this template's resource cache entry (APS5_TEMPLATE_TOUCH).
+    std::uint64_t TouchedPresent() const { return touchedPresent; }
+    void NoteTouchedPresent(std::uint64_t present) { touchedPresent = present; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     static std::uint64_t DepthGuardRefusals();
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
@@ -829,6 +832,7 @@ private:
     // holds; `reason` receives why the proof failed (Count: it passed), `overlapping` the surfaces
     // of a Pending failure in element order (empty otherwise), `accepted` whether a foreign overlap
     // was accepted by either rule (the verify switch then runs the full walk beside the proof).
+    std::uint64_t touchedPresent = ~std::uint64_t{0};
     bool fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted, bool compares = true);
     // T1 (design_cpu_final M3): brings the overlapping surfaces' own objects up to date exactly as
     // the full walk's lookups would, in the walk's binding order, without the lookups: a storage
