@@ -1029,6 +1029,7 @@ std::string DescribeDirect(const DirectTotals& now, const DirectTotals& base) {
 void Direct(bool ring) {
     const bool exact = std::getenv("APS5_DIRECT_DRAWS_EXACT_KEY") != nullptr;
     const bool buffers = RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers);
+    const bool inputs = RuntimeSwitches::Set(RuntimeSwitch::DirectInputs);
     std::vector<State> cycled;
     for (std::uint32_t format = 0; format < RawFormats.size(); ++format) cycled.push_back({Kind::Format, format, 16, 3});
     const std::vector<std::pair<std::string, std::vector<State>>> sets{
@@ -1055,6 +1056,11 @@ void Direct(bool ring) {
             for (std::size_t index = 0; index < states.size(); ++index) Require(Render(states[index], DrawsPerSubmission) == today[index], "direct draws without prepared buffers, " + name + ": submission " + std::to_string(index) + " rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before));
             RuntimeSwitches::Assign(RuntimeSwitch::DirectBuffers, true);
         }
+        if (inputs) {
+            RuntimeSwitches::Assign(RuntimeSwitch::DirectInputs, false);
+            for (std::size_t index = 0; index < states.size(); ++index) Require(Render(states[index], DrawsPerSubmission) == today[index], "direct draws without prepared inputs, " + name + ": submission " + std::to_string(index) + " rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before));
+            RuntimeSwitches::Assign(RuntimeSwitch::DirectInputs, true);
+        }
         for (std::size_t index = 0; index < states.size(); ++index) Require(Render(states[index], DrawsPerSubmission) == today[index], "direct draws, " + name + ": submission " + std::to_string(index) + " rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before));
         RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
         const auto after = DirectTotals::Now();
@@ -1078,6 +1084,17 @@ void Direct(bool ring) {
     else Require(direct != 0, "direct draws: no draw committed directly" + DescribeDirect(now, base));
     if (DirectReport::VerifyEvery() > 1) Require(verified != 0, "direct draws: the verify checked no class hit" + DescribeDirect(now, base));
     if (DirectReport::VerifyEvery() != 1 && DrawRecords::VerifyEvery() > 1) Require(now.commitChecks > base.commitChecks, "direct draws: the committer verify checked no direct hit" + DescribeDirect(now, base));
+    if (inputs && DirectReport::VerifyEvery() != 1 && DrawRecords::VerifyEvery() != 1) {
+        const auto prepared = now.Since(base, DirectCounter::InputsPrepared);
+        const auto used = now.Since(base, DirectCounter::InputsUsed);
+        const auto checked = now.Since(base, DirectCounter::InputsVerifyChecked);
+        std::cout << "direct draws: " << prepared << " hits prepared their inputs, " << used << " took them, " << checked << " were verified\n";
+        Require(now.Since(base, DirectCounter::InputsVerifyDiffering) == 0, "direct draws: the prepared inputs verify found differences" + DescribeDirect(now, base));
+        Require(prepared == used + now.Since(base, DirectCounter::InputsImportChanged, DirectCounter::InputsDropped) + checked, "direct draws: the prepared input hits do not add up to the hits that took them, did not take them and were verified" + DescribeDirect(now, base));
+        if (DirectReport::InputVerifyEvery() == 1) Require(used == 0 && checked != 0, "direct draws: with every prepared input hit due for a verify, a commit took prepared inputs or none was verified" + DescribeDirect(now, base));
+        else Require(used != 0, "direct draws: no commit took prepared inputs" + DescribeDirect(now, base));
+        if (DirectReport::InputVerifyEvery() > 1) Require(checked != 0, "direct draws: the prepared inputs verify checked no hit" + DescribeDirect(now, base));
+    }
     if (!buffers || DirectReport::VerifyEvery() == 1 || DrawRecords::VerifyEvery() == 1) return;
     const auto used = now.Since(base, DirectCounter::BuffersUsed);
     const auto checked = now.Since(base, DirectCounter::BuffersVerifyChecked);
@@ -1352,11 +1369,169 @@ int PreparedBuffersMatch() {
     return 0;
 }
 
+constexpr std::size_t InputIndexOffset = 0x100;
+constexpr std::size_t InputVertexOffset = 0x400;
+constexpr std::uint32_t InputVertices = 4;
+
+ShaderRecompiler::VertexAttribute InputAttribute(std::uint64_t address, std::uint32_t stride, std::uint32_t records) {
+    return ShaderRecompiler::VertexAttribute{0, 4, {{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) | (stride << 16u), records, 77u << 12u}}, 0};
+}
+
+int PreparedInputsMatch() {
+    using AgcDriver::DrawRecordInputs;
+    using AgcDriver::Graphics::CompiledShader;
+    using AgcDriver::Graphics::PreparedInputs;
+    using Refusal = PreparedInputs::Refusal;
+    using ShaderRecompiler::ShaderStage;
+    namespace Graphics = AgcDriver::Graphics;
+    const auto device = OpenVulkanTestDevice();
+    if (!device) return VulkanTestSkipped;
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+    Require(context.recorder != nullptr, "prepared inputs: the device has no recorder");
+    auto& recorder = *context.recorder;
+    GuestBlock block;
+    const std::array<std::uint16_t, 6> indices{0, 1, 2, 2, 1, 3};
+    std::memcpy(block.Bytes(InputIndexOffset), indices.data(), sizeof(indices));
+    for (std::uint32_t at = 0; at < InputVertices; ++at) {
+        const std::array<float, 4> value{static_cast<float>(at), 0.0f, 0.0f, 1.0f};
+        std::memcpy(block.Bytes(InputVertexOffset + at * 16u), value.data(), sizeof(value));
+    }
+    AgcDriver::GuestMemory::CollectWritesUncached(block.At(0), BlockBytes);
+    ShaderRecompiler::RecompileResult vertex;
+    vertex.vertexAttributes = {InputAttribute(block.At(InputVertexOffset), 16, InputVertices)};
+    const ShaderRecompiler::RecompileResult fragment{};
+    const std::array<CompiledShader, 2> stages{{{ShaderStage::Vertex, &vertex, 0}, {ShaderStage::Fragment, &fragment, 0}}};
+    Graphics::State state{};
+    state.stages.path = Graphics::ShaderPath::Vertex;
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, 64, 64, -64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.renderExtent = {64, 64};
+    auto recipe = std::make_shared<AgcDriver::DrawRecipe>();
+    recipe->device = context.device;
+    recipe->vertexInput = Graphics::BuildVertexInputLayout(context, vertex.vertexAttributes);
+    recipe->fragmentOutputs = 1;
+    recipe->shaderStages = Graphics::PipelineStages(stages);
+    const AgcDriver::Pm4::DrawParameters indexed{block.At(InputIndexOffset), static_cast<std::uint32_t>(indices.size()), 2, 1, 0, true, 0, 0};
+    const AgcDriver::Pm4::DrawParameters automatic{0, InputVertices, 0, 1, 0, false, 0, 0};
+    const auto prepare = [&](const AgcDriver::Pm4::DrawParameters& draw, PreparedInputs& prepared, const std::string& what) {
+        Require(Graphics::PrepareDrawInputs(context, state, draw, stages, recipe, prepared), "prepared inputs, " + what + ": the draw's inputs were not prepared (" + std::to_string(static_cast<int>(prepared.refusal)) + ")");
+    };
+    const auto verify = [&](const Graphics::State& at, const AgcDriver::Pm4::DrawParameters& draw, PreparedInputs& prepared, DrawRecordInputs wanted, const std::string& what, DrawRecordInputs took = DrawRecordInputs::None) {
+        std::string difference;
+        auto taken = DrawRecordInputs::None;
+        const auto use = Graphics::VerifyPreparedInputsForTest(context, at, draw, stages, *recipe, prepared, difference, &taken);
+        Require(use == wanted, "prepared inputs, " + what + ": the committer answered " + std::to_string(static_cast<int>(use)) + " instead of " + std::to_string(static_cast<int>(wanted)) + (difference.empty() ? std::string() : " (" + difference + ")"));
+        Require(took == DrawRecordInputs::None || taken == took, "prepared inputs, " + what + ": the committer took the inputs as " + std::to_string(static_cast<int>(taken)) + " instead of " + std::to_string(static_cast<int>(took)));
+        return difference;
+    };
+    const bool memoOff = RuntimeSwitches::Set(RuntimeSwitch::NoInputMemo);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoInputMemo, true);
+    struct MemoRestore {
+        bool off;
+        ~MemoRestore() { RuntimeSwitches::Assign(RuntimeSwitch::NoInputMemo, off); }
+    } memoRestore{memoOff};
+    const auto refused = [&](const Graphics::State& at, const AgcDriver::Pm4::DrawParameters& draw, std::shared_ptr<const AgcDriver::DrawRecipe> with, Refusal reason, const std::string& what) {
+        PreparedInputs prepared;
+        Require(!Graphics::PrepareDrawInputs(context, at, draw, stages, std::move(with), prepared) && prepared.refusal == reason, "prepared inputs: " + what + " was prepared, or refused for another reason (" + std::to_string(static_cast<int>(prepared.refusal)) + ")");
+    };
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        if (!context.drawInputsInPlace || Graphics::HostImportFor(context, block.At(0), BlockBytes) == nullptr) {
+            std::cout << "skipped, the device binds no draw input in place from a host import\n";
+            return VulkanTestSkipped;
+        }
+        PreparedInputs prepared;
+        prepare(indexed, prepared, "an indexed draw");
+        Require(prepared.ranges.size() == 2 && prepared.maxIndex == 3 && prepared.inPlaceReads.size() == 2 && prepared.vertexHandles.size() == 1 && prepared.vertexOffsets.size() == 1, "prepared inputs: the indexed draw did not prepare one index range and one vertex range up to vertex 3");
+        Require(prepared.inPlaceReads.front() == std::pair<std::uint64_t, std::uint64_t>{block.At(InputIndexOffset), block.At(InputIndexOffset) + sizeof(indices)}, "prepared inputs: the index range is not the draw's first in-place read");
+        verify(state, indexed, prepared, DrawRecordInputs::Checked, "an indexed in-place draw", DrawRecordInputs::Used);
+        PreparedInputs drawn;
+        prepare(automatic, drawn, "an auto draw");
+        Require(drawn.ranges.size() == 1 && drawn.maxIndex == InputVertices - 1u, "prepared inputs: the auto draw did not prepare one vertex range up to its last vertex");
+        verify(state, automatic, drawn, DrawRecordInputs::Checked, "an auto draw", DrawRecordInputs::Used);
+        PreparedInputs elsewhere;
+        prepare(indexed, elsewhere, "an indexed draw for another state");
+        auto copy = state;
+        verify(copy, indexed, elsewhere, DrawRecordInputs::Shape, "the inputs prepared for another state object");
+        PreparedInputs corrupted;
+        prepare(indexed, corrupted, "an indexed draw to corrupt");
+        ++corrupted.maxIndex;
+        const auto difference = verify(state, indexed, corrupted, DrawRecordInputs::Differs, "a corrupted max index");
+        Require(difference.find("max index") != std::string::npos, "prepared inputs: the verify did not name the max index: " + difference);
+        PreparedInputs offset;
+        prepare(indexed, offset, "an indexed draw to move");
+        offset.vertexOffsets.front() += 16;
+        Require(verify(state, indexed, offset, DrawRecordInputs::Differs, "a moved vertex offset").find("vertex binding 0") != std::string::npos, "prepared inputs: the verify did not name the vertex binding");
+        auto quads = state;
+        quads.quadList = true;
+        refused(quads, automatic, recipe, Refusal::Shape, "a quad list");
+        refused(state, indexed, nullptr, Refusal::NoRecipe, "a draw without a published recipe");
+        auto foreign = std::make_shared<AgcDriver::DrawRecipe>(*recipe);
+        foreign->device = VK_NULL_HANDLE;
+        refused(state, indexed, foreign, Refusal::NoRecipe, "a draw with a recipe of another device");
+        if (!context.primitiveListRestart) {
+            auto restart = state;
+            restart.primitiveRestart = true;
+            refused(restart, indexed, recipe, Refusal::Shape, "an indexed list with primitive restart compacted on the CPU");
+        }
+        alignas(16) static std::array<std::uint16_t, 6> loose{0, 1, 2, 2, 1, 3};
+        const AgcDriver::Pm4::DrawParameters unimported{reinterpret_cast<std::uintptr_t>(loose.data()), static_cast<std::uint32_t>(loose.size()), 2, 1, 0, true, 0, 0};
+        refused(state, unimported, recipe, Refusal::NotInPlace, "an index buffer in memory without a host import");
+        const auto kept = vertex.vertexAttributes;
+        vertex.vertexAttributes = {InputAttribute(block.At(InputVertexOffset), 0, 0)};
+        refused(state, automatic, recipe, Refusal::Shape, "a vertex fetch that reads zeros");
+        vertex.vertexAttributes = kept;
+        PreparedInputs rechecked;
+        prepare(indexed, rechecked, "an indexed draw before another import");
+        GuestBlock other;
+        Require(Graphics::HostImportFor(context, other.At(0), BlockBytes) != nullptr, "prepared inputs: the second block was not imported");
+        Require(Graphics::HostImportSetGeneration() != rechecked.imports, "prepared inputs: a new import did not move the import set generation");
+        verify(state, indexed, rechecked, DrawRecordInputs::Checked, "an indexed draw after another block's import", DrawRecordInputs::Rechecked);
+    }
+    PreparedInputs moved;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        prepare(indexed, moved, "an indexed draw before its block is registered again");
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block.Bytes(0));
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block.Bytes(0), BlockBytes, true, true, true);
+    }
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const auto* import = Graphics::HostImportFor(context, block.At(0), BlockBytes);
+        Require(import != nullptr, "prepared inputs: the block registered again was not imported");
+        Require(Graphics::HostImportSetGeneration() != moved.imports, "prepared inputs: registering the block again did not move the import set generation");
+        const bool reused = import->buffer == moved.ranges.front().handle && Graphics::HostImportOffset(*import, block.At(InputIndexOffset)) == moved.ranges.front().offset;
+        if (reused) std::cout << "the import made after the block was registered again has the old import's buffer handle and offset, so the committer takes the prepared inputs\n";
+        verify(state, indexed, moved, reused ? DrawRecordInputs::Checked : DrawRecordInputs::ImportChanged, "an indexed draw after its block was registered again");
+        recorder.NotePendingWrite(block.At(InputVertexOffset), 16);
+        PreparedInputs behind;
+        prepare(indexed, behind, "an indexed draw behind a pending vertex write");
+        verify(state, indexed, behind, DrawRecordInputs::Checked, "an indexed draw behind a pending vertex write");
+        PreparedInputs stored;
+        prepare(indexed, stored, "an indexed draw under a queued store");
+        const std::array<std::byte, 4> label{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+        recorder.RecordStore(import->buffer, Graphics::HostImportOffset(*import, block.At(InputIndexOffset)), label, block.At(InputIndexOffset));
+        Require(recorder.QueuedStoreOverlaps(block.At(InputIndexOffset), label.size()), "prepared inputs: the label store over the index range was not queued");
+        verify(state, indexed, stored, DrawRecordInputs::Refused, "an indexed draw under a queued store");
+        recorder.Sync();
+    }
+    std::cout << "prepared inputs match today's for an indexed and an auto in-place draw, also after another block's import moved the import set; they are refused for a quad list, a missing or foreign recipe, CPU-compacted restart lists, an index buffer without a host import and a zero-reading vertex fetch; on the committer they give way to today's inputs for another state object, an import replaced by a registry change and a queued store over the index range, and keep the behind-a-write answer of today's check; the verify names a changed max index and vertex offset\n";
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
         if (argc > 1 && std::string_view(argv[1]) == "--direct-buffers") return PreparedBuffersMatch();
+        if (argc > 1 && std::string_view(argv[1]) == "--direct-inputs") return PreparedInputsMatch();
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;

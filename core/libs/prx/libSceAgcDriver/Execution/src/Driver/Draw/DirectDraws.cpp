@@ -258,6 +258,50 @@ void prepareBuffers(const LeanDrawJob& job, const DirectStages& resolved, DrawRe
     DirectDraws::Add(Counter::BuffersBlobBytes, prepared.blob.size());
 }
 
+Counter InputRefusal(Graphics::PreparedInputs::Refusal refusal) {
+    using Refusal = Graphics::PreparedInputs::Refusal;
+    switch (refusal) {
+    case Refusal::NoRecipe: return Counter::InputsNoRecipe;
+    case Refusal::NotInPlace: return Counter::InputsNotInPlace;
+    case Refusal::Inaccessible: return Counter::InputsInaccessible;
+    case Refusal::Thrown: return Counter::InputsThrown;
+    default: return Counter::InputsShape;
+    }
+}
+
+void prepareInputs(const LeanDrawJob& job, const LeanAnchor& anchor, const DirectStages& resolved, DrawRecordHit& hit) {
+    auto recipe = hit.record->commit->inputsRecipe.load(std::memory_order_acquire);
+    if (recipe == nullptr) {
+        DirectDraws::Add(Counter::InputsNoRecipe);
+        return;
+    }
+    auto& prepared = hit.preparedInputs.emplace();
+    const auto pending = Graphics::Recorder::PendingWriteSnapshot();
+    std::optional<DrawPipeline::Watch> queued;
+    if (DrawPipeline::Active()) queued = DrawPipeline::Queue0().WatchWrites();
+    bool done = false;
+    try {
+        done = anchor.device->PrepareDrawInputs(job.shape->decode->state, hit.parameters, hit.stages, std::move(recipe), prepared);
+    } catch (const std::exception&) {
+        prepared.refusal = Graphics::PreparedInputs::Refusal::Thrown;
+    }
+    if (!done) {
+        DirectDraws::Add(InputRefusal(prepared.refusal));
+        hit.preparedInputs.reset();
+        return;
+    }
+    struct ReadStorage {};
+    auto& read = HostThreadLocal<AddressRanges, ReadStorage>();
+    read.clear();
+    if (hit.parameters.indexed) read.emplace_back(prepared.ranges.front().begin, prepared.ranges.front().end);
+    if (!read.empty() && (!RangesSettled(read, resolved.before.get(), resolved.generation) || !Graphics::Recorder::ReadsSettled(read, pending.get()) || (queued.has_value() && DrawPipeline::Queue0().WrittenSince(*queued, read)))) {
+        DirectDraws::Add(Counter::InputsUnsettled);
+        hit.preparedInputs.reset();
+        return;
+    }
+    DirectDraws::Add(Counter::InputsPrepared);
+}
+
 }
 
 std::size_t DirectStageStore::KeyHash::operator()(const std::pair<std::uint64_t, std::uint64_t>& key) const {
@@ -449,7 +493,7 @@ std::uint64_t DirectStores::Follow(std::uint64_t serial) {
     auto live = Graphics::RuntimeSwitches::Snapshot();
     // Switches that change only what the committer does with a hit, or only dispatch packets,
     // leave the stages and classes as they are, so an in-run A/B of one keeps the stores.
-    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs}) live.Assign(id, false);
+    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs}) live.Assign(id, false);
     if (!tagged || deviceSerial != serial || !(live == switches)) {
         tagged = true;
         deviceSerial = serial;
@@ -792,6 +836,10 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
         if ((job.recordFlags & DrawRecordFlags::DirectBuffers) != 0) {
             prepareBuffers(job, resolved, *hit);
             lap(Step::Buffers);
+        }
+        if ((job.recordFlags & DrawRecordFlags::DirectInputs) != 0) {
+            prepareInputs(job, anchor, resolved, *hit);
+            lap(Step::Inputs);
         }
         commitRecordDraw(job, anchor, std::move(hit));
         lap(Step::HandOff);

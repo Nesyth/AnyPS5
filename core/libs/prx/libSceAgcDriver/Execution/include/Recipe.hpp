@@ -123,6 +123,8 @@ enum class DrawRecordHold : std::uint8_t { Held, First, Pass, Epoch, Proof, Pend
 // why it took today's way instead, or how a verify compared them with today's way.
 enum class DrawRecordBuffers : std::uint8_t { None, Used, PlanDiffers, MovedHazard, UnmovedHazard, DepthGuards, Checked, Differs, MemoryChanged, Unwatched, Count };
 
+enum class DrawRecordInputs : std::uint8_t { None, Used, Rechecked, ImportChanged, Shape, Refused, Checked, Differs, Count };
+
 struct DrawRecordEffects {
     bool pushed = false;
     bool unpushed = false;
@@ -137,6 +139,7 @@ struct DrawRecordEffects {
     std::optional<Graphics::ShaderResources::CleanProof> cleanProof;
     DrawRecordBuffers buffers = DrawRecordBuffers::None;
     Graphics::ShaderResources::PreparedDifference bufferDifference;
+    DrawRecordInputs inputs = DrawRecordInputs::None;
 };
 
 struct DrawRecordAccess {
@@ -224,10 +227,14 @@ struct DrawRecordCommit {
     // because the recipe holds its template weakly.
     AtomicSharedPtr<const Graphics::ShaderResources::BufferPlan> bufferPlan;
     bool bufferPlanAsked = false;
+    bool verifyInputs = false;
+    AtomicSharedPtr<const DrawRecipe> inputsRecipe;
+    bool inputsRecipeAsked = false;
 
     void Adopt(std::shared_ptr<const DrawRecipe> built) {
         recipe = std::move(built);
         if (std::exchange(bufferPlanAsked, false)) bufferPlan.store(nullptr);
+        if (std::exchange(inputsRecipeAsked, false)) inputsRecipe.store(nullptr);
         pass = {};
         keep = {};
         ticket = {};
