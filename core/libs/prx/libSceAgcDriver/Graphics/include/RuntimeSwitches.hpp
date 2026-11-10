@@ -87,6 +87,7 @@ enum class RuntimeSwitch : std::size_t {
     CleanCollects,
     DirectBuffers,
     PipelineDispatchMisses,
+    XpCommitFloor,
     NoPlanCleanProofs,
     DeferredEncode,
     Count,

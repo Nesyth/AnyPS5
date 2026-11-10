@@ -7090,6 +7090,7 @@ bool ShaderResources::PreparedMovesClear(const PreparedBuffers& prepared, Record
     }
     // The finisher's accessibility answers hold while no mapping changed since.
     const bool accessible = (prepared.forget & 1u) == 0 && GuestMemory::ForgetSerial() == prepared.forget;
+    if (accessible && RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) return true;
     return movedRangesClear(recorder, ranges, ticket, accessible);
 }
 
@@ -7390,7 +7391,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSn
     prepareFaultSlot();
     bindingsChecked = heapStage && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind);
     for (const auto& item : prepared.selected) {
-        if (item.moved) continue;
+        if (item.moved || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) continue;
         const auto& allocation = allocations[item.allocation];
         if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return {};
     }

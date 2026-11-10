@@ -1537,6 +1537,12 @@ InPlaceInputMemo::Entry inPlaceInputState(const Recorder& recorder, std::uint64_
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
     auto* recorder = context.recorder;
     if (recorder == nullptr || bytes == 0 || !context.drawInputsInPlace) return nullptr;
+    if (RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) {
+        const auto* found = HostImportFor(context, address, bytes);
+        if (found == nullptr || HostImportOffset(*found, address) % alignment != 0) return nullptr;
+        recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
+        return found;
+    }
     const bool memo = !RuntimeSwitches::Set(RuntimeSwitch::NoInputMemo);
     // APS5_VERIFY_INPUT_MEMO: a memo hit runs the checks too, takes their answer and counts the hits
     // that answered otherwise ([input-memo-verify] on stderr).
@@ -5284,6 +5290,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         // A ceiling for the proof work of record draws, not a mode: the template is taken as it is
         // (APS5_XP_PROOF_AS_IS), or with APS5_XP_PROOF_NONE also set, without any check at all.
         static const bool none = std::getenv("APS5_XP_PROOF_NONE") != nullptr;
+        if (RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) return true;
         if (RuntimeSwitches::Set(RuntimeSwitch::XpProofAsIs)) return none || resources->AsIsCurrent();
         if (!record.cleanProofs) return resources->ProveCurrent(shaders, &result.proof);
         ShaderResources::CleanProof clean = ShaderResources::CleanProof::FirstProof;
@@ -5375,7 +5382,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     if (recording) {
         CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
         if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
-        if (const auto present = Recorder::Presents(); record.touchedPresent != present) {
+        if (const auto present = Recorder::Presents(); record.touchedPresent != present && !RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) {
             SharedResourceCache().Touch(recipe.key);
             record.touchedPresent = present;
         }
