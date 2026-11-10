@@ -1586,7 +1586,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         DrawRecords::AddOnCommitter(Counter::CommitFirst);
         if (hit.direct) DirectDraws::Add(DirectDraws::Counter::CommitFirst);
     } else if (!verify) {
-        const auto outcome = localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr);
+        const auto outcome = localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, nullptr, hit.preparedBuffers.has_value() ? &*hit.preparedBuffers : nullptr);
         if (hit.planned) NotePlannedCommit(commit);
         if (hit.direct) NoteDirectCommit(commit, outcome.recorded);
         if (outcome.recorded) {

@@ -2766,6 +2766,7 @@ struct RecordedDraw {
     std::shared_ptr<Framebuffer> pushFramebuffer;
     bool* pushed = nullptr;
     DrawCommitView* view = nullptr;
+    const ShaderResources::PreparedBuffers* prepared = nullptr;
 };
 
 // A remapped viewport depth range reads its scale and offset from the draw's push block (the vertex shader's
@@ -5166,7 +5167,7 @@ bool sharedRecordPassServes(const SharedRecordPass& shared, const State& state, 
 
 }
 
-DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer) {
+DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer, const ShaderResources::PreparedBuffers* prepared) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     auto* recorder = Recorder::Active();
     const bool recording = answer == nullptr;
@@ -5428,6 +5429,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     drawn.pushPipeline = std::move(pushPipeline);
     drawn.pushFramebuffer = std::move(pushFramebuffer);
     drawn.pushed = &record.effects.pushed;
+    drawn.prepared = prepared;
     recordDraw(context, state, draw, shaders, inputs, drawn, outcome, timer, ownWaitedMs, trace);
     record.effects.passHeld = held;
     if (recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {

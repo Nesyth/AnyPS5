@@ -118,7 +118,9 @@ struct DrawRecipeOutcome {
 // miss records nothing.
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace = nullptr);
 void FailRecordChecks(DrawRecipeMiss check, std::uint32_t count);
-DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace = nullptr, DrawCommitView* answer = nullptr);
+// `prepared`: the buffers a finisher prepared for a direct hit (APS5_DIRECT_BUFFERS), bound in place
+// of today's moved-buffer check and snapshot selection while they hold for the draw.
+DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace = nullptr, DrawCommitView* answer = nullptr, const ShaderResources::PreparedBuffers* prepared = nullptr);
 // Whether DrawWithRecord can record a draw at all (APS5_SYNC_DRAWS and APS5_DUMP_TARGETS unset).
 bool DrawsRecordable();
 // Why a full draw asked for a record's recipe built none, counted per reason since the start:
