@@ -36,6 +36,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1023,8 +1024,11 @@ std::string DescribeDirect(const DirectTotals& now, const DirectTotals& base) {
     return text;
 }
 
+// With APS5_DIRECT_BUFFERS set, every set also renders with the switch off first, so the two images
+// of a submission are compared through today's; the commit binds the buffers the finisher prepared.
 void Direct(bool ring) {
     const bool exact = std::getenv("APS5_DIRECT_DRAWS_EXACT_KEY") != nullptr;
+    const bool buffers = RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers);
     std::vector<State> cycled;
     for (std::uint32_t format = 0; format < RawFormats.size(); ++format) cycled.push_back({Kind::Format, format, 16, 3});
     const std::vector<std::pair<std::string, std::vector<State>>> sets{
@@ -1046,6 +1050,11 @@ void Direct(bool ring) {
         for (const auto& state : states) today.push_back(Render(state, DrawsPerSubmission));
         RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, true);
         const auto before = DirectTotals::Now();
+        if (buffers) {
+            RuntimeSwitches::Assign(RuntimeSwitch::DirectBuffers, false);
+            for (std::size_t index = 0; index < states.size(); ++index) Require(Render(states[index], DrawsPerSubmission) == today[index], "direct draws without prepared buffers, " + name + ": submission " + std::to_string(index) + " rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before));
+            RuntimeSwitches::Assign(RuntimeSwitch::DirectBuffers, true);
+        }
         for (std::size_t index = 0; index < states.size(); ++index) Require(Render(states[index], DrawsPerSubmission) == today[index], "direct draws, " + name + ": submission " + std::to_string(index) + " rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before));
         RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
         const auto after = DirectTotals::Now();
@@ -1069,6 +1078,14 @@ void Direct(bool ring) {
     else Require(direct != 0, "direct draws: no draw committed directly" + DescribeDirect(now, base));
     if (DirectReport::VerifyEvery() > 1) Require(verified != 0, "direct draws: the verify checked no class hit" + DescribeDirect(now, base));
     if (DirectReport::VerifyEvery() != 1 && DrawRecords::VerifyEvery() > 1) Require(now.commitChecks > base.commitChecks, "direct draws: the committer verify checked no direct hit" + DescribeDirect(now, base));
+    if (!buffers || DirectReport::VerifyEvery() == 1 || DrawRecords::VerifyEvery() == 1) return;
+    const auto used = now.Since(base, DirectCounter::BuffersUsed);
+    const auto checked = now.Since(base, DirectCounter::BuffersVerifyChecked);
+    std::cout << "direct draws: " << now.Since(base, DirectCounter::BuffersPrepared) << " hits prepared their buffers, " << used << " bound them, " << checked << " were verified\n";
+    Require(now.Since(base, DirectCounter::BuffersVerifyDiffering) == 0, "direct draws: the prepared buffers verify found differences" + DescribeDirect(now, base));
+    if (DirectReport::BufferVerifyEvery() == 1) Require(used == 0 && checked != 0, "direct draws: with every prepared hit due for a verify, a commit bound prepared buffers or none was verified" + DescribeDirect(now, base));
+    else Require(used != 0, "direct draws: no commit bound prepared buffers" + DescribeDirect(now, base));
+    if (DirectReport::BufferVerifyEvery() > 1) Require(checked != 0, "direct draws: the prepared buffers verify checked no hit" + DescribeDirect(now, base));
 }
 
 constexpr std::uint32_t PlannedBufferBytes = 256;
@@ -1188,6 +1205,55 @@ int PreparedBuffersMatch() {
         Require(kinds == std::array<std::size_t, 3>{1, 1, 1}, "prepared buffers: the draw did not select one in-place buffer, one moved data block and one moved guest buffer");
         const auto still = expectSame(vertex, 0, 2, "the template's own stages");
         Require(still == std::array<std::size_t, 3>{2, 0, 0}, "prepared buffers: the template's own draw did not select its two in-place buffers");
+        // The committer's half: the moved-range check leaves the ticket as today's does (the second
+        // round trusts the ranges the first one stamped), the verify finds the two ways equal and a
+        // changed byte or moved size, and the prepared selection binds today's bytes from one slice.
+        const auto expectCommitted = [&](const ShaderRecompiler::RecompileResult& program, std::size_t movedRanges, const std::string& what) {
+            const auto stages = stagesOf(program);
+            ShaderResources::PreparedBuffers prepared;
+            Require(ShaderResources::PrepareDirectBuffers(*plan, stages, &target, prepared), "prepared buffers, " + what + ": the draw's buffers were not prepared");
+            prepared.plan = plan;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> todayRanges;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> preparedRanges;
+            ShaderResources::MoveTicket todayTicket;
+            ShaderResources::MoveTicket preparedTicket;
+            todayTicket.ranges = &todayRanges;
+            preparedTicket.ranges = &preparedRanges;
+            std::optional<std::vector<ShaderResources::MovedBuffer>> today;
+            for (std::size_t round = 0; round < 2; ++round) {
+                todayTicket.checked = todayTicket.trusted = preparedTicket.checked = preparedTicket.trusted = 0;
+                today = resources.MovedReadOnlyBuffers(stages, recorder, &target, nullptr, &todayTicket);
+                Require(today.has_value() && resources.PreparedMovesClear(prepared, recorder, &preparedTicket), "prepared buffers, " + what + ": a moved range was refused");
+                const bool same = todayTicket.valid == preparedTicket.valid && todayTicket.recorder == preparedTicket.recorder && todayTicket.note == preparedTicket.note && todayTicket.pending == preparedTicket.pending && todayTicket.allocations == preparedTicket.allocations && todayTicket.epoch == preparedTicket.epoch && todayTicket.checked == preparedTicket.checked && todayTicket.trusted == preparedTicket.trusted && todayRanges == preparedRanges;
+                Require(same && preparedTicket.checked == movedRanges && preparedTicket.trusted == (round == 0 ? 0 : movedRanges), "prepared buffers, " + what + ": round " + std::to_string(round) + " of the prepared moved-range check left the ticket otherwise than today's check");
+            }
+            Require(ShaderResources::ComparePreparedMoves(prepared, *today).what == nullptr, "prepared buffers, " + what + ": the verify found the moved lists different");
+            std::vector<std::size_t> selected;
+            const auto bindings = resources.PrepareDrawBindings(recorder, *today, false, nullptr, false, &selected);
+            Require(ShaderResources::ComparePreparedSelection(prepared, bindings.get(), selected).what == nullptr, "prepared buffers, " + what + ": the verify found the selections different");
+            auto corrupted = prepared;
+            corrupted.blob[corrupted.selected.back().offset] ^= std::byte{0xff};
+            const auto changed = ShaderResources::ComparePreparedSelection(corrupted, bindings.get(), selected);
+            Require(changed.what != nullptr && std::string_view(changed.what) == "bytes" && !changed.memoryChanged, "prepared buffers, " + what + ": the verify did not find a changed byte");
+            if (!prepared.moved.empty()) {
+                auto resized = prepared;
+                resized.moved.front().size += 4;
+                Require(ShaderResources::ComparePreparedMoves(resized, *today).what != nullptr, "prepared buffers, " + what + ": the verify did not find a moved buffer of another size");
+            }
+            std::vector<std::size_t> taken;
+            bool used = false;
+            const auto bound = resources.PrepareDrawBindings(recorder, prepared.moved, false, nullptr, false, &taken, &prepared, &used);
+            Require(used && bound != nullptr && taken == selected && bound->snapshots.size() == bindings->snapshots.size(), "prepared buffers, " + what + ": the prepared selection was not bound, or bound other allocations");
+            const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 1);
+            for (std::size_t index = 0; index < taken.size(); ++index) {
+                const auto& mine = bound->snapshots[index];
+                const auto& theirs = bindings->snapshots[index];
+                Require(mine.buffer == bound->snapshots.front().buffer && mine.offset % alignment == 0, "prepared buffers, " + what + ": snapshot " + std::to_string(index) + " is not an aligned part of one upload slice");
+                Require(mine.address == theirs.address && mine.bytes == theirs.bytes && std::memcmp(mine.Bytes().data(), theirs.Bytes().data(), mine.bytes) == 0, "prepared buffers, " + what + ": snapshot " + std::to_string(index) + " binds another range or other bytes than today's");
+            }
+        };
+        expectCommitted(drawn, 1, "a moved buffer, an in-place buffer and changed shader data, on the committer");
+        expectCommitted(vertex, 0, "the template's own stages, on the committer");
         auto longer = vertex;
         longer.bindings[1].guestDescriptor.push_back(0u);
         expectRefused(resources, *plan, longer, Refusal::Classification, false, "shader data of another size");
@@ -1208,7 +1274,52 @@ int PreparedBuffersMatch() {
         moving.bindings[0] = PlannedBuffers(block, block.At(MovedBufferOffset), PlannedBufferBytes);
         expectRefused(capped, *plan, moving, Refusal::Budget, false, "a moved buffer over the snapshot budget");
     }
-    std::cout << "prepared buffers match today's moved buffers and snapshot selection for a moved buffer, an in-place buffer and changed shader data, and are refused for shader data of another size, unmapped memory, a range over the upload limit and the snapshot budget\n";
+    // Last, as it leaves pending writes in the open batch: a guest write after the finisher's read is
+    // told apart as memory changed, and pending writes send the committer to today's way.
+    {
+        ShaderResources resources(context, vertex, fragment, target, 0, 0);
+        const auto plan = resources.DirectBufferPlan(stagesOf(vertex));
+        auto drawn = vertex;
+        drawn.bindings[0] = PlannedBuffers(block, block.At(MovedBufferOffset), PlannedBufferBytes);
+        const auto stages = stagesOf(drawn);
+        ShaderResources::PreparedBuffers prepared;
+        Require(plan != nullptr && ShaderResources::PrepareDirectBuffers(*plan, stages, &target, prepared), "prepared buffers, hazards: the draw's buffers were not prepared");
+        prepared.plan = plan;
+        const auto inPlace = std::ranges::find_if(prepared.selected, [](const ShaderResources::PreparedBuffers::Selected& item) { return !item.moved; });
+        Require(inPlace != prepared.selected.end(), "prepared buffers, hazards: no in-place buffer was selected");
+        // A moved buffer in memory no template imports, which the write tracker watches.
+        GuestBlock outside;
+        std::memset(outside.Bytes(0), 0x66, PlannedBufferBytes);
+        auto away = vertex;
+        away.bindings[0] = PlannedBuffers(block, outside.At(0), PlannedBufferBytes);
+        const auto awayStages = stagesOf(away);
+        ShaderResources::PreparedBuffers early;
+        Require(ShaderResources::PrepareDirectBuffers(*plan, awayStages, &target, early), "prepared buffers, hazards: a buffer moved to another block was not prepared");
+        early.plan = plan;
+        const bool watched = AgcDriver::GuestMemory::Watched(outside.At(0), PlannedBufferBytes);
+        std::cout << (watched ? "a guest write after the finisher's read is checked to count as memory changed\n" : "the moved buffer's block is not write-watched, so a guest write after the finisher's read is not checked to count as memory changed\n");
+        if (watched) {
+            early.generation = AgcDriver::GuestMemory::TrackerGeneration();
+            std::memset(outside.Bytes(0), 0x77, PlannedBufferBytes);
+            AgcDriver::GuestMemory::CollectWritesUncached(outside.At(0), BlockBytes);
+            const auto today = resources.MovedReadOnlyBuffers(awayStages, recorder, &target);
+            Require(today.has_value(), "prepared buffers, hazards: today's check refused a buffer moved to another block");
+            std::vector<std::size_t> selected;
+            const auto bindings = resources.PrepareDrawBindings(recorder, *today, false, nullptr, false, &selected);
+            const auto difference = ShaderResources::ComparePreparedSelection(early, bindings.get(), selected);
+            Require(difference.what != nullptr && difference.memoryChanged, "prepared buffers, hazards: a guest write between the finisher's read and today's was not told apart as memory changed (" + std::string(difference.what != nullptr ? difference.what : "no difference") + ")");
+        }
+        recorder.NotePendingWrite(block.At(InPlaceBufferOffset), PlannedBufferBytes);
+        Require(resources.PreparedMovesClear(prepared, recorder, nullptr), "prepared buffers, hazards: a pending write beside the moved range refused it");
+        std::vector<std::size_t> selected;
+        bool used = true;
+        static_cast<void>(resources.PrepareDrawBindings(recorder, prepared.moved, false, nullptr, false, &selected, &prepared, &used));
+        Require(!used && std::ranges::find(selected, inPlace->allocation) == selected.end(), "prepared buffers, hazards: a pending write over the in-place range did not send the selection to today's way, which leaves the range out");
+        recorder.NotePendingWrite(block.At(MovedBufferOffset), PlannedBufferBytes);
+        Require(!resources.PreparedMovesClear(prepared, recorder, nullptr), "prepared buffers, hazards: a pending write over the moved range did not refuse it");
+        recorder.Sync();
+    }
+    std::cout << "prepared buffers match today's moved buffers and snapshot selection for a moved buffer, an in-place buffer and changed shader data, and are refused for shader data of another size, unmapped memory, a range over the upload limit and the snapshot budget; on the committer they leave the ticket as today's check does, bind today's bytes from one aligned upload slice, and give way to today's check and selection under pending writes; the verify tells a changed byte, a resized moved buffer and a guest write after the read apart\n";
     return 0;
 }
 

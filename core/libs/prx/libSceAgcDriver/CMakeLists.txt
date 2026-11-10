@@ -847,6 +847,7 @@ endfunction()
 
 set(agcDirectDrawsDifference "\\[direct-draws-verify\\] [-a-z ]+ differs:")
 set(agcDirectDrawsBuildDifference "\\[direct-draws-build\\] ")
+set(agcDirectBuffersDifference "\\[direct-buffers-verify\\] [-a-z ]+ differs:")
 
 function(agc_add_direct_draws_test agcTestName)
     set(agcPipelineEnvironment ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1)
