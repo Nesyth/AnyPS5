@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDraws.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/LeanDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StagePlanReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -1532,6 +1533,14 @@ void NotePlannedCommit(const DrawRecordCommit& commit) {
     if (effects.movedTrusted != 0) StagePlans::AddOnCommitter(Counter::MovedTrusted, effects.movedTrusted);
 }
 
+void NoteDirectCommit(const DrawRecordCommit& commit, bool recorded) {
+    using DirectDraws::Counter;
+    DirectDraws::Add(recorded ? Counter::CommitHits : Counter::CommitMisses);
+    const auto& effects = commit.effects;
+    if (effects.cleanProof.has_value()) DirectDraws::Add(*effects.cleanProof == Graphics::ShaderResources::CleanProof::Skipped ? Counter::ProofsSkipped : Counter::ProofsNotSkipped);
+    else if (effects.proved) DirectDraws::Add(Counter::ProofsFull);
+}
+
 bool SameVertexInput(const Graphics::VertexInputLayout& a, const Graphics::VertexInputLayout& b) {
     const auto sameBinding = [](const VkVertexInputBindingDescription& x, const VkVertexInputBindingDescription& y) { return x.binding == y.binding && x.stride == y.stride && x.inputRate == y.inputRate; };
     const auto sameAttribute = [](const VkVertexInputAttributeDescription& x, const VkVertexInputAttributeDescription& y) { return x.location == y.location && x.binding == y.binding && x.format == y.format && x.offset == y.offset; };
@@ -1560,15 +1569,17 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     recordLabelsForPacket(localDevice.get(), queue);
     noteDrawWriters(hit.stages, queue);
     auto& commit = *hit.record->commit;
-    commit.cleanProofs = hit.planned && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoPlanCleanProofs);
+    commit.cleanProofs = hit.direct ? Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectCleanProofs) : hit.planned && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoPlanCleanProofs);
     static std::uint64_t ordinal = 0;
     const auto every = DrawRecords::VerifyEvery();
     const bool verify = commit.recipe != nullptr && every != 0 && ++ordinal % every == 0;
     if (commit.recipe == nullptr) {
         DrawRecords::AddOnCommitter(Counter::CommitFirst);
+        if (hit.direct) DirectDraws::Add(DirectDraws::Counter::CommitFirst);
     } else if (!verify) {
         const auto outcome = localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr);
         if (hit.planned) NotePlannedCommit(commit);
+        if (hit.direct) NoteDirectCommit(commit, outcome.recorded);
         if (outcome.recorded) {
             if (hit.planned || hit.direct) ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
             const auto& effects = commit.effects;
@@ -1610,6 +1621,9 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     if (differs) {
         commit.Adopt(nullptr);
         DrawRecords::AddOnCommitter(Counter::CommitDemoted);
+        // One recipe serves every draw of a direct class, so a class whose commit differed once
+        // goes back to today's path for good.
+        if (hit.direct) RefuseDirectClass(hit.owner);
         return;
     }
     if (built != nullptr && (!verify || !answer.filled || answer.resources != today.resources)) {

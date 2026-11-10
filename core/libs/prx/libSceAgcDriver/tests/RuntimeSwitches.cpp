@@ -62,6 +62,7 @@ void registry() {
     Require(!RuntimeSwitches::Set(RuntimeSwitch::StagePlans) && !RuntimeSwitches::Set(RuntimeSwitch::NoPlanCleanProofs), "a stage plan switch the environment does not set started set");
     Require(RuntimeSwitches::Find("APS5_DIRECT_DRAWS") == RuntimeSwitch::DirectDraws, "APS5_DIRECT_DRAWS is not a runtime switch");
     Require(!RuntimeSwitches::Set(RuntimeSwitch::DirectDraws), "APS5_DIRECT_DRAWS started set without the environment setting it");
+    Require(RuntimeSwitches::Find("APS5_DIRECT_CLEAN_PROOFS") == RuntimeSwitch::DirectCleanProofs && !RuntimeSwitches::Set(RuntimeSwitch::DirectCleanProofs), "APS5_DIRECT_CLEAN_PROOFS is not a runtime switch that starts unset");
 }
 
 void snapshot() {

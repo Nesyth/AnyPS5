@@ -121,6 +121,15 @@ void FailRecordChecks(DrawRecipeMiss check, std::uint32_t count);
 DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace = nullptr, DrawCommitView* answer = nullptr);
 // Whether DrawWithRecord can record a draw at all (APS5_SYNC_DRAWS and APS5_DUMP_TARGETS unset).
 bool DrawsRecordable();
+// Why a full draw asked for a record's recipe built none, counted per reason since the start:
+// the request was dropped early (stencil replay, quad list, strip patches, heap stages without
+// data recipes, proxied targets), the resources are not cacheable, the draw waited, it is
+// indirect, the template is not reusable or reuses its space, a target is multisampled, the
+// pipeline reorders samples, or the draw left the recorded path.
+enum class RecipeRefusal : std::uint8_t { Dropped, NotCacheable, Waited, Indirect, NotReusable, SpaceReuse, Multisampled, ReordersSamples, NotRecorded, Count };
+inline constexpr std::array<const char*, static_cast<std::size_t>(RecipeRefusal::Count)> RecipeRefusalNames{"dropped early", "not cacheable", "waited", "indirect", "template not reusable", "space reuse", "multisampled", "reorders samples", "not recorded"};
+void NoteRecipeRefusal(RecipeRefusal reason);
+std::array<std::uint64_t, static_cast<std::size_t>(RecipeRefusal::Count)> RecipeRefusals();
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
 

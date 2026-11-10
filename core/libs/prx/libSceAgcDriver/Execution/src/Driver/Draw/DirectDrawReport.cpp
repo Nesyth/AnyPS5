@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -32,6 +33,7 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "draws", "direct",
     "shape", "heap", "invocation", "sample retry", "walk", "torn reads", "tables", "poisoned", "no patch", "addressed", "side", "push constants", "unsettled", "views not current", "memory changed", "labels", "parameter overflow", "class new", "class refused", "verify",
     "classes built", "not queued", "writes differ", "verify differs", "build differs", "classes evicted", "stages built", "stages evicted", "invocations rebuilt", "verify checked", "verify differing",
+    "commit hits", "first commits", "commit misses", "commits demoted", "proofs skipped", "proofs not skipped", "full proofs",
 };
 
 constexpr std::array<const char*, StepCount> StepNames{"request", "invocation", "walk", "key", "side", "class", "checks", "hand-off"};
@@ -235,6 +237,25 @@ void Report(bool force) {
         static_cast<unsigned long long>(stagesKnown.load(std::memory_order_relaxed)), static_cast<unsigned long long>(at(Counter::StagesBuilt)),
         static_cast<unsigned long long>(at(Counter::InvocationsRebuilt)), static_cast<unsigned long long>(at(Counter::VerifyChecked)), static_cast<unsigned long long>(at(Counter::VerifyDiffering)),
         perDraw(Step::Request), perDraw(Step::Invocation), perDraw(Step::Walk), perDraw(Step::Key), perDraw(Step::Side), perDraw(Step::Class), perDraw(Step::Checks), perDraw(Step::HandOff));
+    const auto commits = at(Counter::CommitHits) + at(Counter::CommitFirst) + at(Counter::CommitMisses);
+    if (commits == 0) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] %llu commits: %llu from the record (%.1f%%), %llu first commits, %llu misses, %llu demoted; template proofs: %llu skipped clean, %llu not skipped, %llu in full; stages evicted %llu\n",
+        static_cast<unsigned long long>(commits), static_cast<unsigned long long>(at(Counter::CommitHits)), 100.0 * static_cast<double>(at(Counter::CommitHits)) / static_cast<double>(commits),
+        static_cast<unsigned long long>(at(Counter::CommitFirst)), static_cast<unsigned long long>(at(Counter::CommitMisses)), static_cast<unsigned long long>(at(Counter::CommitDemoted)),
+        static_cast<unsigned long long>(at(Counter::ProofsSkipped)), static_cast<unsigned long long>(at(Counter::ProofsNotSkipped)), static_cast<unsigned long long>(at(Counter::ProofsFull)),
+        static_cast<unsigned long long>(at(Counter::StagesEvicted)));
+    static std::array<std::uint64_t, static_cast<std::size_t>(Graphics::RecipeRefusal::Count)> refusalsReported{};
+    const auto refusals = Graphics::RecipeRefusals();
+    std::string unbuilt;
+    for (std::size_t index = 0; index < refusals.size(); ++index) {
+        if (refusals[index] == refusalsReported[index]) continue;
+        unbuilt += unbuilt.empty() ? "" : ", ";
+        unbuilt += Graphics::RecipeRefusalNames[index];
+        unbuilt += ' ';
+        unbuilt += std::to_string(refusals[index] - refusalsReported[index]);
+    }
+    refusalsReported = refusals;
+    if (!unbuilt.empty()) AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] full draws that built no recipe: %s\n", unbuilt.c_str());
 }
 
 const char* CounterName(Counter counter) {

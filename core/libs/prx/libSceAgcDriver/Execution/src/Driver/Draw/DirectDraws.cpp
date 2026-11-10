@@ -207,18 +207,24 @@ std::shared_ptr<const DirectStage> DirectStageStore::Find(std::uint64_t variant,
 
 std::shared_ptr<const DirectStage> DirectStageStore::Install(std::shared_ptr<const DirectStage> stage, std::uint64_t tag, bool& installed) {
     installed = false;
-    std::lock_guard lock(mutex);
-    if (!DirectStores::Get().Current(tag)) return stage;
-    const std::pair key{stage->variant, stage->key};
-    if (const auto found = stages.find(key); found != stages.end()) return found->second;
-    if (stages.size() >= Bound) {
-        DirectDraws::Add(Counter::StagesEvicted, stages.size());
-        stages.clear();
-        clears.fetch_add(1, std::memory_order_release);
+    bool overflowed = false;
+    {
+        std::lock_guard lock(mutex);
+        if (!DirectStores::Get().Current(tag)) return stage;
+        const std::pair key{stage->variant, stage->key};
+        if (const auto found = stages.find(key); found != stages.end()) return found->second;
+        if (stages.size() >= Bound) {
+            DirectDraws::Add(Counter::StagesEvicted, stages.size());
+            stages.clear();
+            clears.fetch_add(1, std::memory_order_release);
+            overflowed = true;
+        }
+        stages.emplace(key, stage);
+        installed = true;
+        DirectDraws::NoteStages(stages.size());
     }
-    stages.emplace(key, stage);
-    installed = true;
-    DirectDraws::NoteStages(stages.size());
+    // A class key names its stages by pointer, so no class can hit once its stages are gone.
+    if (overflowed) DirectStores::Get().classes.Evict();
     return stage;
 }
 
@@ -319,6 +325,16 @@ bool DirectClassStore::Refuse(const DirectClass& found, Counter reason) {
     return true;
 }
 
+void DirectClassStore::Evict() {
+    std::lock_guard lock(mutex);
+    DirectDraws::Add(Counter::ClassesEvicted, kept);
+    classes.clear();
+    kept = 0;
+    bytes = 0;
+    clears.fetch_add(1, std::memory_order_release);
+    note();
+}
+
 void DirectClassStore::Clear() {
     std::lock_guard lock(mutex);
     classes.clear();
@@ -335,6 +351,13 @@ std::size_t DirectClassStore::Size() const {
 
 void DirectClassStore::note() const {
     DirectDraws::NoteClasses(kept, bytes);
+}
+
+void RefuseDirectClass(const std::shared_ptr<const void>& owner) {
+    if (owner == nullptr) return;
+    const auto& found = *static_cast<const DirectClass*>(owner.get());
+    DirectDraws::Add(Counter::CommitDemoted);
+    if (DirectStores::Get().classes.Refuse(found, Counter::RefusedVerify)) DirectDraws::Add(Counter::RefusedVerify);
 }
 
 DirectStores& DirectStores::Get() {
@@ -355,7 +378,9 @@ std::uint64_t DirectStores::Follow(std::uint64_t serial) {
     if (seen.epoch == current && seen.generation == generation && seen.deviceSerial == serial) return current;
     std::lock_guard lock(mutex);
     auto live = Graphics::RuntimeSwitches::Snapshot();
-    live.Assign(Graphics::RuntimeSwitch::DirectDraws, false);
+    // Switches that change only what the committer does with a hit, or only dispatch packets,
+    // leave the stages and classes as they are, so an in-run A/B of one keeps the stores.
+    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::PipelineDispatch}) live.Assign(id, false);
     if (!tagged || deviceSerial != serial || !(live == switches)) {
         tagged = true;
         deviceSerial = serial;

@@ -45,6 +45,13 @@ enum class Counter : std::uint8_t {
     InvocationsRebuilt,
     VerifyChecked,
     VerifyDiffering,
+    CommitHits,
+    CommitFirst,
+    CommitMisses,
+    CommitDemoted,
+    ProofsSkipped,
+    ProofsNotSkipped,
+    ProofsFull,
     Count,
 };
 

@@ -42,7 +42,7 @@ public:
     std::shared_ptr<const DirectStage> Find(std::uint64_t variant, std::uint64_t key) const;
     // The stage kept for the key: the first install wins, and a stage built under a tag the
     // stores no longer carry is handed back without being kept. A full store is cleared first,
-    // its stages counted as evicted.
+    // its stages counted as evicted, and the class store is emptied with it.
     std::shared_ptr<const DirectStage> Install(std::shared_ptr<const DirectStage> stage, std::uint64_t tag, bool& installed);
     void Clear();
     std::size_t Size() const;
@@ -111,6 +111,9 @@ public:
     std::shared_ptr<const DirectClass> Install(std::shared_ptr<const DirectClass> entry, std::uint64_t tag, bool& installed);
     // Replaces `found`, while the store still holds it, by a refused entry of its key.
     bool Refuse(const DirectClass& found, DirectDraws::Counter reason);
+    // Drops every class and counts the kept ones as evicted: the stage store does this when it
+    // overflows, because the classes name stages it no longer holds.
+    void Evict();
     void Clear();
     std::size_t Size() const;
 
@@ -127,6 +130,10 @@ private:
     std::size_t bytes = 0;
     std::atomic<std::uint64_t> clears{1};
 };
+
+// Refuses the class a direct hit names as its owner, from the committer, after the commit of its
+// record differed from today's draw under APS5_VERIFY_DRAW_RECORDS.
+void RefuseDirectClass(const std::shared_ptr<const void>& owner);
 
 // The stores of direct draws, tagged with the device serial and the switch copy without
 // APS5_DIRECT_DRAWS: a change of the tag clears every store, a flip of APS5_DIRECT_DRAWS alone
