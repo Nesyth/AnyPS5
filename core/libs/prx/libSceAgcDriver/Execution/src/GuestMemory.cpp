@@ -120,6 +120,41 @@ void raiseForgetSlot(std::atomic<std::uint64_t>& slot, std::uint64_t serial) {
 }
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
+
+// APS5_CLEAN_COLLECTS: a collect of a range that lies inside the arena's remembered clean ranges
+// (armed and unwritten since, GuestArenaAllClean) answers without a walk: a write would have
+// faulted and dropped the range from the clean set, so the walk could find nothing.
+// APS5_VERIFY_CLEAN_COLLECTS walks such ranges anyway and reports a walk that stamped a page.
+struct CleanCollectCounters {
+    std::atomic<std::uint64_t> answered{0};
+    std::atomic<std::uint64_t> walked{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> written{0};
+    std::atomic<std::int64_t> reportedAt{0};
+};
+
+CleanCollectCounters& cleanCollectCounters() {
+    static CleanCollectCounters counters;
+    return counters;
+}
+
+bool CleanCollects() {
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::CleanCollects);
+}
+
+bool VerifyCleanCollects() {
+    static const bool on = std::getenv("APS5_VERIFY_CLEAN_COLLECTS") != nullptr;
+    return on;
+}
+
+void reportCleanCollects() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!stats) return;
+    auto& counters = cleanCollectCounters();
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (counters.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    std::fprintf(stderr, "[clean-collects] 10 s: %llu collects answered from clean ranges, %llu walked; verify so far: %llu clean ranges walked, %llu with a page stamped by the walk\n", static_cast<unsigned long long>(counters.answered.exchange(0)), static_cast<unsigned long long>(counters.walked.exchange(0)), static_cast<unsigned long long>(counters.verified.load()), static_cast<unsigned long long>(counters.written.load()));
+}
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 std::atomic<std::uint64_t> ownWriteSerial{0};
@@ -1890,8 +1925,26 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
         }
     }
+#ifdef _WIN32
+    bool cleanCandidate = false;
+    if (useMemo && CleanCollects()) {
+        const std::uint64_t pair[2] = {first, stop};
+        cleanCandidate = GuestArena::GuestArenaAllClean_nid_no_patch(pair, 1);
+        reportCleanCollects();
+        if (cleanCandidate && !VerifyCleanCollects()) {
+            cleanCollectCounters().answered.fetch_add(1, std::memory_order_relaxed);
+            return tracker.stable.load(std::memory_order_acquire);
+        }
+        if (!cleanCandidate) cleanCollectCounters().walked.fetch_add(1, std::memory_order_relaxed);
+    }
+#else
+    constexpr bool cleanCandidate = false;
+#endif
     const auto lock = lockTracker(tracker);
     tracker.initialize();
+    const auto newestBeforeWalk = cleanCandidate ? tracker.newestStamp(first, stop) : std::uint64_t{0};
+    const auto cleanFirst = first;
+    const auto cleanStop = stop;
 #ifdef _WIN32
     const bool sortedRegions = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SortedHostRegions);
 #else
@@ -1927,6 +1980,13 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 #else
         return 0;
 #endif
+    }
+    if (cleanCandidate) {
+        auto& counters = cleanCollectCounters();
+        counters.verified.fetch_add(1, std::memory_order_relaxed);
+        if (tracker.newestStamp(cleanFirst, cleanStop) > newestBeforeWalk) {
+            if (counters.written.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[clean-collects] verify: the walk of a clean range stamped a page (0x%llx+%llu)\n", static_cast<unsigned long long>(cleanFirst), static_cast<unsigned long long>(cleanStop - cleanFirst));
+        }
     }
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {

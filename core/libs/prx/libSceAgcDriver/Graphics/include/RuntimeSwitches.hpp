@@ -84,6 +84,7 @@ enum class RuntimeSwitch : std::size_t {
     DirectDraws,
     DirectCleanProofs,
     DirectPassTargets,
+    CleanCollects,
     NoPlanCleanProofs,
     DeferredEncode,
     Count,
