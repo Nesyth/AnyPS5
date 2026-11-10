@@ -19,6 +19,7 @@
 #include <limits>
 #include <span>
 #include <array>
+#include <atomic>
 #include <sstream>
 #include <string_view>
 
@@ -247,6 +248,21 @@ bool ditheredAlphaSamplesSupported(const Registers& cx) {
     const auto config = find(cx, 0x2f8);
     const auto eqaa = find(cx, 0x201);
     return config != cx.end() && (config->second & 0x700007u) == 0x300003u && eqaa != cx.end() && (eqaa->second & 0x207777u) == 0x3303u;
+}
+
+// A dithered alpha-to-coverage state (DB_ALPHA_TO_MASK 0x18701) with a sample configuration that has no mask
+// table here. The first of them print their sample words, which the failure message does not carry. Returns
+// whether APS5_PLAIN_ALPHA_FALLBACK draws such a state with plain alpha-to-coverage instead of refusing it:
+// coverage then switches at half alpha in every pixel instead of following the dither pattern.
+bool plainAlphaFallback(const Registers& cx) {
+    static const bool fallback = std::getenv("APS5_PLAIN_ALPHA_FALLBACK") != nullptr;
+    static std::atomic<int> reports{0};
+    if (reports.load(std::memory_order_relaxed) < 8 && reports.fetch_add(1, std::memory_order_relaxed) < 8) {
+        const auto config = find(cx, 0x2f8);
+        const auto eqaa = find(cx, 0x201);
+        std::fprintf(stderr, "[alpha-to-coverage] dithered alpha-to-coverage has no mask table for PA_SC_AA_CONFIG 0x%08x (%s) and DB_EQAA 0x%08x (%s); %s\n", config != cx.end() ? config->second : 0u, config != cx.end() ? "set" : "unset", eqaa != cx.end() ? eqaa->second : 0u, eqaa != cx.end() ? "set" : "unset", fallback ? "drawn with plain alpha-to-coverage (APS5_PLAIN_ALPHA_FALLBACK)" : "refused");
+    }
+    return fallback;
 }
 
 bool twoSampleDitheredAlphaSamplesSupported(const Registers& cx) {
@@ -1588,6 +1604,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     result.alphaToCoverage = alpha == AlphaToCoverageUndithered || (!alphaDisabled && ditheredAlphaToCoverageWord(alpha));
     result.ditheredAlphaToCoverage = result.alphaToCoverage && ditheredAlphaToCoverageWord(alpha);
     if (!result.alphaToCoverage) zero(cx, 0x2dc, alphaDisabled ? AlphaToCoverageMask & ~1u : AlphaToCoverageMask, "dithered or rounded alpha-to-coverage");
+    if (result.ditheredAlphaToCoverage && alpha == AlphaToCoverageDithered && !ditheredAlphaSamplesSupported(cx) && plainAlphaFallback(cx)) result.ditheredAlphaToCoverage = false;
     if (result.ditheredAlphaToCoverage && alpha == AlphaToCoverageDithered) {
         Require(ditheredAlphaSamplesSupported(cx), "dithered alpha-to-coverage requires eight matched raster/DB_EQAA samples and one pixel iteration");
         Require(!result.customSampleLocations, "dithered alpha-to-coverage with custom sample locations is unsupported");
@@ -2549,9 +2566,10 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
         if ((word != AlphaToCoverageUndithered && !ditheredAlphaToCoverageWord(word)) || alphaDisabled) {
             if (auto reason = nonzero(cx, 0x2dc, alphaDisabled ? AlphaToCoverageMask & ~1u : AlphaToCoverageMask, "dithered or rounded alpha-to-coverage"); !reason.empty()) return reason;
         }
-        if (!alphaDisabled && word == AlphaToCoverageDithered && !ditheredAlphaSamplesSupported(cx)) return "AGC graphics: dithered alpha-to-coverage requires eight matched raster/DB_EQAA samples and one pixel iteration";
+        const bool plainFallback = !alphaDisabled && word == AlphaToCoverageDithered && !ditheredAlphaSamplesSupported(cx) && plainAlphaFallback(cx);
+        if (!alphaDisabled && word == AlphaToCoverageDithered && !ditheredAlphaSamplesSupported(cx) && !plainFallback) return "AGC graphics: dithered alpha-to-coverage requires eight matched raster/DB_EQAA samples and one pixel iteration";
         if (!alphaDisabled && word == AlphaToCoverageTwoSampleDithered && !twoSampleDitheredAlphaSamplesSupported(cx)) return "AGC graphics: DB_ALPHA_TO_MASK 0xe701 requires two matched raster/DB_EQAA samples and one pixel iteration";
-        if (!alphaDisabled && ditheredAlphaToCoverageWord(word)) {
+        if (!alphaDisabled && ditheredAlphaToCoverageWord(word) && !plainFallback) {
             if (word == AlphaToCoverageDithered && !ditheredAlphaLocationsSupported(cx)) return "AGC graphics: dithered alpha-to-coverage with custom sample locations is unsupported";
             if (word == AlphaToCoverageTwoSampleDithered && !twoSampleDitheredAlphaLocationsSupported(cx)) return "AGC graphics: DB_ALPHA_TO_MASK 0xe701 is supported only with the two-sample locations (4,4),(-4,-4) or (-4,4),(4,-4) in every pixel";
             std::uint32_t format = 0;
