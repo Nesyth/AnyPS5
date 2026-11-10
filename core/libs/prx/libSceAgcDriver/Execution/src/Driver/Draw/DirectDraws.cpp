@@ -200,7 +200,10 @@ Counter BufferRefusal(Graphics::ShaderResources::PreparedBuffers::Refusal refusa
 }
 
 // The hit's buffers from its record's buffer plan, taken against the colour target the commit
-// will draw with (commitRecordDraw hands the committer the job's decode state).
+// will draw with (commitRecordDraw hands the committer the job's decode state). The guest bytes
+// are read here, ahead of the commit, so they follow the walk's settled rule: a write queued or
+// pending before this draw may land before the commit, and once it retired no committer test
+// sees it.
 void prepareBuffers(const LeanDrawJob& job, const DirectStages& resolved, DrawRecordHit& hit) {
     auto plan = hit.record->commit->bufferPlan.load(std::memory_order_acquire);
     if (plan == nullptr) {
@@ -217,6 +220,17 @@ void prepareBuffers(const LeanDrawJob& job, const DirectStages& resolved, DrawRe
     }
     if (!done) {
         DirectDraws::Add(BufferRefusal(prepared.refusal));
+        hit.preparedBuffers.reset();
+        return;
+    }
+    struct ReadStorage {};
+    auto& read = HostThreadLocal<AddressRanges, ReadStorage>();
+    read.clear();
+    for (const auto& item : prepared.selected) {
+        if (item.begin != 0) read.emplace_back(item.begin, item.begin + item.bytes);
+    }
+    if (!read.empty() && !RangesSettled(read, resolved.before.get(), resolved.generation)) {
+        DirectDraws::Add(Counter::BuffersUnsettled);
         hit.preparedBuffers.reset();
         return;
     }
