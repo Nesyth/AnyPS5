@@ -1577,6 +1577,35 @@ void NoteDirectBuffers(const DrawRecordCommit& commit, bool prepared) {
     }
 }
 
+void NoteDirectInputs(const DrawRecordCommit& commit, bool prepared) {
+    using DirectDraws::Counter;
+    switch (commit.effects.inputs) {
+    case DrawRecordInputs::None:
+        if (prepared) DirectDraws::Add(Counter::InputsDropped);
+        break;
+    case DrawRecordInputs::Used: DirectDraws::Add(Counter::InputsUsed); break;
+    case DrawRecordInputs::Rechecked:
+        DirectDraws::Add(Counter::InputsUsed);
+        DirectDraws::Add(Counter::InputsRechecked);
+        break;
+    case DrawRecordInputs::ImportChanged: DirectDraws::Add(Counter::InputsImportChanged); break;
+    case DrawRecordInputs::Shape: DirectDraws::Add(Counter::InputsCommitShape); break;
+    case DrawRecordInputs::Refused: DirectDraws::Add(Counter::InputsRefused); break;
+    case DrawRecordInputs::Checked: DirectDraws::Add(Counter::InputsVerifyChecked); break;
+    case DrawRecordInputs::Differs:
+        DirectDraws::Add(Counter::InputsVerifyChecked);
+        DirectDraws::Add(Counter::InputsVerifyDiffering);
+        break;
+    default: break;
+    }
+}
+
+void PublishInputsRecipe(DrawRecordCommit& commit) {
+    if (commit.inputsRecipeAsked || commit.recipe == nullptr || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectInputs)) return;
+    commit.inputsRecipeAsked = true;
+    commit.inputsRecipe.store(commit.recipe);
+}
+
 void PublishBufferPlan(DrawRecordCommit& commit, std::span<const Graphics::CompiledShader> stages) {
     if (commit.bufferPlanAsked || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectBuffers)) return;
     commit.bufferPlanAsked = true;
@@ -1623,16 +1652,24 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         static std::uint64_t bufferOrdinal = 0;
         const auto bufferEvery = DirectDraws::BufferVerifyEvery();
         commit.verifyBuffers = prepared != nullptr && bufferEvery != 0 && ++bufferOrdinal % bufferEvery == 0;
+        auto* inputs = hit.preparedInputs.has_value() ? &*hit.preparedInputs : nullptr;
+        static std::uint64_t inputOrdinal = 0;
+        const auto inputEvery = DirectDraws::InputVerifyEvery();
+        commit.verifyInputs = inputs != nullptr && inputEvery != 0 && ++inputOrdinal % inputEvery == 0;
         // DrawFromRecord can return before DrawWithRecord resets them.
         commit.effects = {};
-        const auto outcome = localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, nullptr, prepared);
+        const auto outcome = localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, nullptr, prepared, inputs);
         if (hit.planned) NotePlannedCommit(commit);
         if (hit.direct) {
             NoteDirectCommit(commit, outcome.recorded);
             NoteDirectBuffers(commit, prepared != nullptr);
+            NoteDirectInputs(commit, inputs != nullptr);
         }
         if (outcome.recorded) {
-            if (hit.direct) PublishBufferPlan(commit, hit.stages);
+            if (hit.direct) {
+                PublishBufferPlan(commit, hit.stages);
+                PublishInputsRecipe(commit);
+            }
             if (hit.planned || hit.direct) ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
             const auto& effects = commit.effects;
             DrawRecords::AddOnCommitter(Counter::CommitHits);
@@ -1647,6 +1684,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         DrawRecords::AddOnCommitter(CommitMiss(outcome.miss));
     }
     if ((commit.recipe == nullptr || verify) && hit.preparedBuffers.has_value()) DirectDraws::Add(DirectDraws::Counter::BuffersDropped);
+    if ((commit.recipe == nullptr || verify) && hit.preparedInputs.has_value()) DirectDraws::Add(DirectDraws::Counter::InputsDropped);
     if (hit.planned || hit.direct) ThreadReport::MarkItem(ThreadReport::ItemMark::PlanFallback);
     DrawCommitView answer;
     if (verify) static_cast<void>(localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, &answer));

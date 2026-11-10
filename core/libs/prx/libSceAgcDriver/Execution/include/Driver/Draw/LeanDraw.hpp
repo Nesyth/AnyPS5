@@ -63,7 +63,7 @@ struct LeanDrawJob {
     const DrawRecordSet* records;
     const StagePlanSet* plans;
     std::uint64_t recordGeneration;
-    std::uint8_t recordFlags;
+    std::uint16_t recordFlags;
     Pm4::DrawParameters parameters;
     DrawUserWords words;
 };
