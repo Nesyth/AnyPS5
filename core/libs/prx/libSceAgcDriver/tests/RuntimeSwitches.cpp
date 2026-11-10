@@ -63,6 +63,7 @@ void registry() {
     Require(RuntimeSwitches::Find("APS5_DIRECT_DRAWS") == RuntimeSwitch::DirectDraws, "APS5_DIRECT_DRAWS is not a runtime switch");
     Require(!RuntimeSwitches::Set(RuntimeSwitch::DirectDraws), "APS5_DIRECT_DRAWS started set without the environment setting it");
     Require(RuntimeSwitches::Find("APS5_DIRECT_CLEAN_PROOFS") == RuntimeSwitch::DirectCleanProofs && !RuntimeSwitches::Set(RuntimeSwitch::DirectCleanProofs), "APS5_DIRECT_CLEAN_PROOFS is not a runtime switch that starts unset");
+    Require(RuntimeSwitches::Find("APS5_DIRECT_PASS_TARGETS") == RuntimeSwitch::DirectPassTargets && !RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets), "APS5_DIRECT_PASS_TARGETS is not a runtime switch that starts unset");
 }
 
 void snapshot() {

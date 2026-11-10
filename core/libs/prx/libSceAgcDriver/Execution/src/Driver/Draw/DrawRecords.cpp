@@ -1539,6 +1539,9 @@ void NoteDirectCommit(const DrawRecordCommit& commit, bool recorded) {
     const auto& effects = commit.effects;
     if (effects.cleanProof.has_value()) DirectDraws::Add(*effects.cleanProof == Graphics::ShaderResources::CleanProof::Skipped ? Counter::ProofsSkipped : Counter::ProofsNotSkipped);
     else if (effects.proved) DirectDraws::Add(Counter::ProofsFull);
+    if (effects.sharedHold) DirectDraws::Add(Counter::HoldShared);
+    else if (effects.hold == DrawRecordHold::Held) DirectDraws::Add(Counter::HoldOwn);
+    else if (effects.hold != DrawRecordHold::Count) DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::HoldFirst) + static_cast<std::size_t>(effects.hold) - static_cast<std::size_t>(DrawRecordHold::First)));
 }
 
 bool SameVertexInput(const Graphics::VertexInputLayout& a, const Graphics::VertexInputLayout& b) {
