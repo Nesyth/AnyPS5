@@ -52,6 +52,15 @@ enum class Counter : std::uint8_t {
     ProofsSkipped,
     ProofsNotSkipped,
     ProofsFull,
+    HoldOwn,
+    HoldShared,
+    HoldFirst,
+    HoldPass,
+    HoldEpoch,
+    HoldProof,
+    HoldPending,
+    HoldDepth,
+    HoldTarget,
     Count,
 };
 

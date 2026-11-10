@@ -5131,6 +5131,41 @@ bool DrawsRecordable() {
     return RecordDraws() && DumpTargetLimit() == 0;
 }
 
+namespace {
+
+// The targets the last record draw left refreshed in the open render pass, kept for every record
+// (APS5_DIRECT_PASS_TARGETS): a record that draws to the same targets under the same serials
+// holds them as a record does that drew in the pass itself (DrawRecordPass). What a refresh
+// depends on beside the serials is the key: the colour and depth targets as the attachment memo
+// of today's draws compares them, the depth and stencil write intent, and the views.
+struct SharedRecordPass {
+    DrawRecordPass pass;
+    std::vector<ColorTarget> colors;
+    std::optional<DepthTarget> depth;
+    bool depthWrite = false;
+    bool stencilTest = false;
+    bool stencilWritten = false;
+    bool depthCopySource = false;
+    std::vector<VkImageView> views;
+    std::vector<const StorageTexture*> targets;
+};
+
+struct SharedRecordPassStorage {};
+
+SharedRecordPass& sharedRecordPass() {
+    return HostThreadLocal<SharedRecordPass, SharedRecordPassStorage>();
+}
+
+bool sharedRecordPassServes(const SharedRecordPass& shared, const State& state, const DrawRecipe& recipe) {
+    if (!shared.pass.valid || shared.views != recipe.targetViews || shared.colors.size() != state.colors.size() || shared.targets.size() != recipe.targets.size() || shared.depth.has_value() != state.depth.has_value() || shared.depthCopySource != state.depthCopySource) return false;
+    for (std::size_t index = 0; index < state.colors.size(); ++index) {
+        if (!sameColorTarget(shared.colors[index], state.colors[index])) return false;
+    }
+    return !state.depth || (sameDepthTarget(*shared.depth, *state.depth) && shared.depthWrite == state.depthWrite && shared.stencilTest == state.stencilTest && shared.stencilWritten == writesStencilTarget(state));
+}
+
+}
+
 DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     auto* recorder = Recorder::Active();
@@ -5173,26 +5208,37 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     }
     std::vector<std::shared_ptr<StorageTexture>> targets;
     targets.reserve(recipe.targets.size());
-    const auto& pass = record.pass;
-    auto hold = DrawRecordHold::Held;
-    if (!pass.valid) hold = DrawRecordHold::First;
-    else if (pass.recorder != recorder->Id() || !recorder->RenderPassOpen() || pass.generation != recorder->RenderPassGeneration()) hold = DrawRecordHold::Pass;
-    else if (pass.epoch != GuestMemory::CollectEpoch()) hold = DrawRecordHold::Epoch;
-    else if (pass.proof != GuestMemory::ProofSerial()) hold = DrawRecordHold::Proof;
-    else if (pass.pending != StorageTexture::PendingSerial()) hold = DrawRecordHold::Pending;
-    else if (pass.versions.size() != recipe.targets.size()) hold = DrawRecordHold::Target;
-    else if (recipe.hasDepth && (pass.depthSerial != DepthSurfacesSerial() || pass.depthReleased != DepthSurfacesReleased())) hold = DrawRecordHold::Depth;
-    bool held = hold == DrawRecordHold::Held;
+    const auto holdUnder = [&](const DrawRecordPass& pass) {
+        if (!pass.valid) return DrawRecordHold::First;
+        if (pass.recorder != recorder->Id() || !recorder->RenderPassOpen() || pass.generation != recorder->RenderPassGeneration()) return DrawRecordHold::Pass;
+        if (pass.epoch != GuestMemory::CollectEpoch()) return DrawRecordHold::Epoch;
+        if (pass.proof != GuestMemory::ProofSerial()) return DrawRecordHold::Proof;
+        if (pass.pending != StorageTexture::PendingSerial()) return DrawRecordHold::Pending;
+        if (pass.versions.size() != recipe.targets.size()) return DrawRecordHold::Target;
+        if (recipe.hasDepth && (pass.depthSerial != DepthSurfacesSerial() || pass.depthReleased != DepthSurfacesReleased())) return DrawRecordHold::Depth;
+        return DrawRecordHold::Held;
+    };
+    const auto* pass = &record.pass;
+    auto hold = holdUnder(*pass);
+    const SharedRecordPass* shared = nullptr;
+    if (hold != DrawRecordHold::Held && RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets)) {
+        const auto& kept = sharedRecordPass();
+        if (sharedRecordPassServes(kept, state, recipe) && holdUnder(kept.pass) == DrawRecordHold::Held) shared = &kept;
+    }
+    if (shared != nullptr) pass = &shared->pass;
+    bool held = hold == DrawRecordHold::Held || shared != nullptr;
     for (std::size_t index = 0; held && index < recipe.targets.size(); ++index) {
         auto stored = recipe.targets[index].lock();
-        if (stored == nullptr || stored->UploadVersion() != pass.versions[index] || !stored->Cached() || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) {
+        if (stored == nullptr || (shared != nullptr && stored.get() != shared->targets[index]) || stored->UploadVersion() != pass->versions[index] || !stored->Cached() || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) {
             held = false;
-            hold = DrawRecordHold::Target;
+            if (shared == nullptr) hold = DrawRecordHold::Target;
+            shared = nullptr;
             break;
         }
         targets.push_back(std::move(stored));
     }
     record.effects.hold = hold;
+    record.effects.sharedHold = held && shared != nullptr;
     if (!held) {
         targets.clear();
         if (failed(DrawRecipeMiss::TargetGone)) return miss(DrawRecipeMiss::TargetGone);
@@ -5392,6 +5438,18 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         remembered.depthReleased = DepthSurfacesReleased();
         remembered.versions.clear();
         for (const auto* target : residents) remembered.versions.push_back(target != nullptr ? target->UploadVersion() : 0u);
+        if (!record.effects.sharedHold && RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets)) {
+            auto& kept = sharedRecordPass();
+            kept.pass = remembered;
+            kept.colors.assign(state.colors.begin(), state.colors.end());
+            kept.depth = state.depth;
+            kept.depthWrite = state.depthWrite;
+            kept.stencilTest = state.stencilTest;
+            kept.stencilWritten = writesStencilTarget(state);
+            kept.depthCopySource = state.depthCopySource;
+            kept.views = record.recipe->targetViews;
+            kept.targets.assign(residents.begin(), residents.end());
+        }
     } else {
         record.pass.valid = false;
     }

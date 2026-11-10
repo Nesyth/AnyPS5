@@ -83,6 +83,7 @@ enum class RuntimeSwitch : std::size_t {
     StagePlans,
     DirectDraws,
     DirectCleanProofs,
+    DirectPassTargets,
     NoPlanCleanProofs,
     Count,
 };

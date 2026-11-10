@@ -124,6 +124,7 @@ struct DrawRecordEffects {
     std::size_t movedChecked = 0;
     std::size_t movedTrusted = 0;
     DrawRecordHold hold = DrawRecordHold::Count;
+    bool sharedHold = false;
     bool proved = false;
     std::optional<Graphics::ShaderResources::CleanProof> cleanProof;
 };
