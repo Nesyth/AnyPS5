@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StagePlanReport.hpp"
@@ -974,6 +975,92 @@ void InjectedCommit(Arms& arms) {
     DrawRecords::CorruptCommits(false);
 }
 
+namespace DirectReport = AgcDriver::DriverDetail::DirectDraws;
+using DirectCounter = DirectReport::Counter;
+
+struct DirectTotals {
+    std::array<std::uint64_t, static_cast<std::size_t>(DirectCounter::Count)> counters{};
+    std::uint64_t differences = 0;
+    std::uint64_t buildDifferences = 0;
+    std::uint64_t commitChecks = 0;
+
+    static DirectTotals Now() {
+        DirectTotals totals;
+        for (std::size_t index = 0; index < totals.counters.size(); ++index) totals.counters[index] = DirectReport::Total(static_cast<DirectCounter>(index));
+        for (std::size_t index = 0; index < static_cast<std::size_t>(DrawRecords::Field::Count); ++index) {
+            totals.differences += DirectReport::Differences(static_cast<DrawRecords::Field>(index));
+            totals.buildDifferences += DirectReport::BuildDifferences(static_cast<DrawRecords::Field>(index));
+        }
+        totals.commitChecks = DrawRecords::Checked(DrawRecords::Item::Commit);
+        return totals;
+    }
+
+    std::uint64_t Since(const DirectTotals& base, DirectCounter counter) const { return counters[static_cast<std::size_t>(counter)] - base.counters[static_cast<std::size_t>(counter)]; }
+    std::uint64_t Since(const DirectTotals& base, DirectCounter first, DirectCounter last) const {
+        std::uint64_t total = 0;
+        for (auto index = static_cast<std::size_t>(first); index <= static_cast<std::size_t>(last); ++index) total += Since(base, static_cast<DirectCounter>(index));
+        return total;
+    }
+};
+
+std::string DescribeDirect(const DirectTotals& now, const DirectTotals& base) {
+    std::string text;
+    for (std::size_t index = 0; index < now.counters.size(); ++index) {
+        const auto moved = now.Since(base, static_cast<DirectCounter>(index));
+        if (moved != 0) text += std::string("; ") + DirectReport::CounterName(static_cast<DirectCounter>(index)) + " " + std::to_string(moved);
+    }
+    if (now.commitChecks != base.commitChecks) text += "; committer checks " + std::to_string(now.commitChecks - base.commitChecks);
+    return text;
+}
+
+void Direct(bool ring) {
+    const bool exact = std::getenv("APS5_DIRECT_DRAWS_EXACT_KEY") != nullptr;
+    std::vector<State> cycled;
+    for (std::uint32_t format = 0; format < RawFormats.size(); ++format) cycled.push_back({Kind::Format, format, 16, 3});
+    const std::vector<std::pair<std::string, std::vector<State>>> sets{
+        {"constants behind a moving user data pointer", Alternating(Kind::Constants, 4)},
+        {"the same constants in draws of other vertex counts", MovingIdentities(Kind::Constants, 4)},
+        {"a vertex buffer descriptor moving inside a memory table", Alternating(Kind::Table, 4)},
+        {"a fetched vertex buffer moving", Alternating(Kind::Fetch, 4)},
+        {"an inline constant buffer moving to a new ring slot", Moving(Kind::Ring, 4)},
+        {"a constant buffer and the table in it moving", Moving(Kind::RingInner, 4)},
+        {"a buffer format word cycling", cycled},
+    };
+    const auto base = DirectTotals::Now();
+    for (const auto& [name, states] : sets) {
+        RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+        RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
+        RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
+        std::vector<std::vector<std::uint8_t>> today;
+        for (const auto& state : states) today.push_back(Render(state, DrawsPerSubmission));
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, true);
+        const auto before = DirectTotals::Now();
+        for (std::size_t index = 0; index < states.size(); ++index) Require(Render(states[index], DrawsPerSubmission) == today[index], "direct draws, " + name + ": submission " + std::to_string(index) + " rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before));
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
+        const auto after = DirectTotals::Now();
+        std::cout << "direct draws, " << name << ":" << DescribeDirect(after, before) << '\n';
+        if (!ring || name != sets[1].first) continue;
+        if (exact) Require(after.Since(before, DirectCounter::ClassesBuilt) != 0, "direct draws, " + name + ": with exact class keys, draws of another vertex count built no class of their own" + DescribeDirect(after, before));
+        else Require(after.Since(before, DirectCounter::ClassesBuilt) == 0 && after.Since(before, DirectCounter::FallbackClassNew) == 0, "direct draws, " + name + ": draws of another vertex count did not share the class of the first" + DescribeDirect(after, before));
+    }
+    const auto now = DirectTotals::Now();
+    const auto draws = now.Since(base, DirectCounter::Draws);
+    const auto direct = now.Since(base, DirectCounter::Direct);
+    const auto fallbacks = now.Since(base, DirectCounter::FallbackShape, DirectCounter::FallbackVerify);
+    std::cout << "direct draws: " << draws << " draws, " << direct << " direct, " << fallbacks << " fallbacks, " << now.Since(base, DirectCounter::ClassesBuilt) << " classes built, " << now.Since(base, DirectCounter::StagesBuilt) << " stages built\n";
+    if (!ring) return;
+    Require(draws != 0 && direct + fallbacks == draws, "direct draws: the direct and fallback draws do not add up to the draws the finisher took" + DescribeDirect(now, base));
+    Require(now.differences == base.differences && now.Since(base, DirectCounter::VerifyDiffering) == 0, "direct draws: the verify found differences" + DescribeDirect(now, base));
+    Require(now.buildDifferences == base.buildDifferences && now.Since(base, DirectCounter::RefusedDiffers) == 0, "direct draws: a class build found differences" + DescribeDirect(now, base));
+    Require(now.Since(base, DirectCounter::ClassesBuilt) != 0, "direct draws: no class was built" + DescribeDirect(now, base));
+    const auto verified = now.Since(base, DirectCounter::VerifyChecked);
+    if (DirectReport::VerifyEvery() == 1) Require(direct == 0 && verified != 0, "direct draws: with every direct job due for a verify, a class hit committed directly or none was verified" + DescribeDirect(now, base));
+    else Require(direct != 0, "direct draws: no draw committed directly" + DescribeDirect(now, base));
+    if (DirectReport::VerifyEvery() > 1) Require(verified != 0, "direct draws: the verify checked no class hit" + DescribeDirect(now, base));
+    if (DirectReport::VerifyEvery() != 1 && DrawRecords::VerifyEvery() > 1) Require(now.commitChecks > base.commitChecks, "direct draws: the committer verify checked no direct hit" + DescribeDirect(now, base));
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -991,6 +1078,8 @@ int main(int argc, char** argv) {
         const bool leanEnvironment = RuntimeSwitches::Set(RuntimeSwitch::LeanFront);
         const bool recordsEnvironment = RuntimeSwitches::Set(RuntimeSwitch::DrawRecords);
         const bool plansEnvironment = RuntimeSwitches::Set(RuntimeSwitch::StagePlans);
+        const bool directEnvironment = RuntimeSwitches::Set(RuntimeSwitch::DirectDraws);
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
         Arms arms;
         arms.ring = DrawFinisher::Enabled() && DrawFinisher::Overlap() && DrawPipeline::Depth() != 0;
         PlanArms planArms;
@@ -1005,6 +1094,7 @@ int main(int argc, char** argv) {
         Blocks blocks;
         Scene = &blocks;
         Prepare();
+        if (directEnvironment) Direct(arms.ring);
         if (inject) {
             Injected(arms);
         } else if (injectCommit) {
@@ -1027,9 +1117,11 @@ int main(int argc, char** argv) {
         }
         DrawRecords::Report(true);
         StagePlanReport::Report(true);
+        AgcDriver::DriverDetail::DirectDraws::Report(true);
         RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, leanEnvironment);
         RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, recordsEnvironment);
         RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, plansEnvironment);
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, directEnvironment);
         AgcDriverShutdown_nid_postfix();
         std::cout << (inject || injectCommit || injectPlans ? "the draw record verify caught a corrupted answer and today's path drew" : "draw record hits render as today's path for moved constants, descriptors and vertex buffers, relocate inline buffer descriptors read through and bound, patch read-only buffer bases and sizes moved inside captured runs, pick the variant of a changed format word, record through the committer half with pushed constants, held targets and per-batch keeps, and fall back on structural changes, writes after the fetch and failed committer checks") << (arms.ring ? "" : " (no finisher ring: records never ran)") << '\n';
         return 0;

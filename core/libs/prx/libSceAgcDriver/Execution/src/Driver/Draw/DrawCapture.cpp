@@ -152,24 +152,30 @@ std::runtime_error Driver::stageFailure(const DrawProgram& program, const Shader
     return std::runtime_error(where.str() + error.what());
 }
 
+ShaderRecompiler::RecompileRequest Driver::drawStageRequest(const DrawProgram& program, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const ShaderRecompiler::MemoryRegion> memory, std::span<const ShaderRecompiler::LinkedProgram> linked, const VulkanDevice& device, std::uint32_t pushOffset, const Pm4::DrawParameters& drawParameters, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics) {
+    using Stage = ShaderRecompiler::ShaderStage;
+    const auto waveSize = Graphics::StageWaveSize(graphics.stages, program.binary.stage);
+    ShaderRecompiler::RecompileRequest request{
+        program.binary,
+        {waveSize, program.firstUserSgpr, program.userData, std::nullopt, program.binary.stage == Stage::Fragment ? std::optional(pixel) : std::nullopt, vertexInfo, memory, RegisteredFloatMode(*program.snapshot)},
+        device.Target(),
+        {0, 0, pushOffset, Graphics::StagePushLimit(graphics.stages, pushOffset, graphics.depthRemap.mode != 0u) - pushOffset % Graphics::PipelinePushSlotBytes},
+        ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, Graphics::StageMeshConfiguration(graphics.stages, program.binary.stage), graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}, program.binary.stage == Stage::Mesh ? meshBarycentrics : std::nullopt}
+    };
+    if (graphics.depthRemap.mode != 0u && pushOffset < Graphics::PipelinePushSlotBytes) {
+        request.layout.pushConstantSizeBytes = std::min(request.layout.pushConstantSizeBytes, ShaderRecompiler::DepthRemapPushOffsetBytes - pushOffset);
+    }
+    if (request.target.deviceImageTables) request.target.deviceImageTables = device.DeviceImagesServe(program.binary.codeAddress);
+    return request;
+}
+
 std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(const DrawStageContext& context, std::size_t i, std::uint32_t pushOffset, const Pm4::DrawParameters& drawParameters, bool heapPartners) try {
     PerformanceTimer timing("Shader.DrawStage");
     using Stage = ShaderRecompiler::ShaderStage;
     context.phaseTiming.Phase(DrawRowVectors);
     const auto& program = context.programs[i];
     Graphics::HeapCostScope prepareCost(Graphics::HeapCost::StagePrepare);
-    const auto waveSize = Graphics::StageWaveSize(context.graphics.stages, program.binary.stage);
-    ShaderRecompiler::RecompileRequest request{
-        program.binary,
-        {waveSize, program.firstUserSgpr, program.userData, std::nullopt, program.binary.stage == Stage::Fragment ? std::optional(context.pixel) : std::nullopt, context.vertexInfos[i], context.memory, RegisteredFloatMode(*program.snapshot)},
-        context.localDevice->Target(),
-        {0, 0, pushOffset, Graphics::StagePushLimit(context.graphics.stages, pushOffset, context.graphics.depthRemap.mode != 0u) - pushOffset % Graphics::PipelinePushSlotBytes},
-        ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, context.linked, Graphics::StageMeshConfiguration(context.graphics.stages, program.binary.stage), context.graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}, program.binary.stage == Stage::Mesh ? context.meshBarycentrics : std::nullopt}
-    };
-    if (context.graphics.depthRemap.mode != 0u && pushOffset < Graphics::PipelinePushSlotBytes) {
-        request.layout.pushConstantSizeBytes = std::min(request.layout.pushConstantSizeBytes, ShaderRecompiler::DepthRemapPushOffsetBytes - pushOffset);
-    }
-    if (request.target.deviceImageTables) request.target.deviceImageTables = context.localDevice->DeviceImagesServe(program.binary.codeAddress);
+    auto request = drawStageRequest(program, context.graphics, context.pixel, context.vertexInfos[i], context.memory, context.linked, *context.localDevice, pushOffset, drawParameters, context.meshBarycentrics);
     const auto waitedBefore = traceCapSync() || context.profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     const bool heapCandidate = heapPartners && (program.binary.stage == Stage::Fragment || HeapPreRasterStage(program.binary.stage)) && !HeapStageExcluded(program.binary.stage) && HeapFragmentsEnabled();
     const auto fragmentOnHeap = [&] {

@@ -4399,11 +4399,15 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->hasDepth = state.depth.has_value();
             recipe->perDrawMoves = dataRecipes;
             *recipeOut = std::move(recipe);
+        } else if (prepared.recordRecipe) {
+            using enum RecipeRefusal;
+            NoteRecipeRefusal(recipeOut == nullptr ? Dropped : !cacheable ? NotCacheable : outcome.waited ? Waited : args != nullptr ? Indirect : !resources->Reusable() ? NotReusable : resources->SpaceReuse() ? SpaceReuse : multisampled ? Multisampled : ReordersSamples);
         }
         timing.Mark("draw_and_resource_release");
         report(outcome.waited ? (outcome.reason == SyncLease ? " recorded then waited (lease)" : " recorded then waited (copied writes)") : completion ? " recorded with completion" : " recorded");
         return;
     }
+    if (prepared.recordRecipe) NoteRecipeRefusal(RecipeRefusal::NotRecorded);
     if (prepared.passAttachments) attachmentMemo().valid = false;
     const bool gpuIndirect = args != nullptr && indirect.path == IndirectDrawPath::Gpu;
     const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
@@ -5107,6 +5111,24 @@ bool failRecordCheck(DrawRecipeMiss check) {
 
 void FailRecordChecks(DrawRecipeMiss check, std::uint32_t count) {
     recordFailures[static_cast<std::size_t>(check)].store(count, std::memory_order_relaxed);
+}
+
+namespace {
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RecipeRefusal::Count)> recipeRefusals{};
+}
+
+void NoteRecipeRefusal(RecipeRefusal reason) {
+    recipeRefusals[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(RecipeRefusal::Count)> RecipeRefusals() {
+    std::array<std::uint64_t, static_cast<std::size_t>(RecipeRefusal::Count)> counts{};
+    for (std::size_t index = 0; index < counts.size(); ++index) counts[index] = recipeRefusals[index].load(std::memory_order_relaxed);
+    return counts;
+}
+
+bool DrawsRecordable() {
+    return RecordDraws() && DumpTargetLimit() == 0;
 }
 
 DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer) {

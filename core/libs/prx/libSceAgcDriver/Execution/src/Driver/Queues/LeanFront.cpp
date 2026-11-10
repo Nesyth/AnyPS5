@@ -1,9 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanFront.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordReport.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/HeapStages.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StagePlanReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -130,6 +133,8 @@ FrontMode Take(Latch& latch, bool eligible) {
         latch.recordsVerifyEvery = 0;
         latch.stagePlans = false;
         latch.stagePlansVerifyEvery = 0;
+        latch.directDraws = false;
+        latch.directVerifyEvery = 0;
         return FrontMode::Today;
     }
     const auto generation = Graphics::RuntimeSwitches::Generation();
@@ -144,13 +149,16 @@ FrontMode Take(Latch& latch, bool eligible) {
     latch.mode = mode;
     latch.verifyEvery = mode == FrontMode::Lean ? VerifyEvery() : 0;
     latch.checkSwitches = Due(latch, Item::SwitchRead);
-    const bool plans = mode == FrontMode::Lean && latch.switches.Set(Graphics::RuntimeSwitch::StagePlans);
+    const bool direct = mode == FrontMode::Lean && latch.switches.Set(Graphics::RuntimeSwitch::DirectDraws) && !Graphics::DescriptorHeapEnabled() && !HeapFragmentsEnabled();
+    latch.directDraws = direct;
+    latch.directVerifyEvery = direct ? DirectDraws::VerifyEvery() : 0;
+    const bool plans = mode == FrontMode::Lean && !direct && latch.switches.Set(Graphics::RuntimeSwitch::StagePlans);
     const std::uint8_t plansTaken = plans ? 2 : 1;
     if (latch.stagePlansTaken != 0 && latch.stagePlansTaken != plansTaken) StagePlans::AddOnWorker(StagePlans::Counter::ModeChanges);
     latch.stagePlansTaken = plansTaken;
     latch.stagePlans = plans;
     latch.stagePlansVerifyEvery = plans ? StagePlans::VerifyEvery() : 0;
-    const bool records = mode == FrontMode::Lean && !plans && latch.switches.Set(Graphics::RuntimeSwitch::DrawRecords);
+    const bool records = mode == FrontMode::Lean && !direct && !plans && latch.switches.Set(Graphics::RuntimeSwitch::DrawRecords);
     const std::uint8_t recordsTaken = records ? 2 : 1;
     if (latch.recordsTaken != 0 && latch.recordsTaken != recordsTaken) DrawRecords::AddOnWorker(DrawRecords::Counter::RecordModeChanges);
     latch.recordsTaken = recordsTaken;
@@ -161,6 +169,7 @@ FrontMode Take(Latch& latch, bool eligible) {
         Report(false);
         DrawRecords::Report(false);
         StagePlans::Report(false);
+        DirectDraws::Report(false);
     }
     return mode;
 }

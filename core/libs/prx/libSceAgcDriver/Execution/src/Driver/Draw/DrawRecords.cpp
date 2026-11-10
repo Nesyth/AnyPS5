@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDraws.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/LeanDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StagePlanReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -105,23 +106,27 @@ void DrawRecordSink::Reset() {
     writes.clear();
 }
 
-void DrawRecordSink::NoteVertices(std::span<const std::optional<ShaderRecompiler::ShaderVertexStageInfo>> infos) {
-    vertexLayout.clear();
-    vertexInputs.clear();
+void DrawVertexLayout(std::span<const std::optional<ShaderRecompiler::ShaderVertexStageInfo>> infos, std::vector<std::uint32_t>& layout, std::vector<std::uint32_t>& inputs) {
+    layout.clear();
+    inputs.clear();
     for (const auto& info : infos) {
         if (!info) {
-            vertexLayout.push_back(0);
+            layout.push_back(0);
             continue;
         }
         const auto count = std::min<std::uint32_t>(info->resourcesNum, ShaderRecompiler::ShaderVertexStageInfo::MaxResources);
-        vertexLayout.insert(vertexLayout.end(), {0x80000000u | count, info->fetchAttribReg, info->fetchBufferReg, info->fetchEmbedded ? 1u : 0u, info->paClVsOutCntl, info->depthRemapMode, info->pointList ? 1u : 0u, std::bit_cast<std::uint32_t>(info->pointSize), std::bit_cast<std::uint32_t>(info->pointSizeMin), std::bit_cast<std::uint32_t>(info->pointSizeMax)});
+        layout.insert(layout.end(), {0x80000000u | count, info->fetchAttribReg, info->fetchBufferReg, info->fetchEmbedded ? 1u : 0u, info->paClVsOutCntl, info->depthRemapMode, info->pointList ? 1u : 0u, std::bit_cast<std::uint32_t>(info->pointSize), std::bit_cast<std::uint32_t>(info->pointSizeMin), std::bit_cast<std::uint32_t>(info->pointSizeMax)});
         for (std::uint32_t index = 0; index < count; ++index) {
             const auto& fields = info->resources[index].fields;
             const auto& destination = info->resourcesDst[index];
-            vertexLayout.insert(vertexLayout.end(), {fields[1] & 0xffff0000u, fields[3], static_cast<std::uint32_t>(destination.registerStart), static_cast<std::uint32_t>(destination.registersNum), static_cast<std::uint32_t>(destination.attrId), destination.fetchIndex});
-            vertexInputs.insert(vertexInputs.end(), {fields[0], fields[1] & 0xffffu, fields[2]});
+            layout.insert(layout.end(), {fields[1] & 0xffff0000u, fields[3], static_cast<std::uint32_t>(destination.registerStart), static_cast<std::uint32_t>(destination.registersNum), static_cast<std::uint32_t>(destination.attrId), destination.fetchIndex});
+            inputs.insert(inputs.end(), {fields[0], fields[1] & 0xffffu, fields[2]});
         }
     }
+}
+
+void DrawRecordSink::NoteVertices(std::span<const std::optional<ShaderRecompiler::ShaderVertexStageInfo>> infos) {
+    DrawVertexLayout(infos, vertexLayout, vertexInputs);
 }
 
 std::shared_ptr<DrawRecord> DrawRecord::Build(const DrawRecordKey& key, std::shared_ptr<const LeanShape> shape, std::uint64_t deviceSerial, std::uint64_t generation, std::uint64_t present, const DrawRecordSink& sink) {
@@ -1528,6 +1533,14 @@ void NotePlannedCommit(const DrawRecordCommit& commit) {
     if (effects.movedTrusted != 0) StagePlans::AddOnCommitter(Counter::MovedTrusted, effects.movedTrusted);
 }
 
+void NoteDirectCommit(const DrawRecordCommit& commit, bool recorded) {
+    using DirectDraws::Counter;
+    DirectDraws::Add(recorded ? Counter::CommitHits : Counter::CommitMisses);
+    const auto& effects = commit.effects;
+    if (effects.cleanProof.has_value()) DirectDraws::Add(*effects.cleanProof == Graphics::ShaderResources::CleanProof::Skipped ? Counter::ProofsSkipped : Counter::ProofsNotSkipped);
+    else if (effects.proved) DirectDraws::Add(Counter::ProofsFull);
+}
+
 bool SameVertexInput(const Graphics::VertexInputLayout& a, const Graphics::VertexInputLayout& b) {
     const auto sameBinding = [](const VkVertexInputBindingDescription& x, const VkVertexInputBindingDescription& y) { return x.binding == y.binding && x.stride == y.stride && x.inputRate == y.inputRate; };
     const auto sameAttribute = [](const VkVertexInputAttributeDescription& x, const VkVertexInputAttributeDescription& y) { return x.location == y.location && x.binding == y.binding && x.format == y.format && x.offset == y.offset; };
@@ -1556,17 +1569,19 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     recordLabelsForPacket(localDevice.get(), queue);
     noteDrawWriters(hit.stages, queue);
     auto& commit = *hit.record->commit;
-    commit.cleanProofs = hit.planned && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoPlanCleanProofs);
+    commit.cleanProofs = hit.direct ? Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectCleanProofs) : hit.planned && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoPlanCleanProofs);
     static std::uint64_t ordinal = 0;
     const auto every = DrawRecords::VerifyEvery();
     const bool verify = commit.recipe != nullptr && every != 0 && ++ordinal % every == 0;
     if (commit.recipe == nullptr) {
         DrawRecords::AddOnCommitter(Counter::CommitFirst);
+        if (hit.direct) DirectDraws::Add(DirectDraws::Counter::CommitFirst);
     } else if (!verify) {
         const auto outcome = localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr);
         if (hit.planned) NotePlannedCommit(commit);
+        if (hit.direct) NoteDirectCommit(commit, outcome.recorded);
         if (outcome.recorded) {
-            if (hit.planned) ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
+            if (hit.planned || hit.direct) ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
             const auto& effects = commit.effects;
             DrawRecords::AddOnCommitter(Counter::CommitHits);
             if (effects.pushed) DrawRecords::AddOnCommitter(Counter::CommitPushed);
@@ -1579,7 +1594,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         }
         DrawRecords::AddOnCommitter(CommitMiss(outcome.miss));
     }
-    if (hit.planned) ThreadReport::MarkItem(ThreadReport::ItemMark::PlanFallback);
+    if (hit.planned || hit.direct) ThreadReport::MarkItem(ThreadReport::ItemMark::PlanFallback);
     DrawCommitView answer;
     if (verify) static_cast<void>(localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, &answer));
     if (verify && DrawRecords::CorruptingCommits() && !answer.bindings.empty()) {
@@ -1606,6 +1621,9 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     if (differs) {
         commit.Adopt(nullptr);
         DrawRecords::AddOnCommitter(Counter::CommitDemoted);
+        // One recipe serves every draw of a direct class, so a class whose commit differed once
+        // goes back to today's path for good.
+        if (hit.direct) RefuseDirectClass(hit.owner);
         return;
     }
     if (built != nullptr && (!verify || !answer.filled || answer.resources != today.resources)) {
@@ -1787,7 +1805,7 @@ bool Driver::compareRecordAnswer(const LeanDrawJob& job, const DrawRecord& recor
     if (answer.writes != today.writes) note(Field::WriteTemplates, "the record holds " + std::to_string(answer.writes.size()) + " write ranges, today's draw writes " + std::to_string(today.writes.size()));
     if (answer.contentKey != today.contentKey) note(Field::ContentKeys, firstDifference(answer.contentKey, today.contentKey));
     if (record.vertexLayout != sink.vertexLayout) note(Field::VertexLayouts, firstDifference(record.vertexLayout, sink.vertexLayout));
-    if (record.plan->addressed && answer.snapshotWords != today.snapshotWords) note(Field::Snapshots, "the record's snapshots cover " + std::to_string(answer.snapshotWords.size()) + " words, today's " + std::to_string(today.snapshotWords.size()) + "; " + firstDifference(answer.snapshotWords, today.snapshotWords));
+    if (record.plan != nullptr && record.plan->addressed && answer.snapshotWords != today.snapshotWords) note(Field::Snapshots, "the record's snapshots cover " + std::to_string(answer.snapshotWords.size()) + " words, today's " + std::to_string(today.snapshotWords.size()) + "; " + firstDifference(answer.snapshotWords, today.snapshotWords));
     if (!today.snapshotWords.empty()) {
         const auto unread = [&](std::uint64_t address) {
             const auto found = std::lower_bound(today.snapshotWords.begin(), today.snapshotWords.end(), std::pair<std::uint64_t, std::uint32_t>{address, 0u});

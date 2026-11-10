@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/LeanDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanFront.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -425,6 +426,7 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
     }();
     const bool records = frontLatch.records;
     const bool plans = frontLatch.stagePlans;
+    const bool direct = frontLatch.directDraws;
     const auto recordsOff = [&](DrawRecords::Counter reason) {
         if (plans) {
             using Off = StagePlans::Counter;
@@ -517,10 +519,16 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
         finishLeanDraw(*local, LeanAnchor{submission.shaders, leanDraws.device, 0});
         return DrawVerdict::Drawn;
     }
-    if (plans) probeStagePlans(*job, record);
-    else if (records) probeDrawRecord(*job, shape);
+    if (direct) {
+        job->recordFlags = DrawRecordFlags::Direct;
+        if (DirectDraws::Due(frontLatch)) job->recordFlags |= DrawRecordFlags::VerifyDue;
+    } else if (plans) {
+        probeStagePlans(*job, record);
+    } else if (records) {
+        probeDrawRecord(*job, shape);
+    }
     record.lastSeq = finisher.Issued();
-    const bool answered = (job->recordFlags & (DrawRecordFlags::BuildWanted | DrawRecordFlags::VerifyDue)) != 0;
+    const bool answered = !direct && (job->recordFlags & (DrawRecordFlags::BuildWanted | DrawRecordFlags::VerifyDue)) != 0;
     finisher.PublishLean(&Driver::runLeanDraw, shape.writes, job->drawKey, job->shapeKey, !answered ? nullptr : plans ? &Driver::retireStagePlans : &Driver::retireDrawRecord);
     return DrawVerdict::Drawn;
 }

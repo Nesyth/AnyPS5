@@ -147,6 +147,8 @@ struct DrawRecordSink {
     DrawRecordHash Inputs() const { return HashDrawRecordWords(vertexInputs, {}); }
 };
 
+void DrawVertexLayout(std::span<const std::optional<ShaderRecompiler::ShaderVertexStageInfo>> infos, std::vector<std::uint32_t>& layout, std::vector<std::uint32_t>& inputs);
+
 struct DrawRecordSinkTag {};
 using DrawRecordSinkSlot = HostThreadSlot<DrawRecordSink*, DrawRecordSinkTag>;
 
@@ -206,6 +208,11 @@ struct DrawRecordHit {
     bool buffersPatched = false;
     bool relocated = false;
     bool planned = false;
+    bool direct = false;
+    // A direct hit's class, which keeps the record and the stages' donors alive, and the captures
+    // whose registered image views the hit's stages point into.
+    std::shared_ptr<const void> owner;
+    std::vector<std::shared_ptr<const ShaderRecompiler::ResourceCapture>> captures;
 };
 
 namespace DrawRecordFlags {
@@ -216,6 +223,7 @@ constexpr std::uint8_t BuildWanted = 4;
 constexpr std::uint8_t VerifyDue = 8;
 constexpr std::uint8_t StagePlans = 16;
 constexpr std::uint8_t PlanProbed = 32;
+constexpr std::uint8_t Direct = 64;
 
 }
 

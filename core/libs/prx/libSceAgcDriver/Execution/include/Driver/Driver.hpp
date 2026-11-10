@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/LeanDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
@@ -59,6 +60,10 @@ inline std::uint32_t ThreadDimensionGroups(std::uint32_t threads, std::uint32_t 
 }
 
 struct DrawTail;
+struct DirectStages;
+struct DirectClass;
+struct DirectClassKey;
+class DirectStepClock;
 
 struct DrawStageContext {
     const QueueState& queue;
@@ -299,6 +304,7 @@ private:
     void resolveDrawDecode(const QueueState& queue, const Submission& submission, const Graphics::Context& context, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile);
     void lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData);
     enum class HeapDirect { Declined, Unmapped, Taken };
+    static ShaderRecompiler::RecompileRequest drawStageRequest(const DrawProgram& program, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const ShaderRecompiler::MemoryRegion> memory, std::span<const ShaderRecompiler::LinkedProgram> linked, const VulkanDevice& device, std::uint32_t pushOffset, const Pm4::DrawParameters& drawParameters, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics);
     std::shared_ptr<const ShaderRecompiler::RecompileResult> materializeDrawStage(const DrawStageContext& context, std::size_t i, std::uint32_t pushOffset, const Pm4::DrawParameters& drawParameters, bool heapPartners);
     HeapDirect materializeHeapDirect(const DrawStageContext& context, std::size_t i, const ShaderRecompiler::PreparedShaderInvocation& invocation, const ShaderRecompiler::RecompileRequest& request, PerformanceTimer& timing);
     static std::runtime_error stageFailure(const DrawProgram& program, const ShaderRecompiler::RecompileRequest& request, const std::exception& error, std::span<const ShaderRecompiler::MemoryRegion> regions);
@@ -341,6 +347,12 @@ private:
     void verifyStagePlanHit(const LeanDrawJob& job, const DrawRecord& record, const DrawRecordView& answer, const DrawRecordSink& sink);
     void installStagePlans(const LeanDrawJob& job, const StagePlanAnswer& answer);
     static void retireStagePlans(const std::byte* payload, std::shared_ptr<const void>&& answer);
+    void finishDirectDraw(const LeanDrawJob& job);
+    std::optional<DirectDraws::Counter> resolveDirectStages(const LeanDrawJob& job, const LeanAnchor& anchor, DirectStages& resolved, DirectStepClock* clock);
+    std::optional<DirectDraws::Counter> assembleDirectHit(const LeanDrawJob& job, DirectStages& resolved, DrawRecordHit& hit);
+    const DrawRecordSink* finishDirectAnswer(const LeanDrawJob& job, const LeanAnchor& anchor, const DirectStages& resolved, const DrawRecordHit& hit, DrawRecordView& answer);
+    void buildDirectClass(const LeanDrawJob& job, const LeanAnchor& anchor, const DirectClassKey& key, std::uint64_t probe, const DirectStages& resolved, const DrawRecordHit& hit);
+    void verifyDirectHit(const LeanDrawJob& job, const LeanAnchor& anchor, const DirectClass& found, const DirectStages& resolved, const DrawRecordHit& hit);
     void restartFinishedDraw(DrawTail& tail);
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();

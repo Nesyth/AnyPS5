@@ -905,6 +905,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 void Driver::runLeanDraw(const std::byte* payload) {
     auto& driver = Get();
     const auto& job = *std::launder(reinterpret_cast<const LeanDrawJob*>(payload));
+    if ((job.recordFlags & DrawRecordFlags::Direct) != 0) {
+        driver.finishDirectDraw(job);
+        return;
+    }
     if ((job.recordFlags & DrawRecordFlags::StagePlans) != 0) {
         driver.finishStagePlanDraw(job);
         return;
