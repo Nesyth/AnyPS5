@@ -147,6 +147,8 @@ struct DrawRecordSink {
     DrawRecordHash Inputs() const { return HashDrawRecordWords(vertexInputs, {}); }
 };
 
+void DrawVertexLayout(std::span<const std::optional<ShaderRecompiler::ShaderVertexStageInfo>> infos, std::vector<std::uint32_t>& layout, std::vector<std::uint32_t>& inputs);
+
 struct DrawRecordSinkTag {};
 using DrawRecordSinkSlot = HostThreadSlot<DrawRecordSink*, DrawRecordSinkTag>;
 

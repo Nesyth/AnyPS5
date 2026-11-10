@@ -105,23 +105,27 @@ void DrawRecordSink::Reset() {
     writes.clear();
 }
 
-void DrawRecordSink::NoteVertices(std::span<const std::optional<ShaderRecompiler::ShaderVertexStageInfo>> infos) {
-    vertexLayout.clear();
-    vertexInputs.clear();
+void DrawVertexLayout(std::span<const std::optional<ShaderRecompiler::ShaderVertexStageInfo>> infos, std::vector<std::uint32_t>& layout, std::vector<std::uint32_t>& inputs) {
+    layout.clear();
+    inputs.clear();
     for (const auto& info : infos) {
         if (!info) {
-            vertexLayout.push_back(0);
+            layout.push_back(0);
             continue;
         }
         const auto count = std::min<std::uint32_t>(info->resourcesNum, ShaderRecompiler::ShaderVertexStageInfo::MaxResources);
-        vertexLayout.insert(vertexLayout.end(), {0x80000000u | count, info->fetchAttribReg, info->fetchBufferReg, info->fetchEmbedded ? 1u : 0u, info->paClVsOutCntl, info->depthRemapMode, info->pointList ? 1u : 0u, std::bit_cast<std::uint32_t>(info->pointSize), std::bit_cast<std::uint32_t>(info->pointSizeMin), std::bit_cast<std::uint32_t>(info->pointSizeMax)});
+        layout.insert(layout.end(), {0x80000000u | count, info->fetchAttribReg, info->fetchBufferReg, info->fetchEmbedded ? 1u : 0u, info->paClVsOutCntl, info->depthRemapMode, info->pointList ? 1u : 0u, std::bit_cast<std::uint32_t>(info->pointSize), std::bit_cast<std::uint32_t>(info->pointSizeMin), std::bit_cast<std::uint32_t>(info->pointSizeMax)});
         for (std::uint32_t index = 0; index < count; ++index) {
             const auto& fields = info->resources[index].fields;
             const auto& destination = info->resourcesDst[index];
-            vertexLayout.insert(vertexLayout.end(), {fields[1] & 0xffff0000u, fields[3], static_cast<std::uint32_t>(destination.registerStart), static_cast<std::uint32_t>(destination.registersNum), static_cast<std::uint32_t>(destination.attrId), destination.fetchIndex});
-            vertexInputs.insert(vertexInputs.end(), {fields[0], fields[1] & 0xffffu, fields[2]});
+            layout.insert(layout.end(), {fields[1] & 0xffff0000u, fields[3], static_cast<std::uint32_t>(destination.registerStart), static_cast<std::uint32_t>(destination.registersNum), static_cast<std::uint32_t>(destination.attrId), destination.fetchIndex});
+            inputs.insert(inputs.end(), {fields[0], fields[1] & 0xffffu, fields[2]});
         }
     }
+}
+
+void DrawRecordSink::NoteVertices(std::span<const std::optional<ShaderRecompiler::ShaderVertexStageInfo>> infos) {
+    DrawVertexLayout(infos, vertexLayout, vertexInputs);
 }
 
 std::shared_ptr<DrawRecord> DrawRecord::Build(const DrawRecordKey& key, std::shared_ptr<const LeanShape> shape, std::uint64_t deviceSerial, std::uint64_t generation, std::uint64_t present, const DrawRecordSink& sink) {

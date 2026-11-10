@@ -5109,6 +5109,10 @@ void FailRecordChecks(DrawRecipeMiss check, std::uint32_t count) {
     recordFailures[static_cast<std::size_t>(check)].store(count, std::memory_order_relaxed);
 }
 
+bool DrawsRecordable() {
+    return RecordDraws() && DumpTargetLimit() == 0;
+}
+
 DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     auto* recorder = Recorder::Active();

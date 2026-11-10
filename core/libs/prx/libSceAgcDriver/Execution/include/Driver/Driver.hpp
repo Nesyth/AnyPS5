@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/LeanDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
@@ -59,6 +60,8 @@ inline std::uint32_t ThreadDimensionGroups(std::uint32_t threads, std::uint32_t 
 }
 
 struct DrawTail;
+struct DirectStages;
+class DirectStepClock;
 
 struct DrawStageContext {
     const QueueState& queue;
@@ -343,6 +346,7 @@ private:
     void installStagePlans(const LeanDrawJob& job, const StagePlanAnswer& answer);
     static void retireStagePlans(const std::byte* payload, std::shared_ptr<const void>&& answer);
     void finishDirectDraw(const LeanDrawJob& job);
+    std::optional<DirectDraws::Counter> resolveDirectStages(const LeanDrawJob& job, const LeanAnchor& anchor, DirectStages& resolved, DirectStepClock* clock);
     void restartFinishedDraw(DrawTail& tail);
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();

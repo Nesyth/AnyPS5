@@ -119,6 +119,8 @@ struct DrawRecipeOutcome {
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace = nullptr);
 void FailRecordChecks(DrawRecipeMiss check, std::uint32_t count);
 DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace = nullptr, DrawCommitView* answer = nullptr);
+// Whether DrawWithRecord can record a draw at all (APS5_SYNC_DRAWS and APS5_DUMP_TARGETS unset).
+bool DrawsRecordable();
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
 
