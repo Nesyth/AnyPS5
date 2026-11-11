@@ -1622,6 +1622,10 @@ bool SameVertexInput(const Graphics::VertexInputLayout& a, const Graphics::Verte
 
 void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, DrawRecordHit& hit, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape) {
     using DrawRecords::Counter;
+    if (hit.direct && hit.record->commit->recipe != nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpNoCommits)) {
+        ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
+        return;
+    }
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
