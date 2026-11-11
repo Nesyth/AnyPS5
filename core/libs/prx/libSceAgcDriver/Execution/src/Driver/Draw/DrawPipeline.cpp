@@ -74,10 +74,11 @@ enum LeanSlotState : std::uint8_t { LeanFree, LeanReady, LeanDone };
 
 bool finisherTakes(unsigned index) {
     if (index == 0) return true;
-    return Graphics::RuntimeSwitches::Set(index == 1 ? Graphics::RuntimeSwitch::SecondFinisher : Graphics::RuntimeSwitch::ThirdFinisher);
+    constexpr Graphics::RuntimeSwitch switches[4] = {Graphics::RuntimeSwitch::SecondFinisher, Graphics::RuntimeSwitch::ThirdFinisher, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher};
+    return Graphics::RuntimeSwitches::Set(switches[index - 1]);
 }
 
-constexpr const char* FinisherNames[3] = {"draw finisher", "draw finisher 2", "draw finisher 3"};
+constexpr const char* FinisherNames[5] = {"draw finisher", "draw finisher 2", "draw finisher 3", "draw finisher 4", "draw finisher 5"};
 
 constexpr unsigned PublishedReadAttempts = 8;
 
@@ -612,7 +613,7 @@ void DrawFinisher::startFinishers() {
         extra[index - 1] = std::thread([this, index] {
             FinisherThread::Set(true);
             RaiseWorkerThreadPriority(FinisherNames[index]);
-            PlaceFinisherThread(FinisherNames[index]);
+            if (index < 3 || std::getenv("APS5_EXTRA_FINISHERS_UNPINNED") == nullptr) PlaceFinisherThread(FinisherNames[index]);
             run(index);
         });
         runningFinishers.fetch_add(1, std::memory_order_acq_rel);
@@ -966,14 +967,13 @@ void DrawFinisher::Drain() {
 }
 
 void DrawFinisher::Stop() {
-    std::thread finishers[3];
+    std::thread finishers[5];
     {
         const auto lock = lockFor(mutex);
         closing = true;
         closed.store(true, std::memory_order_release);
         finishers[0] = std::move(thread);
-        finishers[1] = std::move(extra[0]);
-        finishers[2] = std::move(extra[1]);
+        for (std::size_t index = 0; index < extra.size(); ++index) finishers[index + 1] = std::move(extra[index]);
     }
     wake.notify_all();
     turnWake.notify_all();
