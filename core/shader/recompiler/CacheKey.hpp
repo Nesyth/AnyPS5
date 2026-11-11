@@ -395,6 +395,7 @@ private:
         append(key, value.shaderImageMinLod);
         append(key, value.deviceImageTables);
         append(key, value.float16HostNans);
+        append(key, value.float32HostNans);
         append(key, value.float16WidenNans);
         append(key, value.float16NarrowNans);
     }

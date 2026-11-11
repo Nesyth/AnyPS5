@@ -44,6 +44,7 @@ struct TranslateOptions {
     bool gcnLegacyVertexInputs = false;
     bool nativeFloat16Fma = false;
     bool float16HostNans = false;
+    bool float32HostNans = false;
     std::optional<ShaderFloatMode> floatMode;
     ShaderStageInputInfo inputInfo;
     const EmbeddedFetchPlan* embeddedFetch = nullptr;

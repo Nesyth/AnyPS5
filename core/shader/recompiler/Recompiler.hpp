@@ -387,6 +387,7 @@ struct SpirvTarget {
     bool shaderImageMinLod = false;
     bool deviceImageTables = false;
     bool float16HostNans = false;
+    bool float32HostNans = false;
     bool float16WidenNans = false;
     bool float16NarrowNans = false;
 };

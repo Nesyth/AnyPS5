@@ -27,6 +27,7 @@ public:
     void SetEntryRounding(const RoundingState& state) { setRounding(state); }
     void SetNativeFloat16(bool enabled, bool fma, bool hostNans) { nativeFloat16 = enabled; nativeFloat16Fma = enabled && fma; float16HostNans = enabled && hostNans; }
     void SetFloat32DenormPreserve(bool enabled) { float32DenormPreserve = enabled; }
+    void SetFloat32HostNans(bool enabled) { float32HostNans = enabled; }
     void SetFloat32FlushToZero(bool enabled) { float32FlushToZero = enabled; }
     void SetFloat32FlushDeclared(bool enabled) { float32FlushDeclared = enabled; }
     void SetFloat64(bool enabled) { float64 = enabled; }
@@ -104,6 +105,7 @@ private:
     IrU32 quietNan16(IrU32 bits);
     IrValue* nanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, IrValue* invalidProduct = nullptr, bool multiplication = false);
     IrValue* propagatedNanResultF32(std::initializer_list<IrValue*> sources, IrValue* result);
+    bool hostNanResultF32(std::initializer_list<IrValue*> sources) const;
     IrValue& invalidProductF32(IrValue* lhs, IrValue* rhs);
     IrValue& invalidOperationF32(std::initializer_list<IrValue*> sources, IrValue& invalidProduct);
     std::array<IrU32, 2> quietNan64(const std::array<IrU32, 2>& bits);
@@ -402,6 +404,7 @@ private:
     bool nativeFloat16 = false;
     bool nativeFloat16Fma = false;
     bool float16HostNans = false;
+    bool float32HostNans = false;
     IrBuilder ir;
     IrBlock& block;
     IrU1 instructionBranchCondition;

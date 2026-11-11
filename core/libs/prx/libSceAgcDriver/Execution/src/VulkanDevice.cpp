@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Float16NanProbe.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Float32NanProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Float16ConversionProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FloatFlushProbe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
@@ -666,6 +667,7 @@ struct VulkanDevice::State {
     bool float32DenormPreserve = false;
     bool float16HostNanCandidate = false;
     bool float16HostNans = false;
+    bool float32HostNans = false;
     bool probingFloatControls = false;
     bool demoteToHelperInvocation = false;
     bool earlyFragmentSampleMaskTestBeforeSampleCounting = false;
@@ -2919,6 +2921,14 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->float16HostNans = probe.mismatches == 0u;
         std::fprintf(stderr, "[float-controls] f16 NaN results with IEEE_MODE clear: %s (%u of %u probe results differ from the selected NaN, %.0f ms)\n", state->float16HostNans ? "host" : "selected", probe.mismatches, probe.compared, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - probeStart).count());
     }
+    if (std::getenv("APS5_NO_HOST_F32_NANS") == nullptr) {
+        const auto probeStart = std::chrono::steady_clock::now();
+        state->probingFloatControls = true;
+        const auto probe = ProbeFloat32HostNans(*this, Target());
+        state->probingFloatControls = false;
+        state->float32HostNans = probe.mismatches == 0u;
+        std::fprintf(stderr, "[float-controls] f32 NaN results with IEEE_MODE clear: %s (%u of %u probe results differ from the selected NaN, %.0f ms)\n", state->float32HostNans ? "host" : "selected", probe.mismatches, probe.compared, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - probeStart).count());
+    }
     if (std::getenv("APS5_NO_NATIVE_F16_NANS") == nullptr) {
         const auto probeStart = std::chrono::steady_clock::now();
         state->probingFloatControls = true;
@@ -4870,6 +4880,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     auto target = state->shaderProfile->Target();
     target.float32FlushToZero = state->float32FlushToZero && !state->float32FlushComputeOnly;
     target.float16HostNans = state->float16HostNans;
+    target.float32HostNans = state->float32HostNans;
     target.fusedExactArithmetic = state->fusedExactArithmetic;
     target.hostInterpolationFirst = state->hostInterpolationFirst;
     target.float32DenormPreserve = state->float32DenormPreserve;
