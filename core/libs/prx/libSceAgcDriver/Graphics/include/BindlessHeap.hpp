@@ -283,7 +283,7 @@ void NoteCommandBufferBegun(VkCommandBuffer commands);
 void CmdPushConstants(const Context& context, VkCommandBuffer commands, VkPipelineLayout layout, VkShaderStageFlags stages,
                       std::uint32_t offset, std::uint32_t size, const void* values);
 void CmdBindDescriptorSets(const Context& context, VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout,
-                           std::uint32_t firstSet, std::uint32_t setCount, const VkDescriptorSet* sets, SetBindSite site);
+                           std::uint32_t firstSet, std::uint32_t setCount, const VkDescriptorSet* sets, SetBindSite site, std::uint32_t offsetCount = 0, const std::uint32_t* offsets = nullptr);
 void CmdPushDescriptorSet(PFN_vkCmdPushDescriptorSetKHR push, VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, std::uint32_t set,
                           std::uint32_t writeCount, const VkWriteDescriptorSet* writes, SetBindSite site);
 std::uint64_t DescriptorHeapBinds();

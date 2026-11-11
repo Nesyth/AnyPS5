@@ -5219,6 +5219,11 @@ bool VulkanDevice::PrepareDrawInputs(const Graphics::State& graphics, const Pm4:
     return Graphics::PrepareDrawInputs(state->context, graphics, draw, shaders, std::move(recipe), prepared);
 }
 
+bool VulkanDevice::PlaceDirectBuffers(Graphics::ShaderResources::PreparedBuffers& prepared) const {
+    if (!state->contextReady) return false;
+    return Graphics::ShaderResources::PlaceDirectBuffers(state->context, prepared);
+}
+
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey, const std::uint32_t* fragmentOutputs, bool recordRecipe) {
     startJournalReplay();
     for (const auto& shader : shaders) {

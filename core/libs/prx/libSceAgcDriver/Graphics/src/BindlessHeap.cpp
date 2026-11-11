@@ -1090,9 +1090,9 @@ void CmdPushConstants(const Context& context, VkCommandBuffer commands, VkPipeli
 }
 
 void CmdBindDescriptorSets(const Context& context, VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout,
-                           std::uint32_t firstSet, std::uint32_t setCount, const VkDescriptorSet* sets, SetBindSite site) {
+                           std::uint32_t firstSet, std::uint32_t setCount, const VkDescriptorSet* sets, SetBindSite site, std::uint32_t offsetCount, const std::uint32_t* offsets) {
     context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, firstSet, setCount,
-                                                                                         sets, 0, nullptr);
+                                                                                         sets, offsetCount, offsets);
     if (pipelineStats()) setBinds[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
     forgetHeapBinding(commands);
 }

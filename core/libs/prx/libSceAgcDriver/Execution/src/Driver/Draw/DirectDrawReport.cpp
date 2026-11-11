@@ -47,7 +47,15 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "not reusable", "heap stage", "lease", "address table", "copied writes", "fault checks", "space reuse", "GPU writes", "GPU copies", "depth copies",
     "multisampled", "multisampled depth", "not the recipe's", "linear", "fmask",
     "set repeat ns", "set repeats timed", "store repeat ns", "store repeats timed", "shared repeat ns", "shared repeats timed",
+    "bindings placed", "bindings not placed", "finisher slices bound", "finisher slices bound with a written set", "blobs copied", "placed for another device", "unmoved-range hazard", "depth guards", "slices returned", "bytes not copied", "objects not allocated",
+    "unmoved tests", "unmoved tests answered by stamp", "guard walks answered by the prepared test", "sets lent", "sets written", "bindings verified", "bindings differing", "stamp claims refuted",
+    "today's pushed ns", "today's pushed timed", "today's written-set ns", "today's written-set timed", "placed pushed ns", "placed pushed timed", "placed written-set ns", "placed written-set timed", "keep ns", "keeps timed", "dynamic sets bound", "dynamic sets written", "dynamic sets refused",
+    "dynamic pushed sets bound", "dynamic tuple hits", "written pushed ns", "written pushed timed", "written unpushed ns", "written unpushed timed", "dynamic pushed ns", "dynamic pushed timed", "dynamic unpushed ns", "dynamic unpushed timed",
+    "refused after a difference", "no prepared buffers", "stencil references or mesh window", "heap pipeline", "heap stage or binding", "address stages", "update after bind", "addressed buffers", "fault descriptors", "set or write shape", "per-draw uniform buffer", "per-draw binding of another type", "binding flags", "no per-draw storage buffer", "over the device limit", "push pipeline held", "other set without per-draw storage buffers", "before a second set was written", "repeat route", "pipeline not built", "rebound template or selection",
+    "refused after a difference", "no prepared buffers", "stencil references or mesh window", "heap pipeline", "heap stage or binding", "address stages", "update after bind", "addressed buffers", "fault descriptors", "set or write shape", "per-draw uniform buffer", "per-draw binding of another type", "binding flags", "no per-draw storage buffer", "over the device limit", "push pipeline held", "other set without per-draw storage buffers", "before a second set was written", "repeat route", "pipeline not built", "rebound template or selection",
 };
+static_assert(static_cast<std::size_t>(Counter::BindingsLeftUnpushedRebound) - static_cast<std::size_t>(Counter::BindingsLeftUnpushedRefused) + 2 == static_cast<std::size_t>(Graphics::ShaderResources::DynamicLeave::Count), "every way an unpushed draw leaves the dynamic route needs a counter");
+static_assert(static_cast<std::size_t>(Counter::BindingsLeftPushedRebound) - static_cast<std::size_t>(Counter::BindingsLeftPushedRefused) + 2 == static_cast<std::size_t>(Graphics::ShaderResources::DynamicLeave::Count), "every way a pushed draw leaves the dynamic route needs a counter");
 
 constexpr std::array<const char*, StepCount> StepNames{"request", "invocation", "walk", "key", "side", "class", "checks", "buffers", "inputs", "hand-off"};
 
@@ -148,6 +156,7 @@ std::array<std::atomic<std::uint64_t>, AllowedKinds> allowed{};
 std::atomic<std::uint64_t> printed{0};
 std::atomic<std::uint64_t> bufferPrinted{0};
 std::atomic<std::uint64_t> repeatPrinted{0};
+std::atomic<std::uint64_t> bindingsPrinted{0};
 std::atomic<std::uint64_t> classesKnown{0};
 std::atomic<std::uint64_t> classBytes{0};
 std::atomic<std::uint64_t> stagesKnown{0};
@@ -210,6 +219,10 @@ void NoteRepeatDifference(std::string_view field, std::string_view detail) {
     if (repeatPrinted.fetch_add(1, std::memory_order_relaxed) < PrintedPerWindow) std::fprintf(stderr, "[direct-repeat-verify] %.*s differs: %.*s\n", static_cast<int>(field.size()), field.data(), static_cast<int>(detail.size()), detail.data());
 }
 
+void NoteBindingsDifference(std::string_view field, std::string_view detail) {
+    if (bindingsPrinted.fetch_add(1, std::memory_order_relaxed) < PrintedPerWindow) std::fprintf(stderr, "[commit-bindings-verify] %.*s differs: %.*s\n", static_cast<int>(field.size()), field.data(), static_cast<int>(detail.size()), detail.data());
+}
+
 void Add(Counter counter, std::uint64_t count) {
     bump(own().counters[static_cast<std::size_t>(counter)], count);
 }
@@ -268,6 +281,7 @@ void Report(bool force) {
     printed.store(0, std::memory_order_relaxed);
     bufferPrinted.store(0, std::memory_order_relaxed);
     repeatPrinted.store(0, std::memory_order_relaxed);
+    bindingsPrinted.store(0, std::memory_order_relaxed);
     const auto& counts = since.counters;
     const auto at = [&](Counter counter) { return counts[static_cast<std::size_t>(counter)]; };
     const auto draws = at(Counter::Draws);
@@ -330,6 +344,33 @@ void Report(bool force) {
             static_cast<unsigned long long>(at(Counter::RepeatBlocks)), static_cast<unsigned long long>(at(Counter::RepeatLate)),
             static_cast<unsigned long long>(at(Counter::RepeatVerifyChecked)), static_cast<unsigned long long>(at(Counter::RepeatVerifyDiffering)), static_cast<unsigned long long>(at(Counter::RepeatRefuted)),
             perCommit(Counter::RepeatFullNanoseconds, Counter::RepeatFullTimed), perCommit(Counter::RepeatNanoseconds, Counter::RepeatTimed), perCommit(Counter::RepeatSetsNanoseconds, Counter::RepeatSetsTimed), perCommit(Counter::RepeatStoresNanoseconds, Counter::RepeatStoresTimed), perCommit(Counter::RepeatSharedNanoseconds, Counter::RepeatSharedTimed));
+    }
+    if (sum(Counter::BindingsPlaced, Counter::BindingsLeftPushedRebound) != 0) {
+        static Graphics::ShaderResources::UploadRingCounts ringReported;
+        const auto ring = Graphics::ShaderResources::UploadRingTotals();
+        const auto perDraw = [&](Counter nanoseconds, Counter timed) { return at(timed) == 0 ? 0.0 : static_cast<double>(at(nanoseconds)) / static_cast<double>(at(timed)); };
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] bindings: %llu placed on the finisher, %llu not placed; %llu finisher slices bound (%llu with a written set), %llu blobs copied, %llu not taken%s, %llu slices returned unbound; %llu bytes not copied, %llu objects not allocated; unmoved tests %llu, %llu answered by stamp; %llu guard walks answered by the prepared depth test; per-draw sets %llu lent, %llu written; verify %llu checked, %llu differing, %llu stamp claims refuted; ns per binding step: today pushed %.0f (%llu), today with a written set %.0f (%llu), placed pushed %.0f (%llu), placed with a written set %.0f (%llu); ns per keep %.0f (%llu); dynamic sets: %llu unpushed draws, %llu pushed draws, %llu tuple hits, %llu tuple misses (sets written), %llu draws refused, %llu templates over the device limit; ns per written-set step: pushed today %.0f (%llu), unpushed today %.0f (%llu), pushed dynamic %.0f (%llu), unpushed dynamic %.0f (%llu); upload ring: %llu chunks, %llu reused, %llu added, %llu overflow, %llu busy at most; left the dynamic route with a written set: %llu unpushed%s, %llu pushed%s\n",
+            static_cast<unsigned long long>(at(Counter::BindingsPlaced)), static_cast<unsigned long long>(at(Counter::BindingsNotPlaced)),
+            static_cast<unsigned long long>(at(Counter::BindingsTaken)), static_cast<unsigned long long>(at(Counter::BindingsTakenWritten)), static_cast<unsigned long long>(at(Counter::BindingsCopied)),
+            static_cast<unsigned long long>(sum(Counter::BindingsOtherDevice, Counter::BindingsDepthGuards)), reasons(counts, Counter::BindingsOtherDevice, Counter::BindingsDepthGuards).c_str(), static_cast<unsigned long long>(at(Counter::BindingsReturned)),
+            static_cast<unsigned long long>(at(Counter::BindingsBytes)), static_cast<unsigned long long>(at(Counter::BindingsObjects)),
+            static_cast<unsigned long long>(at(Counter::BindingsTested)), static_cast<unsigned long long>(at(Counter::BindingsStamped)), static_cast<unsigned long long>(at(Counter::BindingsGuards)),
+            static_cast<unsigned long long>(at(Counter::BindingsSetsLent)), static_cast<unsigned long long>(at(Counter::BindingsSetsWritten)),
+            static_cast<unsigned long long>(at(Counter::BindingsVerifyChecked)), static_cast<unsigned long long>(at(Counter::BindingsVerifyDiffering)), static_cast<unsigned long long>(at(Counter::BindingsRefuted)),
+            perDraw(Counter::BindingsTodayPushedNanoseconds, Counter::BindingsTodayPushedTimed), static_cast<unsigned long long>(at(Counter::BindingsTodayPushedTimed)),
+            perDraw(Counter::BindingsTodayWrittenNanoseconds, Counter::BindingsTodayWrittenTimed), static_cast<unsigned long long>(at(Counter::BindingsTodayWrittenTimed)),
+            perDraw(Counter::BindingsNewPushedNanoseconds, Counter::BindingsNewPushedTimed), static_cast<unsigned long long>(at(Counter::BindingsNewPushedTimed)),
+            perDraw(Counter::BindingsNewWrittenNanoseconds, Counter::BindingsNewWrittenTimed), static_cast<unsigned long long>(at(Counter::BindingsNewWrittenTimed)),
+            perDraw(Counter::BindingsKeepNanoseconds, Counter::BindingsKeepTimed), static_cast<unsigned long long>(at(Counter::BindingsKeepTimed)),
+            static_cast<unsigned long long>(at(Counter::BindingsDynamicBound)), static_cast<unsigned long long>(at(Counter::BindingsDynamicPushedBound)), static_cast<unsigned long long>(at(Counter::BindingsDynamicHits)), static_cast<unsigned long long>(at(Counter::BindingsDynamicWritten)), static_cast<unsigned long long>(at(Counter::BindingsDynamicRefused)), static_cast<unsigned long long>(Graphics::ShaderResources::DynamicPlansRefused()),
+            perDraw(Counter::BindingsWrittenPushedNanoseconds, Counter::BindingsWrittenPushedTimed), static_cast<unsigned long long>(at(Counter::BindingsWrittenPushedTimed)),
+            perDraw(Counter::BindingsWrittenUnpushedNanoseconds, Counter::BindingsWrittenUnpushedTimed), static_cast<unsigned long long>(at(Counter::BindingsWrittenUnpushedTimed)),
+            perDraw(Counter::BindingsDynamicPushedNanoseconds, Counter::BindingsDynamicPushedTimed), static_cast<unsigned long long>(at(Counter::BindingsDynamicPushedTimed)),
+            perDraw(Counter::BindingsDynamicUnpushedNanoseconds, Counter::BindingsDynamicUnpushedTimed), static_cast<unsigned long long>(at(Counter::BindingsDynamicUnpushedTimed)),
+            static_cast<unsigned long long>(ring.chunks), static_cast<unsigned long long>(ring.reused - ringReported.reused), static_cast<unsigned long long>(ring.added - ringReported.added), static_cast<unsigned long long>(ring.overflow - ringReported.overflow), static_cast<unsigned long long>(ring.inFlight),
+            static_cast<unsigned long long>(sum(Counter::BindingsLeftUnpushedRefused, Counter::BindingsLeftUnpushedRebound)), reasons(counts, Counter::BindingsLeftUnpushedRefused, Counter::BindingsLeftUnpushedRebound).c_str(),
+            static_cast<unsigned long long>(sum(Counter::BindingsLeftPushedRefused, Counter::BindingsLeftPushedRebound)), reasons(counts, Counter::BindingsLeftPushedRefused, Counter::BindingsLeftPushedRebound).c_str());
+        ringReported = ring;
     }
     if (commits == 0) return;
     static std::array<std::uint64_t, static_cast<std::size_t>(Graphics::RecipeRefusal::Count)> refusalsReported{};

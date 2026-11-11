@@ -379,6 +379,7 @@ public:
     Graphics::RepeatOutcome RepeatFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, const Graphics::ShaderResources::PreparedBuffers* prepared, Graphics::PreparedInputs* preparedInputs, DrawCommitView* describe = nullptr, std::uint64_t verifyEvery = 0);
     std::vector<std::uint32_t> DrawContentKey(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) const;
     bool PrepareDrawInputs(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, Graphics::PreparedInputs& prepared) const;
+    bool PlaceDirectBuffers(Graphics::ShaderResources::PreparedBuffers& prepared) const;
     bool DrawInputsInPlace() const;
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders, std::optional<std::uint32_t>* fragmentOutputs = nullptr) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);

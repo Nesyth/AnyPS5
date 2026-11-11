@@ -27,6 +27,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -34,12 +35,14 @@
 #include <functional>
 #include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1136,14 +1139,19 @@ constexpr std::uint32_t RepeatRounds = 4;
 constexpr std::uint32_t RepeatTimingRounds = 24;
 constexpr std::uint32_t AdditiveBlend = 0x40000101u;
 constexpr std::array<std::uint32_t, 4> RepeatVertexCounts{3u, 6u, 9u, 6u};
+constexpr std::size_t StillSlot = 15;
+constexpr std::uint32_t StillDraws = 48;
 
-enum class RepeatScene { Constants, Sets, Ring, Shared };
+enum class RepeatScene { Constants, Sets, Ring, Shared, Lend, Still, Mixed };
 
 const char* RepeatSceneName(RepeatScene scene) {
     switch (scene) {
     case RepeatScene::Constants: return "per-draw constants";
     case RepeatScene::Sets: return "per-draw data in both sets";
     case RepeatScene::Ring: return "per-draw constant buffers";
+    case RepeatScene::Lend: return "per-draw data beside a constant buffer in place";
+    case RepeatScene::Still: return "a constant buffer in place, rewritten per pass";
+    case RepeatScene::Mixed: return "per-draw data in both sets, the pushed set at rest every other pass";
     default: return "two classes and a pass break";
     }
 }
@@ -1162,28 +1170,52 @@ std::vector<std::uint8_t> RenderScene(RepeatScene scene, std::uint32_t round) {
     RegisterWrites registers{{0x8b, 0}, {0x8c, 0}, {0x00b, 3u << 1u}, {0x00c, static_cast<std::uint32_t>(first)}, {0x00d, static_cast<std::uint32_t>(first >> 32u)}, {0x00e, 0u}};
     auto vertex = reinterpret_cast<std::uintptr_t>(PlainVertex.data());
     auto pixel = reinterpret_cast<std::uintptr_t>(ConstantPixel.data());
-    if (scene == RepeatScene::Sets) {
+    if (scene == RepeatScene::Sets || scene == RepeatScene::Lend || scene == RepeatScene::Mixed) {
         for (std::uint32_t draw = 0; draw < RepeatDraws; ++draw) {
             const float shift = 0.0009765625f * static_cast<float>(1 + draw + round * RepeatDraws);
             std::memcpy(blocks.data.Bytes(RepeatVertexOffset + draw * 0x40u), &shift, sizeof(shift));
         }
+        const float rest = 0.0009765625f;
+        std::memcpy(blocks.data.Bytes(RepeatVertexOffset + RepeatDraws * 0x40u), &rest, sizeof(rest));
         const auto shifts = blocks.data.At(RepeatVertexOffset);
         registers = {{0x8b, 2u << 1u}, {0x8c, static_cast<std::uint32_t>(shifts)}, {0x8d, static_cast<std::uint32_t>(shifts >> 32u)}, {0x00b, 3u << 1u}, {0x00c, static_cast<std::uint32_t>(first)}, {0x00d, static_cast<std::uint32_t>(first >> 32u)}, {0x00e, 0u}};
         vertex = reinterpret_cast<std::uintptr_t>(DataVertex.data());
+    }
+    if (scene == RepeatScene::Still) {
+        const auto slot = RingSlotsOffset + StillSlot * RingSlotBytes;
+        for (std::uint32_t word = 0; word < RingSlotBytes / 4u; ++word) {
+            const auto value = word >= 4u && word < 8u ? 0u : 0x3a800000u + round * 0x1000u + word;
+            std::memcpy(blocks.ring.Bytes(slot + word * 4u), &value, sizeof(value));
+        }
+        const auto constants = RawDescriptor(blocks.ring.At(slot), ConstantRecords);
+        registers = {{0x8b, 0}, {0x8c, 0}, {0x00b, 4u << 1u}, {0x00c, constants[0]}, {0x00d, constants[1]}, {0x00e, constants[2]}, {0x00f, constants[3]}};
+        pixel = reinterpret_cast<std::uintptr_t>(RingPixel.data());
+    }
+    if (scene == RepeatScene::Lend) {
+        const auto constants = RawDescriptor(blocks.ring.At(RingSlotsOffset), ConstantRecords);
+        const auto shifts = blocks.data.At(RepeatVertexOffset);
+        registers = {{0x8b, 2u << 1u}, {0x8c, static_cast<std::uint32_t>(shifts)}, {0x8d, static_cast<std::uint32_t>(shifts >> 32u)}, {0x00b, 4u << 1u}, {0x00c, constants[0]}, {0x00d, constants[1]}, {0x00e, constants[2]}, {0x00f, constants[3]}};
+        pixel = reinterpret_cast<std::uintptr_t>(RingPixel.data());
     }
     if (scene == RepeatScene::Ring) {
         const auto constants = RawDescriptor(blocks.ring.At(RingSlotsOffset + (round % 6) * RingSlotBytes), ConstantRecords);
         registers = {{0x8b, 0}, {0x8c, 0}, {0x00b, 4u << 1u}, {0x00c, constants[0]}, {0x00d, constants[1]}, {0x00e, constants[2]}, {0x00f, constants[3]}};
         pixel = reinterpret_cast<std::uintptr_t>(RingPixel.data());
     }
-    const auto draws = scene == RepeatScene::Shared ? SharedDraws : RepeatDraws;
+    const auto draws = scene == RepeatScene::Shared ? SharedDraws : scene == RepeatScene::Still ? StillDraws : RepeatDraws;
     SubmitDraws(vertex, pixel, {{0x242, 4}}, registers, blocks.target, draws, 3, AdditiveBlend, [&](std::vector<std::uint32_t>& commands, std::uint32_t draw) -> std::uint32_t {
-        if (scene == RepeatScene::Ring) return RepeatVertexCounts[(draw + round) % RepeatVertexCounts.size()];
+        if (scene == RepeatScene::Ring || scene == RepeatScene::Still) return RepeatVertexCounts[(draw + round) % RepeatVertexCounts.size()];
+        if (scene == RepeatScene::Lend) {
+            const auto shift = blocks.data.At(RepeatVertexOffset + draw * 0x40u);
+            Append(commands, 0x76, {0x8c, static_cast<std::uint32_t>(shift)});
+            Append(commands, 0x76, {0x8d, static_cast<std::uint32_t>(shift >> 32u)});
+            return 3;
+        }
         const auto pointer = blocks.data.At(RepeatConstantsOffset + draw * 0x40u);
         Append(commands, 0x76, {0x00c, static_cast<std::uint32_t>(pointer)});
         Append(commands, 0x76, {0x00d, static_cast<std::uint32_t>(pointer >> 32u)});
-        if (scene == RepeatScene::Sets) {
-            const auto shift = blocks.data.At(RepeatVertexOffset + draw * 0x40u);
+        if (scene == RepeatScene::Sets || scene == RepeatScene::Mixed) {
+            const auto shift = blocks.data.At(RepeatVertexOffset + (scene == RepeatScene::Mixed && round % 2u == 1u ? RepeatDraws : draw) * 0x40u);
             Append(commands, 0x76, {0x8c, static_cast<std::uint32_t>(shift)});
             Append(commands, 0x76, {0x8d, static_cast<std::uint32_t>(shift >> 32u)});
             return 3;
@@ -1356,6 +1388,262 @@ void Repeats(bool ring) {
         }
     }
     environment.Apply();
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectPassTargets, passTargets);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, repeatEnvironment);
+}
+
+namespace BindingHooks {
+
+std::atomic<int> fired{0};
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads(AgcDriver::DrawRecordCommit& record) {
+    if (record.recipe == nullptr) return {};
+    const auto resources = record.recipe->templateRef.lock();
+    if (resources == nullptr) return {};
+    return resources->InPlaceReads();
+}
+
+void PendingWrite(AgcDriver::DrawRecordCommit& record) {
+    auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    const auto reads = InPlaceReads(record);
+    if (recorder == nullptr || reads.empty()) return;
+    for (const auto& [begin, end] : reads) recorder->NotePendingWrite(begin, static_cast<std::size_t>(end - begin));
+    fired.fetch_add(1);
+}
+
+void QueuedStore(AgcDriver::DrawRecordCommit& record) {
+    auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    const auto reads = InPlaceReads(record);
+    if (recorder == nullptr || reads.empty()) return;
+    for (const auto& [begin, end] : reads) recorder->QueueKeyStore(VK_NULL_HANDLE, 0, 0, nullptr, begin, end);
+    fired.fetch_add(1);
+}
+
+}
+
+constexpr std::size_t LingeringChunks = 2;
+constexpr std::size_t SmallChunkBytes = 128;
+constexpr std::size_t RingChunkBytes = 1536;
+
+std::size_t LooseChunks() {
+    const auto placed = AgcDriver::Graphics::ShaderResources::PlacedUploadChunks();
+    const auto ring = static_cast<std::size_t>(AgcDriver::Graphics::ShaderResources::UploadRingTotals().chunks);
+    return placed > ring ? placed - ring : 0;
+}
+
+std::size_t PlacedChunksAfterIdle(std::size_t bound) {
+    for (std::uint32_t attempt = 0; attempt < 400 && LooseChunks() > bound; ++attempt) {
+        AgcDriverWaitIdle_nid_postfix();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return LooseChunks();
+}
+
+void CommitBindings(bool ring) {
+    using AgcDriver::Graphics::SetCommitBindingsHookForTest;
+    using AgcDriver::Graphics::ShaderResources;
+    const auto verifyEvery = AgcDriver::Graphics::CommitBindingsVerifyEvery();
+    const bool stampsEnvironment = RuntimeSwitches::Set(RuntimeSwitch::CommitBindingsStamps);
+    const bool setsEnvironment = RuntimeSwitches::Set(RuntimeSwitch::CommitBindingsSets);
+    const bool dynamicEnvironment = RuntimeSwitches::Set(RuntimeSwitch::CommitBindingsDynamic);
+    const bool ownSets = RuntimeSwitches::Set(RuntimeSwitch::OwnDrawSets);
+    RuntimeSwitches::Assign(RuntimeSwitch::OwnDrawSets, true);
+    const bool repeatEnvironment = RuntimeSwitches::Set(RuntimeSwitch::DirectRepeat);
+    const bool passTargets = RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets);
+    const bool committed = ring && DirectReport::VerifyEvery() != 1 && DrawRecords::VerifyEvery() != 1 && RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) && DirectReport::BufferVerifyEvery() == 0;
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectPassTargets, true);
+    const auto perDraw = [](const DirectTotals& now, const DirectTotals& base, DirectCounter nanoseconds, DirectCounter timed) {
+        const auto count = now.Since(base, timed);
+        return count == 0 ? 0.0 : static_cast<double>(now.Since(base, nanoseconds)) / static_cast<double>(count);
+    };
+    for (const auto scene : {RepeatScene::Constants, RepeatScene::Sets, RepeatScene::Ring, RepeatScene::Lend, RepeatScene::Mixed}) {
+        const std::string name = RepeatSceneName(scene);
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
+        RuntimeSwitches::Assign(RuntimeSwitch::CommitBindings, false);
+        std::vector<std::vector<std::uint8_t>> today;
+        for (std::uint32_t round = 0; round < RepeatRounds; ++round) today.push_back(RenderScene(scene, round));
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, true);
+        const auto render = [&](bool bindings, bool stamps, bool sets, bool dynamic, const std::string& what) {
+            RuntimeSwitches::Assign(RuntimeSwitch::CommitBindings, bindings);
+            RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsStamps, stamps);
+            RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsSets, sets);
+            RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsDynamic, dynamic);
+            const auto before = DirectTotals::Now();
+            for (std::uint32_t round = 0; round < RepeatRounds; ++round) Require(RenderScene(scene, round) == today[round], "commit bindings, " + name + ", " + what + ": round " + std::to_string(round) + " rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before));
+            const auto after = DirectTotals::Now();
+            std::cout << "commit bindings, " << name << ", " << what << ": " << after.Since(before, DirectCounter::BindingsTaken) << " finisher slices bound, " << after.Since(before, DirectCounter::BindingsStamped) << " unmoved tests answered by stamp, " << after.Since(before, DirectCounter::BindingsSetsLent) << " sets lent, " << after.Since(before, DirectCounter::BindingsVerifyChecked) << " verified, " << ShaderResources::PlacedUploadChunks() << " finisher chunks alive" << DescribeDirect(after, before) << '\n';
+            Require(after.Since(before, DirectCounter::BindingsVerifyDiffering) == 0 && after.Since(before, DirectCounter::BindingsRefuted) == 0, "commit bindings, " + name + ", " + what + ": the verify found differences or refuted stamps" + DescribeDirect(after, before));
+            Require(PlacedChunksAfterIdle(LingeringChunks) <= LingeringChunks, "commit bindings, " + name + ", " + what + ": " + std::to_string(ShaderResources::PlacedUploadChunks()) + " finisher upload chunks are still alive two seconds after the batches completed");
+            return std::pair{before, after};
+        };
+        static_cast<void>(render(false, false, false, false, "without the switch"));
+        const auto [placedBefore, placedAfter] = render(true, false, false, false, "with finisher slices");
+        const auto [stampedBefore, stampedAfter] = render(true, true, true, false, "with finisher slices, stamps and lent sets");
+        const auto [dynamicBefore, dynamicAfter] = render(true, true, true, true, "with every sub-switch");
+        if (committed && scene == RepeatScene::Sets) Require(dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsDynamicPushedBound) != 0, "commit bindings, " + name + ": no pushed draw with a written second set bound dynamic sets" + DescribeDirect(dynamicAfter, dynamicBefore));
+        if (committed && scene == RepeatScene::Mixed) Require(dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsDynamicBound) != 0 && dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsDynamicPushedBound) != 0 && dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsLeftUnpushedPushHeld) == 0, "commit bindings, " + name + ": a record that holds a push pipeline did not bind dynamic sets both when its pushed set moved and when only its other set did" + DescribeDirect(dynamicAfter, dynamicBefore));
+        if (committed && verifyEvery != 0 && dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsDynamicBound) + dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsDynamicPushedBound) != 0) Require(dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsVerifyChecked) != 0, "commit bindings, " + name + ": the verify checked no commit with dynamic sets" + DescribeDirect(dynamicAfter, dynamicBefore));
+        if (committed && scene == RepeatScene::Lend) Require(stampedAfter.Since(stampedBefore, DirectCounter::BindingsSetsLent) != 0, "commit bindings, " + name + ": no draw borrowed the set an earlier draw wrote" + DescribeDirect(stampedAfter, stampedBefore));
+        if (!committed) continue;
+        Require(placedAfter.Since(placedBefore, DirectCounter::BindingsTaken) != 0 && placedAfter.Since(placedBefore, DirectCounter::BindingsCopied) == 0, "commit bindings, " + name + ": no commit bound the finisher's slice, or one copied the block" + DescribeDirect(placedAfter, placedBefore));
+        Require(placedAfter.Since(placedBefore, DirectCounter::BindingsBytes) != 0 && placedAfter.Since(placedBefore, DirectCounter::BindingsObjects) != 0, "commit bindings, " + name + ": no bytes were left uncopied or no object unallocated" + DescribeDirect(placedAfter, placedBefore));
+        if (verifyEvery != 0) Require(placedAfter.Since(placedBefore, DirectCounter::BindingsVerifyChecked) != 0, "commit bindings, " + name + ": the verify checked no commit" + DescribeDirect(placedAfter, placedBefore));
+        if (scene == RepeatScene::Sets) Require(placedAfter.Since(placedBefore, DirectCounter::BindingsTakenWritten) != 0, "commit bindings, " + name + ": no commit with a written set bound the finisher's slice" + DescribeDirect(placedAfter, placedBefore));
+        if (scene == RepeatScene::Ring) Require(stampedAfter.Since(stampedBefore, DirectCounter::BindingsStamped) != 0, "commit bindings, " + name + ": no unmoved test was answered by stamp" + DescribeDirect(stampedAfter, stampedBefore));
+        if (scene == RepeatScene::Ring) {
+            const auto expectHook = [&](const std::string& what, AgcDriver::Graphics::CommitBindingsHookForTest hook, bool refused) {
+                RuntimeSwitches::Assign(RuntimeSwitch::CommitBindings, true);
+                RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsStamps, true);
+                RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsDynamic, false);
+                const auto before = DirectTotals::Now();
+                BindingHooks::fired.store(0);
+                SetCommitBindingsHookForTest(hook);
+                const auto image = RenderScene(scene, 1);
+                SetCommitBindingsHookForTest(nullptr);
+                const auto after = DirectTotals::Now();
+                Require(BindingHooks::fired.load() == 1, "commit bindings, " + name + ", " + what + ": the hook did not run once before a commit");
+                if (refused) Require(after.Since(before, DirectCounter::BindingsHazard) != 0 && after.Since(before, DirectCounter::BindingsReturned) != 0, "commit bindings, " + name + ", " + what + ": no commit refused its finisher slice for an unmoved-range hazard and returned it" + DescribeDirect(after, before));
+                else Require(after.Since(before, DirectCounter::BindingsHazard) == 0 && after.Since(before, DirectCounter::BindingsTaken) == after.Since(before, DirectCounter::BuffersUsed), "commit bindings, " + name + ", " + what + ": a commit that binds the prepared buffers today did not bind the finisher's slice" + DescribeDirect(after, before));
+                Require(after.Since(before, DirectCounter::BindingsVerifyDiffering) == 0 && after.Since(before, DirectCounter::BindingsRefuted) == 0, "commit bindings, " + name + ", " + what + ": the verify found differences or refuted stamps" + DescribeDirect(after, before));
+                Require(image == today[1], "commit bindings, " + name + ", " + what + ": the pass rendered differently from today's path" + DescribeDirect(after, before));
+                RuntimeSwitches::Assign(RuntimeSwitch::CommitBindings, false);
+                Require(RenderScene(scene, 2) == today[2], "commit bindings, " + name + ", " + what + ": the next pass rendered differently from today's path");
+                Require(PlacedChunksAfterIdle(LingeringChunks) <= LingeringChunks, "commit bindings, " + name + ", " + what + ": " + std::to_string(ShaderResources::PlacedUploadChunks()) + " finisher upload chunks are still alive two seconds after the next batch completed");
+                std::cout << "commit bindings, " << name << ", " << what << ": " << (refused ? "refused and returned" : "bound as today's prepared buffers") << DescribeDirect(after, before) << '\n';
+            };
+            expectHook("a pending write over a selected in-place buffer before the commit", &BindingHooks::PendingWrite, true);
+            expectHook("a key store queued over a selected in-place buffer before the commit", &BindingHooks::QueuedStore, false);
+        }
+        if (std::getenv("APS5_PIPELINE_STATS") != nullptr && verifyEvery == 0) {
+            const auto timing = [&](bool bindings) {
+                RuntimeSwitches::Assign(RuntimeSwitch::CommitBindings, bindings);
+                RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsStamps, bindings);
+                RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsSets, bindings);
+                RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsDynamic, bindings);
+                const auto before = DirectTotals::Now();
+                for (std::uint32_t round = 0; round < RepeatTimingRounds; ++round) static_cast<void>(RenderScene(scene, round % RepeatRounds));
+                return std::pair{before, DirectTotals::Now()};
+            };
+            constexpr std::uint32_t TimingRuns = 7;
+            std::array<double, 6> best{};
+            best.fill(std::numeric_limits<double>::max());
+            const auto keepBest = [&](std::size_t at, double value) {
+                if (value != 0.0) best[at] = std::min(best[at], value);
+            };
+            for (std::uint32_t run = 0; run < TimingRuns; ++run) {
+                const auto [todayBefore, todayAfter] = timing(false);
+                const auto [newBefore, newAfter] = timing(true);
+                keepBest(0, perDraw(todayAfter, todayBefore, DirectCounter::BindingsTodayPushedNanoseconds, DirectCounter::BindingsTodayPushedTimed));
+                keepBest(1, perDraw(todayAfter, todayBefore, DirectCounter::BindingsTodayWrittenNanoseconds, DirectCounter::BindingsTodayWrittenTimed));
+                keepBest(2, perDraw(newAfter, newBefore, DirectCounter::BindingsNewPushedNanoseconds, DirectCounter::BindingsNewPushedTimed));
+                keepBest(3, perDraw(newAfter, newBefore, DirectCounter::BindingsNewWrittenNanoseconds, DirectCounter::BindingsNewWrittenTimed));
+                keepBest(4, perDraw(todayAfter, todayBefore, DirectCounter::BindingsKeepNanoseconds, DirectCounter::BindingsKeepTimed));
+                keepBest(5, perDraw(newAfter, newBefore, DirectCounter::BindingsKeepNanoseconds, DirectCounter::BindingsKeepTimed));
+            }
+            const auto shown = [&](std::size_t at) { return best[at] == std::numeric_limits<double>::max() ? 0.0 : best[at]; };
+            std::cout << "commit bindings timing, " << name << ": ns per binding step (best of " << TimingRuns << " runs), today's route pushed " << shown(0) << ", with a written set " << shown(1) << "; with the switches pushed " << shown(2) << ", with a written set " << shown(3) << "; ns per keep, today " << shown(4) << ", with the switches " << shown(5) << "\n";
+        }
+    }
+    {
+        const auto scene = RepeatScene::Still;
+        const std::string name = RepeatSceneName(scene);
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
+        RuntimeSwitches::Assign(RuntimeSwitch::CommitBindings, false);
+        RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsDynamic, false);
+        std::vector<std::vector<std::uint8_t>> today;
+        for (std::uint32_t round = 0; round < RepeatRounds; ++round) today.push_back(RenderScene(scene, round));
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, true);
+        const auto run = [&](bool bindings, bool dynamic, const std::string& what) {
+            RuntimeSwitches::Assign(RuntimeSwitch::CommitBindings, bindings);
+            RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsStamps, bindings);
+            RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsSets, false);
+            RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsDynamic, dynamic);
+            const auto before = DirectTotals::Now();
+            for (std::uint32_t round = 0; round < RepeatRounds; ++round) Require(RenderScene(scene, round) == today[round], "commit bindings, " + name + ", " + what + ": round " + std::to_string(round) + " rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before));
+            const auto after = DirectTotals::Now();
+            std::cout << "commit bindings, " << name << ", " << what << ": " << after.Since(before, DirectCounter::BindingsDynamicBound) << " dynamic sets bound, " << after.Since(before, DirectCounter::BindingsDynamicWritten) << " written, " << after.Since(before, DirectCounter::BindingsVerifyChecked) << " verified" << DescribeDirect(after, before) << '\n';
+            Require(after.Since(before, DirectCounter::BindingsVerifyDiffering) == 0 && after.Since(before, DirectCounter::BindingsRefuted) == 0, "commit bindings, " + name + ", " + what + ": the verify found differences or refuted stamps" + DescribeDirect(after, before));
+            Require(PlacedChunksAfterIdle(LingeringChunks) <= LingeringChunks, "commit bindings, " + name + ", " + what + ": " + std::to_string(ShaderResources::PlacedUploadChunks()) + " finisher upload chunks are still alive two seconds after the batches completed");
+            return std::pair{before, after};
+        };
+        const auto [plainBefore, plainAfter] = run(true, false, "without dynamic sets");
+        const auto [dynamicBefore, dynamicAfter] = run(true, true, "with dynamic sets");
+        if (committed) {
+            Require(plainAfter.Since(plainBefore, DirectCounter::BindingsTakenWritten) != 0, "commit bindings, " + name + ": no commit wrote a set on today's route" + DescribeDirect(plainAfter, plainBefore));
+            const auto bound = dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsDynamicBound);
+            const auto written = dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsDynamicWritten);
+            Require(bound != 0 && written < bound, "commit bindings, " + name + ": " + std::to_string(bound) + " draws bound dynamic sets, " + std::to_string(written) + " sets were written" + DescribeDirect(dynamicAfter, dynamicBefore));
+            if (verifyEvery != 0) Require(dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsVerifyChecked) != 0, "commit bindings, " + name + ": the verify checked no dynamic draw" + DescribeDirect(dynamicAfter, dynamicBefore));
+            ShaderResources::SetUploadChunkBytesForTest(SmallChunkBytes);
+            const auto [smallBefore, smallAfter] = run(true, true, "with dynamic sets and small finisher chunks");
+            ShaderResources::SetUploadChunkBytesForTest(0);
+            const auto smallBound = smallAfter.Since(smallBefore, DirectCounter::BindingsDynamicBound);
+            const auto smallWritten = smallAfter.Since(smallBefore, DirectCounter::BindingsDynamicWritten);
+            Require(smallBound != 0 && smallWritten > written && smallWritten <= smallBound, "commit bindings, " + name + ": with a new finisher chunk every few draws " + std::to_string(smallBound) + " draws bound dynamic sets and " + std::to_string(smallWritten) + " sets were written, against " + std::to_string(written) + " with whole chunks" + DescribeDirect(smallAfter, smallBefore));
+            ShaderResources::SetDynamicLimitForTest(0);
+            const auto [limitBefore, limitAfter] = run(true, true, "with dynamic sets over the device limit");
+            ShaderResources::SetDynamicLimitForTest(std::nullopt);
+            Require(limitAfter.Since(limitBefore, DirectCounter::BindingsDynamicBound) == 0 && limitAfter.Since(limitBefore, DirectCounter::BindingsDynamicRefused) != 0, "commit bindings, " + name + ": a template over the dynamic descriptor limit bound a dynamic set or was not counted" + DescribeDirect(limitAfter, limitBefore));
+            ShaderResources::SetUploadChunkBytesForTest(SmallChunkBytes);
+            RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsDynamic, true);
+            const auto fullBefore = ShaderResources::UploadRingTotals();
+            Require(RenderScene(scene, 0) == today[0], "commit bindings, " + name + ": a pass that overflows the upload ring rendered differently from today's path");
+            const auto fullAfter = ShaderResources::UploadRingTotals();
+            Require(RenderScene(scene, 1) == today[1], "commit bindings, " + name + ": the pass after an overflowing one rendered differently from today's path");
+            const auto nextAfter = ShaderResources::UploadRingTotals();
+            std::cout << "commit bindings, " << name << ", upload ring with " << SmallChunkBytes << "-byte chunks: first pass " << fullAfter.added - fullBefore.added << " chunks added, " << fullAfter.reused - fullBefore.reused << " reused, " << fullAfter.overflow - fullBefore.overflow << " overflow; next pass " << nextAfter.reused - fullAfter.reused << " reused, " << nextAfter.overflow - fullAfter.overflow << " overflow\n";
+            Require(fullAfter.reused == fullBefore.reused && fullAfter.overflow > fullBefore.overflow && nextAfter.reused > fullAfter.reused, "commit bindings, " + name + ": the upload ring reused a chunk while its batch was open, did not overflow, or did not reuse its chunks once the batch completed");
+            ShaderResources::SetUploadChunkBytesForTest(RingChunkBytes);
+            const auto ringBefore = ShaderResources::UploadRingTotals();
+            const auto [ringPassBefore, ringPassAfter] = run(true, true, "with dynamic sets and a ring of small chunks");
+            const auto ringAfter = ShaderResources::UploadRingTotals();
+            ShaderResources::SetUploadChunkBytesForTest(0);
+            const auto ringWritten = ringPassAfter.Since(ringPassBefore, DirectCounter::BindingsDynamicWritten);
+            const auto ringHits = ringPassAfter.Since(ringPassBefore, DirectCounter::BindingsDynamicHits);
+            std::cout << "commit bindings, " << name << ", upload ring with " << RingChunkBytes << "-byte chunks: " << ringAfter.added - ringBefore.added << " chunks added, " << ringAfter.reused - ringBefore.reused << " reused, " << ringWritten << " tuples written, " << ringHits << " tuple hits\n";
+            Require(ringAfter.reused > ringBefore.reused && ringHits != 0 && ringWritten <= 2u * (ringAfter.added - ringBefore.added), "commit bindings, " + name + ": a tuple written for a ring chunk was not hit again when the ring came round to it" + DescribeDirect(ringPassAfter, ringPassBefore));
+        }
+        if (std::getenv("APS5_PIPELINE_STATS") != nullptr && verifyEvery == 0) {
+            constexpr std::uint32_t TimingRuns = 7;
+            std::array<double, 4> best{};
+            best.fill(std::numeric_limits<double>::max());
+            const auto timing = [&](bool bindings) {
+                RuntimeSwitches::Assign(RuntimeSwitch::CommitBindings, bindings);
+                RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsStamps, bindings);
+                RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsSets, false);
+                RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsDynamic, bindings);
+                const auto before = DirectTotals::Now();
+                for (std::uint32_t round = 0; round < RepeatTimingRounds; ++round) static_cast<void>(RenderScene(scene, round % RepeatRounds));
+                return std::pair{before, DirectTotals::Now()};
+            };
+            for (std::uint32_t timed = 0; timed < TimingRuns; ++timed) {
+                const auto [todayBefore, todayAfter] = timing(false);
+                const auto [newBefore, newAfter] = timing(true);
+                const auto keep = [&](std::size_t at, double value) {
+                    if (value != 0.0) best[at] = std::min(best[at], value);
+                };
+                keep(0, perDraw(todayAfter, todayBefore, DirectCounter::BindingsTodayWrittenNanoseconds, DirectCounter::BindingsTodayWrittenTimed));
+                keep(1, perDraw(newAfter, newBefore, DirectCounter::BindingsNewWrittenNanoseconds, DirectCounter::BindingsNewWrittenTimed));
+                keep(2, perDraw(todayAfter, todayBefore, DirectCounter::BindingsTodayPushedNanoseconds, DirectCounter::BindingsTodayPushedTimed));
+                keep(3, perDraw(newAfter, newBefore, DirectCounter::BindingsNewPushedNanoseconds, DirectCounter::BindingsNewPushedTimed));
+            }
+            const auto shown = [&](std::size_t at) { return best[at] == std::numeric_limits<double>::max() ? 0.0 : best[at]; };
+            std::cout << "commit bindings timing, " << name << ": ns per binding step (best of " << TimingRuns << " runs), today's route with a written set " << shown(0) << ", with dynamic sets " << shown(1) << " (pushed: today " << shown(2) << ", with the switches " << shown(3) << ")\n";
+        }
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::CommitBindings, false);
+    for (std::uint32_t round = 0; round < RepeatRounds; ++round) static_cast<void>(RenderScene(RepeatScene::Constants, round));
+    Require(PlacedChunksAfterIdle(0) == 0, "commit bindings: " + std::to_string(AgcDriver::Graphics::ShaderResources::PlacedUploadChunks()) + " finisher upload chunks are still alive after passes without the switch");
+    RuntimeSwitches::Assign(RuntimeSwitch::CommitBindings, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsStamps, stampsEnvironment);
+    RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsSets, setsEnvironment);
+    RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsDynamic, dynamicEnvironment);
+    RuntimeSwitches::Assign(RuntimeSwitch::OwnDrawSets, ownSets);
     RuntimeSwitches::Assign(RuntimeSwitch::DirectPassTargets, passTargets);
     RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
     RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, repeatEnvironment);
@@ -1826,6 +2114,7 @@ int main(int argc, char** argv) {
         Prepare();
         if (directEnvironment) Direct(arms.ring);
         if (directEnvironment && RuntimeSwitches::Set(RuntimeSwitch::DirectRepeat)) Repeats(arms.ring);
+        if (directEnvironment && RuntimeSwitches::Set(RuntimeSwitch::CommitBindings)) CommitBindings(arms.ring);
         if (inject) {
             Injected(arms);
         } else if (injectCommit) {
