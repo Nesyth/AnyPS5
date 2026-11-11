@@ -11,7 +11,7 @@ namespace AgcDriver::DriverDetail {
 
 namespace DirectDraws {
 
-enum class Counter : std::uint8_t {
+enum class Counter : std::uint16_t {
     Draws,
     Direct,
     FallbackShape,
