@@ -125,6 +125,7 @@ struct WriteSubscription {
     };
     std::vector<Bump> bumps;
     std::uint64_t overflowedAt = 0;
+    bool generationOnly = false;
 };
 
 namespace {
@@ -182,6 +183,10 @@ void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSour
         const auto visit = [&](std::uint64_t block, const std::vector<WriteSubscription*>& subscribers) {
             for (auto* subscription : subscribers) {
                 const auto generation = subscription->generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+                if (subscription->generationOnly) {
+                    ++bumped;
+                    continue;
+                }
                 if (!subscription->bumps.empty() && subscription->bumps.back().block == block && subscription->bumps.back().lookup == lookup) subscription->bumps.back().generation = generation;
                 else if (subscription->bumps.size() < MaxRecordedBumps) subscription->bumps.push_back({generation, block, !lookup, lookup});
                 else if (subscription->overflowedAt == 0) {
@@ -2976,6 +2981,12 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     return tracker.watched && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && tracker.covers(address, bytes);
+}
+
+std::shared_ptr<WriteSubscription> SubscribeWriteGeneration(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    auto subscription = SubscribeWrites(ranges);
+    subscription->generationOnly = true;
+    return subscription;
 }
 
 std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {

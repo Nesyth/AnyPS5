@@ -5188,7 +5188,78 @@ void ShaderResources::recordClean(bool proved, const CleanStamp& stamp) {
     if (stats && std::any_of(cleanSourced.begin(), cleanSourced.end(), [&](std::size_t i) { return StorageTexture::FindPending(validatedTextures[i].resource.baseAddress, validatedTextures[i].bytes).get() == validatedTextures[i].source; })) noteCleanRule(CleanRuleEvent::ExemptOverPending);
 }
 
+bool ShaderResources::expressEligible() const {
+    return reusable && !heapStage && bda == nullptr && !addressedBuffers && !rebound && directRegions.empty() && !GuestMemory::WriteIndexEnabled() && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits);
+}
+
+ShaderResources::ExpressBefore ShaderResources::expressBefore() {
+    ExpressBefore before;
+    expressSourcesBefore.clear();
+    if (!expressEligible()) return before;
+    if (expressWatch == nullptr) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        ranges.reserve(describedRanges.size() * 2u + storageTextures.size());
+        for (const auto& range : describedRanges) {
+            ranges.emplace_back(range.address, range.address + range.bytes);
+            if (range.dccAddress != 0) ranges.emplace_back(range.dccAddress, range.dccAddress + DccKeyBytes(range.bytes));
+        }
+        for (const auto& image : storageTextures) {
+            if (image != nullptr) ranges.emplace_back(image->Descriptor().baseAddress, image->Descriptor().baseAddress + image->GuestBytes());
+        }
+        if (ranges.empty()) return before;
+        expressWatch = GuestMemory::SubscribeWriteGeneration(ranges);
+    }
+    before.generation = GuestMemory::SubscriptionGeneration(*expressWatch);
+    before.watched = true;
+    for (const auto& surface : validatedTextures) {
+        if (surface.source != nullptr) expressSourcesBefore.emplace_back(surface.source, surface.source->StateEpoch());
+    }
+    return before;
+}
+
+void ShaderResources::expressAfter(bool proved, const ExpressBefore& before) {
+    expressValid = false;
+    if (!proved || !before.watched || !cleanProved || !directRegions.empty()) return;
+    std::size_t at = 0;
+    for (const auto& surface : validatedTextures) {
+        if (surface.source == nullptr) continue;
+        if (at >= expressSourcesBefore.size() || expressSourcesBefore[at].first != surface.source) return;
+        ++at;
+    }
+    if (at != expressSourcesBefore.size()) return;
+    expressSources.swap(expressSourcesBefore);
+    expressGeneration = before.generation;
+    expressAt = cleanAt;
+    expressValid = true;
+}
+
+ShaderResources::ExpressMiss ShaderResources::ExpressCurrent() {
+    if (!expressValid || !cleanProved || expressWatch == nullptr) return ExpressMiss::NotProved;
+    if (GuestMemory::SubscriptionGeneration(*expressWatch) != expressGeneration) return ExpressMiss::Watch;
+    if (GuestMemory::CleanForgetSerial() != expressAt.forget) return ExpressMiss::Forget;
+    if (HostImportSetGeneration() != expressAt.imports || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != expressAt.allocations || GuestMemory::UnwatchSerial() != expressAt.unwatched || DepthSurfacesSerial() != expressAt.depthSurfaces) return ExpressMiss::Serials;
+    for (const auto& [source, epoch] : expressSources) {
+        if (source->StateEpoch() != epoch) return ExpressMiss::Sources;
+    }
+    if (!registeredImageViewsCurrent(registeredImageViews)) return ExpressMiss::Views;
+    if (!Recorder::InCompletion() && Recorder::Active() != nullptr && ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0)) return ExpressMiss::PendingCpu;
+    if (!guestMemory.StagingDecisionsCurrent()) return ExpressMiss::Staging;
+    return ExpressMiss::None;
+}
+
+void ShaderResources::ExpressStage(Recorder& recorder) {
+    guestMemory.RecordStagingCopies(recorder);
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report, CleanProof* clean) {
+    if (!expressValid && expressWatch == nullptr && !RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits)) return revalidateClean(shaders, report, clean);
+    const auto before = expressBefore();
+    const bool proved = revalidateClean(shaders, report, clean);
+    expressAfter(proved, before);
+    return proved;
+}
+
+bool ShaderResources::revalidateClean(std::span<const CompiledShader> shaders, ProofReport* report, CleanProof* clean) {
     if (clean == nullptr && !RuntimeSwitches::Set(RuntimeSwitch::CleanCurrency)) {
         const bool ok = revalidateProof(shaders, report);
         if (!ok) cleanProved = false;

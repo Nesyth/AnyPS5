@@ -89,6 +89,7 @@ CollectWalkCounts CollectWalksCounted();
 struct WriteSubscription;
 bool WriteIndexEnabled();
 std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+std::shared_ptr<WriteSubscription> SubscribeWriteGeneration(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 std::uint64_t SubscriptionGeneration(const WriteSubscription& subscription);
 std::span<const std::pair<std::uint64_t, std::uint64_t>> SubscriptionSpans(const WriteSubscription& subscription);
 bool SweepSubscription(const WriteSubscription& subscription);

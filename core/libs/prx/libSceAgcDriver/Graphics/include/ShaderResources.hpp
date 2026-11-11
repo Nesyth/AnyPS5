@@ -457,6 +457,9 @@ public:
     std::shared_ptr<DrawBindings> PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut = nullptr, const PreparedBuffers* prepared = nullptr, PreparedBuffers::Selection* preparedSelection = nullptr, BindingRoute* route = nullptr) const;
     void PushDrawBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
     bool FragmentEligible() const { return reusable && !heapStage && bda == nullptr && !addressedBuffers && !rebound && context.descriptorCache != nullptr; }
+    enum class ExpressMiss : std::uint8_t { None, NotProved, Watch, Forget, Serials, Sources, Views, PendingCpu, Staging, Count };
+    ExpressMiss ExpressCurrent();
+    void ExpressStage(Recorder& recorder);
     PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route) const;
     void PushFragmentBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
     void WriteFragmentSets(DrawBindings& result, std::span<const std::size_t> selected, std::int32_t pushedSet) const;
@@ -1290,6 +1293,20 @@ private:
     std::uint8_t cleanViewsKept(const CleanStamp& stamp);
     bool cleanSourcesCurrent(FastFail& reason);
     bool cleanProved = false;
+    struct ExpressBefore {
+        std::uint64_t generation = 0;
+        bool watched = false;
+    };
+    ExpressBefore expressBefore();
+    void expressAfter(bool proved, const ExpressBefore& before);
+    bool expressEligible() const;
+    bool revalidateClean(std::span<const CompiledShader> shaders, ProofReport* report, CleanProof* clean);
+    std::shared_ptr<GuestMemory::WriteSubscription> expressWatch;
+    std::uint64_t expressGeneration = 0;
+    CleanStamp expressAt;
+    bool expressValid = false;
+    std::vector<std::pair<const StorageTexture*, std::uint64_t>> expressSources;
+    std::vector<std::pair<const StorageTexture*, std::uint64_t>> expressSourcesBefore;
     std::uint8_t cleanEligibility = 0;
     std::uint32_t cleanMisses = 0;
     CleanProof cleanRefusal = CleanProof::FirstProof;

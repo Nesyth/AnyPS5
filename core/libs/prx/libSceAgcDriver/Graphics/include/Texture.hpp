@@ -453,7 +453,16 @@ public:
     // Whether the storage cache holds this image (set and cleared by the cache under its mutex, the
     // clear before the eviction's flush): what a lookup of its surface would return.
     bool Cached() const { return cached.load(std::memory_order_acquire); }
-    void SetCached(bool value) { cached.store(value, std::memory_order_release); }
+    void SetCached(bool value) {
+        cached.store(value, std::memory_order_release);
+        NoteStateChange();
+    }
+    std::uint64_t StateEpoch() const { return stateEpoch.load(std::memory_order_acquire); }
+    void NoteStateChange() const { stateEpoch.fetch_add(1, std::memory_order_acq_rel); }
+    void SetUploadedKeys(DccKeys keys) {
+        uploadedKeys = keys;
+        NoteStateChange();
+    }
     FastProofStamp& FastProof() const { return fastProof; }
     // The pending image whose surface starts at `address` and covers at least `bytes` (a mip chain
     // contains a descriptor of its first mips), if any; the caller decides whether the geometry fits
@@ -823,6 +832,7 @@ private:
     std::vector<BaselineMiss> pendingMiss;
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;
+    mutable std::atomic<std::uint64_t> stateEpoch{0};
     mutable DccKeys filledKeys = DccKeys::Uncompressed;
     mutable DccKeyProof keyProof;
     mutable DccRangeProof targetKeyProof;
