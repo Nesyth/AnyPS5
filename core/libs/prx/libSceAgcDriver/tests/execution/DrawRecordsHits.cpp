@@ -1201,7 +1201,7 @@ void Repeats(bool ring) {
     const auto taken = on.Since(off, DirectCounter::RepeatTaken);
     const auto checked = on.Since(off, DirectCounter::RepeatVerifyChecked);
     std::cout << "repeat commits: " << taken << " taken, " << on.Since(off, DirectCounter::RepeatNoBlock, DirectCounter::RepeatUnmovedHazard) << " not taken, " << on.Since(off, DirectCounter::RepeatBlocks) << " blocks built, " << checked << " verified" << DescribeDirect(on, off) << '\n';
-    const bool committed = ring && DirectReport::VerifyEvery() != 1 && DrawRecords::VerifyEvery() != 1 && DirectReport::BufferVerifyEvery() != 1 && DirectReport::InputVerifyEvery() != 1;
+    const bool committed = ring && DirectReport::VerifyEvery() != 1 && DrawRecords::VerifyEvery() != 1 && RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) && RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) && DirectReport::BufferVerifyEvery() == 0 && DirectReport::InputVerifyEvery() == 0;
     if (committed) {
         Require(on.Since(off, DirectCounter::RepeatBlocks) != 0, "repeat commits: no full commit built a repeat block" + DescribeDirect(on, off));
         if (verifyEvery == 1) Require(taken == 0 && checked != 0, "repeat commits: with every repeat due for a verify, a repeat was taken or none was verified" + DescribeDirect(on, off));
