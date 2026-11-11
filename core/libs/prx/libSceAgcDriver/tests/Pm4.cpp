@@ -2554,7 +2554,8 @@ void timeLists(const char* layout, const ListPointers& lists, std::uint32_t pair
         bool direct;
     };
     constexpr std::array<Mode, 3> Modes{{{"today", false, false}, {"batched", true, false}, {"direct", false, true}}};
-    constexpr int Rounds = 40;
+    constexpr int Rounds = 20;
+    constexpr int Samples = 7;
     auto submission = listSubmission(lists, pairs);
     std::array<double, Modes.size()> perList{};
     std::array<std::uint64_t, Modes.size()> misses{};
@@ -2566,14 +2567,17 @@ void timeLists(const char* layout, const ListPointers& lists, std::uint32_t pair
         resolveListsOnce(submission);
         resolveListsOnce(submission);
         const auto missed = LeanFront::Total(Counter::ListCacheMisses);
-        const auto start = std::chrono::steady_clock::now();
-        for (int round = 0; round < Rounds; ++round) {
-            AgcDriver::GuestMemory::BumpCollectEpoch();
-            Access::ResolveLists(submission, true);
-            Access::RecycleLists(submission);
+        perList[mode] = std::numeric_limits<double>::max();
+        for (int sample = 0; sample < Samples; ++sample) {
+            const auto start = std::chrono::steady_clock::now();
+            for (int round = 0; round < Rounds; ++round) {
+                AgcDriver::GuestMemory::BumpCollectEpoch();
+                Access::ResolveLists(submission, true);
+                Access::RecycleLists(submission);
+            }
+            const auto elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+            perList[mode] = std::min(perList[mode], elapsed / (static_cast<double>(Rounds) * static_cast<double>(lists.size())));
         }
-        const auto elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
-        perList[mode] = elapsed / (static_cast<double>(Rounds) * static_cast<double>(lists.size()));
         misses[mode] = LeanFront::Total(Counter::ListCacheMisses) - missed;
         answers.push_back(resolveListsOnce(submission));
     }
@@ -2584,7 +2588,7 @@ void timeLists(const char* layout, const ListPointers& lists, std::uint32_t pair
             check(answers[mode][list].words == answers[0][list].words && (answers[mode][list].flags & 1u) == (answers[0][list].flags & 1u), "the timed register list paths resolved different words or validity");
         }
     }
-    std::printf("register list timing, %s (%zu lists of %u pairs, %d rounds): today %.3f us per list (%llu misses), batched %.3f us per list (%llu misses), direct %.3f us per list\n", layout, lists.size(), pairs, Rounds,
+    std::printf("register list timing, %s (%zu lists of %u pairs, best of %d runs of %d tails): today %.3f us per list (%llu misses), batched %.3f us per list (%llu misses), direct %.3f us per list\n", layout, lists.size(), pairs, Samples, Rounds,
         perList[0], static_cast<unsigned long long>(misses[0]), perList[1], static_cast<unsigned long long>(misses[1]), perList[2]);
 }
 
