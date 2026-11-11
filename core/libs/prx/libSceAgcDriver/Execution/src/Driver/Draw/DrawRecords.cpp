@@ -1644,10 +1644,16 @@ void NoteCommitBindings(const DrawRecord& record, DrawRecordCommit& commit, cons
         DirectDraws::Add(nanoseconds, noted.nanoseconds);
         DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(nanoseconds) + 1u));
     }
+    if (noted.timed && noted.written) {
+        const auto counter = noted.dynamicBound != 0 ? (noted.pushed ? Counter::BindingsDynamicPushedNanoseconds : Counter::BindingsDynamicUnpushedNanoseconds) : (noted.pushed ? Counter::BindingsWrittenPushedNanoseconds : Counter::BindingsWrittenUnpushedNanoseconds);
+        DirectDraws::Add(counter, noted.nanoseconds);
+        DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(counter) + 1u));
+    }
     if (noted.timed && noted.keepNanoseconds != 0) {
         DirectDraws::Add(Counter::BindingsKeepNanoseconds, noted.keepNanoseconds);
         DirectDraws::Add(Counter::BindingsKeepTimed);
     }
+    if (noted.dynamicLeave != 0 && noted.written && noted.dynamicBound == 0) DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(noted.pushed ? Counter::BindingsLeftPushedRefused : Counter::BindingsLeftUnpushedRefused) + noted.dynamicLeave - 1u));
     if (!noted.routed) return;
     switch (noted.taken) {
     case Taken::Placed:
@@ -1666,7 +1672,8 @@ void NoteCommitBindings(const DrawRecord& record, DrawRecordCommit& commit, cons
     if (noted.tested != 0) DirectDraws::Add(Counter::BindingsTested, noted.tested);
     if (noted.stamped != 0) DirectDraws::Add(Counter::BindingsStamped, noted.stamped);
     if (noted.guards != 0) DirectDraws::Add(Counter::BindingsGuards, noted.guards);
-    if (noted.dynamicBound != 0) DirectDraws::Add(Counter::BindingsDynamicBound, noted.dynamicBound);
+    if (noted.dynamicBound != 0) DirectDraws::Add(noted.pushed ? Counter::BindingsDynamicPushedBound : Counter::BindingsDynamicBound, noted.dynamicBound);
+    if (noted.dynamicHits != 0) DirectDraws::Add(Counter::BindingsDynamicHits, noted.dynamicHits);
     if (noted.dynamicWritten != 0) DirectDraws::Add(Counter::BindingsDynamicWritten, noted.dynamicWritten);
     if (noted.dynamicRefused != 0) DirectDraws::Add(Counter::BindingsDynamicRefused, noted.dynamicRefused);
     if (noted.setsLent != 0) DirectDraws::Add(Counter::BindingsSetsLent, noted.setsLent);

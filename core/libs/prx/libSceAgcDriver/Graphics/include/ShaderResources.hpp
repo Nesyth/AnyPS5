@@ -252,10 +252,14 @@ public:
         std::vector<std::size_t> pushSelected;
         std::array<bool, 2> lent{};
         std::array<std::shared_ptr<const DrawBindings>, 2> lenders;
-        bool dynamic = false;
-        std::array<std::shared_ptr<const void>, 2> dynamicSets;
-        std::array<std::uint32_t, 2> dynamicCounts{};
-        std::array<std::uint32_t, 32> dynamicOffsets{};
+        struct DynamicBound {
+            std::array<std::shared_ptr<const void>, 2> sets;
+            std::array<std::uint32_t, 2> counts{};
+            std::array<std::uint32_t, 32> offsets{};
+        };
+        std::unique_ptr<DynamicBound> dynamic;
+        std::uint32_t DynamicCount(std::size_t set) const { return dynamic != nullptr ? dynamic->counts[set] : 0u; }
+        const std::uint32_t* DynamicOffsets(std::size_t set) const { return dynamic != nullptr ? dynamic->offsets.data() + (set == 0 ? 0u : dynamic->counts[0]) : nullptr; }
         ~DrawBindings();
     };
     struct PushPlan {
@@ -358,6 +362,7 @@ public:
         VkDevice placedDevice = VK_NULL_HANDLE;
     };
     enum class BindingTaken : std::uint8_t { None, Placed, Copied, OtherDevice, Count };
+    enum class DynamicLeave : std::uint8_t { None, Refused, Prepared, Stages, HeapPipeline, Heap, Address, AfterBind, Addressed, Faults, Shape, Uniform, OtherType, Flags, NoStorage, Limit, PushHeld, OtherSet, First, Repeats, Pipeline, Rebound, Count };
     struct BindingRoute {
         bool placed = false;
         bool stamps = false;
@@ -368,9 +373,14 @@ public:
         std::uint32_t guards = 0;
         const PreparedBuffers* selection = nullptr;
         bool dynamic = false;
+        bool pushDynamic = false;
+        std::uint32_t dynamicHits = 0;
         std::uint32_t dynamicBound = 0;
         std::uint32_t dynamicWritten = 0;
         std::uint32_t dynamicRefused = 0;
+        DynamicLeave plainLeave = DynamicLeave::None;
+        DynamicLeave pushedLeave = DynamicLeave::None;
+        DynamicLeave leave = DynamicLeave::None;
         BindingTaken taken = BindingTaken::None;
         std::uint32_t tested = 0;
         std::uint32_t stamped = 0;
@@ -380,6 +390,14 @@ public:
     static bool PlaceDirectBuffers(const Context& context, PreparedBuffers& prepared);
     static std::size_t PlacedUploadChunks();
     static void SetUploadChunkBytesForTest(std::size_t bytes);
+    struct UploadRingCounts {
+        std::uint64_t reused = 0;
+        std::uint64_t added = 0;
+        std::uint64_t overflow = 0;
+        std::uint64_t chunks = 0;
+        std::uint64_t inFlight = 0;
+    };
+    static UploadRingCounts UploadRingTotals();
     // The first difference between prepared buffers and today's way of the same draw, compared as
     // data (APS5_VERIFY_DIRECT_BUFFERS): `what` names the part and stays null where they agree;
     // `memoryChanged`: only bytes differ, in a guest range written after the finisher read it (a
@@ -420,8 +438,17 @@ public:
         std::array<std::vector<std::size_t>, 2> dynamicSlots;
         std::vector<std::size_t> slotAllocations;
         std::size_t storageDynamic = 0;
+        std::array<std::size_t, 2> setDynamic{};
+        bool plainFits = false;
+        bool pushedBuilt = false;
+        bool pushedFits = false;
+        std::vector<std::uint32_t> pushedMainKey;
+        std::vector<std::uint32_t> pushedFragmentKey;
+        PipelineSetLayouts pushedLayouts;
     };
     const DynamicPlan* DynamicLayouts() const;
+    const PipelineSetLayouts* DynamicPushLayouts() const;
+    DynamicLeave DynamicLeaveFor(bool pushed) const;
     static void SetDynamicLimitForTest(std::optional<std::uint32_t> limit);
     static std::uint64_t DynamicPlansRefused();
     // `prepared` (buffers prepared from this object's plan, with `moved` their moved list) takes
@@ -466,7 +493,7 @@ public:
         std::uint64_t content = 0;
     };
     void DescribeDrawBindings(const DrawBindings* bound, std::span<const std::size_t> selected, const PushPlan* plan, std::vector<BoundBuffer>& out, bool contents = false) const;
-    void DescribeDynamicBindings(const DrawBindings& bound, std::span<const std::size_t> selected, std::vector<BoundBuffer>& out) const;
+    void DescribeDynamicBindings(const DrawBindings& bound, std::span<const std::size_t> selected, const PushPlan* plan, std::vector<BoundBuffer>& out) const;
     bool RecordLean() const;
     struct DrawUse {
         DrawUse() = default;
@@ -1187,10 +1214,12 @@ private:
     mutable bool pushPlanBuilt = false;
     mutable std::unique_ptr<DynamicPlan> dynamicPlan;
     mutable bool dynamicPlanBuilt = false;
+    mutable DynamicLeave dynamicPlanMiss = DynamicLeave::None;
+    mutable DynamicLeave pushedPlanMiss = DynamicLeave::None;
     struct DynamicSetEntry;
     mutable std::array<std::vector<std::shared_ptr<DynamicSetEntry>>, 2> dynamicSets;
     mutable std::vector<VkDescriptorBufferInfo> dynamicBuffers;
-    bool writeDynamicSets(DrawBindings& result, std::span<const std::size_t> selected, BindingRoute& route) const;
+    bool writeDynamicSets(DrawBindings& result, std::span<const std::size_t> selected, BindingRoute& route, std::int32_t pushedSet) const;
     mutable std::shared_ptr<const BufferPlan> bufferPlan;
     mutable bool bufferPlanBuilt = false;
     std::shared_ptr<OwnDrawSets> makeOwnDrawSets() const;

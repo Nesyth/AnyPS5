@@ -8209,7 +8209,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::finishDrawBindin
     if (result == nullptr || (selected.empty() && !rebound)) return {};
     const bool lends = route != nullptr && route->sets && lendsSets(pushedSet, faultRecord);
     if (pushedSet < 0) {
-        const bool dynamic = route != nullptr && route->dynamic && faultRecord == nullptr && writeDynamicSets(*result, selected, *route);
+        const auto refusedBefore = route != nullptr ? route->dynamicRefused : 0u;
+        const bool dynamic = route != nullptr && route->dynamic && faultRecord == nullptr && writeDynamicSets(*result, selected, *route, -1);
+        if (route != nullptr && !dynamic) route->leave = !route->dynamic ? route->plainLeave : faultRecord != nullptr ? DynamicLeave::Faults : route->dynamicRefused != refusedBefore ? DynamicLeave::None : DynamicLeave::Rebound;
         if (!dynamic) {
             if (lends) lendDrawSets(*result, selected, pushedSet, *route);
             writeDrawSets(*result, selected, faultRecord);
@@ -8218,9 +8220,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::finishDrawBindin
     } else {
         const auto& sets = pushPlan->allocationSets;
         if (std::ranges::any_of(selected, [&](std::size_t index) { return index >= sets.size() || sets[index] != static_cast<std::uint8_t>(pushedSet); })) {
-            if (lends) lendDrawSets(*result, selected, pushedSet, *route);
-            writeDrawSets(*result, selected, faultRecord, pushedSet);
-            if (lends) noteSetLenders(result, selected, *route);
+            const auto refusedBefore = route != nullptr ? route->dynamicRefused : 0u;
+            const bool dynamic = route != nullptr && route->pushDynamic && faultRecord == nullptr && writeDynamicSets(*result, selected, *route, pushedSet);
+            if (route != nullptr && !dynamic) route->leave = !route->pushDynamic ? route->pushedLeave : faultRecord != nullptr ? DynamicLeave::Faults : route->dynamicRefused != refusedBefore ? DynamicLeave::None : DynamicLeave::Rebound;
+            if (!dynamic) {
+                if (lends) lendDrawSets(*result, selected, pushedSet, *route);
+                writeDrawSets(*result, selected, faultRecord, pushedSet);
+                if (lends) noteSetLenders(result, selected, *route);
+            }
         } else {
             result->cache = context.descriptorCache;
         }
@@ -8394,18 +8401,41 @@ std::atomic<std::size_t> placedUploadChunks{0};
 std::atomic<std::size_t> uploadChunkBytes{0};
 constexpr std::size_t SharedUploadChunk = std::size_t{16} << 20u;
 
+constexpr std::size_t UploadRingChunks = 8;
+
 struct SharedUpload {
     std::mutex mutex;
-    std::weak_ptr<Buffer> chunk;
     VkDevice device = VK_NULL_HANDLE;
+    std::size_t chunkBytes = 0;
+    std::vector<std::shared_ptr<Buffer>> ring;
+    std::size_t current = 0;
+    std::shared_ptr<Buffer> overflow;
     std::size_t used = 0;
 };
+
+struct UploadRingTally {
+    std::atomic<std::uint64_t> reused{0};
+    std::atomic<std::uint64_t> added{0};
+    std::atomic<std::uint64_t> overflow{0};
+    std::atomic<std::uint64_t> chunks{0};
+    std::atomic<std::uint64_t> inFlight{0};
+};
+
+UploadRingTally& uploadRingTally() {
+    static UploadRingTally tally;
+    return tally;
+}
 
 SharedUpload& sharedUpload() {
     static auto* kept = new SharedUpload;
     return *kept;
 }
 
+}
+
+ShaderResources::UploadRingCounts ShaderResources::UploadRingTotals() {
+    auto& tally = uploadRingTally();
+    return {tally.reused.load(std::memory_order_relaxed), tally.added.load(std::memory_order_relaxed), tally.overflow.load(std::memory_order_relaxed), tally.chunks.load(std::memory_order_relaxed), tally.inFlight.load(std::memory_order_relaxed)};
 }
 
 void ShaderResources::SetUploadChunkBytesForTest(std::size_t bytes) {
@@ -8435,28 +8465,70 @@ bool ShaderResources::PlaceDirectBuffers(const Context& context, PreparedBuffers
         const bool shared = RuntimeSwitches::Set(RuntimeSwitch::CommitBindingsDynamic);
         const auto chosen = uploadChunkBytes.load(std::memory_order_relaxed);
         const auto chunkBytes = chosen != 0 ? chosen : shared ? SharedUploadChunk : Recorder::DrawUploadChunk;
-        const auto take = [&](std::weak_ptr<Buffer>& chunk, VkDevice& device, std::size_t& used) {
-            buffer = device == context.device ? chunk.lock() : nullptr;
-            offset = (used + alignment - 1) & ~(alignment - 1);
-            if (buffer == nullptr || offset + bytes > buffer->Bytes().size()) {
-                auto* made = new Buffer(context, std::max(chunkBytes, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-                placedUploadChunks.fetch_add(1, std::memory_order_acq_rel);
-                buffer = std::shared_ptr<Buffer>(made, [](Buffer* held) {
-                    delete held;
-                    placedUploadChunks.fetch_sub(1, std::memory_order_acq_rel);
-                });
-                chunk = buffer;
-                device = context.device;
-                offset = 0;
-            }
-            used = offset + bytes;
+        const auto make = [&] {
+            auto* made = new Buffer(context, std::max(chunkBytes, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            placedUploadChunks.fetch_add(1, std::memory_order_acq_rel);
+            return std::shared_ptr<Buffer>(made, [](Buffer* held) {
+                delete held;
+                placedUploadChunks.fetch_sub(1, std::memory_order_acq_rel);
+            });
         };
         if (shared) {
             auto& common = sharedUpload();
+            auto& tally = uploadRingTally();
             std::lock_guard lock(common.mutex);
-            take(common.chunk, common.device, common.used);
+            if (common.device != context.device || common.chunkBytes != chunkBytes) {
+                common.ring.clear();
+                common.overflow.reset();
+                common.device = context.device;
+                common.chunkBytes = chunkBytes;
+                common.current = 0;
+                common.used = 0;
+                tally.chunks.store(0, std::memory_order_relaxed);
+            }
+            const auto* held = common.overflow != nullptr ? &common.overflow : common.current < common.ring.size() ? &common.ring[common.current] : nullptr;
+            offset = (common.used + alignment - 1) & ~(alignment - 1);
+            if (held == nullptr || offset + bytes > (*held)->Bytes().size()) {
+                common.overflow.reset();
+                bool found = false;
+                std::uint64_t busy = 0;
+                for (std::size_t step = 1; step <= common.ring.size(); ++step) {
+                    const auto index = (common.current + step) % common.ring.size();
+                    if (common.ring[index].use_count() != 1 || common.ring[index]->Bytes().size() < bytes) {
+                        ++busy;
+                        continue;
+                    }
+                    if (found) continue;
+                    std::atomic_thread_fence(std::memory_order_acquire);
+                    common.current = index;
+                    found = true;
+                    tally.reused.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (busy > tally.inFlight.load(std::memory_order_relaxed)) tally.inFlight.store(busy, std::memory_order_relaxed);
+                if (!found && common.ring.size() < UploadRingChunks) {
+                    common.ring.push_back(make());
+                    common.current = common.ring.size() - 1;
+                    tally.added.fetch_add(1, std::memory_order_relaxed);
+                    tally.chunks.store(common.ring.size(), std::memory_order_relaxed);
+                } else if (!found) {
+                    common.overflow = make();
+                    tally.overflow.fetch_add(1, std::memory_order_relaxed);
+                }
+                held = common.overflow != nullptr ? &common.overflow : &common.ring[common.current];
+                offset = 0;
+            }
+            buffer = *held;
+            common.used = offset + bytes;
         } else {
-            take(upload.chunk, upload.device, upload.used);
+            buffer = upload.device == context.device ? upload.chunk.lock() : nullptr;
+            offset = (upload.used + alignment - 1) & ~(alignment - 1);
+            if (buffer == nullptr || offset + bytes > buffer->Bytes().size()) {
+                buffer = make();
+                upload.chunk = buffer;
+                upload.device = context.device;
+                offset = 0;
+            }
+            upload.used = offset + bytes;
         }
         std::memcpy(buffer->Bytes().data() + offset, prepared.blob.data(), bytes);
     }
@@ -9007,7 +9079,16 @@ std::uint64_t ShaderResources::DynamicPlansRefused() {
 const ShaderResources::DynamicPlan* ShaderResources::DynamicLayouts() const {
     if (dynamicPlanBuilt) return dynamicPlan.get();
     dynamicPlanBuilt = true;
-    if (context.descriptorCache == nullptr || !completed || heapStage || usesBda || bda != nullptr || updateAfterBind || addressedBuffers || !faultDescriptors.empty()) return nullptr;
+    const auto missed = [&](DynamicLeave why) -> const DynamicPlan* {
+        dynamicPlanMiss = why;
+        return nullptr;
+    };
+    if (context.descriptorCache == nullptr || !completed) return missed(DynamicLeave::Shape);
+    if (heapStage) return missed(DynamicLeave::Heap);
+    if (usesBda || bda != nullptr) return missed(DynamicLeave::Address);
+    if (updateAfterBind) return missed(DynamicLeave::AfterBind);
+    if (addressedBuffers) return missed(DynamicLeave::Addressed);
+    if (!faultDescriptors.empty()) return missed(DynamicLeave::Faults);
     constexpr auto none = std::numeric_limits<std::size_t>::max();
     auto plan = std::make_unique<DynamicPlan>();
     std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> description;
@@ -9020,14 +9101,14 @@ const ShaderResources::DynamicPlan* ShaderResources::DynamicLayouts() const {
     plan->slotAllocations.assign(descriptorBuffers.size(), none);
     std::size_t next = 0;
     for (const auto& binding : bindings) {
-        if (binding.heap) return nullptr;
+        if (binding.heap) return missed(DynamicLeave::Heap);
         const auto set = setOf(binding);
-        if (set > 1u) return nullptr;
+        if (set > 1u) return missed(DynamicLeave::Shape);
         described[set] = true;
         const auto original = set == 0 ? _set : fragment.set;
         const bool selectable = std::ranges::any_of(binding.allocations, [&](std::size_t index) { return index < allocations.size() && (DataRole(allocations[index].role) || (allocations[index].guest && !allocations[index].written)); });
         const bool dynamic = selectable && binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && binding.flags == 0;
-        if (selectable && !dynamic) return nullptr;
+        if (selectable && !dynamic) return missed(binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? DynamicLeave::Flags : binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? DynamicLeave::Uniform : DynamicLeave::OtherType);
         auto layout = binding.layout;
         if (dynamic) layout.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
         description[set].push_back(layout);
@@ -9037,23 +9118,29 @@ const ShaderResources::DynamicPlan* ShaderResources::DynamicLayouts() const {
             const auto& write = descriptorWrites[next];
             plan->writeSets[next] = static_cast<std::uint8_t>(set);
             if (dynamic) {
-                if (write.pBufferInfo == nullptr || write.dstArrayElement != 0 || write.descriptorCount != binding.layout.descriptorCount || binding.allocations.size() != write.descriptorCount) return nullptr;
+                if (write.pBufferInfo == nullptr || write.dstArrayElement != 0 || write.descriptorCount != binding.layout.descriptorCount || binding.allocations.size() != write.descriptorCount) return missed(DynamicLeave::Shape);
                 plan->writeTypes[next] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
                 const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
                 for (std::size_t element = 0; element < binding.allocations.size(); ++element) plan->slotAllocations[offset + element] = binding.allocations[element];
                 dynamicBindings[set].emplace_back(binding.layout.binding, offset);
                 plan->storageDynamic += write.descriptorCount;
+                plan->setDynamic[set] += write.descriptorCount;
             }
             ++writes;
             ++next;
         }
-        if (dynamic && writes != 1) return nullptr;
+        if (dynamic && writes != 1) return missed(DynamicLeave::Shape);
     }
-    if (next != descriptorWrites.size() || plan->storageDynamic == 0) return nullptr;
-    if (plan->storageDynamic > context.limits.maxDescriptorSetStorageBuffersDynamic || plan->storageDynamic > std::tuple_size_v<decltype(DrawBindings::dynamicOffsets)>) {
+    if (next != descriptorWrites.size()) return missed(DynamicLeave::Shape);
+    if (plan->storageDynamic == 0) return missed(DynamicLeave::NoStorage);
+    constexpr auto capacity = std::tuple_size_v<decltype(DrawBindings::DynamicBound::offsets)>;
+    const auto fits = [&](std::size_t count) { return count <= context.limits.maxDescriptorSetStorageBuffersDynamic && count <= capacity; };
+    plan->plainFits = fits(plan->storageDynamic);
+    if (!plan->plainFits && !fits(plan->setDynamic[0]) && !fits(plan->setDynamic[1])) {
         dynamicPlansRefused.fetch_add(1, std::memory_order_relaxed);
-        return nullptr;
+        return missed(DynamicLeave::Limit);
     }
+    if (!plan->plainFits) dynamicPlansRefused.fetch_add(1, std::memory_order_relaxed);
     plan->mainKey.assign(layoutKey.begin(), layoutKey.end());
     plan->fragmentKey.assign(fragmentLayoutKey.begin(), fragmentLayoutKey.end());
     for (std::size_t set = 0; set < 2u; ++set) {
@@ -9093,11 +9180,47 @@ const ShaderResources::DynamicPlan* ShaderResources::DynamicLayouts() const {
     return dynamicPlan.get();
 }
 
-bool ShaderResources::writeDynamicSets(DrawBindings& result, std::span<const std::size_t> selected, BindingRoute& route) const {
+const PipelineSetLayouts* ShaderResources::DynamicPushLayouts() const {
+    const auto* plan = DynamicLayouts();
+    if (plan == nullptr) return nullptr;
+    auto& built = *dynamicPlan;
+    if (built.pushedBuilt) return built.pushedFits ? &built.pushedLayouts : nullptr;
+    built.pushedBuilt = true;
+    const auto* push = PushLayouts();
+    const auto missed = [&](DynamicLeave why) -> const PipelineSetLayouts* {
+        pushedPlanMiss = why;
+        return nullptr;
+    };
+    if (push == nullptr || push->set > 1u) return missed(DynamicLeave::Shape);
+    const auto other = push->set == 0 ? 1u : 0u;
+    if (!plan->dynamicSet[other]) return missed(DynamicLeave::OtherSet);
+    if (plan->setDynamic[other] > std::min<std::size_t>(context.limits.maxDescriptorSetStorageBuffersDynamic, std::tuple_size_v<decltype(DrawBindings::DynamicBound::offsets)>)) return missed(DynamicLeave::Limit);
+    built.pushedMainKey = other == 0 ? plan->mainKey : push->mainKey;
+    built.pushedFragmentKey = other == 1 ? plan->fragmentKey : push->fragmentKey;
+    built.pushedLayouts = push->layouts;
+    if (other == 0) built.pushedLayouts.main = plan->layouts[0];
+    else built.pushedLayouts.fragment = plan->layouts[1];
+    built.pushedLayouts.mainKey = built.pushedMainKey;
+    built.pushedLayouts.fragmentKey = built.pushedFragmentKey;
+    built.pushedLayouts.dynamic = true;
+    built.pushedFits = true;
+    return &built.pushedLayouts;
+}
+
+ShaderResources::DynamicLeave ShaderResources::DynamicLeaveFor(bool pushed) const {
+    const auto* plan = DynamicLayouts();
+    if (plan == nullptr) return dynamicPlanMiss;
+    if (!pushed) return plan->plainFits ? DynamicLeave::None : DynamicLeave::Limit;
+    return DynamicPushLayouts() != nullptr ? DynamicLeave::None : pushedPlanMiss;
+}
+
+bool ShaderResources::writeDynamicSets(DrawBindings& result, std::span<const std::size_t> selected, BindingRoute& route, std::int32_t pushedSet) const {
     const auto* plan = DynamicLayouts();
     if (plan == nullptr || rebound || selected.size() > result.snapshots.size()) return false;
-    const auto limit = std::min(context.limits.maxDescriptorSetStorageBuffersDynamic, dynamicLimitOverride.load(std::memory_order_relaxed));
-    if (plan->storageDynamic > limit) {
+    if (pushedSet >= 0 && DynamicPushLayouts() == nullptr) return false;
+    const auto limit = std::min({context.limits.maxDescriptorSetStorageBuffersDynamic, dynamicLimitOverride.load(std::memory_order_relaxed), static_cast<std::uint32_t>(std::tuple_size_v<decltype(DrawBindings::DynamicBound::offsets)>)});
+    const auto counted = pushedSet < 0 ? plan->storageDynamic : plan->setDynamic[pushedSet == 0 ? 1 : 0];
+    if (counted > limit || (pushedSet < 0 && !plan->plainFits)) {
         ++route.dynamicRefused;
         return false;
     }
@@ -9108,17 +9231,18 @@ bool ShaderResources::writeDynamicSets(DrawBindings& result, std::span<const std
     const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 1);
     struct KeysStorage {};
     auto& keys = HostThreadLocal<std::array<std::vector<std::pair<const std::shared_ptr<Buffer>*, VkDescriptorBufferInfo>>, 2>, KeysStorage>();
+    auto bound = std::make_unique<DrawBindings::DynamicBound>();
     std::uint32_t at = 0;
     for (std::size_t set = 0; set < 2u; ++set) {
         auto& key = keys[set];
         key.clear();
-        if (!plan->written[set]) continue;
+        if (!plan->written[set] || static_cast<std::int32_t>(set) == pushedSet) continue;
         for (const auto slot : plan->dynamicSlots[set]) {
             const auto allocation = plan->slotAllocations[slot];
             const auto chosen = std::find(selected.begin(), selected.end(), allocation);
             if (chosen == selected.end()) {
                 key.emplace_back(nullptr, descriptorBuffers[slot]);
-                result.dynamicOffsets[at++] = 0;
+                bound->offsets[at++] = 0;
                 continue;
             }
             const auto& snapshot = result.snapshots[static_cast<std::size_t>(chosen - selected.begin())];
@@ -9127,14 +9251,13 @@ bool ShaderResources::writeDynamicSets(DrawBindings& result, std::span<const std
                 return false;
             }
             key.emplace_back(&snapshot.buffer, wholeDwordRange({snapshot.buffer->Handle(), 0, snapshot.bytes}));
-            result.dynamicOffsets[at++] = static_cast<std::uint32_t>(snapshot.offset);
+            bound->offsets[at++] = static_cast<std::uint32_t>(snapshot.offset);
         }
     }
     const auto sameInfo = [](const VkDescriptorBufferInfo& a, const VkDescriptorBufferInfo& b) { return a.buffer == b.buffer && a.offset == b.offset && a.range == b.range; };
     const std::weak_ptr<Buffer> unowned;
     for (std::size_t set = 0; set < 2u; ++set) {
-        result.dynamicCounts[set] = 0;
-        if (!plan->written[set]) continue;
+        if (!plan->written[set] || static_cast<std::int32_t>(set) == pushedSet) continue;
         const auto& key = keys[set];
         auto& list = dynamicSets[set];
         std::shared_ptr<DynamicSetEntry> entry;
@@ -9149,6 +9272,7 @@ bool ShaderResources::writeDynamicSets(DrawBindings& result, std::span<const std
             }
             if (same) entry = *candidate;
         }
+        if (entry != nullptr) ++route.dynamicHits;
         if (entry == nullptr) {
             auto made = std::make_shared<DynamicSetEntry>();
             made->layout = plan->layouts[set];
@@ -9189,17 +9313,18 @@ bool ShaderResources::writeDynamicSets(DrawBindings& result, std::span<const std
             result.fragmentLayout = entry->layout;
         }
         result.lent[set] = true;
-        result.dynamicSets[set] = entry;
-        result.dynamicCounts[set] = static_cast<std::uint32_t>(key.size());
+        bound->sets[set] = entry;
+        bound->counts[set] = static_cast<std::uint32_t>(key.size());
     }
     result.cache = context.descriptorCache;
     result.owned = {};
-    result.dynamic = true;
+    result.dynamic = std::move(bound);
     ++route.dynamicBound;
     return true;
 }
 
-void ShaderResources::DescribeDynamicBindings(const DrawBindings& bound, std::span<const std::size_t> selected, std::vector<BoundBuffer>& out) const {
+
+void ShaderResources::DescribeDynamicBindings(const DrawBindings& bound, std::span<const std::size_t> selected, const PushPlan* push, std::vector<BoundBuffer>& out) const {
     out.clear();
     const auto* plan = dynamicPlan.get();
     if (plan == nullptr) return;
@@ -9207,14 +9332,24 @@ void ShaderResources::DescribeDynamicBindings(const DrawBindings& bound, std::sp
     std::vector<VkDescriptorBufferInfo> buffers = dynamicBuffers.size() == descriptorBuffers.size() ? dynamicBuffers : descriptorBuffers;
     std::vector<std::size_t> owners(buffers.size(), none);
     std::vector<std::uint64_t> contents(buffers.size(), 0);
+    const bool pushing = bound.pushedSet >= 0 && push != nullptr;
+    std::vector<std::size_t> pushedOwners(buffers.size(), none);
+    if (pushing) overlayPushedBuffers(bound, *push, buffers, pushedOwners);
+    for (std::size_t slot = 0; slot < pushedOwners.size(); ++slot) {
+        if (pushedOwners[slot] == none) continue;
+        owners[slot] = pushedOwners[slot];
+        std::uint64_t hash = 0xcbf29ce484222325ull;
+        for (const auto byte : bound.snapshots[pushedOwners[slot]].Bytes()) hash = (hash ^ std::to_integer<std::uint8_t>(byte)) * 0x100000001b3ull;
+        contents[slot] = hash;
+    }
     std::uint32_t at = 0;
     for (std::size_t set = 0; set < 2u; ++set) {
-        const auto* entry = static_cast<const DynamicSetEntry*>(bound.dynamicSets[set].get());
+        const auto* entry = bound.dynamic != nullptr ? static_cast<const DynamicSetEntry*>(bound.dynamic->sets[set].get()) : nullptr;
         if (entry == nullptr) continue;
         const auto& slots = plan->dynamicSlots[set];
         for (std::size_t index = 0; index < slots.size() && index < entry->infos.size(); ++index) {
             auto info = entry->infos[index];
-            info.offset += bound.dynamicOffsets[at + index];
+            info.offset += bound.dynamic->offsets[at + index];
             const auto slot = slots[index];
             buffers[slot] = info;
             const auto chosen = std::find(selected.begin(), selected.end(), plan->slotAllocations[slot]);
@@ -9228,15 +9363,13 @@ void ShaderResources::DescribeDynamicBindings(const DrawBindings& bound, std::sp
             for (const auto byte : owner->Bytes().subspan(static_cast<std::size_t>(info.offset), snapshot.bytes)) hash = (hash ^ std::to_integer<std::uint8_t>(byte)) * 0x100000001b3ull;
             contents[slot] = hash;
         }
-        at += bound.dynamicCounts[set];
+        at += bound.DynamicCount(set);
     }
-    for (std::size_t index = 0; index < descriptorWrites.size(); ++index) {
-        if (plan->writeSets[index] == 0xffu) continue;
-        const auto& write = descriptorWrites[index];
-        if (write.pBufferInfo == nullptr) continue;
+    const auto emit = [&](std::uint32_t set, const VkWriteDescriptorSet& write) {
+        if (write.pBufferInfo == nullptr) return;
         const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
         for (std::uint32_t element = 0; element < write.descriptorCount; ++element) {
-            BoundBuffer entry{plan->writeSets[index], write.dstBinding, write.dstArrayElement + element, buffers[offset + element]};
+            BoundBuffer entry{set, write.dstBinding, write.dstArrayElement + element, buffers[offset + element]};
             if (const auto owner = owners[offset + element]; owner != none) {
                 const auto& snapshot = bound.snapshots[owner];
                 entry.snapshot = true;
@@ -9246,7 +9379,15 @@ void ShaderResources::DescribeDynamicBindings(const DrawBindings& bound, std::sp
             }
             out.push_back(entry);
         }
+    };
+    for (std::size_t index = 0; index < descriptorWrites.size(); ++index) {
+        if (plan->writeSets[index] == 0xffu || (pushing && static_cast<std::int32_t>(plan->writeSets[index]) == bound.pushedSet)) continue;
+        emit(plan->writeSets[index], descriptorWrites[index]);
     }
+    if (pushing) {
+        for (const auto index : push->writes) emit(push->set, descriptorWrites[index]);
+    }
+    std::ranges::sort(out, [](const BoundBuffer& a, const BoundBuffer& b) { return std::tie(a.set, a.binding, a.element) < std::tie(b.set, b.binding, b.element); });
 }
 
 
@@ -9519,10 +9660,10 @@ void ShaderResources::PushDrawBindings(VkCommandBuffer commands, VkPipelineLayou
     const auto fragmentSet = ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet;
     if (plan.set == 1u) {
         const auto set = result.allocation.set != VK_NULL_HANDLE ? result.allocation.set : _set;
-        if (set != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, SetBindSite::Draw);
+        if (set != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, SetBindSite::Draw, result.DynamicCount(0), result.DynamicOffsets(0));
     } else if (splitSets) {
         const auto set = result.fragmentAllocation.set != VK_NULL_HANDLE ? result.fragmentAllocation.set : fragment.set;
-        if (set != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, fragmentSet, 1, &set, SetBindSite::Draw);
+        if (set != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, fragmentSet, 1, &set, SetBindSite::Draw, result.DynamicCount(1), result.DynamicOffsets(1));
     }
     struct PushBuffersStorage {};
     auto& buffers = HostThreadLocal<std::vector<VkDescriptorBufferInfo>, PushBuffersStorage>();
