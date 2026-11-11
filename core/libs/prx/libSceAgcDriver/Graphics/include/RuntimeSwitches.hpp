@@ -103,6 +103,9 @@ enum class RuntimeSwitch : std::size_t {
     XpNoCommits,
     FourthFinisher,
     FifthFinisher,
+    CleanResidentViews,
+    CleanPendingRanges,
+    RefusedCollectMemo,
     Count,
 };
 

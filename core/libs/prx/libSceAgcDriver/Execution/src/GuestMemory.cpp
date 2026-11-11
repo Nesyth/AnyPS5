@@ -1942,6 +1942,115 @@ bool sharedCollectMemo() {
     return shared;
 }
 
+struct RefusedCollect {
+    std::uintptr_t begin = 0;
+    std::uintptr_t end = 0;
+    std::uint64_t epoch = 0;
+    std::uint64_t unwatched = 0;
+    std::uint64_t mapping = 0;
+    std::uint64_t forget = 0;
+};
+
+struct RefusedCollects {
+    std::array<RefusedCollect, 32> entries{};
+    std::size_t next = 0;
+    std::uint64_t hits = 0;
+};
+
+RefusedCollects& refusedCollects() {
+    struct Slot {};
+    return ThreadScratch<RefusedCollects, Slot>();
+}
+
+bool refusedCollectMemo() {
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RefusedCollectMemo);
+}
+
+std::uint64_t verifyRefusedCollectsEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_REFUSED_COLLECT_MEMO");
+        return text != nullptr ? std::max<std::uint64_t>(1u, std::strtoull(text, nullptr, 10)) : 0u;
+    }();
+    return every;
+}
+
+bool collectWalkStats() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return stats;
+}
+
+struct CollectWalkCensus {
+    std::atomic<std::uint64_t> complete{0};
+    std::atomic<std::uint64_t> refused{0};
+    std::atomic<std::uint64_t> bytes{0};
+    std::atomic<std::uint64_t> answered{0};
+    std::atomic<std::uint64_t> checked{0};
+    std::atomic<std::uint64_t> differing{0};
+    std::atomic<std::int64_t> reportedAt{0};
+    std::array<std::uint64_t, 6> reported{};
+    std::atomic<std::int64_t> verifyWindow{0};
+    std::atomic<int> verifyLines{0};
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> refusedRanges;
+};
+
+CollectWalkCensus& collectWalkCensus() {
+    static auto* census = new CollectWalkCensus;
+    return *census;
+}
+
+void noteCollectWalk(bool complete, std::uint64_t first, std::uint64_t stop) {
+    auto& census = collectWalkCensus();
+    (complete ? census.complete : census.refused).fetch_add(1, std::memory_order_relaxed);
+    census.bytes.fetch_add(stop - first, std::memory_order_relaxed);
+}
+
+void noteRefusedCollect(std::uint64_t first, std::uint64_t stop) {
+    if (!collectWalkStats()) return;
+    auto& census = collectWalkCensus();
+    std::lock_guard lock(census.mutex);
+    auto& entry = census.refusedRanges[first];
+    ++entry.first;
+    entry.second = stop - first;
+}
+
+void noteRefusedCollectDiffers(std::uint64_t first, std::uint64_t stop) {
+    auto& census = collectWalkCensus();
+    census.differing.fetch_add(1, std::memory_order_relaxed);
+    const auto window = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (census.verifyWindow.exchange(window, std::memory_order_relaxed) != window) census.verifyLines.store(0, std::memory_order_relaxed);
+    if (census.verifyLines.fetch_add(1, std::memory_order_relaxed) >= 8) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[refused-collect-memo-verify] a collect of 0x%llx+%llu the memo answered as refused walked complete in the same epoch\n", static_cast<unsigned long long>(first), static_cast<unsigned long long>(stop - first));
+}
+
+void reportCollectWalks() {
+    if (!collectWalkStats()) return;
+    auto& census = collectWalkCensus();
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    const auto previous = census.reportedAt.exchange(tenSeconds, std::memory_order_relaxed);
+    if (previous == tenSeconds) return;
+    std::string top;
+    std::array<std::uint64_t, 6> since{};
+    {
+        std::lock_guard lock(census.mutex);
+        if (previous != 0) {
+            std::vector<std::pair<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>>> ranges(census.refusedRanges.begin(), census.refusedRanges.end());
+            std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+            for (std::size_t index = 0; index < ranges.size() && index < 10; ++index) {
+                char item[96];
+                std::snprintf(item, sizeof(item), " 0x%llx+%llu x%llu", static_cast<unsigned long long>(ranges[index].first), static_cast<unsigned long long>(ranges[index].second.second), static_cast<unsigned long long>(ranges[index].second.first));
+                top += item;
+            }
+        }
+        census.refusedRanges.clear();
+        const std::array<std::uint64_t, 6> now{census.complete.load(std::memory_order_relaxed), census.refused.load(std::memory_order_relaxed), census.bytes.load(std::memory_order_relaxed), census.answered.load(std::memory_order_relaxed), census.checked.load(std::memory_order_relaxed), census.differing.load(std::memory_order_relaxed)};
+        for (std::size_t index = 0; index < now.size(); ++index) since[index] = now[index] - census.reported[index];
+        census.reported = now;
+    }
+    if (previous == 0) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[collect-walks] 10 s: %llu complete walks, %llu refused walks, %.1f MiB walked; %llu collects answered from the refused-walk memo; verify %llu checked, %llu differing; most refused:%s\n", static_cast<unsigned long long>(since[0]), static_cast<unsigned long long>(since[1]), static_cast<double>(since[2]) / 1048576.0, static_cast<unsigned long long>(since[3]), static_cast<unsigned long long>(since[4]), static_cast<unsigned long long>(since[5]), top.empty() ? " none" : top.c_str());
+}
+
 struct StampRuns {
     WriteTracker& tracker;
     StampKind kind;
@@ -2144,6 +2253,25 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 #else
     constexpr bool cleanCandidate = false;
 #endif
+    const bool refusedMemo = useMemo && epochal && !sharedCollectMemo() && refusedCollectMemo();
+    const bool countWalks = refusedMemo || collectWalkStats();
+    if (countWalks) reportCollectWalks();
+    const auto forget = refusedMemo ? ForgetSerial() : std::uint64_t{0};
+    bool verifyingRefused = false;
+    if (refusedMemo) {
+        auto& refused = refusedCollects();
+        for (const auto& entry : refused.entries) {
+            if (entry.epoch != epoch || entry.begin != first || entry.end != stop || entry.unwatched != unwatched || entry.mapping != mapping || entry.forget != forget) continue;
+            const auto every = verifyRefusedCollectsEvery();
+            if (every == 0 || ++refused.hits % every != 0) {
+                collectWalkCensus().answered.fetch_add(1, std::memory_order_relaxed);
+                noteRefusedCollect(first, stop);
+                return 0;
+            }
+            verifyingRefused = true;
+            break;
+        }
+    }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     const auto newestBeforeWalk = cleanCandidate ? tracker.newestStamp(first, stop) : std::uint64_t{0};
@@ -2175,15 +2303,34 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         first = widenedFirst;
         stop = widenedStop;
     }
+    const auto refusedAnswer = [&] {
+        if (!countWalks) return std::uint64_t{0};
+        noteRefusedCollect(requestedFirst, requestedStop);
+        if (verifyingRefused) collectWalkCensus().checked.fetch_add(1, std::memory_order_relaxed);
+        else if (refusedMemo && (forget & 1u) == 0) {
+            auto& refused = refusedCollects();
+            refused.entries[refused.next++ % refused.entries.size()] = {static_cast<std::uintptr_t>(requestedFirst), static_cast<std::uintptr_t>(requestedStop), epoch, unwatched, mapping, forget};
+        }
+        return std::uint64_t{0};
+    };
     if (!walkWrites(tracker, first, stop, StampKind::Cpu)) {
+        if (countWalks) noteCollectWalk(false, first, stop);
 #ifdef _WIN32
-        if (first == requestedFirst && stop == requestedStop) return 0;
+        if (first == requestedFirst && stop == requestedStop) return refusedAnswer();
         first = requestedFirst;
         stop = requestedStop;
-        if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+        const bool walked = walkWrites(tracker, first, stop, StampKind::Cpu);
+        if (countWalks) noteCollectWalk(walked, first, stop);
+        if (!walked) return refusedAnswer();
 #else
-        return 0;
+        return refusedAnswer();
 #endif
+    } else if (countWalks) {
+        noteCollectWalk(true, first, stop);
+    }
+    if (verifyingRefused) {
+        collectWalkCensus().checked.fetch_add(1, std::memory_order_relaxed);
+        noteRefusedCollectDiffers(requestedFirst, requestedStop);
     }
     if (cleanCandidate) {
         auto& counters = cleanCollectCounters();
@@ -2213,6 +2360,11 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
     return collectWrites(address, bytes, true);
+}
+
+CollectWalkCounts CollectWalksCounted() {
+    auto& census = collectWalkCensus();
+    return {census.complete.load(std::memory_order_relaxed), census.refused.load(std::memory_order_relaxed), census.bytes.load(std::memory_order_relaxed), census.answered.load(std::memory_order_relaxed), census.checked.load(std::memory_order_relaxed), census.differing.load(std::memory_order_relaxed)};
 }
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {

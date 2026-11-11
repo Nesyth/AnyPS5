@@ -67,6 +67,9 @@ void registry() {
     Require(RuntimeSwitches::Find("APS5_CLEAN_COLLECTS") == RuntimeSwitch::CleanCollects && !RuntimeSwitches::Set(RuntimeSwitch::CleanCollects), "APS5_CLEAN_COLLECTS is not a runtime switch that starts unset");
     Require(RuntimeSwitches::Find("APS5_DIRECT_BUFFERS") == RuntimeSwitch::DirectBuffers && !RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers), "APS5_DIRECT_BUFFERS is not a runtime switch that starts unset");
     Require(RuntimeSwitches::Find("APS5_DIRECT_INPUTS") == RuntimeSwitch::DirectInputs && !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs), "APS5_DIRECT_INPUTS is not a runtime switch that starts unset");
+    Require(RuntimeSwitches::Find("APS5_CLEAN_RESIDENT_VIEWS") == RuntimeSwitch::CleanResidentViews && !RuntimeSwitches::Set(RuntimeSwitch::CleanResidentViews), "APS5_CLEAN_RESIDENT_VIEWS is not a runtime switch that starts unset");
+    Require(RuntimeSwitches::Find("APS5_CLEAN_PENDING_RANGES") == RuntimeSwitch::CleanPendingRanges && !RuntimeSwitches::Set(RuntimeSwitch::CleanPendingRanges), "APS5_CLEAN_PENDING_RANGES is not a runtime switch that starts unset");
+    Require(RuntimeSwitches::Find("APS5_REFUSED_COLLECT_MEMO") == RuntimeSwitch::RefusedCollectMemo && !RuntimeSwitches::Set(RuntimeSwitch::RefusedCollectMemo), "APS5_REFUSED_COLLECT_MEMO is not a runtime switch that starts unset");
 }
 
 void snapshot() {
