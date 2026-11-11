@@ -1140,6 +1140,7 @@ constexpr std::uint32_t RepeatTimingRounds = 24;
 constexpr std::uint32_t AdditiveBlend = 0x40000101u;
 constexpr std::array<std::uint32_t, 4> RepeatVertexCounts{3u, 6u, 9u, 6u};
 constexpr std::size_t StillSlot = 15;
+constexpr std::uint32_t StillDraws = 48;
 
 enum class RepeatScene { Constants, Sets, Ring, Shared, Lend, Still };
 
@@ -1198,7 +1199,7 @@ std::vector<std::uint8_t> RenderScene(RepeatScene scene, std::uint32_t round) {
         registers = {{0x8b, 0}, {0x8c, 0}, {0x00b, 4u << 1u}, {0x00c, constants[0]}, {0x00d, constants[1]}, {0x00e, constants[2]}, {0x00f, constants[3]}};
         pixel = reinterpret_cast<std::uintptr_t>(RingPixel.data());
     }
-    const auto draws = scene == RepeatScene::Shared ? SharedDraws : RepeatDraws;
+    const auto draws = scene == RepeatScene::Shared ? SharedDraws : scene == RepeatScene::Still ? StillDraws : RepeatDraws;
     SubmitDraws(vertex, pixel, {{0x242, 4}}, registers, blocks.target, draws, 3, AdditiveBlend, [&](std::vector<std::uint32_t>& commands, std::uint32_t draw) -> std::uint32_t {
         if (scene == RepeatScene::Ring || scene == RepeatScene::Still) return RepeatVertexCounts[(draw + round) % RepeatVertexCounts.size()];
         if (scene == RepeatScene::Lend) {
