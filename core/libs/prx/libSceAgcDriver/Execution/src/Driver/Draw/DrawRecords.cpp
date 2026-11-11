@@ -1634,6 +1634,7 @@ void noteRepeatRefusal(const Graphics::RepeatOutcome& repeated) {
     if (repeated.refusal == Graphics::RepeatRefusal::Count) return;
     DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::RepeatNoBlock) + static_cast<std::size_t>(repeated.refusal)));
     if (repeated.refusal == Graphics::RepeatRefusal::NotSimple && repeated.simple != DrawRepeatClass::Simple) DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::RepeatClassNotRecorded) + static_cast<std::size_t>(repeated.simple) - 1u));
+    if (repeated.refusal == Graphics::RepeatRefusal::NotSimple && repeated.detail != DrawRepeatDetail::None) DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::RepeatDetailNotReusable) + static_cast<std::size_t>(repeated.detail) - 1u));
     if (repeated.late) DirectDraws::Add(Counter::RepeatLate);
 }
 
@@ -1660,9 +1661,9 @@ void verifyRepeat(VulkanDevice& device, const Graphics::State& graphics, DrawRec
     if (answered.miss != Graphics::DrawRecipeMiss::None) {
         if (commit.effects.hold == DrawRecordHold::Count) refute(Graphics::DrawRecipeMissName(answered.miss), "today's way missed before its hold although the stamp held");
         else if (answered.miss == Graphics::DrawRecipeMiss::Proof && described.proofSkipped) refute("proof", "today's proof failed although the template's proof memo held");
-    } else if (commit.effects.hold != DrawRecordHold::Held) {
-        refute("hold", "today's way does not hold the record's own pass memo");
-    } else if (!today.keptOnce || !today.access.has_value()) {
+    } else if (described.shared ? !commit.effects.sharedHold : commit.effects.hold != DrawRecordHold::Held) {
+        refute("hold", described.shared ? "today's way does not hold the pass under the shared pass memo" : "today's way does not hold the record's own pass memo");
+    } else if (!today.keptOnce || (!described.shared && !today.access.has_value())) {
         refute(today.keptOnce ? "pass access" : "keep", "today's way does not take the record's per-batch keep or pass access memo");
     }
     if (refuted) DirectDraws::Add(Counter::RepeatRefuted);
@@ -1731,10 +1732,26 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
             const auto repeated = localDevice->RepeatFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, prepared, inputs, nullptr, DirectDraws::RepeatVerifyEvery());
             if (repeated.taken) {
                 if (timed) {
-                    DirectDraws::Add(Counter::RepeatNanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count()));
+                    const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
+                    DirectDraws::Add(Counter::RepeatNanoseconds, nanoseconds);
                     DirectDraws::Add(Counter::RepeatTimed);
+                    if (repeated.sets) {
+                        DirectDraws::Add(Counter::RepeatSetsNanoseconds, nanoseconds);
+                        DirectDraws::Add(Counter::RepeatSetsTimed);
+                    }
+                    if (repeated.stores) {
+                        DirectDraws::Add(Counter::RepeatStoresNanoseconds, nanoseconds);
+                        DirectDraws::Add(Counter::RepeatStoresTimed);
+                    }
+                    if (repeated.shared) {
+                        DirectDraws::Add(Counter::RepeatSharedNanoseconds, nanoseconds);
+                        DirectDraws::Add(Counter::RepeatSharedTimed);
+                    }
                 }
                 DirectDraws::Add(Counter::RepeatTaken);
+                if (repeated.sets) DirectDraws::Add(Counter::RepeatTakenSets);
+                if (repeated.stores) DirectDraws::Add(Counter::RepeatTakenStores);
+                if (repeated.shared) DirectDraws::Add(Counter::RepeatTakenShared);
                 if (repeated.passBegun) DirectDraws::Add(Counter::RepeatPassBegun);
                 if (repeated.proofSkipped) DirectDraws::Add(Counter::RepeatProofsSkipped);
                 if (repeated.unmovedSkipped) DirectDraws::Add(Counter::RepeatUnmovedSkipped);

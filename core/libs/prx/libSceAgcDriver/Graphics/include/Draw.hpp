@@ -165,10 +165,15 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
 enum class RepeatRefusal : std::uint8_t { NoBlock, NotSimple, VerifyDue, Shape, Objects, Batch, Pass, Epoch, ProofSerial, Pending, Depth, Target, Access, Stores, Linear, Buffers, Selection, DepthGuards, Inputs, Changed, MovedHazard, UnmovedHazard, Count };
 inline constexpr std::array<const char*, static_cast<std::size_t>(RepeatRefusal::Count)> RepeatRefusalNames{"no block", "not simple", "verify due", "shape", "objects", "another batch", "pass", "collect epoch", "proof serial", "pending stores", "depth surfaces", "target changed", "pass access", "queued stores", "drawn linear targets", "no prepared buffers", "selection", "depth guards", "inputs", "changed by the inputs", "moved-range hazard", "unmoved-range hazard"};
 inline constexpr std::array<const char*, static_cast<std::size_t>(DrawRepeatClass::Count)> RepeatClassNames{"simple", "not recorded", "template", "stages", "pipeline", "targets", "not pushed", "sets", "buffers", "inputs", "keep", "pass", "access", "notes", "modes"};
+inline constexpr std::array<const char*, static_cast<std::size_t>(DrawRepeatDetail::Count)> RepeatDetailNames{"none", "not reusable", "heap stage", "lease", "address table", "copied writes", "fault checks", "space reuse", "GPU writes", "GPU copies", "depth copies", "multisampled", "multisampled depth", "not the recipe's", "linear", "fmask"};
 struct RepeatOutcome {
     bool taken = false;
     RepeatRefusal refusal = RepeatRefusal::Count;
     DrawRepeatClass simple = DrawRepeatClass::Simple;
+    DrawRepeatDetail detail = DrawRepeatDetail::None;
+    bool sets = false;
+    bool stores = false;
+    bool shared = false;
     DrawRecordInputs inputs = DrawRecordInputs::None;
     bool late = false;
     bool passBegun = false;
