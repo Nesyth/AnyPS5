@@ -101,6 +101,7 @@ enum class RuntimeSwitch : std::size_t {
     DirectRetry,
     ItemsByTurn,
     XpNoCommits,
+    DirectRepeat,
     Count,
 };
 

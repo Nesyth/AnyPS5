@@ -23,6 +23,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <string>
 #include <type_traits>
 
@@ -1618,6 +1619,62 @@ bool SameVertexInput(const Graphics::VertexInputLayout& a, const Graphics::Verte
     return std::ranges::equal(a.bindings, b.bindings, sameBinding) && std::ranges::equal(a.attributes, b.attributes, sameAttribute);
 }
 
+using CommitDifferenceNote = void (*)(DrawRecords::Field, std::string_view);
+using CommitAllowedNote = void (*)(DrawRecords::Allowed);
+bool compareCommitViews(const DrawRecord& record, const DrawCommitView& answer, const DrawCommitView& today, CommitDifferenceNote noteDifference, CommitAllowedNote noteAllowed, bool corrupting);
+
+void noteRepeatDifference(DrawRecords::Field field, std::string_view detail) {
+    DirectDraws::NoteRepeatDifference(DrawRecords::FieldName(field), detail);
+}
+
+void noteRepeatAllowed(DrawRecords::Allowed) {}
+
+void noteRepeatRefusal(const Graphics::RepeatOutcome& repeated) {
+    using DirectDraws::Counter;
+    if (repeated.refusal == Graphics::RepeatRefusal::Count) return;
+    DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::RepeatNoBlock) + static_cast<std::size_t>(repeated.refusal)));
+    if (repeated.refusal == Graphics::RepeatRefusal::NotSimple && repeated.simple != DrawRepeatClass::Simple) DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::RepeatClassNotRecorded) + static_cast<std::size_t>(repeated.simple) - 1u));
+    if (repeated.late) DirectDraws::Add(Counter::RepeatLate);
+}
+
+bool RepeatTimings() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return stats;
+}
+
+void verifyRepeat(VulkanDevice& device, const Graphics::State& graphics, DrawRecordHit& hit, DrawRecordCommit& commit, const VulkanDevice::DrawTraceContext* trace, const Graphics::ShaderResources::PreparedBuffers* prepared, Graphics::PreparedInputs* inputs) {
+    using DirectDraws::Counter;
+    DrawCommitView mine;
+    const auto described = device.RepeatFromRecord(graphics, hit.parameters, hit.stages, commit, trace, prepared, inputs, &mine);
+    if (!described.taken) return;
+    DirectDraws::Add(Counter::RepeatVerifyChecked);
+    DrawCommitView today;
+    const auto answered = device.DrawFromRecord(graphics, hit.parameters, hit.stages, commit, trace, &today);
+    const auto at = keyText(hit.record->key);
+    bool refuted = false;
+    const auto refute = [&](const std::string& claim, const std::string& detail) {
+        DirectDraws::NoteRepeatDifference("stamp claim " + claim, at + ": " + detail);
+        refuted = true;
+    };
+    if (described.refuted != nullptr) refute(described.refuted, "a range the stamp holds clear has a pending write");
+    if (answered.miss != Graphics::DrawRecipeMiss::None) {
+        if (commit.effects.hold == DrawRecordHold::Count) refute(Graphics::DrawRecipeMissName(answered.miss), "today's way missed before its hold although the stamp held");
+        else if (answered.miss == Graphics::DrawRecipeMiss::Proof && described.proofSkipped) refute("proof", "today's proof failed although the template's proof memo held");
+    } else if (commit.effects.hold != DrawRecordHold::Held) {
+        refute("hold", "today's way does not hold the record's own pass memo");
+    } else if (!today.keptOnce || !today.access.has_value()) {
+        refute(today.keptOnce ? "pass access" : "keep", "today's way does not take the record's per-batch keep or pass access memo");
+    }
+    if (refuted) DirectDraws::Add(Counter::RepeatRefuted);
+    bool differs = compareCommitViews(*hit.record, mine, today, &noteRepeatDifference, &noteRepeatAllowed, false);
+    if (described.pushDifference.what != nullptr) {
+        DirectDraws::NoteRepeatDifference(described.pushDifference.what, at + ": " + described.pushDifference.detail);
+        differs = true;
+    }
+    if (differs) DirectDraws::Add(Counter::RepeatVerifyDiffering);
+    if (differs || refuted) commit.repeat.reset();
+}
+
 }
 
 void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, DrawRecordHit& hit, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape) {
@@ -1662,7 +1719,45 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         commit.verifyInputs = inputs != nullptr && inputEvery != 0 && ++inputOrdinal % inputEvery == 0;
         // DrawFromRecord can return before DrawWithRecord resets them.
         commit.effects = {};
-        const auto outcome = localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, nullptr, prepared, inputs);
+        std::optional<Graphics::DrawRecipeOutcome> repeatedOutcome;
+        auto* fullInputs = inputs;
+        auto takenInputs = DrawRecordInputs::None;
+        const bool repeatOn = hit.direct && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectRepeat);
+        static std::uint64_t timingOrdinal = 0;
+        const bool timed = hit.direct && RepeatTimings() && (++timingOrdinal & 7u) == 0;
+        if (repeatOn && !commit.verifyBuffers && !commit.verifyInputs) {
+            using DirectDraws::Counter;
+            const auto began = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const auto repeated = localDevice->RepeatFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, prepared, inputs, nullptr, DirectDraws::RepeatVerifyEvery());
+            if (repeated.taken) {
+                if (timed) {
+                    DirectDraws::Add(Counter::RepeatNanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count()));
+                    DirectDraws::Add(Counter::RepeatTimed);
+                }
+                DirectDraws::Add(Counter::RepeatTaken);
+                if (repeated.passBegun) DirectDraws::Add(Counter::RepeatPassBegun);
+                if (repeated.proofSkipped) DirectDraws::Add(Counter::RepeatProofsSkipped);
+                if (repeated.unmovedSkipped) DirectDraws::Add(Counter::RepeatUnmovedSkipped);
+                if (!repeated.result.recorded) DirectDraws::Add(Counter::RepeatProofMisses);
+                repeatedOutcome = repeated.result;
+            } else {
+                noteRepeatRefusal(repeated);
+                if (repeated.refusal == Graphics::RepeatRefusal::VerifyDue) verifyRepeat(*localDevice, graphics, hit, commit, tracePtr, prepared, inputs);
+                else if (repeated.refusal == Graphics::RepeatRefusal::Inputs && repeated.inputs != DrawRecordInputs::None) {
+                    fullInputs = nullptr;
+                    takenInputs = repeated.inputs;
+                }
+                commit.effects = {};
+            }
+        }
+        const auto fullBegan = timed && !repeatedOutcome.has_value() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto outcome = repeatedOutcome.has_value() ? *repeatedOutcome : localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, nullptr, prepared, fullInputs);
+        if (timed && !repeatedOutcome.has_value() && outcome.recorded && commit.effects.hold == DrawRecordHold::Held && !commit.effects.sharedHold) {
+            DirectDraws::Add(DirectDraws::Counter::RepeatFullNanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - fullBegan).count()));
+            DirectDraws::Add(DirectDraws::Counter::RepeatFullTimed);
+        }
+        if (takenInputs != DrawRecordInputs::None) commit.effects.inputs = takenInputs;
+        if (repeatOn && !repeatedOutcome.has_value() && commit.repeat != nullptr && commit.repeat->simple == DrawRepeatClass::Simple) DirectDraws::Add(DirectDraws::Counter::RepeatBlocks);
         if (hit.planned) NotePlannedCommit(commit);
         if (hit.direct) {
             NoteDirectCommit(commit, outcome.recorded);
@@ -1730,26 +1825,32 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
 }
 
 bool Driver::verifyRecordCommit(const DrawRecord& record, const DrawCommitView& answer, const DrawCommitView& today) {
-    using DrawRecords::Field;
     DrawRecords::NoteChecked(DrawRecords::Item::Commit);
+    return compareCommitViews(record, answer, today, &DrawRecords::NoteDifference, &DrawRecords::NoteAllowed, DrawRecords::CorruptingCommits());
+}
+
+namespace {
+
+bool compareCommitViews(const DrawRecord& record, const DrawCommitView& answer, const DrawCommitView& today, CommitDifferenceNote noteDifference, CommitAllowedNote noteAllowed, bool corrupting) {
+    using DrawRecords::Field;
     if (!answer.filled) {
-        DrawRecords::NoteAllowed(DrawRecords::Allowed::CommitRecordMissed);
+        noteAllowed(DrawRecords::Allowed::CommitRecordMissed);
         return false;
     }
     if (!today.filled) {
-        DrawRecords::NoteAllowed(DrawRecords::Allowed::CommitTodayUnrecorded);
+        noteAllowed(DrawRecords::Allowed::CommitTodayUnrecorded);
         return false;
     }
     const auto at = keyText(record.key);
     bool differs = false;
     const auto note = [&](Field field, const std::string& detail) {
-        DrawRecords::NoteDifference(field, at + ": " + detail);
+        noteDifference(field, at + ": " + detail);
         differs = true;
     };
     if (answer.resources != today.resources) {
         if (answer.key != today.key) note(Field::Templates, "the record's template key has " + std::to_string(answer.key.size()) + " words, today's " + std::to_string(today.key.size()) + "; " + firstDifference(answer.key, today.key));
         else if (today.lookup != DrawCommitLookup::Hit) note(Field::Templates, "the record proved its template current and its moved buffers, but today's lookup " + lookupText(today, answer.resources) + " and built another");
-        else DrawRecords::NoteAllowed(DrawRecords::Allowed::CommitTemplateRebuilt);
+        else noteAllowed(DrawRecords::Allowed::CommitTemplateRebuilt);
         return differs;
     }
     if (answer.pipeline != today.pipeline) note(Field::Pipelines, "the record binds another pipeline object than today's draw");
@@ -1802,8 +1903,10 @@ bool Driver::verifyRecordCommit(const DrawRecord& record, const DrawCommitView& 
             if (now.storesKeys || now.noteFirst != now.markedFirst || now.noteLayers != now.markedLayers) note(Field::TargetNotes, "target " + std::to_string(target) + ": the record skips its dirty note as already noted in this pass (layers " + std::to_string(now.noteFirst) + "+" + std::to_string(now.noteLayers) + "), but today's note marked layers " + std::to_string(now.markedFirst) + "+" + std::to_string(now.markedLayers) + (now.storesKeys ? " and stored the first write's DCC keys" : ""));
         }
     }
-    if (DrawRecords::CorruptingCommits() && !differs) note(Field::PassKeys, "a corrupted committer answer");
+    if (corrupting && !differs) note(Field::PassKeys, "a corrupted committer answer");
     return differs;
+}
+
 }
 
 void Driver::finishRecordDraw(const LeanDrawJob& job) {

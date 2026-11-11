@@ -377,6 +377,27 @@ public:
     // `preparedSelection` tells whether it did.
     std::shared_ptr<DrawBindings> PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut = nullptr, const PreparedBuffers* prepared = nullptr, PreparedBuffers::Selection* preparedSelection = nullptr) const;
     void PushDrawBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
+    struct RepeatPush {
+        RepeatPush() = default;
+        RepeatPush(const RepeatPush&) = delete;
+        RepeatPush& operator=(const RepeatPush&) = delete;
+        std::vector<VkDescriptorBufferInfo> buffers;
+        std::vector<VkWriteDescriptorSet> writes;
+        std::vector<std::pair<std::size_t, std::size_t>> patches;
+        std::vector<std::size_t> allocations;
+        VkDescriptorSet boundSet = VK_NULL_HANDLE;
+        std::uint32_t boundIndex = 0;
+        std::uint32_t pushIndex = 0;
+    };
+    bool BuildRepeatPush(const PushPlan& plan, std::span<const PreparedBuffers::Selected> selected, RepeatPush& out) const;
+    void RepeatPushBindings(VkCommandBuffer commands, VkPipelineLayout layout, RepeatPush& push, std::span<const PreparedBuffers::Selected> selected, VkBuffer buffer, VkDeviceSize base) const;
+    PreparedDifference CompareRepeatPush(RepeatPush& push, const DrawBindings& bound, const PushPlan& plan) const;
+    PreparedBuffers::Selection RepeatGuards(const PreparedBuffers& prepared) const;
+    void RepeatRequire(std::span<const MovedBuffer> moved) const;
+    bool RepeatUnmovedClear(const Recorder& recorder, const PreparedBuffers& prepared) const;
+    std::shared_ptr<Buffer> RepeatUpload(Recorder& recorder, const PreparedBuffers& prepared, VkDeviceSize& offset) const;
+    bool ProofHeld() const;
+    bool HoldsDepthCopies() const;
     struct BoundBuffer {
         std::uint32_t set = 0;
         std::uint32_t binding = 0;

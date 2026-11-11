@@ -3105,8 +3105,13 @@ struct RecordKeeping {
     DrawCommitView* view = nullptr;
 };
 
+template <typename Target>
+bool keepsOnceFor(const DrawRecordKeep* keep, const Recorder& recorder, const void* resources, const void* pipeline, const void* framebuffer, std::span<const Target> targets, bool plain) {
+    return plain && keep != nullptr && keep->recorder == recorder.Id() && keep->batch == recorder.OpenSerial() && keep->resources == resources && keep->pipeline == pipeline && keep->framebuffer == framebuffer && std::ranges::equal(keep->targets, targets, [](const void* kept, const Target& target) { return kept == std::to_address(target); });
+}
+
 bool keepsOnce(const DrawRecordKeep* keep, const Recorder& recorder, const ShaderResources* resources, const Pipeline* pipeline, const Framebuffer* framebuffer, std::span<const std::shared_ptr<StorageTexture>> targets, bool plain) {
-    return plain && keep != nullptr && keep->recorder == recorder.Id() && keep->batch == recorder.OpenSerial() && keep->resources == resources && keep->pipeline == pipeline && keep->framebuffer == framebuffer && std::ranges::equal(keep->targets, targets, [](const void* kept, const std::shared_ptr<StorageTexture>& target) { return kept == target.get(); });
+    return keepsOnceFor<std::shared_ptr<StorageTexture>>(keep, recorder, resources, pipeline, framebuffer, targets, plain);
 }
 
 void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::pair<std::uint32_t, std::uint32_t>> slices, VkRect2D scissor, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, std::shared_ptr<ShaderResources::DrawUse> use, std::shared_ptr<const void>* spaceKeep, const RecordKeeping& keeping = {}) {
@@ -3472,8 +3477,13 @@ bool PassAccessMemoVerify() {
     return on;
 }
 
+template <typename Target>
+bool passAccessMatchesFor(const DrawRecordAccess& memo, const Recorder* recorder, const ShaderResources& resources, std::span<const Target> targets) {
+    return memo.recorder == recorder && memo.generation == recorder->RenderPassGeneration() && memo.resources == &resources && std::ranges::equal(memo.targets, targets, [](const void* kept, const Target& target) { return kept == std::to_address(target); });
+}
+
 bool passAccessMatches(const DrawRecordAccess& memo, const Recorder* recorder, const ShaderResources& resources, std::span<const std::shared_ptr<StorageTexture>> targets) {
-    return memo.recorder == recorder && memo.generation == recorder->RenderPassGeneration() && memo.resources == &resources && std::ranges::equal(memo.targets, targets, [](const void* kept, const std::shared_ptr<StorageTexture>& target) { return kept == target.get(); });
+    return passAccessMatchesFor<std::shared_ptr<StorageTexture>>(memo, recorder, resources, targets);
 }
 
 void notePassAccessCheck(bool differed) {
@@ -5768,6 +5778,96 @@ bool sharedRecordPassServes(const SharedRecordPass& shared, const State& state, 
     return !state.depth || (sameDepthTarget(*shared.depth, *state.depth) && shared.depthWrite == state.depthWrite && shared.stencilTest == state.stencilTest && shared.stencilWritten == writesStencilTarget(state));
 }
 
+DrawRecordHold recordPassHold(const DrawRecordPass& pass, const Recorder& recorder, const DrawRecipe& recipe, const State& state) {
+    if (!pass.valid) return DrawRecordHold::First;
+    if (recipe.hasDepth && overwrittenStencil(state)) return DrawRecordHold::Depth;
+    if (pass.recorder != recorder.Id() || !recorder.RenderPassOpen() || pass.generation != recorder.RenderPassGeneration()) return DrawRecordHold::Pass;
+    if (pass.epoch != GuestMemory::CollectEpoch()) return DrawRecordHold::Epoch;
+    if (pass.proof != GuestMemory::ProofSerial()) return DrawRecordHold::Proof;
+    if (pass.pending != StorageTexture::PendingSerial()) return DrawRecordHold::Pending;
+    if (pass.versions.size() != recipe.targets.size()) return DrawRecordHold::Target;
+    if (recipe.hasDepth && (pass.depthSerial != DepthSurfacesSerial() || pass.depthReleased != DepthSurfacesReleased())) return DrawRecordHold::Depth;
+    return DrawRecordHold::Held;
+}
+
+bool proveRecordTemplate(DrawRecordCommit& record, ShaderResources& resources, std::span<const CompiledShader> shaders, DrawRecipeOutcome& result, bool injected) {
+    if (injected) return false;
+    record.effects.proved = true;
+    // A ceiling for the proof work of record draws, not a mode: the template is taken as it is
+    // (APS5_XP_PROOF_AS_IS), or with APS5_XP_PROOF_NONE also set, without any check at all.
+    static const bool none = std::getenv("APS5_XP_PROOF_NONE") != nullptr;
+    if (RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) return true;
+    if (RuntimeSwitches::Set(RuntimeSwitch::XpProofAsIs)) return none || resources.AsIsCurrent();
+    if (!record.cleanProofs) return resources.ProveCurrent(shaders, &result.proof);
+    ShaderResources::CleanProof clean = ShaderResources::CleanProof::FirstProof;
+    const bool ok = resources.ProveCurrent(shaders, &result.proof, &clean);
+    record.effects.cleanProof = clean;
+    return ok;
+}
+
+bool recordChecksQueued() {
+    return std::ranges::any_of(recordFailures, [](const std::atomic<std::uint32_t>& left) { return left.load(std::memory_order_relaxed) != 0; });
+}
+
+bool repeatExcludedModes() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool timeEachDraw = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
+    return profile || timeEachDraw || CaptureInputsEnabled() || PassAccessMemoVerify() || CaptureTrace::Enabled() || ReplayCensusEnabled() || RuntimeSwitches::Set(RuntimeSwitch::XpInputsAsIs) || RuntimeSwitches::Set(RuntimeSwitch::XpBindingsAsIs) || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor) || RuntimeSwitches::Set(RuntimeSwitch::XpProofAsIs);
+}
+
+void fillRepeatBlock(const Context& context, const State& state, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawRecipe& recipe, ShaderResources& resources, const void* plainPipeline, const void* plainFramebuffer, Pipeline* pushPipeline, Framebuffer* pushFramebuffer, std::span<StorageTexture* const> residents, const ShaderResources::PushPlan* push, const ShaderResources::PreparedBuffers* bound, bool inputsPlain, std::uint64_t notesBefore, bool multisample, Recorder& recorder) {
+    if (record.repeat == nullptr) record.repeat = std::make_shared<DrawRepeatBlock>();
+    auto& block = *record.repeat;
+    block.recipe = nullptr;
+    const auto refuse = [&](DrawRepeatClass why) { block.simple = why; };
+    if (!resources.RecordLean() || resources.HeapStage() || resources.HoldsLease() || resources.UsesAddressTable() || resources.HasCopiedWrites() || resources.ChecksFaults() || resources.SpaceReuse() || !resources.GpuWrites().empty() || resources.HoldsDepthCopies()) return refuse(DrawRepeatClass::Template);
+    const bool stencilReferences = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->stencilReferences.empty(); });
+    const bool functionLds = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; });
+    if (shaders.size() > block.programs.size() || stencilReferences || functionLds || UsesMeshWindow(shaders) || PixelFunctionLdsSubgroup(shaders) != 0u) return refuse(DrawRepeatClass::Stages);
+    if (pushPipeline == nullptr || pushFramebuffer == nullptr || push == nullptr || !record.effects.pushed) return refuse(DrawRepeatClass::NotPushed);
+    if (pushPipeline->DescriptorHeap() || pushPipeline->SplitsFaces() || pushPipeline->SplitsSecondChannel()) return refuse(DrawRepeatClass::Pipeline);
+    if (multisample || residents.size() != recipe.targets.size() || (state.depth.has_value() && state.depth->samples != 1u)) return refuse(DrawRepeatClass::Targets);
+    for (std::size_t index = 0; index < residents.size(); ++index) {
+        const auto stored = recipe.targets[index].lock();
+        if (residents[index] == nullptr || stored.get() != residents[index] || residents[index]->Descriptor().tileMode == TextureTileMode::kLinear || state.colors[index].fmaskAddress != 0) return refuse(DrawRepeatClass::Targets);
+    }
+    if (bound == nullptr || record.effects.buffers != DrawRecordBuffers::Used || bound->selected.empty()) return refuse(DrawRepeatClass::Buffers);
+    if ((record.effects.inputs != DrawRecordInputs::Used && record.effects.inputs != DrawRecordInputs::Rechecked) || !inputsPlain) return refuse(DrawRepeatClass::Inputs);
+    if (!keepsOnceFor<StorageTexture*>(&record.keep, recorder, &resources, pushPipeline, pushFramebuffer, residents, true)) return refuse(DrawRepeatClass::Keep);
+    if (!recorder.RenderPassOpen() || !record.pass.valid) return refuse(DrawRepeatClass::Pass);
+    if (!passAccessMatchesFor<StorageTexture*>(record.access, &recorder, resources, residents) || record.access.readsTarget) return refuse(DrawRepeatClass::Access);
+    if (repeatExcludedModes()) return refuse(DrawRepeatClass::Modes);
+    if (!resources.BuildRepeatPush(*push, bound->selected, block.bindings)) return refuse(DrawRepeatClass::Sets);
+    block.moved.clear();
+    for (const auto& item : bound->selected) block.moved.push_back(item.moved);
+    block.state = &state;
+    block.switches = RuntimeSwitches::Generation();
+    block.device = context.device;
+    block.descriptorCache = context.descriptorCache;
+    block.programs.fill(nullptr);
+    for (std::size_t index = 0; index < shaders.size(); ++index) block.programs[index] = shaders[index].program;
+    block.stages = shaders.size();
+    block.resources = &resources;
+    block.pipeline = pushPipeline;
+    block.framebuffer = pushFramebuffer;
+    block.recipePipeline = plainPipeline;
+    block.recipeFramebuffer = plainFramebuffer;
+    block.targets.assign(residents.begin(), residents.end());
+    block.dccAddresses.clear();
+    block.slices.clear();
+    for (const auto& color : state.colors) {
+        block.dccAddresses.push_back(SurfaceForTarget(color).dccAddress);
+        block.slices.emplace_back(color.arraySlice, color.arrayLastSlice != 0 ? color.layers : 1u);
+    }
+    block.push = push;
+    block.passKey = DrawRenderPassKey(context, state, recipe.targetViews);
+    block.fenced = state.depth.has_value();
+    block.writeNotes = recorder.WriteNoteCount();
+    block.notesHeld = block.writeNotes == notesBefore;
+    block.recipe = &recipe;
+    block.simple = DrawRepeatClass::Simple;
+}
+
 }
 
 DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs) {
@@ -5776,6 +5876,9 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     const bool recording = answer == nullptr;
     const auto failed = [&](DrawRecipeMiss check) { return recording && failRecordCheck(check); };
     if (recorder != nullptr && recording) recorder->BoundKeptBytes();
+    const bool repeatBlocks = recording && recorder != nullptr && RuntimeSwitches::Set(RuntimeSwitch::DirectRepeat);
+    const auto notesBefore = repeatBlocks ? recorder->WriteNoteCount() : 0u;
+    if (repeatBlocks && record.repeat != nullptr) record.repeat->simple = DrawRepeatClass::NotRecorded;
     PerformanceTimer timing("Graphics.DrawWithRecord");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawTimer timer(profile);
@@ -5854,17 +5957,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     // The owners and images of the multisampled targets, by color index (owners) and in order (images).
     std::vector<std::shared_ptr<void>> multisampleOwners(multisampleRecipe ? recipe.targets.size() : 0u);
     std::vector<VkImage> multisampleImages;
-    const auto holdUnder = [&](const DrawRecordPass& pass) {
-        if (!pass.valid) return DrawRecordHold::First;
-        if (recipe.hasDepth && overwrittenStencil(state)) return DrawRecordHold::Depth;
-        if (pass.recorder != recorder->Id() || !recorder->RenderPassOpen() || pass.generation != recorder->RenderPassGeneration()) return DrawRecordHold::Pass;
-        if (pass.epoch != GuestMemory::CollectEpoch()) return DrawRecordHold::Epoch;
-        if (pass.proof != GuestMemory::ProofSerial()) return DrawRecordHold::Proof;
-        if (pass.pending != StorageTexture::PendingSerial()) return DrawRecordHold::Pending;
-        if (pass.versions.size() != recipe.targets.size()) return DrawRecordHold::Target;
-        if (recipe.hasDepth && (pass.depthSerial != DepthSurfacesSerial() || pass.depthReleased != DepthSurfacesReleased())) return DrawRecordHold::Depth;
-        return DrawRecordHold::Held;
-    };
+    const auto holdUnder = [&](const DrawRecordPass& pass) { return recordPassHold(pass, *recorder, recipe, state); };
     const auto* pass = &record.pass;
     auto hold = holdUnder(*pass);
     const SharedRecordPass* shared = nullptr;
@@ -5936,18 +6029,8 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     }
     timer.phase(PhasePrepare);
     const auto proved = [&] {
-        if (failed(DrawRecipeMiss::Proof)) return false;
-        record.effects.proved = true;
-        // A ceiling for the proof work of record draws, not a mode: the template is taken as it is
-        // (APS5_XP_PROOF_AS_IS), or with APS5_XP_PROOF_NONE also set, without any check at all.
-        static const bool none = std::getenv("APS5_XP_PROOF_NONE") != nullptr;
-        if (RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) return true;
-        if (RuntimeSwitches::Set(RuntimeSwitch::XpProofAsIs)) return none || resources->AsIsCurrent();
-        if (!record.cleanProofs) return resources->ProveCurrent(shaders, &result.proof);
-        ShaderResources::CleanProof clean = ShaderResources::CleanProof::FirstProof;
-        const bool ok = resources->ProveCurrent(shaders, &result.proof, &clean);
-        record.effects.cleanProof = clean;
-        return ok;
+        const bool injected = failed(DrawRecipeMiss::Proof);
+        return proveRecordTemplate(record, *resources, shaders, result, injected);
     };
     if (!proved()) {
         if (recording) {
@@ -6132,6 +6215,9 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     std::vector<StorageTexture*> residents;
     residents.reserve(targets.size());
     for (const auto& target : targets) residents.push_back(target.get());
+    const void* plainPipeline = pipeline.get();
+    const void* plainFramebuffer = framebuffer.get();
+    const bool inputsPlain = !inputs.nothing && inputs.indices == nullptr && inputs.vertexBuffers.empty() && inputs.restartTable.empty();
     RecordedDraw drawn;
     drawn.recorder = recorder;
     drawn.completion = outcome.completion;
@@ -6190,10 +6276,297 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     } else {
         record.pass.valid = false;
     }
+    if (repeatBlocks) fillRepeatBlock(context, state, shaders, record, recipe, *drawn.resources, plainPipeline, plainFramebuffer, drawn.pushPipeline.get(), drawn.pushFramebuffer.get(), residents, push, bound, inputsPlain, notesBefore, multisampleRecipe, *recorder);
     timing.Mark("draw_and_resource_release");
     reportDrawEnd(state, timer, nullptr, outcome, waitedBefore, ownWaitedMs, " recorded from record");
     result.recorded = true;
     return result;
+}
+
+namespace {
+
+RepeatRefusal repeatHoldRefusal(DrawRecordHold hold) {
+    switch (hold) {
+    case DrawRecordHold::Epoch: return RepeatRefusal::Epoch;
+    case DrawRecordHold::Proof: return RepeatRefusal::ProofSerial;
+    case DrawRecordHold::Pending: return RepeatRefusal::Pending;
+    case DrawRecordHold::Depth: return RepeatRefusal::Depth;
+    case DrawRecordHold::Target: return RepeatRefusal::Target;
+    default: return RepeatRefusal::Pass;
+    }
+}
+
+bool repeatTargetsHeld(const DrawRepeatBlock& block, const DrawRecordPass& pass) {
+    for (std::size_t index = 0; index < block.targets.size(); ++index) {
+        const auto* target = block.targets[index];
+        if (target->UploadVersion() != pass.versions[index] || !target->Cached() || !StorageImageServesKeys(*target, block.dccAddresses[index])) return false;
+    }
+    return true;
+}
+
+struct RepeatReadsStorage {};
+struct RepeatAttachmentsStorage {};
+
+std::uint64_t repeatOrdinal = 0;
+std::atomic<RepeatHookForTest> repeatHook{nullptr};
+
+}
+
+void SetRepeatHookForTest(RepeatHookForTest hook) {
+    repeatHook.store(hook, std::memory_order_release);
+}
+
+RepeatOutcome RepeatCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs, const DrawTraceContext* trace, DrawCommitView* describe, std::uint64_t verifyEvery) {
+    RepeatOutcome out;
+    const auto refuse = [&](RepeatRefusal why) {
+        out.refusal = why;
+        return out;
+    };
+    auto* block = record.repeat.get();
+    if (block == nullptr) return refuse(RepeatRefusal::NoBlock);
+    if (block->simple != DrawRepeatClass::Simple) {
+        out.simple = block->simple;
+        return refuse(RepeatRefusal::NotSimple);
+    }
+    auto* recorder = Recorder::Active();
+    const auto* recipe = record.recipe.get();
+    if (recipe == nullptr || block->recipe != recipe || block->state != &state || block->switches != RuntimeSwitches::Generation() || recorder == nullptr || context.recorder != recorder || context.device != block->device || recipe->device != context.device || context.descriptorCache != block->descriptorCache || draw.indirect || shaders.size() != block->stages || !RecordDraws() || DumpTargetLimit() != 0 || recordChecksQueued() || repeatExcludedModes()) return refuse(RepeatRefusal::Shape);
+    for (std::size_t index = 0; index < shaders.size(); ++index) {
+        if (shaders[index].program != block->programs[index]) return refuse(RepeatRefusal::Shape);
+    }
+    if (!keepsOnceFor<StorageTexture*>(&record.keep, *recorder, block->resources, block->pipeline, block->framebuffer, block->targets, true)) return refuse(RepeatRefusal::Batch);
+    auto& resources = *block->resources;
+    if (!resources.Reusable() || resources.HeapStage() || !resources.RecordLean()) return refuse(RepeatRefusal::Objects);
+    if (const auto hold = recordPassHold(record.pass, *recorder, *recipe, state); hold != DrawRecordHold::Held) return refuse(repeatHoldRefusal(hold));
+    if (!repeatTargetsHeld(*block, record.pass)) return refuse(RepeatRefusal::Target);
+    if (!passAccessMatchesFor<StorageTexture*>(record.access, recorder, resources, block->targets) || record.access.readsTarget) return refuse(RepeatRefusal::Access);
+    if (recorder->HasQueuedKeyStores() || recorder->HasQueuedStores()) return refuse(RepeatRefusal::Stores);
+    if (StorageTexture::DrawnLinearPending()) return refuse(RepeatRefusal::Linear);
+    if (prepared == nullptr || !RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || record.verifyBuffers || prepared->plan == nullptr || prepared->plan != resources.DirectBufferPlan(shaders)) return refuse(RepeatRefusal::Buffers);
+    auto& push = block->bindings;
+    if (prepared->blob.empty() || prepared->selected.size() != push.allocations.size()) return refuse(RepeatRefusal::Selection);
+    for (std::size_t index = 0; index < push.allocations.size(); ++index) {
+        if (prepared->selected[index].allocation != push.allocations[index] || prepared->selected[index].moved != block->moved[index]) return refuse(RepeatRefusal::Selection);
+    }
+    if (resources.RepeatGuards(*prepared) != ShaderResources::PreparedBuffers::Selection::Taken) return refuse(RepeatRefusal::DepthGuards);
+    if (preparedInputs == nullptr || !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || record.verifyInputs) return refuse(RepeatRefusal::Inputs);
+    const bool memoRoute = !record.cleanProofs && !RuntimeSwitches::Set(RuntimeSwitch::CleanCurrency);
+    if (describe == nullptr && repeatHook.load(std::memory_order_relaxed) != nullptr) {
+        if (const auto hook = repeatHook.exchange(nullptr, std::memory_order_acq_rel); hook != nullptr) {
+            hook(record);
+            return RepeatCommit(context, state, draw, shaders, record, prepared, preparedInputs, trace, nullptr, verifyEvery);
+        }
+    }
+    if (describe != nullptr) {
+        auto& view = *describe;
+        view.filled = true;
+        view.resources = &resources;
+        view.pipeline = block->recipePipeline;
+        view.framebuffer = block->recipeFramebuffer;
+        view.key = recipe->key;
+        view.views = recipe->targetViews;
+        view.targets.assign(block->targets.begin(), block->targets.end());
+        view.passKey = recipe->passKey;
+        view.moved.clear();
+        view.movedSizes.clear();
+        view.movedWords.clear();
+        for (const auto& entry : prepared->moved) {
+            view.moved.emplace_back(entry.allocation, entry.address);
+            view.movedSizes.push_back(entry.size);
+            view.movedWords.emplace_back(entry.words.begin(), entry.words.end());
+        }
+        view.pushStages = recipe->pushStages;
+        view.push = {};
+        if (recipe->pushStages != 0) {
+            view.push = AssemblePushConstants(shaders);
+            resources.PatchPushConstants(view.push);
+        }
+        view.vertexInput = recipe->vertexInput;
+        view.fragmentOutputs = recipe->fragmentOutputs;
+        view.shaderStages = recipe->shaderStages;
+        view.hasDepth = recipe->hasDepth;
+        auto slice = recorder->DrawUpload(prepared->blob.size());
+        std::memcpy(slice.bytes, prepared->blob.data(), prepared->blob.size());
+        ShaderResources::DrawBindings described;
+        described.pushedSet = static_cast<std::int32_t>(block->push->set);
+        described.pushSelected = push.allocations;
+        for (const auto& item : prepared->selected) described.snapshots.push_back({item.begin, slice.buffer, slice.offset + item.offset, item.bytes});
+        resources.DescribeDrawBindings(&described, push.allocations, block->push, view.bindings);
+        out.pushDifference = resources.CompareRepeatPush(push, described, *block->push);
+        view.bound = true;
+        view.pushed = true;
+        view.pushPipeline = block->pipeline;
+        view.pushFramebuffer = block->framebuffer;
+        view.access = record.access;
+        view.keptOnce = true;
+        view.keep = record.keep;
+        view.passNotes = true;
+        out.proofSkipped = memoRoute && resources.ProofHeld();
+        out.unmovedSkipped = block->notesHeld && recorder->WriteNoteCount() == block->writeNotes;
+        if (out.unmovedSkipped && !resources.RepeatUnmovedClear(*recorder, *prepared)) out.refuted = "unmoved ranges";
+        out.taken = true;
+        return out;
+    }
+    if (verifyEvery != 0 && ++repeatOrdinal % verifyEvery == 0) return refuse(RepeatRefusal::VerifyDue);
+    const DepthCopySourceScope depthCopySource(state.depthCopySource);
+    PerformanceTimer timing("Graphics.RepeatCommit");
+    DrawTimer timer(false);
+    recorder->BoundKeptBytes();
+    if (record.keep.batch != recorder->OpenSerial() || !recorder->RenderPassOpen()) return refuse(RepeatRefusal::Batch);
+    record.effects = {};
+    DrawInputs inputs;
+    out.inputs = takePreparedInputs(context, state, draw, shaders, *recipe, *preparedInputs, inputs, timer, timing);
+    if (out.inputs != DrawRecordInputs::Used && out.inputs != DrawRecordInputs::Rechecked) return refuse(RepeatRefusal::Inputs);
+    const auto giveBack = [&](RepeatRefusal why) {
+        preparedInputs->vertexInput = std::move(inputs.vertexInput);
+        preparedInputs->vertexHandles = std::move(inputs.vertexHandles);
+        preparedInputs->vertexOffsets = std::move(inputs.vertexOffsets);
+        preparedInputs->inPlaceReads = std::move(inputs.inPlaceReads);
+        out.inputs = DrawRecordInputs::None;
+        out.late = true;
+        return refuse(why);
+    };
+    if (record.keep.batch != recorder->OpenSerial() || recordPassHold(record.pass, *recorder, *recipe, state) != DrawRecordHold::Held || !repeatTargetsHeld(*block, record.pass) || record.access.generation != recorder->RenderPassGeneration() || recorder->HasQueuedKeyStores() || recorder->HasQueuedStores() || StorageTexture::DrawnLinearPending()) return giveBack(RepeatRefusal::Changed);
+    record.effects.inputs = out.inputs;
+    out.proofSkipped = memoRoute && resources.ProofHeld();
+    if (out.proofSkipped) {
+        record.effects.proved = true;
+    } else if (!proveRecordTemplate(record, resources, shaders, out.result, false)) {
+        auto owner = recipe->templateRef.lock();
+        SharedResourceCache().Remove(recipe->key, &resources);
+        countCache(&DrawProfile::cacheInvalidated);
+        resources.KeepStorageImageBytes(*recorder);
+        if (owner != nullptr) recorder->Keep(std::move(owner));
+        out.taken = true;
+        out.result.miss = DrawRecipeMiss::Proof;
+        return out;
+    }
+    {
+        auto ticket = record.ticket;
+        ticket.ranges = &record.ticketRanges;
+        ticket.checked = 0;
+        ticket.trusted = 0;
+        if (!resources.PreparedMovesClear(*prepared, *recorder, &ticket)) return giveBack(RepeatRefusal::MovedHazard);
+        ticket.ranges = nullptr;
+        record.ticket = ticket;
+        record.effects.movedChecked = ticket.checked;
+        record.effects.movedTrusted = ticket.trusted;
+    }
+    CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
+    if (const auto present = Recorder::Presents(); record.touchedPresent != present) {
+        if (!RuntimeSwitches::Set(RuntimeSwitch::TemplateTouch) || resources.TouchedPresent() != present) {
+            SharedResourceCache().Touch(recipe->key);
+            resources.NoteTouchedPresent(present);
+        }
+        record.touchedPresent = present;
+    }
+    resources.RepeatRequire(prepared->moved);
+    out.unmovedSkipped = block->notesHeld && recorder->WriteNoteCount() == block->writeNotes;
+    if (!out.unmovedSkipped && !resources.RepeatUnmovedClear(*recorder, *prepared)) return giveBack(RepeatRefusal::UnmovedHazard);
+    VkDeviceSize uploadOffset = 0;
+    auto upload = resources.RepeatUpload(*recorder, *prepared, uploadOffset);
+    if (block->upload != upload.get() || block->uploadBatch != recorder->OpenSerial() || block->uploadRecorder != recorder->Id()) {
+        block->upload = upload.get();
+        block->uploadBatch = recorder->OpenSerial();
+        block->uploadRecorder = recorder->Id();
+        recorder->Keep(upload);
+    }
+    if (RuntimeSwitches::Set(RuntimeSwitch::KeepBytesOnce)) recorder->KeepSnapshotBytes(upload.get(), upload->Bytes().size());
+    else recorder->KeepBytes(upload.get(), upload->Bytes().size());
+    record.effects.buffers = DrawRecordBuffers::Used;
+    record.effects.pushed = true;
+    const auto& memo = record.access;
+    auto& passReads = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, RepeatReadsStorage>();
+    passReads.assign(memo.reads.begin(), memo.reads.end());
+    passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
+    auto& passAttachments = HostThreadLocal<std::vector<std::pair<VkImage, bool>>, RepeatAttachmentsStorage>();
+    passAttachments.clear();
+    for (const auto* target : block->targets) passAttachments.emplace_back(target->Image(), true);
+    const PassAccess passAccess{passReads, memo.writes, memo.images, passAttachments, false, false, memo.writeOnly};
+    resources.RequireGuestBuffers();
+    const auto start = recorder->StartDrawPass(block->passKey, false, block->fenced, passAccess);
+    record.access.generation = recorder->RenderPassGeneration();
+    const auto commands = start.commands;
+    out.passBegun = !start.continued;
+    out.passBreak = start.reason;
+    auto drawTiming = Recorder::NoTiming;
+    if (start.continued) {
+        block->pipeline->Continue(commands, state);
+    } else {
+        recorder->PrepareSampleSlot();
+        PerformanceTrace::Count(PerformanceTrace::RenderPassScope);
+        drawTiming = recorder->BeginGpuTiming(Recorder::CommandClass::Draw);
+        if (Recorder::BarrierValidate()) {
+            auto reads = resources.InPlaceReads();
+            reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
+            auto images = resources.StorageImages();
+            for (const auto* target : block->targets) images.emplace_back(target->Image(), true);
+            recorder->NoteAccess(Recorder::CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, false});
+        }
+        if (start.barrier) {
+            const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+            context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+            Recorder::CountBarriers(Recorder::CommandClass::Draw, 1);
+        }
+        if (inputs.vertexInputBehindGpuWrite) {
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT);
+            Recorder::CountBarriers(Recorder::CommandClass::Draw, 1);
+        }
+        block->pipeline->Begin(commands, *block->framebuffer, state.renderExtent, state);
+    }
+    NoteHeapRecord(false, false);
+    resources.RepeatPushBindings(commands, block->pipeline->Layout(), push, prepared->selected, upload->Handle(), uploadOffset);
+    pushDrawConstants(*block->pipeline, commands, state, draw, shaders, resources, nullptr, recipe->pushStages, 0, false, inputs.meshLayerStride, nullptr);
+    noteDrawFaultToken(context, *recorder, commands, shaders, draw, static_cast<std::uint32_t>(AgcDriver::FaultStage::graphics), nullptr);
+    std::uint32_t subdraw = 0;
+    recordDrawCommands(context, commands, state, draw, inputs, nullptr, VK_NULL_HANDLE, 0, trace, subdraw);
+    recorder->EndGpuTiming(Recorder::NoTiming);
+    recorder->LeaveRenderPassOpen(block->passKey, drawTiming, block->fenced, passAccess);
+    record.effects.keptOnce = true;
+    const auto recorderId = recorder->Id();
+    for (std::size_t index = 0; index < block->targets.size(); ++index) {
+        auto* target = block->targets[index];
+        const auto [slice, count] = block->slices[index];
+        if (target->RenoteInPass(recorderId, recorder->RenderPassGeneration(), slice, count)) {
+            ++record.effects.notesSkipped;
+            continue;
+        }
+        target->MarkSliceDirty(slice, count);
+        if (recorder->RenderPassOpen()) target->RememberPassNote(recorderId, recorder->RenderPassGeneration(), slice, count);
+    }
+    record.effects.hold = DrawRecordHold::Held;
+    record.effects.passHeld = true;
+    if (recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {
+        auto& remembered = record.pass;
+        remembered.valid = true;
+        remembered.recorder = recorderId;
+        remembered.generation = recorder->RenderPassGeneration();
+        remembered.epoch = GuestMemory::CollectEpoch();
+        remembered.proof = GuestMemory::ProofSerial();
+        remembered.pending = StorageTexture::PendingSerial();
+        remembered.depthSerial = DepthSurfacesSerial();
+        remembered.depthReleased = DepthSurfacesReleased();
+        remembered.versions.clear();
+        for (const auto* target : block->targets) remembered.versions.push_back(target->UploadVersion());
+        if (RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets)) {
+            auto& kept = sharedRecordPass();
+            kept.pass = remembered;
+            kept.colors.assign(state.colors.begin(), state.colors.end());
+            kept.depth = state.depth;
+            kept.depthWrite = state.depthWrite;
+            kept.stencilTest = state.stencilTest;
+            kept.stencilWritten = writesStencilTarget(state);
+            kept.depthCopySource = state.depthCopySource;
+            kept.views = recipe->targetViews;
+            kept.targets.assign(block->targets.begin(), block->targets.end());
+        }
+    } else {
+        record.pass.valid = false;
+    }
+    timing.Mark("draw_and_resource_release");
+    out.taken = true;
+    out.result.recorded = true;
+    return out;
 }
 
 namespace {

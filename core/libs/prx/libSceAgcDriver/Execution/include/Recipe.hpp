@@ -205,6 +205,37 @@ struct DrawCommitView {
 struct DrawCommitViewTag {};
 using DrawCommitViewSlot = HostThreadSlot<DrawCommitView*, DrawCommitViewTag>;
 
+enum class DrawRepeatClass : std::uint8_t { Simple, NotRecorded, Template, Stages, Pipeline, Targets, NotPushed, Sets, Buffers, Inputs, Keep, Pass, Access, Notes, Modes, Count };
+
+struct DrawRepeatBlock {
+    DrawRepeatClass simple = DrawRepeatClass::NotRecorded;
+    const DrawRecipe* recipe = nullptr;
+    const Graphics::State* state = nullptr;
+    std::uint64_t switches = 0;
+    VkDevice device = VK_NULL_HANDLE;
+    const void* descriptorCache = nullptr;
+    std::array<const void*, 4> programs{};
+    std::size_t stages = 0;
+    Graphics::ShaderResources* resources = nullptr;
+    Graphics::Pipeline* pipeline = nullptr;
+    Graphics::Framebuffer* framebuffer = nullptr;
+    const void* recipePipeline = nullptr;
+    const void* recipeFramebuffer = nullptr;
+    std::vector<Graphics::StorageTexture*> targets;
+    std::vector<std::uint64_t> dccAddresses;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> slices;
+    const Graphics::ShaderResources::PushPlan* push = nullptr;
+    std::uint64_t passKey = 0;
+    bool fenced = false;
+    bool notesHeld = false;
+    std::uint64_t writeNotes = 0;
+    Graphics::ShaderResources::RepeatPush bindings;
+    std::vector<bool> moved;
+    std::uint64_t uploadRecorder = 0;
+    std::uint64_t uploadBatch = 0;
+    const void* upload = nullptr;
+};
+
 struct DrawRecordCommit {
     std::shared_ptr<const DrawRecipe> recipe;
     DrawRecordPass pass;
@@ -230,9 +261,11 @@ struct DrawRecordCommit {
     bool verifyInputs = false;
     AtomicSharedPtr<const DrawRecipe> inputsRecipe;
     bool inputsRecipeAsked = false;
+    std::shared_ptr<DrawRepeatBlock> repeat;
 
     void Adopt(std::shared_ptr<const DrawRecipe> built) {
         recipe = std::move(built);
+        repeat.reset();
         if (std::exchange(bufferPlanAsked, false)) bufferPlan.store(nullptr);
         if (std::exchange(inputsRecipeAsked, false)) inputsRecipe.store(nullptr);
         pass = {};
