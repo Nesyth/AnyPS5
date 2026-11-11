@@ -907,6 +907,130 @@ void EachResolverKeepsItsOwnFunctions() {
     Expect(handed.cmdDraw == plain.cmdDraw, "a resolver that returns a thunk got it wrapped again");
 }
 
+void FragmentsSpliceInOrder() {
+    const auto functions = resolve(stubContext());
+    CommandStream batch;
+    CommandStream fragments(CommandStream::Mode::Fragments);
+    std::vector<CommandStream::Fragment> made;
+    for (std::uint32_t draw = 0; draw < 3; ++draw) {
+        fragments.BeginFragment();
+        functions.cmdDraw(fragments.Handle(), draw, 2, 0, 0);
+        functions.cmdDraw(fragments.Handle(), draw, 3, 0, 0);
+        made.push_back(fragments.EndFragment());
+    }
+    Expect(made[1].Ops() == 2 && !made[1].Empty() && made[1].Slabs() == 1, "a fragment of two draws holds " + std::to_string(made[1].Ops()) + " ops in " + std::to_string(made[1].Slabs()) + " slabs");
+    functions.cmdDispatch(batch.Handle(), 7, 1, 1);
+    batch.Splice(std::move(made[2]));
+    functions.cmdDispatch(batch.Handle(), 8, 1, 1);
+    batch.Splice(std::move(made[0]));
+    Expect(made[2].Empty() && made[2].Slabs() == 0, "a spliced fragment kept its records or slabs");
+    Expect(batch.Ops() == 6 && batch.SplicedSlabs() == 1, "the batch holds " + std::to_string(batch.Ops()) + " ops and " + std::to_string(batch.SplicedSlabs()) + " spliced slabs");
+    calls.clear();
+    batch.Replay(Real);
+    const auto draw = [](std::uint32_t first, std::uint32_t second) {
+        std::string expected = begin(DrawName, Real);
+        for (const std::uint32_t value : {first, second, 0u, 0u}) bytes(expected, value);
+        return expected;
+    };
+    const auto dispatch = [](std::uint32_t groups) {
+        std::string expected = begin(DispatchName, Real);
+        for (const std::uint32_t value : {groups, 1u, 1u}) bytes(expected, value);
+        return expected;
+    };
+    const std::vector<std::string> expected{dispatch(7), draw(2, 2), draw(2, 3), dispatch(8), draw(0, 2), draw(0, 3)};
+    Expect(calls == expected, "spliced fragments replayed out of order: " + firstDifference(expected, calls));
+    calls.clear();
+    CommandStream::ReplayFragment(made[1], Real);
+    const std::vector<std::string> alone{draw(1, 2), draw(1, 3)};
+    Expect(calls == alone, "a fragment replayed into a command buffer differs: " + firstDifference(alone, calls));
+    ExpectThrows([&] { CommandStream::ReplayFragment(made[1], batch.Handle()); }, "not a stream handle", "replaying a fragment into a stream handle");
+    ExpectThrows([&] { fragments.Splice(std::move(made[1])); }, "open batch stream", "splicing into a fragment stream");
+    batch.Close();
+    CommandStream::Fragment late;
+    fragments.BeginFragment();
+    functions.cmdDraw(fragments.Handle(), 9, 9, 0, 0);
+    late = fragments.EndFragment();
+    ExpectThrows([&] { batch.Splice(std::move(late)); }, "open batch stream", "splicing into a closed batch");
+    batch.Reset();
+    Expect(batch.SplicedSlabs() == 0 && batch.Empty(), "Reset kept spliced slabs or records");
+}
+
+void FragmentsSpanSlabsAndLargeRecords() {
+    const auto functions = resolve(stubContext());
+    CommandStream fragments(CommandStream::Mode::Fragments);
+    std::vector<unsigned char> payload(CommandStream::SlabBytes + 4096);
+    unsigned char seed = 11;
+    pattern(payload.data(), payload.size(), seed);
+    fragments.BeginFragment();
+    for (std::uint32_t draw = 0; draw < 3000; ++draw) functions.cmdDraw(fragments.Handle(), draw, 1, 0, 0);
+    functions.cmdUpdateBuffer(fragments.Handle(), fake<VkBuffer>(0x4100), 0, payload.size(), payload.data());
+    functions.cmdDraw(fragments.Handle(), 3000, 1, 0, 0);
+    auto big = fragments.EndFragment();
+    Expect(big.Ops() == 3002 && big.Slabs() >= 3, "a fragment over several slabs holds " + std::to_string(big.Ops()) + " ops in " + std::to_string(big.Slabs()) + " slabs");
+    fragments.BeginFragment();
+    functions.cmdDraw(fragments.Handle(), 1, 1, 0, 0);
+    auto next = fragments.EndFragment();
+    Expect(next.Slabs() == 1, "a fragment after a large one holds " + std::to_string(next.Slabs()) + " slabs");
+    std::vector<unsigned char> scratch = payload;
+    std::fill(payload.begin(), payload.end(), static_cast<unsigned char>(0));
+    CommandStream batch;
+    batch.Splice(std::move(big));
+    batch.Splice(std::move(next));
+    calls.clear();
+    batch.Replay(Real);
+    std::string update = begin(UpdateBufferName, Real);
+    bytes(update, fake<VkBuffer>(0x4100));
+    bytes(update, VkDeviceSize{0});
+    bytes(update, static_cast<VkDeviceSize>(scratch.size()));
+    items(update, scratch.data(), static_cast<std::uint64_t>(scratch.size()));
+    Expect(calls.size() == 3003 && calls[3000] == update, "a fragment's large update replayed differently after the caller's bytes changed");
+}
+
+void FragmentsCompareRecordByRecord() {
+    const auto functions = resolve(stubContext());
+    Data data;
+    std::vector<unsigned char> large;
+    makeData(data, large);
+    CommandStream fragments(CommandStream::Mode::Fragments);
+    const auto record = [&](VkCommandBuffer commands, VkDescriptorSet set, VkBuffer pushed, std::uint32_t count) {
+        functions.cmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, fake<VkPipeline>(0x6001));
+        functions.cmdSetViewport(commands, 0, 1, data.viewports.data());
+        functions.cmdSetScissor(commands, 0, 1, data.scissors.data());
+        functions.cmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, fake<VkPipelineLayout>(0x6002), 1, 1, &set, 0, nullptr);
+        auto write = data.writes[0];
+        const VkDescriptorBufferInfo info{pushed, 64, 256};
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.descriptorCount = 1;
+        write.pImageInfo = nullptr;
+        write.pTexelBufferView = nullptr;
+        write.pBufferInfo = &info;
+        write.pNext = nullptr;
+        functions.cmdPushDescriptorSetKHR(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, fake<VkPipelineLayout>(0x6002), 0, 1, &write);
+        functions.cmdPushConstants(commands, fake<VkPipelineLayout>(0x6002), VK_SHADER_STAGE_VERTEX_BIT, 0, static_cast<std::uint32_t>(data.pushBytes.size()), data.pushBytes.data());
+        const VkBuffer vertices = fake<VkBuffer>(0x6003);
+        const VkDeviceSize offset = 16;
+        functions.cmdBindVertexBuffers(commands, 0, 1, &vertices, &offset);
+        functions.cmdBindIndexBuffer(commands, fake<VkBuffer>(0x6004), 32, VK_INDEX_TYPE_UINT16);
+        functions.cmdDrawIndexed(commands, count, 1, 0, 0, 0);
+    };
+    fragments.BeginFragment();
+    record(fragments.Handle(), fake<VkDescriptorSet>(0x7001), fake<VkBuffer>(0x7002), 36);
+    const auto mine = fragments.EndFragment();
+    CommandStream batch;
+    functions.cmdDispatch(batch.Handle(), 1, 1, 1);
+    const auto mark = batch.MarkOps();
+    record(batch.Handle(), fake<VkDescriptorSet>(0x7101), fake<VkBuffer>(0x7102), 36);
+    const char* what = nullptr;
+    Expect(CommandStream::SameRecords(mine, batch, mark, true, &what), std::string("records with other set and snapshot handles differ: ") + (what != nullptr ? what : "?"));
+    Expect(!CommandStream::SameRecords(mine, batch, mark, false, &what), "records with other handles compare equal when handles count");
+    CommandStream other;
+    record(other.Handle(), fake<VkDescriptorSet>(0x7101), fake<VkBuffer>(0x7102), 35);
+    what = nullptr;
+    Expect(!CommandStream::SameRecords(mine, other, 0, true, &what) && what != nullptr && std::string_view(what) == DrawIndexedName, "a draw with another index count was not caught by the comparison");
+    functions.cmdDraw(other.Handle(), 1, 1, 0, 0);
+    Expect(!CommandStream::SameRecords(mine, other, 0, true, &what), "a longer stream compared equal");
+}
+
 }
 
 int main() {
@@ -918,6 +1042,9 @@ int main() {
         ClosedStreamsRefuseAppends();
         StreamsRecycleTheirMemory();
         EachResolverKeepsItsOwnFunctions();
+        FragmentsSpliceInOrder();
+        FragmentsSpanSlabsAndLargeRecords();
+        FragmentsCompareRecordByRecord();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;
