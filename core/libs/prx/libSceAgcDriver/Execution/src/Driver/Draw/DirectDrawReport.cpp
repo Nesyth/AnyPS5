@@ -49,7 +49,7 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "set repeat ns", "set repeats timed", "store repeat ns", "store repeats timed", "shared repeat ns", "shared repeats timed",
     "bindings placed", "bindings not placed", "finisher slices bound", "finisher slices bound with a written set", "blobs copied", "placed for another device", "unmoved-range hazard", "depth guards", "slices returned", "bytes not copied", "objects not allocated",
     "unmoved tests", "unmoved tests answered by stamp", "guard walks answered by the prepared test", "sets lent", "sets written", "bindings verified", "bindings differing", "stamp claims refuted",
-    "today's pushed ns", "today's pushed timed", "today's written-set ns", "today's written-set timed", "placed pushed ns", "placed pushed timed", "placed written-set ns", "placed written-set timed", "keep ns", "keeps timed",
+    "today's pushed ns", "today's pushed timed", "today's written-set ns", "today's written-set timed", "placed pushed ns", "placed pushed timed", "placed written-set ns", "placed written-set timed", "keep ns", "keeps timed", "dynamic sets bound", "dynamic sets written", "dynamic sets refused",
 };
 
 constexpr std::array<const char*, StepCount> StepNames{"request", "invocation", "walk", "key", "side", "class", "checks", "buffers", "inputs", "hand-off"};
@@ -342,7 +342,7 @@ void Report(bool force) {
     }
     if (sum(Counter::BindingsPlaced, Counter::BindingsNewWrittenTimed) != 0) {
         const auto perDraw = [&](Counter nanoseconds, Counter timed) { return at(timed) == 0 ? 0.0 : static_cast<double>(at(nanoseconds)) / static_cast<double>(at(timed)); };
-        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] bindings: %llu placed on the finisher, %llu not placed; %llu finisher slices bound (%llu with a written set), %llu blobs copied, %llu not taken%s, %llu slices returned unbound; %llu bytes not copied, %llu objects not allocated; unmoved tests %llu, %llu answered by stamp; %llu guard walks answered by the prepared depth test; per-draw sets %llu lent, %llu written; verify %llu checked, %llu differing, %llu stamp claims refuted; ns per binding step: today pushed %.0f (%llu), today with a written set %.0f (%llu), placed pushed %.0f (%llu), placed with a written set %.0f (%llu); ns per keep %.0f (%llu)\n",
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] bindings: %llu placed on the finisher, %llu not placed; %llu finisher slices bound (%llu with a written set), %llu blobs copied, %llu not taken%s, %llu slices returned unbound; %llu bytes not copied, %llu objects not allocated; unmoved tests %llu, %llu answered by stamp; %llu guard walks answered by the prepared depth test; per-draw sets %llu lent, %llu written; verify %llu checked, %llu differing, %llu stamp claims refuted; ns per binding step: today pushed %.0f (%llu), today with a written set %.0f (%llu), placed pushed %.0f (%llu), placed with a written set %.0f (%llu); ns per keep %.0f (%llu); dynamic sets: %llu draws bound, %llu sets written, %llu draws refused, %llu templates over the device limit\n",
             static_cast<unsigned long long>(at(Counter::BindingsPlaced)), static_cast<unsigned long long>(at(Counter::BindingsNotPlaced)),
             static_cast<unsigned long long>(at(Counter::BindingsTaken)), static_cast<unsigned long long>(at(Counter::BindingsTakenWritten)), static_cast<unsigned long long>(at(Counter::BindingsCopied)),
             static_cast<unsigned long long>(sum(Counter::BindingsOtherDevice, Counter::BindingsDepthGuards)), reasons(counts, Counter::BindingsOtherDevice, Counter::BindingsDepthGuards).c_str(), static_cast<unsigned long long>(at(Counter::BindingsReturned)),
@@ -354,7 +354,8 @@ void Report(bool force) {
             perDraw(Counter::BindingsTodayWrittenNanoseconds, Counter::BindingsTodayWrittenTimed), static_cast<unsigned long long>(at(Counter::BindingsTodayWrittenTimed)),
             perDraw(Counter::BindingsNewPushedNanoseconds, Counter::BindingsNewPushedTimed), static_cast<unsigned long long>(at(Counter::BindingsNewPushedTimed)),
             perDraw(Counter::BindingsNewWrittenNanoseconds, Counter::BindingsNewWrittenTimed), static_cast<unsigned long long>(at(Counter::BindingsNewWrittenTimed)),
-            perDraw(Counter::BindingsKeepNanoseconds, Counter::BindingsKeepTimed), static_cast<unsigned long long>(at(Counter::BindingsKeepTimed)));
+            perDraw(Counter::BindingsKeepNanoseconds, Counter::BindingsKeepTimed), static_cast<unsigned long long>(at(Counter::BindingsKeepTimed)),
+            static_cast<unsigned long long>(at(Counter::BindingsDynamicBound)), static_cast<unsigned long long>(at(Counter::BindingsDynamicWritten)), static_cast<unsigned long long>(at(Counter::BindingsDynamicRefused)), static_cast<unsigned long long>(Graphics::ShaderResources::DynamicPlansRefused()));
     }
     if (commits == 0) return;
     static std::array<std::uint64_t, static_cast<std::size_t>(Graphics::RecipeRefusal::Count)> refusalsReported{};

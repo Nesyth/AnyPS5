@@ -6128,6 +6128,7 @@ std::uint32_t SetDescriptorLimit(const Context& context, VkDescriptorType type, 
     const bool sampledUpdateAfterBind = updateAfterBind && context.sampledImageUpdateAfterBind;
     switch (type) {
         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: return updateAfterBind ? indexed.maxDescriptorSetUpdateAfterBindStorageBuffers : limits.maxDescriptorSetStorageBuffers;
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: return limits.maxDescriptorSetStorageBuffersDynamic;
         case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: return sampledUpdateAfterBind ? indexed.maxDescriptorSetUpdateAfterBindSampledImages : limits.maxDescriptorSetSampledImages;
         case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: return limits.maxDescriptorSetStorageImages;
         case VK_DESCRIPTOR_TYPE_SAMPLER: return sampledUpdateAfterBind ? indexed.maxDescriptorSetUpdateAfterBindSamplers : limits.maxDescriptorSetSamplers;
@@ -8208,9 +8209,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::finishDrawBindin
     if (result == nullptr || (selected.empty() && !rebound)) return {};
     const bool lends = route != nullptr && route->sets && lendsSets(pushedSet, faultRecord);
     if (pushedSet < 0) {
-        if (lends) lendDrawSets(*result, selected, pushedSet, *route);
-        writeDrawSets(*result, selected, faultRecord);
-        if (lends) noteSetLenders(result, selected, *route);
+        const bool dynamic = route != nullptr && route->dynamic && faultRecord == nullptr && writeDynamicSets(*result, selected, *route);
+        if (!dynamic) {
+            if (lends) lendDrawSets(*result, selected, pushedSet, *route);
+            writeDrawSets(*result, selected, faultRecord);
+            if (lends) noteSetLenders(result, selected, *route);
+        }
     } else {
         const auto& sets = pushPlan->allocationSets;
         if (std::ranges::any_of(selected, [&](std::size_t index) { return index >= sets.size() || sets[index] != static_cast<std::uint8_t>(pushedSet); })) {
@@ -8387,7 +8391,25 @@ bool ShaderResources::unmovedClear(const Recorder& recorder, const PreparedBuffe
 namespace {
 
 std::atomic<std::size_t> placedUploadChunks{0};
+std::atomic<std::size_t> uploadChunkBytes{0};
+constexpr std::size_t SharedUploadChunk = std::size_t{16} << 20u;
 
+struct SharedUpload {
+    std::mutex mutex;
+    std::weak_ptr<Buffer> chunk;
+    VkDevice device = VK_NULL_HANDLE;
+    std::size_t used = 0;
+};
+
+SharedUpload& sharedUpload() {
+    static auto* kept = new SharedUpload;
+    return *kept;
+}
+
+}
+
+void ShaderResources::SetUploadChunkBytesForTest(std::size_t bytes) {
+    uploadChunkBytes.store(bytes, std::memory_order_relaxed);
 }
 
 std::size_t ShaderResources::PlacedUploadChunks() {
@@ -8410,20 +8432,32 @@ bool ShaderResources::PlaceDirectBuffers(const Context& context, PreparedBuffers
     std::size_t offset = 0;
     if (!prepared.selected.empty()) {
         const auto alignment = prepared.plan->alignment;
-        buffer = upload.device == context.device ? upload.chunk.lock() : nullptr;
-        offset = (upload.used + alignment - 1) & ~(alignment - 1);
-        if (buffer == nullptr || offset + bytes > buffer->Bytes().size()) {
-            auto* made = new Buffer(context, std::max(Recorder::DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            placedUploadChunks.fetch_add(1, std::memory_order_acq_rel);
-            buffer = std::shared_ptr<Buffer>(made, [](Buffer* chunk) {
-                delete chunk;
-                placedUploadChunks.fetch_sub(1, std::memory_order_acq_rel);
-            });
-            upload.chunk = buffer;
-            upload.device = context.device;
-            offset = 0;
+        const bool shared = RuntimeSwitches::Set(RuntimeSwitch::CommitBindingsDynamic);
+        const auto chosen = uploadChunkBytes.load(std::memory_order_relaxed);
+        const auto chunkBytes = chosen != 0 ? chosen : shared ? SharedUploadChunk : Recorder::DrawUploadChunk;
+        const auto take = [&](std::weak_ptr<Buffer>& chunk, VkDevice& device, std::size_t& used) {
+            buffer = device == context.device ? chunk.lock() : nullptr;
+            offset = (used + alignment - 1) & ~(alignment - 1);
+            if (buffer == nullptr || offset + bytes > buffer->Bytes().size()) {
+                auto* made = new Buffer(context, std::max(chunkBytes, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                placedUploadChunks.fetch_add(1, std::memory_order_acq_rel);
+                buffer = std::shared_ptr<Buffer>(made, [](Buffer* held) {
+                    delete held;
+                    placedUploadChunks.fetch_sub(1, std::memory_order_acq_rel);
+                });
+                chunk = buffer;
+                device = context.device;
+                offset = 0;
+            }
+            used = offset + bytes;
+        };
+        if (shared) {
+            auto& common = sharedUpload();
+            std::lock_guard lock(common.mutex);
+            take(common.chunk, common.device, common.used);
+        } else {
+            take(upload.chunk, upload.device, upload.used);
         }
-        upload.used = offset + bytes;
         std::memcpy(buffer->Bytes().data() + offset, prepared.blob.data(), bytes);
     }
     auto placed = std::make_shared<DrawBindings>();
@@ -8938,6 +8972,283 @@ const ShaderResources::PushPlan* ShaderResources::PushLayouts() const {
     pushPlan = std::move(plan);
     return pushPlan.get();
 }
+
+namespace {
+
+constexpr std::uint32_t DynamicLayoutKeyTag = 0x44594e41u;
+constexpr std::size_t DynamicSetsPerSet = 8;
+std::atomic<std::uint32_t> dynamicLimitOverride{~0u};
+std::atomic<std::uint64_t> dynamicPlansRefused{0};
+
+}
+
+struct ShaderResources::DynamicSetEntry {
+    DescriptorCache* cache = nullptr;
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    DescriptorCache::SetAllocation allocation;
+    std::vector<std::weak_ptr<Buffer>> owners;
+    std::vector<VkDescriptorBufferInfo> infos;
+    DynamicSetEntry() = default;
+    DynamicSetEntry(const DynamicSetEntry&) = delete;
+    DynamicSetEntry& operator=(const DynamicSetEntry&) = delete;
+    ~DynamicSetEntry() {
+        if (cache != nullptr) cache->Recycle(layout, allocation);
+    }
+};
+
+void ShaderResources::SetDynamicLimitForTest(std::optional<std::uint32_t> limit) {
+    dynamicLimitOverride.store(limit.value_or(~0u), std::memory_order_relaxed);
+}
+
+std::uint64_t ShaderResources::DynamicPlansRefused() {
+    return dynamicPlansRefused.load(std::memory_order_relaxed);
+}
+
+const ShaderResources::DynamicPlan* ShaderResources::DynamicLayouts() const {
+    if (dynamicPlanBuilt) return dynamicPlan.get();
+    dynamicPlanBuilt = true;
+    if (context.descriptorCache == nullptr || !completed || heapStage || usesBda || bda != nullptr || updateAfterBind || addressedBuffers || !faultDescriptors.empty()) return nullptr;
+    constexpr auto none = std::numeric_limits<std::size_t>::max();
+    auto plan = std::make_unique<DynamicPlan>();
+    std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> description;
+    std::array<std::vector<VkDescriptorBindingFlags>, 2> flags;
+    std::array<std::vector<std::pair<std::uint32_t, std::size_t>>, 2> dynamicBindings;
+    std::array<bool, 2> described{};
+    plan->writeSets.assign(descriptorWrites.size(), 0xffu);
+    plan->writeTypes.resize(descriptorWrites.size());
+    for (std::size_t index = 0; index < descriptorWrites.size(); ++index) plan->writeTypes[index] = descriptorWrites[index].descriptorType;
+    plan->slotAllocations.assign(descriptorBuffers.size(), none);
+    std::size_t next = 0;
+    for (const auto& binding : bindings) {
+        if (binding.heap) return nullptr;
+        const auto set = setOf(binding);
+        if (set > 1u) return nullptr;
+        described[set] = true;
+        const auto original = set == 0 ? _set : fragment.set;
+        const bool selectable = std::ranges::any_of(binding.allocations, [&](std::size_t index) { return index < allocations.size() && (DataRole(allocations[index].role) || (allocations[index].guest && !allocations[index].written)); });
+        const bool dynamic = selectable && binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && binding.flags == 0;
+        if (selectable && !dynamic) return nullptr;
+        auto layout = binding.layout;
+        if (dynamic) layout.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+        description[set].push_back(layout);
+        flags[set].push_back(binding.flags);
+        std::size_t writes = 0;
+        while (next < descriptorWrites.size() && descriptorWrites[next].dstBinding == binding.layout.binding && descriptorWrites[next].dstSet == original) {
+            const auto& write = descriptorWrites[next];
+            plan->writeSets[next] = static_cast<std::uint8_t>(set);
+            if (dynamic) {
+                if (write.pBufferInfo == nullptr || write.dstArrayElement != 0 || write.descriptorCount != binding.layout.descriptorCount || binding.allocations.size() != write.descriptorCount) return nullptr;
+                plan->writeTypes[next] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+                const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
+                for (std::size_t element = 0; element < binding.allocations.size(); ++element) plan->slotAllocations[offset + element] = binding.allocations[element];
+                dynamicBindings[set].emplace_back(binding.layout.binding, offset);
+                plan->storageDynamic += write.descriptorCount;
+            }
+            ++writes;
+            ++next;
+        }
+        if (dynamic && writes != 1) return nullptr;
+    }
+    if (next != descriptorWrites.size() || plan->storageDynamic == 0) return nullptr;
+    if (plan->storageDynamic > context.limits.maxDescriptorSetStorageBuffersDynamic || plan->storageDynamic > std::tuple_size_v<decltype(DrawBindings::dynamicOffsets)>) {
+        dynamicPlansRefused.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    plan->mainKey.assign(layoutKey.begin(), layoutKey.end());
+    plan->fragmentKey.assign(fragmentLayoutKey.begin(), fragmentLayoutKey.end());
+    for (std::size_t set = 0; set < 2u; ++set) {
+        plan->written[set] = (described[set] || splitSets) && (set == 0 || !heapStage);
+        std::ranges::sort(dynamicBindings[set]);
+        for (const auto& [number, offset] : dynamicBindings[set]) {
+            const auto found = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& binding) { return !binding.heap && setOf(binding) == set && binding.layout.binding == number; });
+            for (std::uint32_t element = 0; element < found->layout.descriptorCount; ++element) plan->dynamicSlots[set].push_back(offset + element);
+        }
+        plan->dynamicSet[set] = !plan->dynamicSlots[set].empty();
+        auto& key = set == 0 ? plan->mainKey : plan->fragmentKey;
+        if (plan->dynamicSet[set]) {
+            key.push_back(DynamicLayoutKeyTag);
+            for (const auto& entry : dynamicBindings[set]) key.push_back(entry.first);
+            plan->layouts[set] = context.descriptorCache->Layout(key, description[set], false, flags[set], false);
+        } else {
+            plan->layouts[set] = set == 0 ? _layout : fragment.layout;
+        }
+        auto& sizes = plan->sizes[set];
+        for (const auto& layout : description[set]) {
+            const auto count = layout.descriptorCount;
+            if (count == 0) continue;
+            const auto held = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& entry) { return entry.type == layout.descriptorType; });
+            if (held != sizes.end()) held->descriptorCount += count;
+            else sizes.push_back({layout.descriptorType, count});
+        }
+        std::ranges::sort(sizes, [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+        if (tableBindings[set] != std::numeric_limits<std::size_t>::max()) plan->variable[set] = std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()));
+    }
+    plan->pipelineLayouts = SetLayouts();
+    if (plan->dynamicSet[0]) plan->pipelineLayouts.main = plan->layouts[0];
+    if (plan->dynamicSet[1]) plan->pipelineLayouts.fragment = plan->layouts[1];
+    plan->pipelineLayouts.mainKey = plan->mainKey;
+    plan->pipelineLayouts.fragmentKey = plan->fragmentKey;
+    plan->pipelineLayouts.dynamic = true;
+    dynamicPlan = std::move(plan);
+    return dynamicPlan.get();
+}
+
+bool ShaderResources::writeDynamicSets(DrawBindings& result, std::span<const std::size_t> selected, BindingRoute& route) const {
+    const auto* plan = DynamicLayouts();
+    if (plan == nullptr || rebound || selected.size() > result.snapshots.size()) return false;
+    const auto limit = std::min(context.limits.maxDescriptorSetStorageBuffersDynamic, dynamicLimitOverride.load(std::memory_order_relaxed));
+    if (plan->storageDynamic > limit) {
+        ++route.dynamicRefused;
+        return false;
+    }
+    if (dynamicBuffers.size() != descriptorBuffers.size() || std::memcmp(dynamicBuffers.data(), descriptorBuffers.data(), descriptorBuffers.size() * sizeof(VkDescriptorBufferInfo)) != 0) {
+        for (auto& list : dynamicSets) list.clear();
+        dynamicBuffers.assign(descriptorBuffers.begin(), descriptorBuffers.end());
+    }
+    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 1);
+    struct KeysStorage {};
+    auto& keys = HostThreadLocal<std::array<std::vector<std::pair<const std::shared_ptr<Buffer>*, VkDescriptorBufferInfo>>, 2>, KeysStorage>();
+    std::uint32_t at = 0;
+    for (std::size_t set = 0; set < 2u; ++set) {
+        auto& key = keys[set];
+        key.clear();
+        if (!plan->written[set]) continue;
+        for (const auto slot : plan->dynamicSlots[set]) {
+            const auto allocation = plan->slotAllocations[slot];
+            const auto chosen = std::find(selected.begin(), selected.end(), allocation);
+            if (chosen == selected.end()) {
+                key.emplace_back(nullptr, descriptorBuffers[slot]);
+                result.dynamicOffsets[at++] = 0;
+                continue;
+            }
+            const auto& snapshot = result.snapshots[static_cast<std::size_t>(chosen - selected.begin())];
+            if (snapshot.buffer == nullptr || snapshot.offset % alignment != 0 || snapshot.offset > std::numeric_limits<std::uint32_t>::max()) {
+                ++route.dynamicRefused;
+                return false;
+            }
+            key.emplace_back(&snapshot.buffer, wholeDwordRange({snapshot.buffer->Handle(), 0, snapshot.bytes}));
+            result.dynamicOffsets[at++] = static_cast<std::uint32_t>(snapshot.offset);
+        }
+    }
+    const auto sameInfo = [](const VkDescriptorBufferInfo& a, const VkDescriptorBufferInfo& b) { return a.buffer == b.buffer && a.offset == b.offset && a.range == b.range; };
+    const std::weak_ptr<Buffer> unowned;
+    for (std::size_t set = 0; set < 2u; ++set) {
+        result.dynamicCounts[set] = 0;
+        if (!plan->written[set]) continue;
+        const auto& key = keys[set];
+        auto& list = dynamicSets[set];
+        std::shared_ptr<DynamicSetEntry> entry;
+        for (auto candidate = list.rbegin(); candidate != list.rend() && entry == nullptr; ++candidate) {
+            const auto& held = **candidate;
+            if (held.infos.size() != key.size()) continue;
+            bool same = true;
+            for (std::size_t index = 0; same && index < key.size(); ++index) {
+                const auto* owner = key[index].first;
+                const auto& mine = held.owners[index];
+                same = sameInfo(held.infos[index], key[index].second) && (owner == nullptr ? !mine.owner_before(unowned) && !unowned.owner_before(mine) : !mine.owner_before(*owner) && !owner->owner_before(mine));
+            }
+            if (same) entry = *candidate;
+        }
+        if (entry == nullptr) {
+            auto made = std::make_shared<DynamicSetEntry>();
+            made->layout = plan->layouts[set];
+            made->allocation = context.descriptorCache->AllocateRewritten(plan->layouts[set], plan->sizes[set], false, plan->variable[set]);
+            Require(made->allocation.set != VK_NULL_HANDLE, "dynamic draw set allocation failed");
+            made->cache = context.descriptorCache;
+            made->owners.reserve(key.size());
+            made->infos.reserve(key.size());
+            for (const auto& [owner, info] : key) {
+                made->owners.push_back(owner != nullptr ? std::weak_ptr<Buffer>(*owner) : std::weak_ptr<Buffer>{});
+                made->infos.push_back(info);
+            }
+            struct BuffersStorage {};
+            auto& buffers = HostThreadLocal<std::vector<VkDescriptorBufferInfo>, BuffersStorage>();
+            buffers = descriptorBuffers;
+            for (std::size_t index = 0; index < key.size(); ++index) buffers[plan->dynamicSlots[set][index]] = key[index].second;
+            struct WritesStorage {};
+            auto& writes = HostThreadLocal<std::vector<VkWriteDescriptorSet>, WritesStorage>();
+            writes.clear();
+            for (std::size_t index = 0; index < descriptorWrites.size(); ++index) {
+                if (plan->writeSets[index] != set) continue;
+                auto& write = writes.emplace_back(descriptorWrites[index]);
+                write.dstSet = made->allocation.set;
+                write.descriptorType = plan->writeTypes[index];
+                if (write.pBufferInfo != nullptr) write.pBufferInfo = buffers.data() + (descriptorWrites[index].pBufferInfo - descriptorBuffers.data());
+            }
+            context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+            if (list.size() >= DynamicSetsPerSet) list.erase(list.begin());
+            list.push_back(made);
+            entry = std::move(made);
+            ++route.dynamicWritten;
+        }
+        if (set == 0) {
+            result.allocation.set = entry->allocation.set;
+            result.layout = entry->layout;
+        } else {
+            result.fragmentAllocation.set = entry->allocation.set;
+            result.fragmentLayout = entry->layout;
+        }
+        result.lent[set] = true;
+        result.dynamicSets[set] = entry;
+        result.dynamicCounts[set] = static_cast<std::uint32_t>(key.size());
+    }
+    result.cache = context.descriptorCache;
+    result.owned = {};
+    result.dynamic = true;
+    ++route.dynamicBound;
+    return true;
+}
+
+void ShaderResources::DescribeDynamicBindings(const DrawBindings& bound, std::span<const std::size_t> selected, std::vector<BoundBuffer>& out) const {
+    out.clear();
+    const auto* plan = dynamicPlan.get();
+    if (plan == nullptr) return;
+    constexpr auto none = std::numeric_limits<std::size_t>::max();
+    std::vector<VkDescriptorBufferInfo> buffers = dynamicBuffers.size() == descriptorBuffers.size() ? dynamicBuffers : descriptorBuffers;
+    std::vector<std::size_t> owners(buffers.size(), none);
+    std::vector<std::uint64_t> contents(buffers.size(), 0);
+    std::uint32_t at = 0;
+    for (std::size_t set = 0; set < 2u; ++set) {
+        const auto* entry = static_cast<const DynamicSetEntry*>(bound.dynamicSets[set].get());
+        if (entry == nullptr) continue;
+        const auto& slots = plan->dynamicSlots[set];
+        for (std::size_t index = 0; index < slots.size() && index < entry->infos.size(); ++index) {
+            auto info = entry->infos[index];
+            info.offset += bound.dynamicOffsets[at + index];
+            const auto slot = slots[index];
+            buffers[slot] = info;
+            const auto chosen = std::find(selected.begin(), selected.end(), plan->slotAllocations[slot]);
+            if (chosen == selected.end()) continue;
+            const auto snapshotIndex = static_cast<std::size_t>(chosen - selected.begin());
+            owners[slot] = snapshotIndex;
+            const auto& snapshot = bound.snapshots[snapshotIndex];
+            const auto owner = entry->owners[index].lock();
+            if (owner == nullptr || owner != snapshot.buffer || info.offset + snapshot.bytes > owner->Bytes().size()) continue;
+            std::uint64_t hash = 0xcbf29ce484222325ull;
+            for (const auto byte : owner->Bytes().subspan(static_cast<std::size_t>(info.offset), snapshot.bytes)) hash = (hash ^ std::to_integer<std::uint8_t>(byte)) * 0x100000001b3ull;
+            contents[slot] = hash;
+        }
+        at += bound.dynamicCounts[set];
+    }
+    for (std::size_t index = 0; index < descriptorWrites.size(); ++index) {
+        if (plan->writeSets[index] == 0xffu) continue;
+        const auto& write = descriptorWrites[index];
+        if (write.pBufferInfo == nullptr) continue;
+        const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
+        for (std::uint32_t element = 0; element < write.descriptorCount; ++element) {
+            BoundBuffer entry{plan->writeSets[index], write.dstBinding, write.dstArrayElement + element, buffers[offset + element]};
+            if (const auto owner = owners[offset + element]; owner != none) {
+                const auto& snapshot = bound.snapshots[owner];
+                entry.snapshot = true;
+                entry.address = snapshot.address;
+                entry.bytes = snapshot.bytes;
+                entry.content = contents[offset + element];
+            }
+            out.push_back(entry);
+        }
+    }
+}
+
 
 const std::shared_ptr<const ShaderResources::BufferPlan>& ShaderResources::DirectBufferPlan(std::span<const CompiledShader> shaders) const {
     if (bufferPlanBuilt) return bufferPlan;

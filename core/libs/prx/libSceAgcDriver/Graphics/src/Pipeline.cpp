@@ -1467,7 +1467,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         if (storeHash != nullptr && store.index.contains(hash)) *storeHash = hash;
     }
     if (created != nullptr) *created = true;
-    if (PipelineJournalEnabled() && !PipelineJournalReplaying() && state.tessellationCapture == nullptr && resources.pushSet < 0) RecordGraphicsPipeline(MakeGraphicsPipelineRecipe(state, vertexInput, resources, shaders, attachmentLayout), shaders);
+    if (PipelineJournalEnabled() && !PipelineJournalReplaying() && state.tessellationCapture == nullptr && resources.pushSet < 0 && !resources.dynamic) RecordGraphicsPipeline(MakeGraphicsPipelineRecipe(state, vertexInput, resources, shaders, attachmentLayout), shaders);
     return pipeline;
 }
 

@@ -1666,6 +1666,9 @@ void NoteCommitBindings(const DrawRecord& record, DrawRecordCommit& commit, cons
     if (noted.tested != 0) DirectDraws::Add(Counter::BindingsTested, noted.tested);
     if (noted.stamped != 0) DirectDraws::Add(Counter::BindingsStamped, noted.stamped);
     if (noted.guards != 0) DirectDraws::Add(Counter::BindingsGuards, noted.guards);
+    if (noted.dynamicBound != 0) DirectDraws::Add(Counter::BindingsDynamicBound, noted.dynamicBound);
+    if (noted.dynamicWritten != 0) DirectDraws::Add(Counter::BindingsDynamicWritten, noted.dynamicWritten);
+    if (noted.dynamicRefused != 0) DirectDraws::Add(Counter::BindingsDynamicRefused, noted.dynamicRefused);
     if (noted.setsLent != 0) DirectDraws::Add(Counter::BindingsSetsLent, noted.setsLent);
     if (noted.setsWritten != 0) DirectDraws::Add(Counter::BindingsSetsWritten, noted.setsWritten);
     bool differs = false;

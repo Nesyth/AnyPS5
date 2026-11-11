@@ -104,6 +104,7 @@ struct PipelineSetLayouts {
     std::span<const std::uint32_t> mainKey;
     std::span<const std::uint32_t> fragmentKey;
     std::int32_t pushSet = -1;
+    bool dynamic = false;
 };
 
 struct TableDescriptors {
@@ -251,6 +252,10 @@ public:
         std::vector<std::size_t> pushSelected;
         std::array<bool, 2> lent{};
         std::array<std::shared_ptr<const DrawBindings>, 2> lenders;
+        bool dynamic = false;
+        std::array<std::shared_ptr<const void>, 2> dynamicSets;
+        std::array<std::uint32_t, 2> dynamicCounts{};
+        std::array<std::uint32_t, 32> dynamicOffsets{};
         ~DrawBindings();
     };
     struct PushPlan {
@@ -362,6 +367,10 @@ public:
         std::uint32_t setsWritten = 0;
         std::uint32_t guards = 0;
         const PreparedBuffers* selection = nullptr;
+        bool dynamic = false;
+        std::uint32_t dynamicBound = 0;
+        std::uint32_t dynamicWritten = 0;
+        std::uint32_t dynamicRefused = 0;
         BindingTaken taken = BindingTaken::None;
         std::uint32_t tested = 0;
         std::uint32_t stamped = 0;
@@ -370,6 +379,7 @@ public:
     };
     static bool PlaceDirectBuffers(const Context& context, PreparedBuffers& prepared);
     static std::size_t PlacedUploadChunks();
+    static void SetUploadChunkBytesForTest(std::size_t bytes);
     // The first difference between prepared buffers and today's way of the same draw, compared as
     // data (APS5_VERIFY_DIRECT_BUFFERS): `what` names the part and stays null where they agree;
     // `memoryChanged`: only bytes differ, in a guest range written after the finisher read it (a
@@ -396,6 +406,24 @@ public:
     // False, with the reason in `out.refusal`, where the draw's buffers cannot be prepared.
     static bool PrepareDirectBuffers(const BufferPlan& plan, std::span<const CompiledShader> shaders, const ColorTarget* target, PreparedBuffers& out);
     const PushPlan* PushLayouts() const;
+    struct DynamicPlan {
+        std::array<bool, 2> written{};
+        std::array<bool, 2> dynamicSet{};
+        std::array<VkDescriptorSetLayout, 2> layouts{};
+        std::array<std::vector<VkDescriptorPoolSize>, 2> sizes;
+        std::array<std::optional<std::uint32_t>, 2> variable;
+        std::vector<std::uint32_t> mainKey;
+        std::vector<std::uint32_t> fragmentKey;
+        PipelineSetLayouts pipelineLayouts;
+        std::vector<std::uint8_t> writeSets;
+        std::vector<VkDescriptorType> writeTypes;
+        std::array<std::vector<std::size_t>, 2> dynamicSlots;
+        std::vector<std::size_t> slotAllocations;
+        std::size_t storageDynamic = 0;
+    };
+    const DynamicPlan* DynamicLayouts() const;
+    static void SetDynamicLimitForTest(std::optional<std::uint32_t> limit);
+    static std::uint64_t DynamicPlansRefused();
     // `prepared` (buffers prepared from this object's plan, with `moved` their moved list) takes
     // the place of today's snapshot selection while its unmoved ranges are still clear;
     // `preparedSelection` tells whether it did.
@@ -438,6 +466,7 @@ public:
         std::uint64_t content = 0;
     };
     void DescribeDrawBindings(const DrawBindings* bound, std::span<const std::size_t> selected, const PushPlan* plan, std::vector<BoundBuffer>& out, bool contents = false) const;
+    void DescribeDynamicBindings(const DrawBindings& bound, std::span<const std::size_t> selected, std::vector<BoundBuffer>& out) const;
     bool RecordLean() const;
     struct DrawUse {
         DrawUse() = default;
@@ -1156,6 +1185,12 @@ private:
     mutable std::unique_ptr<PushPlan> pushPlan;
     void overlayPushedBuffers(const DrawBindings& result, const PushPlan& plan, std::span<VkDescriptorBufferInfo> buffers, std::span<std::size_t> owners = {}) const;
     mutable bool pushPlanBuilt = false;
+    mutable std::unique_ptr<DynamicPlan> dynamicPlan;
+    mutable bool dynamicPlanBuilt = false;
+    struct DynamicSetEntry;
+    mutable std::array<std::vector<std::shared_ptr<DynamicSetEntry>>, 2> dynamicSets;
+    mutable std::vector<VkDescriptorBufferInfo> dynamicBuffers;
+    bool writeDynamicSets(DrawBindings& result, std::span<const std::size_t> selected, BindingRoute& route) const;
     mutable std::shared_ptr<const BufferPlan> bufferPlan;
     mutable bool bufferPlanBuilt = false;
     std::shared_ptr<OwnDrawSets> makeOwnDrawSets() const;

@@ -141,6 +141,9 @@ struct DrawRecordBindings {
     std::uint32_t setsLent = 0;
     std::uint32_t setsWritten = 0;
     std::uint32_t guards = 0;
+    std::uint32_t dynamicBound = 0;
+    std::uint32_t dynamicWritten = 0;
+    std::uint32_t dynamicRefused = 0;
     std::size_t bytes = 0;
     std::uint64_t nanoseconds = 0;
     std::uint64_t keepNanoseconds = 0;
@@ -290,6 +293,9 @@ struct DrawRecordCommit {
     bool inputsRecipeAsked = false;
     std::shared_ptr<DrawRepeatBlock> repeat;
     bool bindingsRefused = false;
+    std::weak_ptr<Graphics::Pipeline> dynamicPipeline;
+    std::weak_ptr<Graphics::Framebuffer> dynamicFramebuffer;
+    const void* dynamicTemplate = nullptr;
 
     void Adopt(std::shared_ptr<const DrawRecipe> built) {
         recipe = std::move(built);
@@ -304,6 +310,9 @@ struct DrawRecordCommit {
         pushPipeline.reset();
         pushFramebuffer.reset();
         pushTemplate = nullptr;
+        dynamicPipeline.reset();
+        dynamicFramebuffer.reset();
+        dynamicTemplate = nullptr;
         touchedPresent = ~std::uint64_t{0};
         ++builds;
     }

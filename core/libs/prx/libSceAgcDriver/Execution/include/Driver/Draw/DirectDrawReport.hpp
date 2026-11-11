@@ -197,6 +197,9 @@ enum class Counter : std::uint8_t {
     BindingsNewWrittenTimed,
     BindingsKeepNanoseconds,
     BindingsKeepTimed,
+    BindingsDynamicBound,
+    BindingsDynamicWritten,
+    BindingsDynamicRefused,
     Count,
 };
 

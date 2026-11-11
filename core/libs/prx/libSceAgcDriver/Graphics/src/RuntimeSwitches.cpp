@@ -123,6 +123,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_COMMIT_BINDINGS",
     "APS5_COMMIT_BINDINGS_STAMPS",
     "APS5_COMMIT_BINDINGS_SETS",
+    "APS5_COMMIT_BINDINGS_DYNAMIC",
 };
 static_assert(SwitchNames.back() != nullptr, "every runtime switch needs a name");
 
@@ -246,6 +247,7 @@ struct SwitchValues {
             std::getenv("APS5_COMMIT_BINDINGS") != nullptr,
             std::getenv("APS5_COMMIT_BINDINGS_STAMPS") != nullptr,
             std::getenv("APS5_COMMIT_BINDINGS_SETS") != nullptr,
+            std::getenv("APS5_COMMIT_BINDINGS_DYNAMIC") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }
