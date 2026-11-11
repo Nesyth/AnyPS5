@@ -515,6 +515,45 @@ void DrawFinisher::AwaitTurn() {
     --turnSleepers;
 }
 
+unsigned DrawFinisher::IdleState() const {
+    if (outstanding.load(std::memory_order_acquire) == 0) return 0;
+    if (leanTake.load(std::memory_order_acquire) < leanTail.load(std::memory_order_acquire)) return parked.load(std::memory_order_acquire) != 0 ? 1 : 2;
+    return 3;
+}
+
+namespace {
+constexpr std::size_t IdleStates = 4;
+constexpr std::size_t IdleLengths = 4;
+std::array<std::array<std::atomic<std::uint64_t>, IdleLengths>, IdleStates> committerIdles{}, committerIdleNs{};
+
+void noteCommitterIdle(unsigned state, std::uint64_t ns) {
+    const std::size_t length = ns < 20000u ? 0 : ns < 100000u ? 1 : ns < 500000u ? 2 : 3;
+    committerIdles[state][length].fetch_add(1, std::memory_order_relaxed);
+    committerIdleNs[state][length].fetch_add(ns, std::memory_order_relaxed);
+}
+
+std::string committerIdleText() {
+    static constexpr const char* names[IdleStates] = {"finisher empty", "jobs untaken with a finisher parked", "jobs untaken with every finisher busy", "jobs in flight only"};
+    std::string text;
+    for (std::size_t state = 0; state < IdleStates; ++state) {
+        std::uint64_t count = 0;
+        std::uint64_t ns = 0;
+        std::array<std::uint64_t, IdleLengths> counts{}, times{};
+        for (std::size_t length = 0; length < IdleLengths; ++length) {
+            counts[length] = committerIdles[state][length].exchange(0, std::memory_order_relaxed);
+            times[length] = committerIdleNs[state][length].exchange(0, std::memory_order_relaxed);
+            count += counts[length];
+            ns += times[length];
+        }
+        char item[320];
+        std::snprintf(item, sizeof(item), "%s %s %llu (%.1f ms; under 20 us %llu, %.1f ms; 20 to 100 us %llu, %.1f ms; 100 to 500 us %llu, %.1f ms; longer %llu, %.1f ms)", state == 0 ? "" : ";", names[state], static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e6,
+            static_cast<unsigned long long>(counts[0]), static_cast<double>(times[0]) / 1e6, static_cast<unsigned long long>(counts[1]), static_cast<double>(times[1]) / 1e6, static_cast<unsigned long long>(counts[2]), static_cast<double>(times[2]) / 1e6, static_cast<unsigned long long>(counts[3]), static_cast<double>(times[3]) / 1e6);
+        text += item;
+    }
+    return text;
+}
+}
+
 unsigned DrawFinisher::Finishers() {
     return runningFinishers.load(std::memory_order_acquire);
 }
@@ -1214,6 +1253,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         kindText += item;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[commits] by kind (10 s):%s\n", kindText.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[committer-idle] 10 s, by the finisher's state when the idle began:%s\n", committerIdleText().c_str());
     const auto vk = Graphics::TakeVkDrawCounts();
     AgcDriver::ProfilePrint_nid_no_patch("[vkdraw] (10 s): %llu vkCmdDraw, %llu vkCmdDrawIndexed, %llu vkCmdDrawIndirect calls, %llu mesh; draw keys %llu, same as the previous draw %llu, seen within the last 4096 draws %llu; draw shapes (state without per-draw user words) same as the previous %llu, seen within the last 4096 %llu\n", static_cast<unsigned long long>(vk.direct), static_cast<unsigned long long>(vk.indexed), static_cast<unsigned long long>(vk.indirect), static_cast<unsigned long long>(vk.mesh), static_cast<unsigned long long>(drawKeys.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSeenRecently.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSeenRecently.exchange(0, std::memory_order_relaxed)));
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
@@ -1241,12 +1281,17 @@ void DrawPipeline::run() {
         bool rangedItem = false;
         bool quietItem = false;
         std::vector<Range> itemRanges;
+        static const bool idleCensus = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+        const bool idleNow = idleCensus && outstanding.load(std::memory_order_acquire) == 0;
+        const unsigned idleState = idleNow ? DrawFinisher::Get().IdleState() : 0;
+        const auto idleStart = idleNow ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             auto lock = lockFor(mutex);
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
+            if (idleNow) noteCommitterIdle(idleState, elapsedNs(idleStart));
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;

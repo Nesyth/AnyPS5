@@ -205,6 +205,7 @@ public:
     static bool Busy() { return outstanding.load(std::memory_order_acquire) != 0; }
     std::uint64_t Issued() const { return issued.load(std::memory_order_relaxed); }
     std::uint64_t Front() const { return frontSeq.load(std::memory_order_acquire); }
+    unsigned IdleState() const;
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
     void Drain();
