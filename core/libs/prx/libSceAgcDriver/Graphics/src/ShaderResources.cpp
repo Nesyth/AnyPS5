@@ -4411,7 +4411,8 @@ void ShaderResources::subscribeIndex(std::span<const CompiledShader> shaders) {
         for (auto block = GuestMemory::WriteBlockOf(begin); block <= GuestMemory::WriteBlockOf(begin + bytes - 1); ++block) subscribedBlocks.emplace_back(block, i);
     }
     for (const auto& table : tableStages) {
-        if (table.images == nullptr || table.map.size() < ShaderRecompiler::ImageTableAbi::HeaderWords) continue;
+        std::span<const std::uint32_t> tableWords;
+        if (tableImages(shaders, table.stage, tableWords) == nullptr || table.map.size() < ShaderRecompiler::ImageTableAbi::HeaderWords) continue;
         const auto tables = table.map[ShaderRecompiler::ImageTableAbi::HeaderTableCount];
         for (std::uint32_t index = 0; index < tables; ++index) {
             const auto header = ShaderRecompiler::ImageTableAbi::TableHeader(index);
@@ -4452,16 +4453,18 @@ void ShaderResources::subscribeIndex(std::span<const CompiledShader> shaders) {
         }
     }
     for (const auto& table : tableStages) {
-        if (table.images == nullptr) continue;
+        std::span<const std::uint32_t> tableWords;
+        const auto* images = tableImages(shaders, table.stage, tableWords);
+        if (images == nullptr) continue;
         for (std::size_t element = 0; element < table.elementTextures.size(); ++element) {
             const auto index = table.elementTextures[element];
-            if (index >= indexElements.size() || (element + 1) * 8u > table.images->guestDescriptor.size()) continue;
+            if (index >= indexElements.size() || (element + 1) * 8u > tableWords.size()) continue;
             auto& entry = indexElements[index];
-            const auto words = std::span<const std::uint32_t>(table.images->guestDescriptor).subspan(element * 8u, 8u);
+            const auto words = tableWords.subspan(element * 8u, 8u);
             std::copy(words.begin(), words.end(), entry.words.begin());
             entry.count = 8;
-            entry.shape = element < table.images->imageShapes.size() ? std::optional(table.images->imageShapes[element]) : std::nullopt;
-            entry.depthCompare = element < table.images->imageDepthCompare.size() && table.images->imageDepthCompare[element];
+            entry.shape = element < images->imageShapes.size() ? std::optional(images->imageShapes[element]) : std::nullopt;
+            entry.depthCompare = element < images->imageDepthCompare.size() && images->imageDepthCompare[element];
             entry.known = true;
         }
     }
