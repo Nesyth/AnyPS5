@@ -1625,11 +1625,27 @@ InPlaceInputMemo::Entry inPlaceInputState(const Recorder& recorder, std::uint64_
     return state;
 }
 
-const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
+namespace {
+
+struct KnownImport {
+    const HostImport* import = nullptr;
+    std::uint64_t imports = 0;
+    std::uint64_t mapping = 0;
+    bool looked = false;
+};
+
+const HostImport* inPlaceImport(const Context& context, std::uint64_t address, std::size_t bytes, KnownImport* known) {
+    if (known == nullptr) return HostImportFor(context, address, bytes);
+    if (HostImportSetGeneration() == known->imports && GuestAllocations::GuestAllocationsGeneration_nid_postfix() == known->mapping) return known->import;
+    known->looked = true;
+    return HostImportFor(context, address, bytes);
+}
+
+const HostImport* inPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite, KnownImport* known) {
     auto* recorder = context.recorder;
     if (recorder == nullptr || bytes == 0 || !context.drawInputsInPlace) return nullptr;
     if (RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) {
-        const auto* found = HostImportFor(context, address, bytes);
+        const auto* found = inPlaceImport(context, address, bytes, known);
         if (found == nullptr || HostImportOffset(*found, address) % alignment != 0) return nullptr;
         recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
         return found;
@@ -1668,7 +1684,7 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
         if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
         const auto drawWriters = DrawCopiedWriters();
         if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return nullptr;
-        const auto* found = HostImportFor(context, address, bytes);
+        const auto* found = inPlaceImport(context, address, bytes, known);
         if (found == nullptr || HostImportOffset(*found, address) % alignment != 0) return nullptr;
         recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
         return found;
@@ -1692,6 +1708,12 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
         memoized.entries[memoized.next++ % memoized.entries.size()] = entry;
     }
     return import;
+}
+
+}
+
+const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
+    return inPlaceDrawInput(context, address, bytes, alignment, behindGpuWrite, nullptr);
 }
 
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart) {
@@ -1797,6 +1819,12 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, std::size_t byt
     auto zero = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     std::fill(zero->Bytes().begin(), zero->Bytes().end(), std::byte{0});
     return zero;
+}
+
+void requireUncountedKills(const State& state) {
+    if (!state.pixelKill || state.pixelEarlyZ || !std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.partialWriteMask != 0; })) return;
+    const auto* recorder = Recorder::Active();
+    Require(recorder == nullptr || !recorder->CountingSamples(), "a partial write of a packed color target merges inside the pixel shader after early depth and stencil tests, which a shader that kills pixels under late tests cannot use while occlusion queries count samples: the early tests would count the pixels it kills");
 }
 
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
@@ -2267,6 +2295,285 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     timing.Mark("vertex_upload");
     return inputs;
 }
+
+struct PreparedInputScratch {
+    std::vector<VertexFetch> fetches;
+    std::vector<std::size_t> fetchValid;
+    std::vector<std::size_t> solo;
+    VertexCopyPlan plan;
+    std::vector<std::size_t> order;
+    std::vector<ExistingHostImport> found;
+};
+
+bool sameVertexLayout(const VertexInputLayout& a, const VertexInputLayout& b) {
+    const auto sameBinding = [](const VkVertexInputBindingDescription& x, const VkVertexInputBindingDescription& y) { return x.binding == y.binding && x.stride == y.stride && x.inputRate == y.inputRate; };
+    const auto sameAttribute = [](const VkVertexInputAttributeDescription& x, const VkVertexInputAttributeDescription& y) { return x.location == y.location && x.binding == y.binding && x.format == y.format && x.offset == y.offset; };
+    return std::ranges::equal(a.bindings, b.bindings, sameBinding) && std::ranges::equal(a.attributes, b.attributes, sameAttribute);
+}
+
+DrawRecordInputs takePreparedInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, PreparedInputs& prepared, DrawInputs& inputs, DrawTimer& timer, PerformanceTimer& timing) {
+    const std::size_t indexRanges = draw.indexed ? 1u : 0u;
+    if (prepared.recipe.get() != &recipe || prepared.device != context.device || prepared.state != &state || prepared.draw != &draw || prepared.shaders != shaders.data() || prepared.stages != shaders.size() || prepared.ranges.size() < indexRanges || context.recorder == nullptr || !context.drawInputsInPlace) return DrawRecordInputs::Shape;
+    const bool mapped = (prepared.forget & 1u) == 0 && GuestMemory::ForgetSerial() == prepared.forget;
+    const auto indexBytes = static_cast<std::size_t>(prepared.indexBytes);
+    if (draw.indexed) {
+        if (!mapped) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), indexBytes, draw.indexSize);
+        RequireNoMultisampleTarget(draw.indexAddress, indexBytes, "an index buffer read");
+    }
+    requireUncountedKills(state);
+    ValidateViewport(context, state.viewport);
+    ValidateDepthBounds(context, state);
+    ValidateSampleMask(context, state, shaders);
+    timer.phase(PhaseValidate);
+    timing.Mark("validate");
+    bool rechecked = false;
+    const auto served = [&](const PreparedInputs::Range& range, bool* behind) {
+        KnownImport known{range.import, prepared.imports, prepared.mapping};
+        const auto* import = inPlaceDrawInput(context, range.begin, static_cast<std::size_t>(range.end - range.begin), range.alignment, behind, &known);
+        rechecked = rechecked || known.looked;
+        if (import == nullptr) return DrawRecordInputs::Refused;
+        return import->buffer == range.handle && HostImportOffset(*import, range.begin) == range.offset ? DrawRecordInputs::Used : DrawRecordInputs::ImportChanged;
+    };
+    if (draw.indexed) {
+        if (const auto use = served(prepared.ranges.front(), nullptr); use != DrawRecordInputs::Used) return use;
+        if (!mapped && !RuntimeSwitches::Set(RuntimeSwitch::SingleIndexCheck)) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), indexBytes, draw.indexSize);
+    }
+    timing.Mark("index_upload");
+    bool behind = false;
+    for (std::size_t at = indexRanges; at < prepared.ranges.size(); ++at) {
+        const auto& range = prepared.ranges[at];
+        const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+        if (!mapped) GuestMemory::CheckRange(reinterpret_cast<const void*>(range.begin), bytes, 1);
+        RequireNoMultisampleTarget(range.begin, bytes, "a vertex buffer read");
+        if (const auto use = served(range, &behind); use != DrawRecordInputs::Used) return use;
+    }
+    inputs.indexBytes = prepared.indexBytes;
+    if (draw.indexed) {
+        inputs.indexHandle = prepared.ranges.front().handle;
+        inputs.indexOffset = prepared.ranges.front().offset;
+    }
+    inputs.maxIndex = prepared.maxIndex;
+    inputs.vertexInput = std::move(prepared.vertexInput);
+    inputs.vertexHandles = std::move(prepared.vertexHandles);
+    inputs.vertexOffsets = std::move(prepared.vertexOffsets);
+    inputs.inPlaceReads = std::move(prepared.inPlaceReads);
+    inputs.vertexInputBehindGpuWrite = behind;
+    inputs.fragmentOutputs = recipe.fragmentOutputs;
+    inputs.shaderStages = recipe.shaderStages;
+    timer.phase(PhaseVertex);
+    timing.Mark("vertex_upload");
+    return rechecked ? DrawRecordInputs::Rechecked : DrawRecordInputs::Used;
+}
+
+std::string describeInputsDifference(const DrawInputs& mine, const DrawInputs& today) {
+    char text[320];
+    const auto wide = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    if (mine.nothing != today.nothing) {
+        std::snprintf(text, sizeof(text), "nothing to draw: prepared %d, today's %d", mine.nothing ? 1 : 0, today.nothing ? 1 : 0);
+        return text;
+    }
+    if (mine.indexBytes != today.indexBytes) {
+        std::snprintf(text, sizeof(text), "index bytes: prepared %llu, today's %llu", wide(mine.indexBytes), wide(today.indexBytes));
+        return text;
+    }
+    if ((mine.indices != nullptr) != (today.indices != nullptr)) {
+        std::snprintf(text, sizeof(text), "index buffer: prepared %s, today's %s", mine.indices != nullptr ? "copied" : "in place", today.indices != nullptr ? "copied" : "in place");
+        return text;
+    }
+    if (mine.indexHandle != today.indexHandle || mine.indexOffset != today.indexOffset) {
+        std::snprintf(text, sizeof(text), "index buffer: prepared %s buffer at offset %llu, today's at %llu", mine.indexHandle == today.indexHandle ? "the same" : "another", wide(mine.indexOffset), wide(today.indexOffset));
+        return text;
+    }
+    if (mine.maxIndex != today.maxIndex) {
+        std::snprintf(text, sizeof(text), "max index: prepared %u, today's %u", mine.maxIndex, today.maxIndex);
+        return text;
+    }
+    if (mine.indexCount != today.indexCount) {
+        std::snprintf(text, sizeof(text), "index count: prepared %lld, today's %lld", mine.indexCount ? static_cast<long long>(*mine.indexCount) : -1ll, today.indexCount ? static_cast<long long>(*today.indexCount) : -1ll);
+        return text;
+    }
+    if (mine.listRestartPrimitive != today.listRestartPrimitive || mine.expandedIndexCount != today.expandedIndexCount || mine.restartTable != today.restartTable) {
+        std::snprintf(text, sizeof(text), "rewritten indices: prepared restart primitive %u, %u expanded, %zu restart starts; today's %u, %u, %zu", mine.listRestartPrimitive, mine.expandedIndexCount, mine.restartTable.size(), today.listRestartPrimitive, today.expandedIndexCount, today.restartTable.size());
+        return text;
+    }
+    if ((mine.retainedVertexInput != nullptr) != (today.retainedVertexInput != nullptr) || !sameVertexLayout(mine.VertexLayout(), today.VertexLayout())) {
+        std::snprintf(text, sizeof(text), "vertex layout: prepared %zu bindings and %zu attributes, today's %zu and %zu", mine.VertexLayout().bindings.size(), mine.VertexLayout().attributes.size(), today.VertexLayout().bindings.size(), today.VertexLayout().attributes.size());
+        return text;
+    }
+    if (mine.vertexBuffers.size() != today.vertexBuffers.size()) {
+        std::snprintf(text, sizeof(text), "vertex copies: prepared %zu, today's %zu", mine.vertexBuffers.size(), today.vertexBuffers.size());
+        return text;
+    }
+    if (mine.vertexHandles.size() != today.vertexHandles.size() || mine.vertexOffsets.size() != today.vertexOffsets.size()) {
+        std::snprintf(text, sizeof(text), "vertex bindings: prepared %zu buffers and %zu offsets, today's %zu and %zu", mine.vertexHandles.size(), mine.vertexOffsets.size(), today.vertexHandles.size(), today.vertexOffsets.size());
+        return text;
+    }
+    for (std::size_t index = 0; index < mine.vertexHandles.size(); ++index) {
+        if (mine.vertexHandles[index] == today.vertexHandles[index] && mine.vertexOffsets[index] == today.vertexOffsets[index]) continue;
+        std::snprintf(text, sizeof(text), "vertex binding %zu: prepared %s buffer at offset %llu, today's at %llu", index, mine.vertexHandles[index] == today.vertexHandles[index] ? "the same" : "another", wide(mine.vertexOffsets[index]), wide(today.vertexOffsets[index]));
+        return text;
+    }
+    if (mine.inPlaceReads != today.inPlaceReads) {
+        std::size_t index = 0;
+        while (index < mine.inPlaceReads.size() && index < today.inPlaceReads.size() && mine.inPlaceReads[index] == today.inPlaceReads[index]) ++index;
+        const auto range = [&](const DrawInputs& inputs) { return index < inputs.inPlaceReads.size() ? inputs.inPlaceReads[index] : std::pair<std::uint64_t, std::uint64_t>{0, 0}; };
+        std::snprintf(text, sizeof(text), "in-place reads: prepared %zu, today's %zu; at %zu prepared 0x%llx-0x%llx, today's 0x%llx-0x%llx", mine.inPlaceReads.size(), today.inPlaceReads.size(), index, wide(range(mine).first), wide(range(mine).second), wide(range(today).first), wide(range(today).second));
+        return text;
+    }
+    if (mine.vertexInputBehindGpuWrite != today.vertexInputBehindGpuWrite) {
+        std::snprintf(text, sizeof(text), "vertex input behind a GPU write: prepared %d, today's %d", mine.vertexInputBehindGpuWrite ? 1 : 0, today.vertexInputBehindGpuWrite ? 1 : 0);
+        return text;
+    }
+    if (mine.fragmentOutputs != today.fragmentOutputs || mine.shaderStages != today.shaderStages) {
+        std::snprintf(text, sizeof(text), "fragment outputs and stages: prepared 0x%x and 0x%x, today's 0x%x and 0x%x", mine.fragmentOutputs, static_cast<unsigned>(mine.shaderStages), today.fragmentOutputs, static_cast<unsigned>(today.shaderStages));
+        return text;
+    }
+    if (mine.meshGroups != today.meshGroups || mine.meshLayers != today.meshLayers || mine.meshLayerStride != today.meshLayerStride) {
+        std::snprintf(text, sizeof(text), "mesh grid: prepared %u x %u by %u, today's %u x %u by %u", mine.meshGroups, mine.meshLayers, mine.meshLayerStride, today.meshGroups, today.meshLayers, today.meshLayerStride);
+        return text;
+    }
+    return {};
+}
+
+DrawRecordInputs verifyPreparedInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, PreparedInputs& prepared, const DrawInputs& today, DrawTimer& timer, PerformanceTimer& timing, std::string& difference, DrawRecordInputs* taken = nullptr) {
+    DrawInputs mine;
+    const auto use = takePreparedInputs(context, state, draw, shaders, recipe, prepared, mine, timer, timing);
+    if (taken != nullptr) *taken = use;
+    if (use != DrawRecordInputs::Used && use != DrawRecordInputs::Rechecked) return use;
+    difference = describeInputsDifference(mine, today);
+    return difference.empty() ? DrawRecordInputs::Checked : DrawRecordInputs::Differs;
+}
+
+void noteInputsDifference(const std::string& difference) {
+    static std::atomic<std::uint64_t> printed{0};
+    if (printed.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[direct-inputs] verify: %s\n", difference.c_str());
+}
+
+}
+
+bool PrepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, PreparedInputs& prepared) {
+    using Refusal = PreparedInputs::Refusal;
+    const auto refuse = [&](Refusal why) {
+        prepared.refusal = why;
+        return false;
+    };
+    prepared.refusal = Refusal::None;
+    prepared.state = &state;
+    prepared.draw = &draw;
+    prepared.shaders = shaders.data();
+    prepared.stages = shaders.size();
+    prepared.device = context.device;
+    prepared.forget = GuestMemory::ForgetSerial();
+    prepared.imports = HostImportSetGeneration();
+    prepared.mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    prepared.vertexHandles.clear();
+    prepared.vertexOffsets.clear();
+    prepared.inPlaceReads.clear();
+    prepared.ranges.clear();
+    if (recipe == nullptr || recipe->device != context.device) return refuse(Refusal::NoRecipe);
+    if (context.recorder == nullptr || !context.drawInputsInPlace || context.hostImportAlignment == 0) return refuse(Refusal::NotInPlace);
+    if (shaders.empty() || draw.indirect || state.quadList || state.stages.mesh || state.stages.tessellation || state.stages.tessellationGeometry || state.tessellationCapture != nullptr || StripPatches(state, shaders)) return refuse(Refusal::Shape);
+    Require(draw.indexed ? draw.flags == 0 : (draw.flags & ~0x20u) == 0, "draw modifiers are unsupported");
+    if (draw.indexed) {
+        Require(draw.indexSize == 2 || draw.indexSize == 4, "only uint16 and uint32 index buffers are supported");
+    } else {
+        Require(draw.indexAddress == 0 && draw.indexSize == 0, "auto draw must not reference an index buffer");
+        if (draw.indexCount == 0 || draw.instanceCount == 0) return refuse(Refusal::Shape);
+        Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - (draw.indexCount - 1u), "auto draw vertex range overflow");
+        Require(draw.firstInstance <= std::numeric_limits<std::uint32_t>::max() - (draw.instanceCount - 1u), "auto draw instance range overflow");
+    }
+    if (draw.indexCount == 0 || draw.instanceCount == 0) return refuse(Refusal::Shape);
+    const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+    Require(indexBytes <= std::numeric_limits<std::size_t>::max(), "index buffer size overflow");
+    if (draw.indexed && (draw.indexAddress % draw.indexSize != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)))) return refuse(Refusal::Inaccessible);
+    Require(!draw.indexed || !state.hasColorTarget || draw.indexAddress + indexBytes <= state.color.MemoryAddress() || state.color.MemoryAddress() + state.color.bytes <= draw.indexAddress, "index buffer aliases the render target");
+    const auto& attributes = DrawVertexAttributes(shaders.front());
+    std::uint32_t maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
+    if (draw.indexed) {
+        const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        if (state.primitiveRestart && !context.primitiveListRestart && listTopology) return refuse(Refusal::Shape);
+        const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart);
+        const auto highest = HighestDrawIndex(std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
+        if (!highest) return refuse(Refusal::Shape);
+        constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
+        if (const auto zeroFrom = attributes.empty() ? std::nullopt : ZeroFetchVertex(attributes)) {
+            const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
+            if (*highest >= limit && *highest - limit >= ZeroFetchSlack) return refuse(Refusal::Shape);
+        }
+        Require(*highest <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
+        Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - *highest, "indexed draw vertex range overflow");
+        maxIndex = *highest + draw.firstVertex;
+        prepared.ranges.push_back({draw.indexAddress, draw.indexAddress + indexBytes, draw.indexSize});
+    }
+    prepared.vertexInput = recipe->vertexInput;
+    const auto& layout = prepared.vertexInput;
+    auto& scratch = HostThreadLocal<PreparedInputScratch, PreparedInputScratch>();
+    auto& fetches = scratch.fetches;
+    auto& fetchValid = scratch.fetchValid;
+    fetches.clear();
+    fetchValid.clear();
+    for (const auto& attribute : attributes) {
+        const auto described = std::find_if(layout.attributes.begin(), layout.attributes.end(), [&](const auto& entry) { return entry.location == attribute.location; });
+        Require(described != layout.attributes.end(), "vertex attribute missing from its input layout");
+        const auto narrow = DecodeVertexFormat(attribute);
+        const std::size_t widened = described->format == narrow.format ? 0u : VertexReadBytes(attribute, described->format) - narrow.bytes;
+        if (NullVertexDescriptor(attribute) || VertexFetchOutOfRange(attribute)) return refuse(Refusal::Shape);
+        const auto bytes = VertexBufferReadSize(attribute, maxIndex, draw.instanceCount, draw.firstInstance) + widened;
+        const auto& fields = attribute.resource.fields;
+        const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
+        const auto firstByte = VertexBufferReadOffset(attribute, draw.firstVertex, draw.firstInstance);
+        Require(!state.hasColorTarget || address + bytes <= state.color.MemoryAddress() || state.color.MemoryAddress() + state.color.bytes <= address + firstByte, "vertex buffer aliases the render target");
+        const auto stride = (fields[1] >> 16u) & 0x3fffu;
+        fetches.push_back({address, address + bytes, stride, attribute.fetchIndex, narrow.alignment});
+        const auto recordBytes = static_cast<std::uint64_t>(fields[2]) * stride;
+        fetchValid.push_back(stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
+    }
+    SoloZeroPaddedFetchIndicesInto(fetches, fetchValid, scratch.solo);
+    if (!scratch.solo.empty()) return refuse(Refusal::Shape);
+    PlanVertexCopiesInto(fetches, scratch.plan, scratch.order);
+    const auto& plan = scratch.plan;
+    for (std::size_t range = 0; range < plan.copies.size(); ++range) {
+        const auto [begin, end] = plan.copies[range];
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin))) return refuse(Refusal::Inaccessible);
+        prepared.ranges.push_back({begin, end, plan.alignments[range]});
+    }
+    for (const auto& range : prepared.ranges) prepared.inPlaceReads.emplace_back(range.begin, range.end);
+    auto& found = scratch.found;
+    found.assign(prepared.ranges.size(), {});
+    if (!prepared.ranges.empty() && !ExistingHostImportsFor(context, prepared.inPlaceReads, found)) return refuse(Refusal::NotInPlace);
+    for (std::size_t index = 0; index < prepared.ranges.size(); ++index) {
+        auto& range = prepared.ranges[index];
+        if (found[index].offset % range.alignment != 0) return refuse(Refusal::NotInPlace);
+        range.import = found[index].import;
+        range.handle = found[index].buffer;
+        range.offset = found[index].offset;
+    }
+    const std::size_t first = draw.indexed ? 1u : 0u;
+    prepared.vertexHandles.reserve(attributes.size());
+    prepared.vertexOffsets.reserve(attributes.size());
+    for (std::size_t index = 0; index < attributes.size(); ++index) {
+        const auto& range = prepared.ranges[first + plan.copyOf[index]];
+        prepared.vertexHandles.push_back(range.handle);
+        prepared.vertexOffsets.push_back(range.offset + plan.offsets[index]);
+    }
+    prepared.indexBytes = indexBytes;
+    prepared.maxIndex = maxIndex;
+    prepared.recipe = std::move(recipe);
+    return true;
+}
+
+DrawRecordInputs VerifyPreparedInputsForTest(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, PreparedInputs& prepared, std::string& difference, DrawRecordInputs* taken) {
+    PerformanceTimer timing("Graphics.VerifyPreparedInputs");
+    DrawTimer timer(false);
+    DrawOutcome outcome;
+    const auto plan = planDraw(context, state, draw, shaders, &recipe, outcome, timer);
+    DrawInputs today;
+    if (plan.nothing) today.nothing = true;
+    else today = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing, &recipe);
+    return verifyPreparedInputs(context, state, draw, shaders, recipe, prepared, today, timer, timing, difference, taken);
+}
+
+namespace {
 
 // The resident-target proof of one attachment (StorageTexture::Refresh: FlushPending, CollectWrites
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
@@ -2921,6 +3228,13 @@ struct StagedWrite {
     VkRect2D area{};
 };
 
+// What a record bound the last time (APS5_XP_BINDINGS_AS_IS, a ceiling experiment).
+struct BindingsAsIs {
+    const ShaderResources* resources = nullptr;
+    const ShaderResources::PushPlan* push = nullptr;
+    std::shared_ptr<ShaderResources::DrawBindings> bindings;
+};
+
 struct RecordedDraw {
     Recorder* recorder = nullptr;
     std::shared_ptr<ShaderResources> resources;
@@ -2958,6 +3272,7 @@ struct RecordedDraw {
     const ShaderResources::PreparedBuffers* preparedCheck = nullptr;
     DrawRecordBuffers* buffers = nullptr;
     ShaderResources::PreparedDifference* bufferDifference = nullptr;
+    BindingsAsIs* bindingsAsIs = nullptr;
 };
 
 // A remapped viewport depth range reads its scale and offset from the draw's push block (the vertex shader's
@@ -3245,7 +3560,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     auto* selectedOut = record.view != nullptr || record.preparedCheck != nullptr ? &viewSelected : nullptr;
     using PreparedSelection = ShaderResources::PreparedBuffers::Selection;
     auto preparedSelection = PreparedSelection::Hazard;
-    const auto drawBindings = record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, selectedOut, record.prepared, &preparedSelection) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus, selectedOut, record.prepared, &preparedSelection);
+    std::shared_ptr<ShaderResources::DrawBindings> keptBindings;
+    const bool bindingsKept = record.bindingsAsIs != nullptr && faultRecord == nullptr && !record.replay && record.view == nullptr && record.preparedCheck == nullptr;
+    if (bindingsKept && record.bindingsAsIs->resources == &resources && record.bindingsAsIs->push == record.push) keptBindings = record.bindingsAsIs->bindings;
+    const auto drawBindings = keptBindings != nullptr ? keptBindings : record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, selectedOut, record.prepared, &preparedSelection) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus, selectedOut, record.prepared, &preparedSelection);
+    if (keptBindings != nullptr) preparedSelection = PreparedSelection::Taken;
+    else if (bindingsKept) *record.bindingsAsIs = {&resources, record.push, drawBindings};
     if (record.prepared != nullptr && record.buffers != nullptr) *record.buffers = preparedSelection == PreparedSelection::Taken ? DrawRecordBuffers::Used : preparedSelection == PreparedSelection::DepthGuards ? DrawRecordBuffers::DepthGuards : DrawRecordBuffers::UnmovedHazard;
     if (record.preparedCheck != nullptr && record.buffers != nullptr && record.bufferDifference != nullptr) {
         auto& difference = *record.bufferDifference;
@@ -5404,6 +5724,11 @@ std::unordered_map<const DrawRecordCommit*, InputsAsIs>& inputsAsIs() {
     return kept;
 }
 
+std::unordered_map<const DrawRecordCommit*, BindingsAsIs>& bindingsAsIs() {
+    thread_local std::unordered_map<const DrawRecordCommit*, BindingsAsIs> kept;
+    return kept;
+}
+
 bool takeInputsAsIs(const Context& context, const DrawRecordCommit& record, const Pm4::DrawParameters& draw, DrawInputs& inputs) {
     auto& all = inputsAsIs();
     const auto found = all.find(&record);
@@ -5445,7 +5770,7 @@ bool sharedRecordPassServes(const SharedRecordPass& shared, const State& state, 
 
 }
 
-DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer, const ShaderResources::PreparedBuffers* prepared) {
+DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     auto* recorder = Recorder::Active();
     const bool recording = answer == nullptr;
@@ -5491,13 +5816,29 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         const bool inputsKept = RuntimeSwitches::Set(RuntimeSwitch::XpInputsAsIs);
         if (!inputsKept && !inputsAsIs().empty()) inputsAsIs().clear();
         if (!inputsKept || !takeInputsAsIs(context, record, draw, inputs)) {
-            const auto plan = planDraw(context, state, draw, shaders, &recipe, outcome, timer);
-            if (plan.nothing) {
-                inputs = {};
-                inputs.nothing = true;
-            } else {
-                inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing, &recipe);
+            const auto today = [&] {
+                const auto plan = planDraw(context, state, draw, shaders, &recipe, outcome, timer);
+                if (plan.nothing) {
+                    inputs = {};
+                    inputs.nothing = true;
+                } else {
+                    inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing, &recipe);
+                }
+            };
+            bool ready = false;
+            if (preparedInputs != nullptr && RuntimeSwitches::Set(RuntimeSwitch::DirectInputs)) {
+                if (record.verifyInputs) {
+                    today();
+                    std::string difference;
+                    record.effects.inputs = verifyPreparedInputs(context, state, draw, shaders, recipe, *preparedInputs, inputs, timer, timing, difference);
+                    if (!difference.empty()) noteInputsDifference(difference);
+                    ready = true;
+                } else {
+                    record.effects.inputs = takePreparedInputs(context, state, draw, shaders, recipe, *preparedInputs, inputs, timer, timing);
+                    ready = record.effects.inputs == DrawRecordInputs::Used || record.effects.inputs == DrawRecordInputs::Rechecked;
+                }
             }
+            if (!ready) today();
             if (inputsKept) keepInputsAsIs(record, draw, inputs);
         }
         if (inputs.nothing) {
@@ -5818,6 +6159,8 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     for (auto& owner : multisampleOwners) {
         if (owner != nullptr) drawn.multisampleTargets.push_back(std::move(owner));
     }
+    if (RuntimeSwitches::Set(RuntimeSwitch::XpBindingsAsIs)) drawn.bindingsAsIs = &bindingsAsIs()[&record];
+    else if (!bindingsAsIs().empty()) bindingsAsIs().clear();
     recordDraw(context, state, draw, shaders, inputs, drawn, outcome, timer, ownWaitedMs, trace);
     record.effects.passHeld = held;
     if ((!multisampleRecipe || RuntimeSwitches::Set(RuntimeSwitch::MsaaRecordHold)) && recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {

@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -75,6 +76,37 @@ struct InPlaceIndices {
 };
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart);
 
+struct PreparedInputs {
+    enum class Refusal : std::uint8_t { None, NoRecipe, Shape, NotInPlace, Inaccessible, Thrown };
+    struct Range {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::uint32_t alignment = 1;
+        const HostImport* import = nullptr;
+        VkBuffer handle = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+    };
+    Refusal refusal = Refusal::None;
+    std::shared_ptr<const DrawRecipe> recipe;
+    const State* state = nullptr;
+    const Pm4::DrawParameters* draw = nullptr;
+    const CompiledShader* shaders = nullptr;
+    std::size_t stages = 0;
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint64_t forget = 0;
+    std::uint64_t imports = 0;
+    std::uint64_t mapping = 0;
+    std::uint64_t indexBytes = 0;
+    std::uint32_t maxIndex = 0;
+    VertexInputLayout vertexInput;
+    std::vector<VkBuffer> vertexHandles;
+    std::vector<VkDeviceSize> vertexOffsets;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
+    std::vector<Range> ranges;
+};
+bool PrepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, PreparedInputs& prepared);
+DrawRecordInputs VerifyPreparedInputsForTest(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, PreparedInputs& prepared, std::string& difference, DrawRecordInputs* taken = nullptr);
+
 std::array<std::uint32_t, 4> MeshIndexBufferDescriptor(const Pm4::DrawParameters& draw);
 
 struct MeshArguments {
@@ -129,7 +161,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
 void FailRecordChecks(DrawRecipeMiss check, std::uint32_t count);
 // `prepared`: the buffers a finisher prepared for a direct hit (APS5_DIRECT_BUFFERS), bound in place
 // of today's moved-buffer check and snapshot selection while they hold for the draw.
-DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace = nullptr, DrawCommitView* answer = nullptr, const ShaderResources::PreparedBuffers* prepared = nullptr);
+DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace = nullptr, DrawCommitView* answer = nullptr, const ShaderResources::PreparedBuffers* prepared = nullptr, PreparedInputs* preparedInputs = nullptr);
 // Whether DrawWithRecord can record a draw at all (APS5_SYNC_DRAWS and APS5_DUMP_TARGETS unset).
 bool DrawsRecordable();
 // Why a full draw asked for a record's recipe built none, counted per reason since the start:

@@ -5170,7 +5170,7 @@ std::vector<std::uint32_t> VulkanDevice::DrawContentKey(const Graphics::State& g
     return Graphics::DrawResourceContentKey(state->context, graphics, draw, shaders);
 }
 
-Graphics::DrawRecipeOutcome VulkanDevice::DrawFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer, const Graphics::ShaderResources::PreparedBuffers* prepared) {
+Graphics::DrawRecipeOutcome VulkanDevice::DrawFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer, const Graphics::ShaderResources::PreparedBuffers* prepared, Graphics::PreparedInputs* preparedInputs) {
     PerformanceTimer timing("Vulkan.DrawFromRecord");
     if (record.recipe == nullptr || record.recipe->device != state->device) {
         Graphics::DrawRecipeOutcome outcome;
@@ -5179,7 +5179,15 @@ Graphics::DrawRecipeOutcome VulkanDevice::DrawFromRecord(const Graphics::State& 
     }
     startJournalReplay();
     const auto context = graphicsContext();
-    return Graphics::DrawWithRecord(context, graphics, draw, shaders, record, trace, answer, prepared);
+    return Graphics::DrawWithRecord(context, graphics, draw, shaders, record, trace, answer, prepared, preparedInputs);
+}
+
+bool VulkanDevice::PrepareDrawInputs(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, Graphics::PreparedInputs& prepared) const {
+    if (!state->contextReady) {
+        prepared.refusal = Graphics::PreparedInputs::Refusal::NotInPlace;
+        return false;
+    }
+    return Graphics::PrepareDrawInputs(state->context, graphics, draw, shaders, std::move(recipe), prepared);
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey, const std::uint32_t* fragmentOutputs, bool recordRecipe) {
