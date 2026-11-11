@@ -106,6 +106,7 @@ public:
     static void CountPipelinedMetadataPass();
     static std::uint64_t PipelinedMetadataPasses();
 private:
+    friend class DrawFinisher;
     struct Item {
         Commit commit;
         std::vector<Range> writes;
@@ -116,9 +117,12 @@ private:
         bool store = false;
         CommitKind kind = CommitKind::Other;
         bool quiet = false;
+        std::uint64_t order = 0;
     };
     DrawPipeline() = default;
     void enqueue(Item item);
+    void queueItem(Item item);
+    void verifyOrder(std::uint64_t order);
     void run();
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
@@ -137,6 +141,10 @@ private:
     std::atomic<std::uint64_t> retiredItems{0};
     std::atomic<std::uint64_t> decodeDrains{0};
     std::uint64_t reportedDecodeDrains = 0;
+    std::uint64_t reportedDeposits = 0;
+    std::uint64_t reportedTurnItems = 0;
+    std::uint64_t verifiedOrder = 0;
+    std::uint64_t orderOrdinal = 0;
     std::uint32_t idleWaiters = 0;
     std::size_t resumeAt = 0;
     bool committerWaiting = false;
@@ -189,6 +197,12 @@ public:
         std::vector<std::byte> labelBytes;
     };
     enum class LabelLookup : std::uint8_t { NotHeld, Value, Unknown };
+    struct DepositCounts {
+        std::uint64_t deposited = 0;
+        std::uint64_t forwarded = 0;
+        std::uint64_t direct = 0;
+    };
+    static DepositCounts Deposits();
     static bool Overlap();
     bool PendingOverlaps(std::uint64_t begin, std::uint64_t end);
     LabelLookup PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value);
@@ -223,11 +237,16 @@ public:
     static bool AheadOfTurn();
 
 private:
+    friend class DrawPipeline;
     struct Slot {
         Job job;
         std::uint64_t seq = 0;
         bool taken = false;
         bool done = false;
+    };
+    struct Deposit {
+        DrawPipeline* pipeline = nullptr;
+        DrawPipeline::Item item;
     };
     struct LeanSlot {
         std::atomic<std::uint64_t> seq{0};
@@ -237,6 +256,7 @@ private:
         std::shared_ptr<const void> answer;
         Job closure;
         Pending pending;
+        std::vector<Deposit> deposits;
         alignas(16) std::array<std::byte, LeanPayloadBytes> payload{};
     };
     DrawFinisher() = default;
@@ -248,7 +268,15 @@ private:
     bool leanReady() const { return leanTake.load(std::memory_order_acquire) < leanTail.load(std::memory_order_acquire); }
     bool takeLean(unsigned index, std::uint64_t& seq);
     void runLean(std::uint64_t seq, std::chrono::steady_clock::time_point& lastEnd);
-    void advanceLeanFront();
+    std::uint64_t advanceLeanFront();
+    void awaitTurn(std::uint64_t seq);
+    bool deposit(DrawPipeline& pipeline, DrawPipeline::Item& item);
+    void forwardOwn(std::uint64_t seq);
+    bool forwardLean(LeanSlot& slot, std::uint64_t seq, std::uint64_t& forwardNs);
+    const std::vector<Deposit>& ownDeposits();
+    bool depositsWrite(std::span<const Range> ranges);
+    bool depositsRead(std::uint64_t address, std::size_t bytes);
+    void checkDrainDeposits();
     void retireLean();
     void rethrowLeanFailure();
     void awaitLeanRoom();

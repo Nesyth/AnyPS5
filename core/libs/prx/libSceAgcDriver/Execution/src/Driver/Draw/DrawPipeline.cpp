@@ -65,12 +65,60 @@ struct FinisherThreadSlot {};
 struct FinisherProducerSlot {};
 struct FinisherSeqSlot {};
 struct FinisherAheadSlot {};
+struct FinisherDepositSlot {};
 using FinisherThread = HostThreadSlot<bool, FinisherThreadSlot>;
 using FinisherProducer = HostThreadSlot<bool, FinisherProducerSlot>;
 using FinisherSeq = HostThreadSlot<std::uint64_t, FinisherSeqSlot>;
 using FinisherAhead = HostThreadSlot<bool, FinisherAheadSlot>;
+using FinisherDeposits = HostThreadSlot<bool, FinisherDepositSlot>;
 
-enum LeanSlotState : std::uint8_t { LeanFree, LeanReady, LeanDone };
+enum LeanSlotState : std::uint8_t { LeanFree, LeanReady, LeanDone, LeanDeposited, LeanForwarding };
+
+std::atomic<std::uint64_t> depositedItems{0};
+std::atomic<std::uint64_t> forwardedItems{0};
+std::atomic<std::uint64_t> turnItems{0};
+
+std::uint64_t depositVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_FINISHER_DEPOSIT");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+std::atomic<std::uint64_t> orderChecks{0};
+std::atomic<std::uint64_t> orderDifferences{0};
+std::atomic<std::uint64_t> drainChecks{0};
+std::atomic<std::uint64_t> drainDifferences{0};
+std::atomic<std::uint64_t> drainOrdinal{0};
+std::atomic<std::uint64_t> depositPrinted{0};
+std::atomic<std::int64_t> depositPrintWindow{0};
+
+void noteDepositDifference(const std::string& text) {
+    const auto window = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (depositPrintWindow.exchange(window, std::memory_order_relaxed) != window) depositPrinted.store(0, std::memory_order_relaxed);
+    if (depositPrinted.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[finisher-deposit-verify] %s\n", text.c_str());
+}
+
+std::uint64_t orderKey() {
+    thread_local std::uint64_t keyBase = 0;
+    thread_local std::uint64_t keyOrdinal = 0;
+    std::uint64_t base = 0;
+    if (const auto seq = FinisherSeq::Get(); seq != 0) base = seq * 2 + 1;
+    else if (FinisherProducer::Get() && !FinisherThread::Get()) base = DrawFinisher::Get().Issued() * 2;
+    if (base == 0) return 0;
+    if (keyBase != base) {
+        keyBase = base;
+        keyOrdinal = 0;
+    }
+    ++keyOrdinal;
+    return (base << 16) | std::min<std::uint64_t>(keyOrdinal, 0xffff);
+}
+
+std::string orderText(std::uint64_t order) {
+    const auto base = order >> 16;
+    return std::string(base % 2 != 0 ? "job " : "worker item before job ") + std::to_string(base / 2) + " (item " + std::to_string(order & 0xffff) + ")";
+}
 
 bool finisherTakes(unsigned index) {
     if (index == 0) return true;
@@ -497,7 +545,19 @@ DrawFinisher::Slot* DrawFinisher::untaken() {
 void DrawFinisher::AwaitTurn() {
     const auto seq = FinisherSeq::Get();
     if (seq == 0) return;
-    if (frontSeq.load(std::memory_order_acquire) == seq) return;
+    if (frontSeq.load(std::memory_order_acquire) != seq) awaitTurn(seq);
+    if (FinisherDeposits::Get()) forwardOwn(seq);
+}
+
+void DrawFinisher::awaitTurn(std::uint64_t seq) {
+    struct Counted {
+        ThreadReport::Clock::time_point start;
+        ~Counted() {
+            if (start == ThreadReport::Clock::time_point{}) return;
+            ThreadReport::Add(ThreadReport::Count::FinisherTurnWaits, 1);
+            ThreadReport::Add(ThreadReport::Count::FinisherTurnNs, ThreadReport::Nanoseconds(start, ThreadReport::Clock::now()));
+        }
+    } counted{ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{}};
     if (spinHandoff() && SpinUntil(HandoffSpinWindow(), [&] { return frontSeq.load(std::memory_order_acquire) == seq; })) return;
     if (ringMode.load(std::memory_order_acquire)) {
         frontWaiters.fetch_add(1, std::memory_order_seq_cst);
@@ -761,7 +821,7 @@ void DrawFinisher::publishLean(LeanSlot& slot) {
     nextSeq = seq + 1;
     issued.store(nextSeq, std::memory_order_relaxed);
     leanTail.store(nextSeq, std::memory_order_seq_cst);
-    const unsigned wanted = 1u | (finisherTakes(1) ? 2u : 0u) | (finisherTakes(2) ? 4u : 0u);
+    const unsigned wanted = 1u | (finisherTakes(1) ? 2u : 0u) | (finisherTakes(2) ? 4u : 0u) | (finisherTakes(3) ? 8u : 0u) | (finisherTakes(4) ? 16u : 0u);
     if ((started.load(std::memory_order_acquire) & wanted) != wanted) {
         const auto lock = lockFor(mutex);
         startFinishers();
@@ -856,27 +916,163 @@ void DrawFinisher::runLean(std::uint64_t seq, std::chrono::steady_clock::time_po
         if (failure == nullptr) failure = error;
         leanFailed.store(true, std::memory_order_release);
     }
-    slot.state.store(LeanDone, std::memory_order_seq_cst);
-    advanceLeanFront();
+    const bool deposited = !slot.deposits.empty();
+    FinisherDeposits::Set(false);
+    slot.state.store(deposited ? LeanDeposited : LeanDone, std::memory_order_seq_cst);
+    const auto forwardNs = advanceLeanFront();
+    if (forwardNs != 0 && lastEnd != ThreadReport::Clock::time_point{}) lastEnd += std::chrono::nanoseconds(forwardNs);
 }
 
-void DrawFinisher::advanceLeanFront() {
+std::uint64_t DrawFinisher::advanceLeanFront() {
     bool moved = false;
+    std::uint64_t forwardNs = 0;
     for (;;) {
         auto front = frontSeq.load(std::memory_order_seq_cst);
         if (front >= leanTail.load(std::memory_order_seq_cst)) break;
-        const auto& slot = leanSlot(front);
-        if (slot.seq.load(std::memory_order_seq_cst) != front || slot.state.load(std::memory_order_seq_cst) != LeanDone) break;
+        auto& slot = leanSlot(front);
+        if (slot.seq.load(std::memory_order_seq_cst) != front) break;
+        const auto state = slot.state.load(std::memory_order_seq_cst);
+        if (state == LeanDeposited) {
+            if (!forwardLean(slot, front, forwardNs)) break;
+            continue;
+        }
+        if (state != LeanDone) break;
         if (!frontSeq.compare_exchange_strong(front, front + 1, std::memory_order_seq_cst)) continue;
         outstanding.fetch_sub(1, std::memory_order_seq_cst);
         moved = true;
     }
-    if (!moved) return;
+    if (!moved) return forwardNs;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (frontWaiters.load(std::memory_order_relaxed) == 0) return;
+    if (frontWaiters.load(std::memory_order_relaxed) == 0) return forwardNs;
     const auto lock = lockFor(mutex);
     idle.notify_all();
     turnWake.notify_all();
+    return forwardNs;
+}
+
+DrawFinisher::DepositCounts DrawFinisher::Deposits() {
+    return {depositedItems.load(std::memory_order_relaxed), forwardedItems.load(std::memory_order_relaxed), turnItems.load(std::memory_order_relaxed)};
+}
+
+bool DrawFinisher::deposit(DrawPipeline& pipeline, DrawPipeline::Item& item) {
+    const auto seq = FinisherSeq::Get();
+    if (seq == 0 || !ringMode.load(std::memory_order_acquire)) return false;
+    if (frontSeq.load(std::memory_order_acquire) == seq) {
+        turnItems.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    leanSlot(seq).deposits.push_back({&pipeline, std::move(item)});
+    FinisherDeposits::Set(true);
+    depositedItems.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void DrawFinisher::forwardOwn(std::uint64_t seq) {
+    FinisherDeposits::Set(false);
+    auto& slotDeposits = leanSlot(seq).deposits;
+    std::vector<Deposit> deposits;
+    deposits.swap(slotDeposits);
+    struct Restore {
+        std::vector<Deposit>& taken;
+        std::vector<Deposit>& slot;
+        ~Restore() {
+            taken.clear();
+            if (slot.empty()) taken.swap(slot);
+        }
+    } restore{deposits, slotDeposits};
+    const auto start = ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
+    std::size_t sent = 0;
+    const auto count = [&] {
+        forwardedItems.fetch_add(sent, std::memory_order_relaxed);
+        if (start == ThreadReport::Clock::time_point{}) return;
+        ThreadReport::Add(ThreadReport::Count::FinisherForwards, sent);
+        ThreadReport::Add(ThreadReport::Count::FinisherForwardNs, ThreadReport::Nanoseconds(start, ThreadReport::Clock::now()));
+    };
+    try {
+        for (auto& held : deposits) {
+            held.pipeline->queueItem(std::move(held.item));
+            ++sent;
+        }
+    } catch (...) {
+        count();
+        throw;
+    }
+    count();
+}
+
+bool DrawFinisher::forwardLean(LeanSlot& slot, std::uint64_t seq, std::uint64_t& forwardNs) {
+    auto expected = static_cast<std::uint8_t>(LeanDeposited);
+    if (!slot.state.compare_exchange_strong(expected, static_cast<std::uint8_t>(LeanForwarding), std::memory_order_seq_cst)) return false;
+    if (slot.seq.load(std::memory_order_seq_cst) != seq) {
+        slot.state.store(LeanDeposited, std::memory_order_seq_cst);
+        return true;
+    }
+    const auto start = ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
+    std::exception_ptr error;
+    std::size_t sent = 0;
+    try {
+        for (auto& held : slot.deposits) {
+            held.pipeline->queueItem(std::move(held.item));
+            ++sent;
+        }
+    } catch (...) {
+        error = std::current_exception();
+    }
+    slot.deposits.clear();
+    forwardedItems.fetch_add(sent, std::memory_order_relaxed);
+    if (start != ThreadReport::Clock::time_point{}) {
+        const auto ns = ThreadReport::Nanoseconds(start, ThreadReport::Clock::now());
+        ThreadReport::Add(ThreadReport::Count::FinisherForwards, sent);
+        ThreadReport::Add(ThreadReport::Count::FinisherForwardNs, ns);
+        forwardNs += ns;
+    }
+    if (error != nullptr) {
+        const auto lock = lockFor(mutex);
+        if (failure == nullptr) failure = error;
+        leanFailed.store(true, std::memory_order_release);
+    }
+    slot.state.store(LeanDone, std::memory_order_seq_cst);
+    return true;
+}
+
+const std::vector<DrawFinisher::Deposit>& DrawFinisher::ownDeposits() {
+    return leanSlot(FinisherSeq::Get()).deposits;
+}
+
+bool DrawFinisher::depositsWrite(std::span<const Range> ranges) {
+    for (const auto& held : ownDeposits()) {
+        for (const auto& [first, last] : held.item.writes) {
+            for (const auto& [begin, end] : ranges) {
+                if (begin < last && first < end) return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool DrawFinisher::depositsRead(std::uint64_t address, std::size_t bytes) {
+    const auto end = address + bytes;
+    for (const auto& held : ownDeposits()) {
+        for (const auto& [begin, limit] : held.item.reads) {
+            if (address < limit && begin < end) return true;
+        }
+    }
+    return false;
+}
+
+void DrawFinisher::checkDrainDeposits() {
+    if (lean == nullptr || drainOrdinal.fetch_add(1, std::memory_order_relaxed) % depositVerifyEvery() != 0) return;
+    drainChecks.fetch_add(1, std::memory_order_relaxed);
+    std::size_t left = 0;
+    std::size_t slots = 0;
+    for (const auto& slot : *lean) {
+        if (slot.deposits.empty()) continue;
+        left += slot.deposits.size();
+        ++slots;
+    }
+    if (left == 0) return;
+    drainDifferences.fetch_add(1, std::memory_order_relaxed);
+    noteDepositDifference("drain end differs: " + std::to_string(left) + " deposited items were left in " + std::to_string(slots) + " ring slots after the finisher drained (front " + std::to_string(frontSeq.load(std::memory_order_acquire)) + ")");
 }
 
 void DrawFinisher::run(unsigned index) {
@@ -988,6 +1184,7 @@ void DrawFinisher::Drain() {
             ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherDrainNs : ThreadReport::Count::OtherDrainNs, ThreadReport::Nanoseconds(drainStart, ThreadReport::Clock::now()));
         }
         if (FinisherProducer::Get()) retireLean();
+        if (depositVerifyEvery() != 0 && FinisherProducer::Get()) checkDrainDeposits();
         rethrowLeanFailure();
         return;
     }
@@ -1129,7 +1326,12 @@ std::atomic<std::uint64_t> itemsByTurn{0};
 }
 
 void DrawPipeline::enqueue(Item item) {
-    if (DrawFinisher::OnFinisherThread()) DrawFinisher::Get().AwaitTurn();
+    if (depositVerifyEvery() != 0) item.order = orderKey();
+    if (DrawFinisher::OnFinisherThread()) {
+        auto& finisher = DrawFinisher::Get();
+        if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FinisherDeposit) && finisher.deposit(*this, item)) return;
+        finisher.AwaitTurn();
+    }
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) {
         if (item.reads.empty() && !ItemTurn::Get() && FinisherProducer::Get() && DrawFinisher::Overlap() && !GuestMemory::GpuMutex().HeldByThisThread() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ItemsByTurn)) {
             DrawFinisher::Pending held;
@@ -1151,6 +1353,10 @@ void DrawPipeline::enqueue(Item item) {
         }
         DrawFinisher::Get().Drain();
     }
+    queueItem(std::move(item));
+}
+
+void DrawPipeline::queueItem(Item item) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
@@ -1179,9 +1385,10 @@ void DrawPipeline::enqueue(Item item) {
         fullWaitNs += waited;
         if (ThreadReport::Enabled()) {
             const bool finisher = DrawFinisher::OnFinisherThread();
+            const bool forwarding = finisher && FinisherSeq::Get() == 0;
             const bool worker = !finisher && ThreadReport::OnQueue0Worker();
-            ThreadReport::Add(finisher ? ThreadReport::Count::FinisherRoomWaits : worker ? ThreadReport::Count::WorkerCommitterRoomWaits : ThreadReport::Count::OtherRoomWaits, 1);
-            ThreadReport::Add(finisher ? ThreadReport::Count::FinisherRoomNs : worker ? ThreadReport::Count::WorkerCommitterRoomNs : ThreadReport::Count::OtherRoomNs, waited);
+            ThreadReport::Add(forwarding ? ThreadReport::Count::FinisherForwardRoomWaits : finisher ? ThreadReport::Count::FinisherRoomWaits : worker ? ThreadReport::Count::WorkerCommitterRoomWaits : ThreadReport::Count::OtherRoomWaits, 1);
+            ThreadReport::Add(forwarding ? ThreadReport::Count::FinisherForwardRoomNs : finisher ? ThreadReport::Count::FinisherRoomNs : worker ? ThreadReport::Count::WorkerCommitterRoomNs : ThreadReport::Count::OtherRoomNs, waited);
         }
         rethrowFailure();
     }
@@ -1233,9 +1440,14 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
     const auto decodeDrainCount = decodeDrains.load(std::memory_order_relaxed);
-    char reads[160];
-    std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held, %llu decode drains, %llu items by turn", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(decodeDrainCount - reportedDecodeDrains), static_cast<unsigned long long>(itemsByTurn.exchange(0, std::memory_order_relaxed)));
+    const auto depositCount = depositedItems.load(std::memory_order_relaxed);
+    const auto turnCount = turnItems.load(std::memory_order_relaxed);
+    char reads[256];
+    std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held, %llu decode drains, %llu items by turn, %llu finisher items deposited, %llu queued at their turn", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(decodeDrainCount - reportedDecodeDrains), static_cast<unsigned long long>(itemsByTurn.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(depositCount - reportedDeposits), static_cast<unsigned long long>(turnCount - reportedTurnItems));
     reportedDecodeDrains = decodeDrainCount;
+    reportedDeposits = depositCount;
+    reportedTurnItems = turnCount;
+    if (depositVerifyEvery() != 0) AgcDriver::ProfilePrint_nid_no_patch("[finisher-deposit-verify] 10 s: every %llu; items checked %llu, out of order %llu; drains checked %llu, with deposits left %llu\n", static_cast<unsigned long long>(depositVerifyEvery()), static_cast<unsigned long long>(orderChecks.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(orderDifferences.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drainChecks.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drainDifferences.exchange(0, std::memory_order_relaxed)));
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
     if (const auto encoded = Graphics::CommandEncoders::TotalsText(); !encoded.empty()) AgcDriver::ProfilePrint_nid_no_patch("[encode] (cumulative): %s\n", encoded.c_str());
     AgcDriver::ProfilePrint_nid_no_patch("[indirect-draws] (cumulative): %s\n", Graphics::IndirectDrawTotalsText().c_str());
@@ -1293,6 +1505,7 @@ void DrawPipeline::run() {
             committerWaiting = false;
             if (idleNow) noteCommitterIdle(idleState, elapsedNs(idleStart));
             if (items.empty()) break;
+            if (depositVerifyEvery() != 0) verifyOrder(items.front().order);
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
             quietItem = items.front().quiet;
@@ -1374,6 +1587,16 @@ void DrawPipeline::run() {
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
 
+void DrawPipeline::verifyOrder(std::uint64_t order) {
+    if (order == 0 || DrawFinisher::Get().closed.load(std::memory_order_acquire) || ++orderOrdinal % depositVerifyEvery() != 0) return;
+    orderChecks.fetch_add(1, std::memory_order_relaxed);
+    if (order <= verifiedOrder) {
+        orderDifferences.fetch_add(1, std::memory_order_relaxed);
+        noteDepositDifference("item order differs: the committer took an item of " + orderText(order) + " after an item of " + orderText(verifiedOrder));
+    }
+    verifiedOrder = order;
+}
+
 void DrawPipeline::Stop() {
     std::thread committer;
     {
@@ -1429,6 +1652,7 @@ std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
 bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     static const bool unordered = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr;
     if (bytes == 0 || unordered) return false;
+    if (FinisherDeposits::Get() && DrawFinisher::Get().depositsRead(address, bytes)) return true;
     const auto end = address + bytes;
     auto& pipeline = Queue0();
     const auto lock = lockFor(pipeline.mutex);
@@ -1458,6 +1682,10 @@ std::uint64_t DrawPipeline::DrainRequestsByReason(DrainReason reason) {
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > 8) return std::nullopt;
+    if (FinisherDeposits::Get()) {
+        const Range range{address, address + bytes};
+        if (DrawFinisher::Get().depositsWrite({&range, 1})) return std::nullopt;
+    }
     if (DrawFinisher::Overlap()) {
         std::uint64_t held = 0;
         const auto lookup = DrawFinisher::Get().PendingLabel(address, bytes, held);
@@ -1483,6 +1711,10 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
 
 DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out) {
     const auto end = address + bytes;
+    if (FinisherDeposits::Get()) {
+        const Range range{address, end};
+        if (DrawFinisher::Get().depositsWrite({&range, 1})) return QueuedWrite::Unknown;
+    }
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) return QueuedWrite::Unknown;
     if (lockless()) {
         const Range range{address, end};
@@ -1512,7 +1744,8 @@ void DrawPipeline::countWrites(const std::vector<Range>& writes, bool added) {
 
 DrawPipeline::Watch DrawPipeline::WatchWrites() {
     if (!Busy()) return {Retired(), 0, {}};
-    if (lockless()) {
+    const bool own = FinisherDeposits::Get();
+    if (lockless() && !own) {
         Watch watch;
         const auto enqueuedBefore = enqueuedItems.load(std::memory_order_acquire);
         if (published.Copy(watch.snapshotWrites, watch.snapshotCount)) {
@@ -1525,6 +1758,12 @@ DrawPipeline::Watch DrawPipeline::WatchWrites() {
     const auto lock = lockFor(mutex);
     Watch watch{retiredItems.load(std::memory_order_relaxed), items.size(), {}};
     for (const auto& item : items) watch.writes.insert(watch.writes.end(), item.writes.begin(), item.writes.end());
+    if (own) {
+        for (const auto& held : DrawFinisher::Get().ownDeposits()) {
+            ++watch.items;
+            watch.writes.insert(watch.writes.end(), held.item.writes.begin(), held.item.writes.end());
+        }
+    }
     return watch;
 }
 
@@ -1534,6 +1773,7 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
             return std::any_of(writes.begin(), writes.end(), [&read](const Range& write) { return read.first < write.second && write.first < read.second; });
         });
     };
+    if (FinisherDeposits::Get() && DrawFinisher::Get().depositsWrite(reads)) return true;
     const auto watched = watch.snapshot ? std::span<const Range>(watch.snapshotWrites.data(), watch.snapshotCount) : std::span<const Range>(watch.writes);
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(reads)) return true;
     if (lockless()) {
@@ -1553,10 +1793,11 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
 }
 
 bool DrawPipeline::Busy() const {
-    return (FinisherProducer::Get() && DrawFinisher::Busy() && DrawFinisher::Overlap()) || outstanding.load(std::memory_order_acquire) != 0 || DrawFinisher::AheadOfTurn();
+    return (FinisherProducer::Get() && DrawFinisher::Busy() && DrawFinisher::Overlap()) || outstanding.load(std::memory_order_acquire) != 0 || DrawFinisher::AheadOfTurn() || FinisherDeposits::Get();
 }
 
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    if (FinisherDeposits::Get() && DrawFinisher::Get().depositsWrite(ranges)) return true;
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(ranges)) return true;
     if (lockless()) {
         const auto answer = published.Overlaps(ranges);
@@ -1573,6 +1814,10 @@ bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uin
 
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
+    if (FinisherDeposits::Get()) {
+        const Range range{address, end};
+        if (DrawFinisher::Get().depositsWrite({&range, 1})) return true;
+    }
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) return true;
     if (lockless()) {
         const Range range{address, end};

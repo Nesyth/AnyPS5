@@ -113,6 +113,7 @@ enum class RuntimeSwitch : std::size_t {
     DirectRepeatSets,
     DirectRepeatStores,
     DirectRepeatShared,
+    FinisherDeposit,
     Count,
 };
 
