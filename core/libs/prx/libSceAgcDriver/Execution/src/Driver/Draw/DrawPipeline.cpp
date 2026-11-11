@@ -722,7 +722,7 @@ void DrawFinisher::publishLean(LeanSlot& slot) {
     nextSeq = seq + 1;
     issued.store(nextSeq, std::memory_order_relaxed);
     leanTail.store(nextSeq, std::memory_order_seq_cst);
-    const unsigned wanted = 1u | (finisherTakes(1) ? 2u : 0u) | (finisherTakes(2) ? 4u : 0u);
+    const unsigned wanted = 1u | (finisherTakes(1) ? 2u : 0u) | (finisherTakes(2) ? 4u : 0u) | (finisherTakes(3) ? 8u : 0u) | (finisherTakes(4) ? 16u : 0u);
     if ((started.load(std::memory_order_acquire) & wanted) != wanted) {
         const auto lock = lockFor(mutex);
         startFinishers();

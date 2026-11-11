@@ -32,6 +32,13 @@ void Require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+void SetThreads(unsigned count) {
+    RuntimeSwitches::Assign(RuntimeSwitch::SecondFinisher, count >= 2);
+    RuntimeSwitches::Assign(RuntimeSwitch::ThirdFinisher, count >= 3);
+    RuntimeSwitches::Assign(RuntimeSwitch::FourthFinisher, count >= 4);
+    RuntimeSwitches::Assign(RuntimeSwitch::FifthFinisher, count >= 5);
+}
+
 std::mutex orderMutex;
 std::vector<std::uint32_t> order;
 
@@ -290,22 +297,26 @@ int main() {
         for (const bool lockless : {false, true}) QueriesFromTheRing(lockless);
         const bool second = RuntimeSwitches::Set(RuntimeSwitch::SecondFinisher);
         const bool third = RuntimeSwitches::Set(RuntimeSwitch::ThirdFinisher);
-        for (const bool more : {false, true}) {
-            RuntimeSwitches::Assign(RuntimeSwitch::SecondFinisher, more);
-            RuntimeSwitches::Assign(RuntimeSwitch::ThirdFinisher, more);
+        const bool fourth = RuntimeSwitches::Set(RuntimeSwitch::FourthFinisher);
+        const bool fifth = RuntimeSwitches::Set(RuntimeSwitch::FifthFinisher);
+        for (const unsigned threads : {1u, 3u, 4u, 5u}) {
+            SetThreads(threads);
             OrderAcrossFinishers();
             FailureRethrown();
             RoomWait();
         }
-        RuntimeSwitches::Assign(RuntimeSwitch::SecondFinisher, true);
-        AheadWaits();
-        for (const bool more : {false, true}) {
-            RuntimeSwitches::Assign(RuntimeSwitch::SecondFinisher, more);
-            RuntimeSwitches::Assign(RuntimeSwitch::ThirdFinisher, more);
+        for (const unsigned threads : {3u, 5u}) {
+            SetThreads(threads);
+            AheadWaits();
+        }
+        for (const unsigned threads : {1u, 3u, 4u, 5u}) {
+            SetThreads(threads);
             AnswersReachTheRetirer();
         }
         RuntimeSwitches::Assign(RuntimeSwitch::SecondFinisher, second);
         RuntimeSwitches::Assign(RuntimeSwitch::ThirdFinisher, third);
+        RuntimeSwitches::Assign(RuntimeSwitch::FourthFinisher, fourth);
+        RuntimeSwitches::Assign(RuntimeSwitch::FifthFinisher, fifth);
         StoreSwitches();
         finisher.Drain();
         finisher.Adopt(false);
