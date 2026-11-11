@@ -811,6 +811,7 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
     std::shared_ptr<DrawRecordHit> hit;
     try {
         reason = resolveDirectStages(job, anchor, resolved, timer);
+        for (std::uint32_t again = 0; again < 2u && reason == Counter::FallbackUnsettled && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectRetry); ++again) reason = resolveDirectStages(job, anchor, resolved, timer);
         if (!reason) {
             key = DirectClassKey::For(job, resolved);
             probe = key.Probe();

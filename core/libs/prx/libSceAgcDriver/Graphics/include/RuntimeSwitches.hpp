@@ -98,6 +98,8 @@ enum class RuntimeSwitch : std::size_t {
     DeferredEncode,
     NoOwnedDrawInputs,
     DirectInputs,
+    DirectRetry,
+    ItemsByTurn,
     Count,
 };
 
