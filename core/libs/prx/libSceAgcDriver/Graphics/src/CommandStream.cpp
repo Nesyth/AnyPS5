@@ -350,6 +350,77 @@ void replayOne(VkCommandBuffer commands, const Record& base) {
     std::apply([&](const auto&... arguments) { function(commands, arguments...); }, record.arguments);
 }
 
+void replayRecord(VkCommandBuffer commands, const Record& record) {
+    switch (static_cast<CommandOp>(record.op)) {
+#define AGC_COMMAND_STREAM_OP(name) \
+    case CommandOp::name: \
+        replayOne<CommandOp::name>(commands, record); \
+        break;
+        AGC_COMMAND_STREAM_OPS(AGC_COMMAND_STREAM_OP)
+#undef AGC_COMMAND_STREAM_OP
+    }
+}
+
+template<typename T>
+bool sameArray(const T* left, const T* right, std::uint64_t count) {
+    if (count == 0) return true;
+    if (left == nullptr || right == nullptr) return left == right;
+    return std::memcmp(static_cast<const void*>(left), static_cast<const void*>(right), sizeof(T) * count) == 0;
+}
+
+bool sameBufferInfo(const VkDescriptorBufferInfo& left, const VkDescriptorBufferInfo& right, bool ignoreHandles) {
+    return left.range == right.range && (ignoreHandles || (left.buffer == right.buffer && left.offset == right.offset));
+}
+
+bool sameWrite(const VkWriteDescriptorSet& left, const VkWriteDescriptorSet& right, bool ignoreHandles) {
+    if (left.pNext != nullptr || right.pNext != nullptr || left.dstBinding != right.dstBinding || left.dstArrayElement != right.dstArrayElement || left.descriptorCount != right.descriptorCount || left.descriptorType != right.descriptorType) return false;
+    if ((left.pImageInfo == nullptr) != (right.pImageInfo == nullptr) || (left.pBufferInfo == nullptr) != (right.pBufferInfo == nullptr) || (left.pTexelBufferView == nullptr) != (right.pTexelBufferView == nullptr)) return false;
+    if (!sameArray(left.pImageInfo, right.pImageInfo, left.descriptorCount) || !sameArray(left.pTexelBufferView, right.pTexelBufferView, left.descriptorCount)) return false;
+    for (std::uint32_t index = 0; left.pBufferInfo != nullptr && index < left.descriptorCount; ++index) {
+        if (!sameBufferInfo(left.pBufferInfo[index], right.pBufferInfo[index], ignoreHandles)) return false;
+    }
+    return true;
+}
+
+template<CommandOp Op>
+bool sameOne(const Record& leftRecord, const Record& rightRecord, bool ignoreHandles) {
+    const auto& left = static_cast<const OpRecord<Op>&>(leftRecord).arguments;
+    const auto& right = static_cast<const OpRecord<Op>&>(rightRecord).arguments;
+    if constexpr (Op == CommandOp::BindPipeline) {
+        return std::get<0>(left) == std::get<0>(right) && (ignoreHandles || std::get<1>(left) == std::get<1>(right));
+    } else if constexpr (Op == CommandOp::SetViewport || Op == CommandOp::SetScissor) {
+        return std::get<0>(left) == std::get<0>(right) && std::get<1>(left) == std::get<1>(right) && sameArray(std::get<2>(left), std::get<2>(right), std::get<1>(left));
+    } else if constexpr (Op == CommandOp::PushConstants) {
+        return std::get<0>(left) == std::get<0>(right) && std::get<1>(left) == std::get<1>(right) && std::get<2>(left) == std::get<2>(right) && std::get<3>(left) == std::get<3>(right) && sameArray(static_cast<const std::byte*>(std::get<4>(left)), static_cast<const std::byte*>(std::get<4>(right)), std::get<3>(left));
+    } else if constexpr (Op == CommandOp::BindDescriptorSets) {
+        const bool head = std::get<0>(left) == std::get<0>(right) && std::get<1>(left) == std::get<1>(right) && std::get<2>(left) == std::get<2>(right) && std::get<3>(left) == std::get<3>(right) && std::get<5>(left) == std::get<5>(right);
+        return head && (ignoreHandles || sameArray(std::get<4>(left), std::get<4>(right), std::get<3>(left))) && sameArray(std::get<6>(left), std::get<6>(right), std::get<5>(left));
+    } else if constexpr (Op == CommandOp::PushDescriptorSetKHR) {
+        if (!(std::get<0>(left) == std::get<0>(right) && std::get<1>(left) == std::get<1>(right) && std::get<2>(left) == std::get<2>(right) && std::get<3>(left) == std::get<3>(right))) return false;
+        for (std::uint32_t index = 0; index < std::get<3>(left); ++index) {
+            if (!sameWrite(std::get<4>(left)[index], std::get<4>(right)[index], ignoreHandles)) return false;
+        }
+        return true;
+    } else if constexpr (Op == CommandOp::BindVertexBuffers) {
+        return std::get<0>(left) == std::get<0>(right) && std::get<1>(left) == std::get<1>(right) && sameArray(std::get<2>(left), std::get<2>(right), std::get<1>(left)) && sameArray(std::get<3>(left), std::get<3>(right), std::get<1>(left));
+    } else if constexpr (!Signature<FunctionOf<Op>>::DataPointers) {
+        return left == right;
+    } else {
+        return false;
+    }
+}
+
+bool sameRecord(const Record& left, const Record& right, bool ignoreHandles) {
+    switch (static_cast<CommandOp>(left.op)) {
+#define AGC_COMMAND_STREAM_OP(name) \
+    case CommandOp::name: \
+        return sameOne<CommandOp::name>(left, right, ignoreHandles);
+        AGC_COMMAND_STREAM_OPS(AGC_COMMAND_STREAM_OP)
+#undef AGC_COMMAND_STREAM_OP
+    }
+    return false;
+}
+
 std::size_t opOf(const char* name) {
     if (std::strncmp(name, "vkCmd", 5) != 0) return OpCount;
     const std::string_view wanted(name);
@@ -372,10 +443,85 @@ PFN_vkVoidFunction thunkFor(std::size_t op, PFN_vkVoidFunction real) {
 
 }
 
-CommandStream::CommandStream() {
+CommandStream::CommandStream() : CommandStream(Mode::Chunks) {}
+
+CommandStream::CommandStream(Mode streamMode) : mode(streamMode) {
     const auto address = reinterpret_cast<std::uintptr_t>(this);
     Require((address & ~HandleAddressMask) == 0, "a command stream lies at an address its handle cannot carry");
     handle = reinterpret_cast<VkCommandBuffer>(address | HandleTag);
+}
+
+void CommandStream::BeginFragment() {
+    Require(mode == Mode::Fragments, "only a fragment stream records fragments");
+    first = nullptr;
+    tail = &first;
+    ops = 0;
+    used = 0;
+    touched.clear();
+    if (slab != nullptr) touched.push_back(slab);
+}
+
+CommandStream::Fragment CommandStream::EndFragment() {
+    Require(mode == Mode::Fragments, "only a fragment stream records fragments");
+    Fragment fragment;
+    fragment.first = first;
+    fragment.tail = first != nullptr ? tail : nullptr;
+    fragment.ops = ops;
+    fragment.bytes = used;
+    fragment.slabs = std::move(touched);
+    touched.clear();
+    first = nullptr;
+    tail = &first;
+    ops = 0;
+    used = 0;
+    return fragment;
+}
+
+void CommandStream::Splice(Fragment&& fragment) {
+    Require(mode == Mode::Chunks && !closed, "a fragment is spliced only into an open batch stream");
+    if (fragment.first == nullptr) return;
+    *tail = fragment.first;
+    tail = fragment.tail;
+    ops += fragment.ops;
+    used += fragment.bytes;
+    for (auto& held : fragment.slabs) {
+        if (spliced.empty() || spliced.back() != held) spliced.push_back(std::move(held));
+    }
+    fragment.first = nullptr;
+    fragment.tail = nullptr;
+    fragment.ops = 0;
+    fragment.bytes = 0;
+    fragment.slabs.clear();
+}
+
+void CommandStream::ReplayFragment(const Fragment& fragment, VkCommandBuffer commands) {
+    Require(!IsHandle(commands), "a fragment replays into a command buffer, not a stream handle");
+    for (const auto* record = fragment.first; record != nullptr; record = record->next) replayRecord(commands, *record);
+}
+
+bool CommandStream::SameRecords(const Fragment& fragment, const CommandStream& stream, std::uint64_t fromOp, bool ignoreHandles, const char** firstDifference) {
+    const Record* theirs = stream.first;
+    for (std::uint64_t skipped = 0; theirs != nullptr && skipped < fromOp; ++skipped) theirs = theirs->next;
+    const Record* mine = fragment.first;
+    const auto differ = [&](const char* what) {
+        if (firstDifference != nullptr) *firstDifference = what;
+        return false;
+    };
+    for (; mine != nullptr && theirs != nullptr; mine = mine->next, theirs = theirs->next) {
+        if (mine->op != theirs->op) return differ("the operation");
+        if (!sameRecord(*mine, *theirs, ignoreHandles)) return differ(OpNames[mine->op].data());
+    }
+    if (mine != nullptr) return differ("the fragment has more operations");
+    if (theirs != nullptr) return differ("today's draw has more operations");
+    return true;
+}
+
+void* CommandStream::growSlab(std::size_t bytes) {
+    slab = std::make_shared<Slab>(std::max(bytes, SlabBytes));
+    touched.push_back(slab);
+    cursor = slab->data.get() + bytes;
+    limit = slab->data.get() + slab->capacity;
+    return slab->data.get();
 }
 
 CommandStream::~CommandStream() {
@@ -388,19 +534,11 @@ bool CommandStream::Records(const char* name) {
 
 void CommandStream::Replay(VkCommandBuffer commands) const {
     Require(!IsHandle(commands), "a command stream cannot replay into a stream handle");
-    for (const auto* record = first; record != nullptr; record = record->next) {
-        switch (static_cast<CommandOp>(record->op)) {
-#define AGC_COMMAND_STREAM_OP(name) \
-        case CommandOp::name: \
-            replayOne<CommandOp::name>(commands, *record); \
-            break;
-            AGC_COMMAND_STREAM_OPS(AGC_COMMAND_STREAM_OP)
-#undef AGC_COMMAND_STREAM_OP
-        }
-    }
+    for (const auto* record = first; record != nullptr; record = record->next) replayRecord(commands, *record);
 }
 
 void CommandStream::Reset() {
+    spliced.clear();
     std::size_t kept = 0;
     auto** retained = &chunks;
     while (*retained != nullptr && (kept == 0 || kept + (*retained)->capacity <= RetainedBytes)) {
@@ -421,6 +559,7 @@ void CommandStream::Reset() {
 }
 
 void* CommandStream::grow(std::size_t bytes) {
+    if (mode == Mode::Fragments) return growSlab(bytes);
     auto* chunk = *unused;
     if (bytes > LargeBytes) {
         if (chunk != nullptr && chunk->capacity >= bytes) *unused = chunk->next;

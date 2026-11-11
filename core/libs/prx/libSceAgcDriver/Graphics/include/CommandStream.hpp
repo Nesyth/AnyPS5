@@ -7,18 +7,63 @@
 #include <vulkan/vulkan.h>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
 struct CommandStreamWriter;
 
 class CommandStream {
+    struct Record;
+
 public:
     static constexpr std::size_t ChunkBytes = 64u * 1024u;
     static constexpr std::size_t LargeBytes = ChunkBytes / 4u;
     static constexpr std::size_t RetainedBytes = 1024u * 1024u;
+    static constexpr std::size_t SlabBytes = 64u * 1024u;
+
+    struct Slab {
+        explicit Slab(std::size_t bytes) : data(new std::byte[bytes]), capacity(bytes) {}
+        std::unique_ptr<std::byte[]> data;
+        std::size_t capacity;
+    };
+
+    class Fragment {
+    public:
+        Fragment() = default;
+        Fragment(Fragment&& other) noexcept : first(std::exchange(other.first, nullptr)), tail(std::exchange(other.tail, nullptr)), ops(std::exchange(other.ops, 0u)), bytes(std::exchange(other.bytes, 0u)), slabs(std::move(other.slabs)) {}
+        Fragment& operator=(Fragment&& other) noexcept {
+            if (this == &other) return *this;
+            first = std::exchange(other.first, nullptr);
+            tail = std::exchange(other.tail, nullptr);
+            ops = std::exchange(other.ops, 0u);
+            bytes = std::exchange(other.bytes, 0u);
+            slabs = std::move(other.slabs);
+            other.slabs.clear();
+            return *this;
+        }
+        Fragment(const Fragment&) = delete;
+        Fragment& operator=(const Fragment&) = delete;
+        bool Empty() const { return first == nullptr; }
+        std::uint64_t Ops() const { return ops; }
+        std::uint64_t Bytes() const { return bytes; }
+        std::size_t Slabs() const { return slabs.size(); }
+
+    private:
+        friend class CommandStream;
+        Record* first = nullptr;
+        Record** tail = nullptr;
+        std::uint64_t ops = 0;
+        std::uint64_t bytes = 0;
+        std::vector<std::shared_ptr<Slab>> slabs;
+    };
+
+    enum class Mode : std::uint8_t { Chunks, Fragments };
 
     CommandStream();
+    explicit CommandStream(Mode mode);
     ~CommandStream();
     CommandStream(const CommandStream&) = delete;
     CommandStream& operator=(const CommandStream&) = delete;
@@ -42,6 +87,14 @@ public:
     std::uint64_t Ops() const { return ops; }
     std::uint64_t Bytes() const { return used; }
     std::size_t ReservedBytes() const { return reserved; }
+    std::size_t SplicedSlabs() const { return spliced.size(); }
+
+    void BeginFragment();
+    Fragment EndFragment();
+    void Splice(Fragment&& fragment);
+    static void ReplayFragment(const Fragment& fragment, VkCommandBuffer commands);
+    static bool SameRecords(const Fragment& fragment, const CommandStream& stream, std::uint64_t fromOp, bool ignoreHandles, const char** firstDifference);
+    std::uint64_t MarkOps() const { return ops; }
 
 private:
     friend struct CommandStreamWriter;
@@ -72,6 +125,7 @@ private:
     }
 
     void* grow(std::size_t bytes);
+    void* growSlab(std::size_t bytes);
     Chunk* makeChunk(std::size_t capacity, Chunk* next);
     void freeChunks(Chunk* chunk);
 
@@ -86,6 +140,10 @@ private:
     std::uint64_t used = 0;
     std::size_t reserved = 0;
     bool closed = false;
+    Mode mode = Mode::Chunks;
+    std::shared_ptr<Slab> slab;
+    std::vector<std::shared_ptr<Slab>> touched;
+    std::vector<std::shared_ptr<Slab>> spliced;
 };
 
 }
