@@ -35,6 +35,8 @@ namespace AgcDriver::Graphics {
 
 class Recorder;
 class OwnDrawSets;
+class RepeatSets;
+class RepeatSetLease;
 struct ShaderResourcesTestAccess;
 
 void FlushCachedTextures(VkDevice device);
@@ -388,9 +390,14 @@ public:
         VkDescriptorSet boundSet = VK_NULL_HANDLE;
         std::uint32_t boundIndex = 0;
         std::uint32_t pushIndex = 0;
+        RepeatSets* sets = nullptr;
+        std::vector<std::size_t> outsideAt;
+        RepeatSetLease* lease = nullptr;
+        std::uint64_t leaseRecorder = 0;
+        std::uint64_t leaseBatch = 0;
     };
-    bool BuildRepeatPush(const PushPlan& plan, std::span<const PreparedBuffers::Selected> selected, RepeatPush& out) const;
-    void RepeatPushBindings(VkCommandBuffer commands, VkPipelineLayout layout, RepeatPush& push, std::span<const PreparedBuffers::Selected> selected, VkBuffer buffer, VkDeviceSize base) const;
+    bool BuildRepeatPush(const PushPlan& plan, std::span<const PreparedBuffers::Selected> selected, RepeatPush& out, bool sets = false) const;
+    void RepeatPushBindings(VkCommandBuffer commands, VkPipelineLayout layout, RepeatPush& push, std::span<const PreparedBuffers::Selected> selected, VkBuffer buffer, VkDeviceSize base, Recorder& recorder) const;
     PreparedDifference CompareRepeatPush(RepeatPush& push, const DrawBindings& bound, const PushPlan& plan) const;
     PreparedBuffers::Selection RepeatGuards(const PreparedBuffers& prepared) const;
     void RepeatRequire(std::span<const MovedBuffer> moved) const;
@@ -1110,6 +1117,7 @@ private:
     mutable bool bufferPlanBuilt = false;
     std::shared_ptr<OwnDrawSets> makeOwnDrawSets() const;
     mutable std::shared_ptr<OwnDrawSets> ownDrawSets;
+    mutable std::vector<std::shared_ptr<RepeatSets>> repeatSets;
     void writeAddressedOverlay(DrawBindings& result, std::span<const std::size_t> selected) const;
     std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;

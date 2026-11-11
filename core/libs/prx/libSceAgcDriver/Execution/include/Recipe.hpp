@@ -206,9 +206,12 @@ struct DrawCommitViewTag {};
 using DrawCommitViewSlot = HostThreadSlot<DrawCommitView*, DrawCommitViewTag>;
 
 enum class DrawRepeatClass : std::uint8_t { Simple, NotRecorded, Template, Stages, Pipeline, Targets, NotPushed, Sets, Buffers, Inputs, Keep, Pass, Access, Notes, Modes, Count };
+enum class DrawRepeatDetail : std::uint8_t { None, NotReusable, HeapStage, Lease, AddressTable, CopiedWrites, FaultChecks, SpaceReuse, GpuWrites, GpuCopies, DepthCopies, Multisampled, MultisampledDepth, NotRecipe, Linear, Fmask, Count };
 
 struct DrawRepeatBlock {
     DrawRepeatClass simple = DrawRepeatClass::NotRecorded;
+    DrawRepeatDetail detail = DrawRepeatDetail::None;
+    bool sets = false;
     const DrawRecipe* recipe = nullptr;
     const Graphics::State* state = nullptr;
     std::uint64_t switches = 0;

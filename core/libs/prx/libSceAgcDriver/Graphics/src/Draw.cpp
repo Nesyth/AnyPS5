@@ -5819,17 +5819,35 @@ void fillRepeatBlock(const Context& context, const State& state, std::span<const
     if (record.repeat == nullptr) record.repeat = std::make_shared<DrawRepeatBlock>();
     auto& block = *record.repeat;
     block.recipe = nullptr;
-    const auto refuse = [&](DrawRepeatClass why) { block.simple = why; };
-    if (!resources.RecordLean() || resources.HeapStage() || resources.HoldsLease() || resources.UsesAddressTable() || resources.HasCopiedWrites() || resources.ChecksFaults() || resources.SpaceReuse() || !resources.GpuWrites().empty() || resources.HoldsDepthCopies()) return refuse(DrawRepeatClass::Template);
+    block.detail = DrawRepeatDetail::None;
+    block.sets = false;
+    const auto refuse = [&](DrawRepeatClass why, DrawRepeatDetail detail = DrawRepeatDetail::None) {
+        block.simple = why;
+        block.detail = detail;
+    };
+    if (resources.HeapStage()) return refuse(DrawRepeatClass::Template, DrawRepeatDetail::HeapStage);
+    if (resources.HoldsLease()) return refuse(DrawRepeatClass::Template, DrawRepeatDetail::Lease);
+    if (resources.UsesAddressTable()) return refuse(DrawRepeatClass::Template, DrawRepeatDetail::AddressTable);
+    if (resources.HasCopiedWrites()) return refuse(DrawRepeatClass::Template, DrawRepeatDetail::CopiedWrites);
+    if (resources.ChecksFaults()) return refuse(DrawRepeatClass::Template, DrawRepeatDetail::FaultChecks);
+    if (resources.SpaceReuse()) return refuse(DrawRepeatClass::Template, DrawRepeatDetail::SpaceReuse);
+    if (!resources.GpuWrites().empty() || std::ranges::any_of(resources.StorageImages(), [](const std::pair<VkImage, bool>& image) { return image.second; })) return refuse(DrawRepeatClass::Template, DrawRepeatDetail::GpuWrites);
+    if (resources.HasGpuCopies()) return refuse(DrawRepeatClass::Template, DrawRepeatDetail::GpuCopies);
+    if (resources.HoldsDepthCopies()) return refuse(DrawRepeatClass::Template, DrawRepeatDetail::DepthCopies);
+    if (!resources.RecordLean()) return refuse(DrawRepeatClass::Template, DrawRepeatDetail::NotReusable);
     const bool stencilReferences = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->stencilReferences.empty(); });
     const bool functionLds = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; });
     if (shaders.size() > block.programs.size() || stencilReferences || functionLds || UsesMeshWindow(shaders) || PixelFunctionLdsSubgroup(shaders) != 0u) return refuse(DrawRepeatClass::Stages);
     if (pushPipeline == nullptr || pushFramebuffer == nullptr || push == nullptr || !record.effects.pushed) return refuse(DrawRepeatClass::NotPushed);
     if (pushPipeline->DescriptorHeap() || pushPipeline->SplitsFaces() || pushPipeline->SplitsSecondChannel()) return refuse(DrawRepeatClass::Pipeline);
-    if (multisample || residents.size() != recipe.targets.size() || (state.depth.has_value() && state.depth->samples != 1u)) return refuse(DrawRepeatClass::Targets);
+    if (multisample) return refuse(DrawRepeatClass::Targets, DrawRepeatDetail::Multisampled);
+    if (state.depth.has_value() && state.depth->samples != 1u) return refuse(DrawRepeatClass::Targets, DrawRepeatDetail::MultisampledDepth);
+    if (residents.size() != recipe.targets.size()) return refuse(DrawRepeatClass::Targets, DrawRepeatDetail::NotRecipe);
     for (std::size_t index = 0; index < residents.size(); ++index) {
         const auto stored = recipe.targets[index].lock();
-        if (residents[index] == nullptr || stored.get() != residents[index] || residents[index]->Descriptor().tileMode == TextureTileMode::kLinear || state.colors[index].fmaskAddress != 0) return refuse(DrawRepeatClass::Targets);
+        if (residents[index] == nullptr || stored.get() != residents[index]) return refuse(DrawRepeatClass::Targets, DrawRepeatDetail::NotRecipe);
+        if (residents[index]->Descriptor().tileMode == TextureTileMode::kLinear) return refuse(DrawRepeatClass::Targets, DrawRepeatDetail::Linear);
+        if (state.colors[index].fmaskAddress != 0) return refuse(DrawRepeatClass::Targets, DrawRepeatDetail::Fmask);
     }
     if (bound == nullptr || record.effects.buffers != DrawRecordBuffers::Used || bound->selected.empty()) return refuse(DrawRepeatClass::Buffers);
     if ((record.effects.inputs != DrawRecordInputs::Used && record.effects.inputs != DrawRecordInputs::Rechecked) || !inputsPlain) return refuse(DrawRepeatClass::Inputs);
@@ -5837,7 +5855,8 @@ void fillRepeatBlock(const Context& context, const State& state, std::span<const
     if (!recorder.RenderPassOpen() || !record.pass.valid) return refuse(DrawRepeatClass::Pass);
     if (!passAccessMatchesFor<StorageTexture*>(record.access, &recorder, resources, residents) || record.access.readsTarget) return refuse(DrawRepeatClass::Access);
     if (repeatExcludedModes()) return refuse(DrawRepeatClass::Modes);
-    if (!resources.BuildRepeatPush(*push, bound->selected, block.bindings)) return refuse(DrawRepeatClass::Sets);
+    if (!resources.BuildRepeatPush(*push, bound->selected, block.bindings, RuntimeSwitches::Set(RuntimeSwitch::DirectRepeatSets))) return refuse(DrawRepeatClass::Sets);
+    block.sets = block.bindings.sets != nullptr;
     block.moved.clear();
     for (const auto& item : bound->selected) block.moved.push_back(item.moved);
     block.state = &state;
@@ -6304,6 +6323,18 @@ bool repeatTargetsHeld(const DrawRepeatBlock& block, const DrawRecordPass& pass)
     return true;
 }
 
+bool repeatStoresClear(const Recorder& recorder, const ShaderResources& resources, bool& queued) {
+    queued = recorder.HasQueuedKeyStores() || recorder.HasQueuedStores();
+    if (!queued) return true;
+    if (!RuntimeSwitches::Set(RuntimeSwitch::DirectRepeatStores)) return false;
+    const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes);
+    };
+    if (recorder.HasQueuedKeyStores() && recorder.AnyQueuedKeyStore(touches)) return false;
+    return !recorder.HasQueuedStores() || !recorder.AnyQueuedStore(touches);
+}
+
 struct RepeatReadsStorage {};
 struct RepeatAttachmentsStorage {};
 
@@ -6326,6 +6357,7 @@ RepeatOutcome RepeatCommit(const Context& context, const State& state, const Pm4
     if (block == nullptr) return refuse(RepeatRefusal::NoBlock);
     if (block->simple != DrawRepeatClass::Simple) {
         out.simple = block->simple;
+        out.detail = block->detail;
         return refuse(RepeatRefusal::NotSimple);
     }
     auto* recorder = Recorder::Active();
@@ -6337,11 +6369,29 @@ RepeatOutcome RepeatCommit(const Context& context, const State& state, const Pm4
     if (!keepsOnceFor<StorageTexture*>(&record.keep, *recorder, block->resources, block->pipeline, block->framebuffer, block->targets, true)) return refuse(RepeatRefusal::Batch);
     auto& resources = *block->resources;
     if (!resources.Reusable() || resources.HeapStage() || !resources.RecordLean()) return refuse(RepeatRefusal::Objects);
-    if (const auto hold = recordPassHold(record.pass, *recorder, *recipe, state); hold != DrawRecordHold::Held) return refuse(repeatHoldRefusal(hold));
-    if (!repeatTargetsHeld(*block, record.pass)) return refuse(RepeatRefusal::Target);
-    if (!passAccessMatchesFor<StorageTexture*>(record.access, recorder, resources, block->targets) || record.access.readsTarget) return refuse(RepeatRefusal::Access);
-    if (recorder->HasQueuedKeyStores() || recorder->HasQueuedStores()) return refuse(RepeatRefusal::Stores);
+    const auto ownHold = recordPassHold(record.pass, *recorder, *recipe, state);
+    const auto heldPass = [&]() -> const DrawRecordPass* {
+        if (recordPassHold(record.pass, *recorder, *recipe, state) == DrawRecordHold::Held) return &record.pass;
+        if (!RuntimeSwitches::Set(RuntimeSwitch::DirectRepeatShared) || !RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets)) return nullptr;
+        const auto& kept = sharedRecordPass();
+        if (!sharedRecordPassServes(kept, state, *recipe) || recordPassHold(kept.pass, *recorder, *recipe, state) != DrawRecordHold::Held || kept.targets.size() != block->targets.size()) return nullptr;
+        for (std::size_t index = 0; index < block->targets.size(); ++index) {
+            if (kept.targets[index] != block->targets[index]) return nullptr;
+        }
+        return &kept.pass;
+    };
+    const auto* holding = heldPass();
+    if (holding == nullptr) return refuse(repeatHoldRefusal(ownHold));
+    out.shared = holding != &record.pass;
+    if (!repeatTargetsHeld(*block, *holding)) return refuse(RepeatRefusal::Target);
+    const auto accessHeld = [&] {
+        if (out.shared) return record.access.recorder == recorder && record.access.resources == &resources && std::ranges::equal(record.access.targets, block->targets, [](const void* kept, const StorageTexture* target) { return kept == target; });
+        return passAccessMatchesFor<StorageTexture*>(record.access, recorder, resources, block->targets);
+    };
+    if (!accessHeld() || record.access.readsTarget) return refuse(RepeatRefusal::Access);
+    if (!repeatStoresClear(*recorder, resources, out.stores)) return refuse(RepeatRefusal::Stores);
     if (StorageTexture::DrawnLinearPending()) return refuse(RepeatRefusal::Linear);
+    out.sets = block->sets;
     if (prepared == nullptr || !RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || record.verifyBuffers || prepared->plan == nullptr || prepared->plan != resources.DirectBufferPlan(shaders)) return refuse(RepeatRefusal::Buffers);
     auto& push = block->bindings;
     if (prepared->blob.empty() || prepared->selected.size() != push.allocations.size()) return refuse(RepeatRefusal::Selection);
@@ -6426,7 +6476,9 @@ RepeatOutcome RepeatCommit(const Context& context, const State& state, const Pm4
         out.late = true;
         return refuse(why);
     };
-    if (record.keep.batch != recorder->OpenSerial() || recordPassHold(record.pass, *recorder, *recipe, state) != DrawRecordHold::Held || !repeatTargetsHeld(*block, record.pass) || record.access.generation != recorder->RenderPassGeneration() || recorder->HasQueuedKeyStores() || recorder->HasQueuedStores() || StorageTexture::DrawnLinearPending()) return giveBack(RepeatRefusal::Changed);
+    bool storesQueued = false;
+    const auto* stillHolding = heldPass();
+    if (record.keep.batch != recorder->OpenSerial() || stillHolding == nullptr || (stillHolding != &record.pass) != out.shared || !repeatTargetsHeld(*block, *stillHolding) || !accessHeld() || !repeatStoresClear(*recorder, resources, storesQueued) || StorageTexture::DrawnLinearPending()) return giveBack(RepeatRefusal::Changed);
     record.effects.inputs = out.inputs;
     out.proofSkipped = memoRoute && resources.ProofHeld();
     if (out.proofSkipped) {
@@ -6460,6 +6512,8 @@ RepeatOutcome RepeatCommit(const Context& context, const State& state, const Pm4
         }
         record.touchedPresent = present;
     }
+    if (!repeatStoresClear(*recorder, resources, storesQueued)) return giveBack(RepeatRefusal::Stores);
+    out.stores = out.stores || storesQueued;
     resources.RepeatRequire(prepared->moved);
     out.unmovedSkipped = block->notesHeld && recorder->WriteNoteCount() == block->writeNotes;
     if (!out.unmovedSkipped && !resources.RepeatUnmovedClear(*recorder, *prepared)) return giveBack(RepeatRefusal::UnmovedHazard);
@@ -6515,7 +6569,7 @@ RepeatOutcome RepeatCommit(const Context& context, const State& state, const Pm4
         block->pipeline->Begin(commands, *block->framebuffer, state.renderExtent, state);
     }
     NoteHeapRecord(false, false);
-    resources.RepeatPushBindings(commands, block->pipeline->Layout(), push, prepared->selected, upload->Handle(), uploadOffset);
+    resources.RepeatPushBindings(commands, block->pipeline->Layout(), push, prepared->selected, upload->Handle(), uploadOffset, *recorder);
     pushDrawConstants(*block->pipeline, commands, state, draw, shaders, resources, nullptr, recipe->pushStages, 0, false, inputs.meshLayerStride, nullptr);
     noteDrawFaultToken(context, *recorder, commands, shaders, draw, static_cast<std::uint32_t>(AgcDriver::FaultStage::graphics), nullptr);
     std::uint32_t subdraw = 0;
@@ -6534,7 +6588,8 @@ RepeatOutcome RepeatCommit(const Context& context, const State& state, const Pm4
         target->MarkSliceDirty(slice, count);
         if (recorder->RenderPassOpen()) target->RememberPassNote(recorderId, recorder->RenderPassGeneration(), slice, count);
     }
-    record.effects.hold = DrawRecordHold::Held;
+    record.effects.hold = out.shared ? ownHold : DrawRecordHold::Held;
+    record.effects.sharedHold = out.shared;
     record.effects.passHeld = true;
     if (recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {
         auto& remembered = record.pass;
@@ -6548,7 +6603,7 @@ RepeatOutcome RepeatCommit(const Context& context, const State& state, const Pm4
         remembered.depthReleased = DepthSurfacesReleased();
         remembered.versions.clear();
         for (const auto* target : block->targets) remembered.versions.push_back(target->UploadVersion());
-        if (RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets)) {
+        if (!out.shared && RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets)) {
             auto& kept = sharedRecordPass();
             kept.pass = remembered;
             kept.colors.assign(state.colors.begin(), state.colors.end());
