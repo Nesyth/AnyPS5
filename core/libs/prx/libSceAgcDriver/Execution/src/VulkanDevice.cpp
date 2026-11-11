@@ -2924,9 +2924,16 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (std::getenv("APS5_NO_HOST_F32_NANS") == nullptr) {
         const auto probeStart = std::chrono::steady_clock::now();
         state->probingFloatControls = true;
-        const auto probe = ProbeFloat32HostNans(*this, Target());
+        const bool probeDetail = std::getenv("APS5_F32_NAN_PROBE_DETAIL") != nullptr;
+        const auto probe = ProbeFloat32HostNans(*this, Target(), probeDetail);
         state->probingFloatControls = false;
         state->float32HostNans = probe.mismatches == 0u;
+        if (probeDetail) {
+            std::string byResult;
+            for (std::size_t index = 0; index < probe.byResult.size(); ++index) byResult += " " + std::to_string(index) + ":" + std::to_string(probe.byResult[index]);
+            std::fprintf(stderr, "[float-controls] f32 NaN probe detail: differing by result%s; by float mode %u %u %u\n", byResult.c_str(), probe.byMode[0], probe.byMode[1], probe.byMode[2]);
+            for (const auto& row : probe.rows) std::fprintf(stderr, "[float-controls] f32 NaN probe row: mode %u result %u operands %08x %08x %08x selected %08x host %08x\n", row.mode, row.result, row.operands[0], row.operands[1], row.operands[2], row.selected, row.host);
+        }
         std::fprintf(stderr, "[float-controls] f32 NaN results with IEEE_MODE clear: %s (%u of %u probe results differ from the selected NaN, %.0f ms)\n", state->float32HostNans ? "host" : "selected", probe.mismatches, probe.compared, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - probeStart).count());
     }
     if (std::getenv("APS5_NO_NATIVE_F16_NANS") == nullptr) {

@@ -14,14 +14,14 @@ using ShaderRecompiler::ShaderStage;
 
 constexpr std::uint32_t Threads = 256;
 constexpr std::uint32_t Inputs = 4;
-constexpr std::uint32_t Results = 16;
+constexpr std::uint32_t Results = 32;
 constexpr std::uint32_t Combinations = 4096;
 
 alignas(256) std::array<std::uint32_t, Threads * Inputs> Input{};
 alignas(256) std::array<std::uint32_t, Threads * Results> Output{};
 
-alignas(256) constexpr std::array<std::uint32_t, 38> Code{
-    0x34020084u, 0x34060086u, 0xe0381000u, 0x80000401u, 0xbf8c3f70u,
+alignas(256) constexpr std::array<std::uint32_t, 50> Code{
+    0x34020084u, 0x34060087u, 0xe0381000u, 0x80000401u, 0xbf8c3f70u,
     0x06140b04u,
     0x08160b04u,
     0x0a180b04u,
@@ -38,7 +38,15 @@ alignas(256) constexpr std::array<std::uint32_t, 38> Code{
     0x082e0906u,
     0x10300d06u,
     0xd54b0019u, 0x04120b05u,
-    0xe0781000u, 0x80010a03u, 0xe0781010u, 0x80010e03u, 0xe0781020u, 0x80011203u, 0xe0781030u, 0x80011603u, 0xbf810000u,
+    0x063408f2u,
+    0x083608f2u,
+    0x0a3808f2u,
+    0x103a08f4u,
+    0x103c0880u,
+    0x103e08f6u,
+    0x064008f3u,
+    0x084208f0u,
+    0xe0781000u, 0x80010a03u, 0xe0781010u, 0x80010e03u, 0xe0781020u, 0x80011203u, 0xe0781030u, 0x80011603u, 0xe0781040u, 0x80011a03u, 0xe0781050u, 0x80011e03u, 0xbf810000u,
 };
 
 constexpr std::array<std::uint32_t, 16> Values{
@@ -90,10 +98,11 @@ ShaderRecompiler::RecompileResult Compile(ShaderRecompiler::SpirvTarget target, 
 
 }
 
-Float32NanProbeResult ProbeFloat32HostNans(VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
+Float32NanProbeResult ProbeFloat32HostNans(VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target, bool detail) {
     Float32NanProbeResult result;
     const std::array<std::optional<ShaderRecompiler::ShaderFloatMode>, 3> modes{std::nullopt, ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false}, ShaderRecompiler::ShaderFloatMode{0xc0u, false, false, false}};
-    for (const auto& mode : modes) {
+    for (std::uint32_t modeIndex = 0; modeIndex < modes.size(); ++modeIndex) {
+        const auto& mode = modes[modeIndex];
         const auto selected = Compile(target, false, mode);
         const auto host = Compile(target, true, mode);
         for (std::uint32_t first = 0; first < Combinations; first += Threads) {
@@ -101,9 +110,16 @@ Float32NanProbeResult ProbeFloat32HostNans(VulkanDevice& device, const ShaderRec
             const auto actual = Run(device, host, first);
             for (std::uint32_t index = 0; index < expected.size(); ++index) {
                 ++result.compared;
-                if (expected[index] != actual[index]) ++result.mismatches;
+                if (expected[index] == actual[index]) continue;
+                ++result.mismatches;
+                ++result.byResult[index % Results];
+                ++result.byMode[modeIndex];
+                if (detail && result.rows.size() < 48u && result.byResult[index % Results] <= 3u) {
+                    const std::uint32_t combination = (first + index / Results) % Combinations;
+                    result.rows.push_back({modeIndex, index % Results, {Values[combination & 15u], Values[(combination >> 4u) & 15u], Values[(combination >> 8u) & 15u]}, expected[index], actual[index]});
+                }
             }
-            if (result.mismatches != 0u) return result;
+            if (result.mismatches != 0u && !detail) return result;
         }
     }
     return result;

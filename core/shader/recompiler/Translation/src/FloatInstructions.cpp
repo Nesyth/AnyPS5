@@ -669,7 +669,7 @@ bool TranslationContext::floatBinary(const RdnaInstruction& inst, IrOpcode opcod
     if (opcode == IrOpcode::FPMul32) result = nanResultF32({args[0], args[1]}, result, nullptr, true);
     if (opcode == IrOpcode::FPSub32) {
         IrValue* negated = &ir.BitCastF32(ir.BitwiseXor(ir.BitCastU32(*args[1]), ir.Constant(0x80000000u)));
-        result = reverse ? propagatedNanResultF32({negated, args[0]}, result) : propagatedNanResultF32({args[0], negated}, result);
+        result = reverse ? propagatedNanResultF32({negated, args[0]}, result, args[1]) : propagatedNanResultF32({args[0], negated}, result, args[1]);
     }
     writeOperand(inst.destination, result);
     return true;

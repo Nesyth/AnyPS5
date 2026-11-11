@@ -104,8 +104,9 @@ private:
     IrU32 quietNan32(IrU32 bits);
     IrU32 quietNan16(IrU32 bits);
     IrValue* nanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, IrValue* invalidProduct = nullptr, bool multiplication = false);
-    IrValue* propagatedNanResultF32(std::initializer_list<IrValue*> sources, IrValue* result);
+    IrValue* propagatedNanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, const IrValue* negatedFrom = nullptr);
     bool hostNanResultF32(std::initializer_list<IrValue*> sources) const;
+    IrValue* hostNanSelectF32(std::initializer_list<IrValue*> sources, IrValue* result, const IrValue* negatedFrom = nullptr);
     IrValue& invalidProductF32(IrValue* lhs, IrValue* rhs);
     IrValue& invalidOperationF32(std::initializer_list<IrValue*> sources, IrValue& invalidProduct);
     std::array<IrU32, 2> quietNan64(const std::array<IrU32, 2>& bits);
