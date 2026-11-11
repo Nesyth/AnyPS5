@@ -5,6 +5,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanFront.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/RewindKick.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <optional>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -168,6 +170,10 @@ void Driver::run(std::uint32_t id) noexcept {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool idleStore = std::getenv("APS5_NO_IDLE_STORE") == nullptr;
     auto& costs = submissionCosts(id);
+    // APS5_WORKER_CORE: queue worker 0 holds a physical core of its own while the switch is set, taken or
+    // given back between submissions when the switches change (APS5_AB flips it in a run).
+    std::uint64_t switchGeneration = 0;
+    bool ownCore = false;
     try {
         PerformanceTrace::BindThread(role);
         for (;;) {
@@ -317,6 +323,13 @@ void Driver::run(std::uint32_t id) noexcept {
                 worker.queued.fetch_sub(1, std::memory_order_acq_rel);
                 running.Start();
                 if (profile && submission.enqueuedAt != std::chrono::steady_clock::time_point{}) costs.dequeueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submission.enqueuedAt).count());
+            }
+            if (id == 0 && Graphics::RuntimeSwitches::Generation() != switchGeneration) {
+                switchGeneration = Graphics::RuntimeSwitches::Generation();
+                if (const bool wanted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::WorkerCore); wanted != ownCore) {
+                    ownCore = wanted;
+                    PlaceQueueWorkerThread(role, wanted);
+                }
             }
             retireLabelTakes(id, submission.received);
             execute(submission);

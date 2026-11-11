@@ -93,6 +93,7 @@ void snapshot() {
         const auto id = static_cast<RuntimeSwitch>(index);
         Require(built.Set(id) == (id == RuntimeSwitch::LeanFront), std::string("a built switch copy has the wrong bit for ") + RuntimeSwitches::Name(id));
     }
+    Require(RuntimeSwitches::Find("APS5_WORKER_CORE") == RuntimeSwitch::WorkerCore, "APS5_WORKER_CORE is not a runtime switch");
 }
 
 void parse() {

@@ -107,6 +107,7 @@ enum class RuntimeSwitch : std::size_t {
     CleanResidentViews,
     CleanPendingRanges,
     RefusedCollectMemo,
+    WorkerCore,
     Count,
 };
 
