@@ -3852,70 +3852,70 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         NoteGuestWorkIn(context, commands);
     } else {
-    if (heapPipeline) {
-        resources.BindDescriptorHeaps(commands);
-        NoteEmptyResourceSet();
-    } else if (pushing) {
-        resources.PushDrawBindings(commands, record.pipeline->Layout(), *drawBindings, *record.push);
-    } else if (drawBindings != nullptr) {
-        Require(!resources.HeapStage(), "a GPU-mode draw needs a VK_EXT_descriptor_heap pipeline");
-        const auto set = drawBindings->allocation.set;
-        const auto fragmentSet = drawBindings->fragmentAllocation.set;
-        if (set != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, SetBindSite::Draw, drawBindings->DynamicCount(0), drawBindings->DynamicOffsets(0));
-        if (fragmentSet != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, SetBindSite::Draw, drawBindings->DynamicCount(1), drawBindings->DynamicOffsets(1));
-    } else {
-        Require(!resources.HeapStage(), "a GPU-mode draw needs a VK_EXT_descriptor_heap pipeline");
-        resources.BindDrawUse(commands, record.pipeline->Layout(), drawUse.get());
-    }
-    if (!heapPipeline && std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
-    if (!heapPipeline && UsesMeshWindow(shaders)) BindMeshWindow(context, commands, record.pipeline->Layout());
-    APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride, drawBindings.get());
-    APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
-    static const bool timeEachDraw = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
-    auto eachDrawTiming = Recorder::NoTiming;
-    if (timeEachDraw) {
-        std::uint64_t key = 0;
-        for (const auto& shader : shaders) {
-            if (shader.program != nullptr && (key == 0 || shader.stage == ShaderRecompiler::ShaderStage::Fragment)) key = shader.program->variantId;
+        if (heapPipeline) {
+            resources.BindDescriptorHeaps(commands);
+            NoteEmptyResourceSet();
+        } else if (pushing) {
+            resources.PushDrawBindings(commands, record.pipeline->Layout(), *drawBindings, *record.push);
+        } else if (drawBindings != nullptr) {
+            Require(!resources.HeapStage(), "a GPU-mode draw needs a VK_EXT_descriptor_heap pipeline");
+            const auto set = drawBindings->allocation.set;
+            const auto fragmentSet = drawBindings->fragmentAllocation.set;
+            if (set != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, SetBindSite::Draw, drawBindings->DynamicCount(0), drawBindings->DynamicOffsets(0));
+            if (fragmentSet != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, SetBindSite::Draw, drawBindings->DynamicCount(1), drawBindings->DynamicOffsets(1));
+        } else {
+            Require(!resources.HeapStage(), "a GPU-mode draw needs a VK_EXT_descriptor_heap pipeline");
+            resources.BindDrawUse(commands, record.pipeline->Layout(), drawUse.get());
         }
-        eachDrawTiming = recorder->BeginInPassGpuTiming(Recorder::DrawTimingKey(key));
-    }
-    noteDrawFaultToken(context, *recorder, commands, shaders, draw, static_cast<std::uint32_t>(state.stages.mesh.has_value() ? AgcDriver::FaultStage::mesh : AgcDriver::FaultStage::graphics), record.indirect != nullptr ? record.indirect->args : nullptr);
-    if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
-    else {
-        recordStencilReplay(context, commands, state, draw, inputs, record.stencilReplay, shaders, resources, record.pushBytes, record.pushStages, drawBindings.get());
-        for (const auto& [reference, pipeline] : record.stencilReplay) recorder->Keep(pipeline);
-    }
-    if (record.pipeline->SplitsFaces()) {
-        record.pipeline->ContinueBackFaces(commands, state);
-        recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
-    }
-    if (record.pipeline->SplitsSecondChannel()) {
-        record.pipeline->ContinueSecondChannel(commands);
-        recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
-    }
-    recorder->EndGpuTiming(eachDrawTiming);
-    if (verifyFragment) {
-        auto& note = *record.fragmentNote;
-        note.verified = true;
-        const char* what = nullptr;
-        bool same = CommandStream::SameRecords(fragment->commands, *batchStream, fragmentMark, true, &what);
-        if (same) {
-            std::vector<std::size_t> chosen;
-            chosen.reserve(record.prepared->selected.size());
-            for (const auto& item : record.prepared->selected) chosen.push_back(item.allocation);
-            std::vector<ShaderResources::BoundBuffer> mine;
-            std::vector<ShaderResources::BoundBuffer> today;
-            resources.DescribeDrawBindings(fragment->bindings.get(), chosen, record.push, mine, true);
-            resources.DescribeDrawBindings(drawBindings.get(), chosen, record.push, today, true);
-            same = std::ranges::equal(mine, today, sameFragmentBound);
-            if (!same) what = "the bindings";
+        if (!heapPipeline && std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
+        if (!heapPipeline && UsesMeshWindow(shaders)) BindMeshWindow(context, commands, record.pipeline->Layout());
+        APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
+        pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride, drawBindings.get());
+        APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+        static const bool timeEachDraw = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
+        auto eachDrawTiming = Recorder::NoTiming;
+        if (timeEachDraw) {
+            std::uint64_t key = 0;
+            for (const auto& shader : shaders) {
+                if (shader.program != nullptr && (key == 0 || shader.stage == ShaderRecompiler::ShaderStage::Fragment)) key = shader.program->variantId;
+            }
+            eachDrawTiming = recorder->BeginInPassGpuTiming(Recorder::DrawTimingKey(key));
         }
-        note.differs = !same;
-        note.what = what;
-        note.drop = DrawFragmentDrop::Verify;
-    }
+        noteDrawFaultToken(context, *recorder, commands, shaders, draw, static_cast<std::uint32_t>(state.stages.mesh.has_value() ? AgcDriver::FaultStage::mesh : AgcDriver::FaultStage::graphics), record.indirect != nullptr ? record.indirect->args : nullptr);
+        if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
+        else {
+            recordStencilReplay(context, commands, state, draw, inputs, record.stencilReplay, shaders, resources, record.pushBytes, record.pushStages, drawBindings.get());
+            for (const auto& [reference, pipeline] : record.stencilReplay) recorder->Keep(pipeline);
+        }
+        if (record.pipeline->SplitsFaces()) {
+            record.pipeline->ContinueBackFaces(commands, state);
+            recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
+        }
+        if (record.pipeline->SplitsSecondChannel()) {
+            record.pipeline->ContinueSecondChannel(commands);
+            recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
+        }
+        recorder->EndGpuTiming(eachDrawTiming);
+        if (verifyFragment) {
+            auto& note = *record.fragmentNote;
+            note.verified = true;
+            const char* what = nullptr;
+            bool same = CommandStream::SameRecords(fragment->commands, *batchStream, fragmentMark, true, &what);
+            if (same) {
+                std::vector<std::size_t> chosen;
+                chosen.reserve(record.prepared->selected.size());
+                for (const auto& item : record.prepared->selected) chosen.push_back(item.allocation);
+                std::vector<ShaderResources::BoundBuffer> mine;
+                std::vector<ShaderResources::BoundBuffer> today;
+                resources.DescribeDrawBindings(fragment->bindings.get(), chosen, record.push, mine, true);
+                resources.DescribeDrawBindings(drawBindings.get(), chosen, record.push, today, true);
+                same = std::ranges::equal(mine, today, sameFragmentBound);
+                if (!same) what = "the bindings";
+            }
+            note.differs = !same;
+            note.what = what;
+            note.drop = DrawFragmentDrop::Verify;
+        }
     }
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (state.tessellationCapture != nullptr) {
