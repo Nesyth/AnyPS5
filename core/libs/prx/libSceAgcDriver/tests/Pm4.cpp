@@ -53,6 +53,24 @@
 #include <unistd.h>
 #endif
 
+namespace AgcDriver::DriverDetail {
+
+struct DriverTestAccess {
+    static void ResolveLists(Submission& submission, bool cacheable) {
+        Driver::Get().resolveLeanLists(submission, cacheable);
+    }
+    static void RecycleLists(Submission& submission) {
+        Driver::Get().leanTails.GiveLists(std::move(submission.lists));
+        submission.lists = {};
+        submission.leanLists = false;
+    }
+    static void ClearListCache() {
+        Driver::Get().leanTails.cache.Clear();
+    }
+};
+
+}
+
 namespace {
 
 void check(bool condition, const char* reason) {
@@ -2380,6 +2398,248 @@ void testRewindListCache() {
         static_cast<unsigned long long>(LeanFront::Total(Counter::LateTailHoists) - hoists), tracked ? "yes" : "no");
 }
 
+using ListPointers = std::vector<const std::uint32_t*>;
+
+struct ResolvedList {
+    std::vector<std::uint32_t> words;
+    std::uint32_t flags = 0;
+};
+
+AgcDriver::DriverDetail::Submission listSubmission(const ListPointers& lists, std::uint32_t pairs) {
+    AgcDriver::DriverDetail::Submission submission{};
+    submission.serial = 0;
+    submission.queue = 0;
+    for (const auto* list : lists) appendPacket(submission.commands, makePacket(0x9f, {low(list), high(list), 0x80000000u, pairs}));
+    return submission;
+}
+
+std::vector<ResolvedList> resolveListsOnce(AgcDriver::DriverDetail::Submission& submission, bool bump = true, bool cacheable = true) {
+    using Access = AgcDriver::DriverDetail::DriverTestAccess;
+    if (bump) AgcDriver::GuestMemory::BumpCollectEpoch();
+    Access::ResolveLists(submission, cacheable);
+    std::vector<ResolvedList> resolved;
+    for (const auto& ref : submission.lists.refs) {
+        const auto view = submission.lists.View(ref);
+        resolved.push_back({std::vector<std::uint32_t>(view.pairs.begin(), view.pairs.end()), ref.flags});
+    }
+    Access::RecycleLists(submission);
+    return resolved;
+}
+
+void fillList(std::uint32_t* list, std::uint32_t pairs, std::uint32_t seed) {
+    for (std::uint32_t pair = 0; pair < pairs; ++pair) {
+        std::atomic_ref<std::uint32_t>(list[2 * pair]).store(0x100u + pair);
+        std::atomic_ref<std::uint32_t>(list[2 * pair + 1]).store(seed * 0x10000u + pair);
+    }
+}
+
+std::uint64_t listVerifyEvery() {
+    const char* text = std::getenv("APS5_VERIFY_LEAN_LISTS");
+    return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+}
+
+void testListBatch() {
+    namespace LeanFront = AgcDriver::DriverDetail::LeanFront;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    using Access = AgcDriver::DriverDetail::DriverTestAccess;
+    using Lists = AgcDriver::DriverDetail::RegisterLists;
+    using Counter = LeanFront::Counter;
+    warmQueueWorker();
+    constexpr std::size_t Count = 64;
+    constexpr std::uint32_t Pairs = 4;
+    constexpr std::size_t Stride = 1024;
+    auto* memory = allocateWatchedWords(Count * Stride);
+    if (!AgcDriver::GuestMemory::WriteWatched() || !watchedWords(memory, Count * Stride)) {
+        std::puts("register list batch: guest memory is not write-watched, nothing to batch");
+        return;
+    }
+    const bool batch = RuntimeSwitches::Set(RuntimeSwitch::LeanListBatch);
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanListBatch, true);
+    Access::ClearListCache();
+    const auto checked = LeanFront::Total(Counter::ListVerifyChecked);
+    const auto differing = LeanFront::Total(Counter::ListVerifyDiffering);
+    ListPointers lists;
+    for (std::size_t list = 0; list < Count; ++list) {
+        fillList(memory + list * Stride, Pairs, static_cast<std::uint32_t>(list + 1));
+        lists.push_back(memory + list * Stride);
+    }
+    auto submission = listSubmission(lists, Pairs);
+    const auto expect = [&](const std::vector<ResolvedList>& resolved, std::size_t list, std::uint32_t seed, bool cached, const char* reason) {
+        std::vector<std::uint32_t> words(2 * Pairs);
+        fillList(words.data(), Pairs, seed);
+        check(resolved.size() == Count && resolved[list].words == words, reason);
+        check(((resolved[list].flags & Lists::Cached) != 0) == cached && (resolved[list].flags & Lists::Valid) != 0, reason);
+    };
+    const auto first = resolveListsOnce(submission);
+    for (std::size_t list = 0; list < Count; ++list) expect(first, list, static_cast<std::uint32_t>(list + 1), false, "a register list read for the first time was served from the cache or read wrong");
+    const auto queries = LeanFront::Total(Counter::ListBatchQueries);
+    const auto ranges = LeanFront::Total(Counter::ListBatchRanges);
+    const auto spans = LeanFront::Total(Counter::ListBatchSpans);
+    const auto batchHits = LeanFront::Total(Counter::ListBatchHits);
+    const auto second = resolveListsOnce(submission);
+    for (std::size_t list = 0; list < Count; ++list) expect(second, list, static_cast<std::uint32_t>(list + 1), true, "a static register list was not served from the cache in the next collect epoch");
+    check(LeanFront::Total(Counter::ListBatchQueries) == queries + 1, "the cached register lists of one segment took more than one batched query");
+    check(LeanFront::Total(Counter::ListBatchRanges) == ranges + Count, "a cached register list was left out of the segment's batched query");
+    check(LeanFront::Total(Counter::ListBatchSpans) == spans + 1, "the adjacent blocks of the cached register lists were not walked as one span");
+    check(LeanFront::Total(Counter::ListBatchHits) == batchHits + Count, "a cached register list was not answered by the batched query");
+
+    const auto invalidations = LeanFront::Total(Counter::ListCacheInvalidations);
+    constexpr std::size_t Written = 5;
+    std::atomic_ref<std::uint32_t>(memory[Written * Stride + 1]).store(0xabcdu);
+    const auto third = resolveListsOnce(submission);
+    check(third[Written].words[1] == 0xabcdu && (third[Written].flags & Lists::Cached) == 0, "a register list the CPU wrote between two segments was served from the cache");
+    for (std::size_t list = 0; list < Count; ++list) {
+        if (list != Written) expect(third, list, static_cast<std::uint32_t>(list + 1), true, "a register list the CPU did not write missed the cache beside one it wrote");
+    }
+    check(LeanFront::Total(Counter::ListCacheInvalidations) == invalidations + 1, "a CPU write into one register list invalidated more than that list");
+
+    constexpr std::size_t Late = 37;
+    resolveListsOnce(submission);
+    std::atomic_ref<std::uint32_t>(memory[Late * Stride + 3]).store(0x5151u);
+    const auto same = resolveListsOnce(submission, false);
+    check(same[Late].words[3] == 0x5151u || (same[Late].flags & Lists::Cached) != 0, "a register list rewritten after the batched query was neither served from the cache nor read again");
+    const auto next = resolveListsOnce(submission);
+    check(next[Late].words[3] == 0x5151u && (next[Late].flags & Lists::Cached) == 0, "a CPU write made in the collect epoch after the batched query was not seen at the next epoch");
+
+    constexpr std::size_t Kept = 20;
+    constexpr std::size_t Others = 8000;
+    constexpr std::size_t Chunk = 2000;
+    auto* others = allocateWatchedWords(Others * 2);
+    for (std::size_t other = 0; other < Others; ++other) {
+        others[2 * other] = 0x200u + static_cast<std::uint32_t>(other % 64);
+        others[2 * other + 1] = static_cast<std::uint32_t>(other);
+    }
+    auto kept = listSubmission({memory + Kept * Stride}, Pairs);
+    check((resolveListsOnce(kept)[0].flags & Lists::Cached) != 0, "a static register list was not cached before the other lists were asked");
+    const auto evicted = LeanFront::Total(Counter::ListCacheEvictions);
+    for (std::size_t from = 0; from < Others; from += Chunk) {
+        ListPointers chunk;
+        for (auto other = from; other < from + Chunk; ++other) chunk.push_back(others + 2 * other);
+        auto asked = listSubmission(chunk, 1);
+        resolveListsOnce(asked);
+    }
+    const auto reasked = resolveListsOnce(kept);
+    check((reasked[0].flags & Lists::Cached) != 0, "a register list asked again after 8000 other lists was no longer cached");
+
+    const bool direct = RuntimeSwitches::Set(RuntimeSwitch::LeanListDirect);
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanListDirect, true);
+    const auto directTails = LeanFront::Total(Counter::DirectListTails);
+    std::atomic_ref<std::uint32_t>(memory[Kept * Stride + 1]).store(0x7777u);
+    const auto read = resolveListsOnce(kept, false);
+    check(read[0].words[1] == 0x7777u && (read[0].flags & Lists::Cached) == 0 && (read[0].flags & Lists::Valid) != 0, "a register list of a tail with APS5_LEAN_LIST_DIRECT was not read from guest memory");
+    check(LeanFront::Total(Counter::DirectListTails) == directTails + 1, "a tail with APS5_LEAN_LIST_DIRECT was not counted");
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanListDirect, direct);
+
+    const auto every = listVerifyEvery();
+    if (every != 0) {
+        check(LeanFront::Total(Counter::ListVerifyChecked) > checked, "APS5_VERIFY_LEAN_LISTS checked no register list served from the cache");
+        check(LeanFront::Total(Counter::ListVerifyDiffering) == differing, "APS5_VERIFY_LEAN_LISTS found a register list served from the cache that differs from today's read");
+    }
+    std::printf("register list batch: %llu lists checked by the verify, %llu evictions over %zu other lists\n", static_cast<unsigned long long>(LeanFront::Total(Counter::ListVerifyChecked) - checked),
+        static_cast<unsigned long long>(LeanFront::Total(Counter::ListCacheEvictions) - evicted), Others);
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanListBatch, batch);
+    Access::ClearListCache();
+}
+
+void timeLists(const char* layout, const ListPointers& lists, std::uint32_t pairs) {
+    namespace LeanFront = AgcDriver::DriverDetail::LeanFront;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    using Access = AgcDriver::DriverDetail::DriverTestAccess;
+    using Counter = LeanFront::Counter;
+    struct Mode {
+        const char* name;
+        bool batch;
+        bool direct;
+    };
+    constexpr std::array<Mode, 3> Modes{{{"today", false, false}, {"batched", true, false}, {"direct", false, true}}};
+    constexpr int Rounds = 40;
+    auto submission = listSubmission(lists, pairs);
+    std::array<double, Modes.size()> perList{};
+    std::array<std::uint64_t, Modes.size()> misses{};
+    std::vector<std::vector<ResolvedList>> answers;
+    for (std::size_t mode = 0; mode < Modes.size(); ++mode) {
+        RuntimeSwitches::Assign(RuntimeSwitch::LeanListBatch, Modes[mode].batch);
+        RuntimeSwitches::Assign(RuntimeSwitch::LeanListDirect, Modes[mode].direct);
+        Access::ClearListCache();
+        resolveListsOnce(submission);
+        resolveListsOnce(submission);
+        const auto missed = LeanFront::Total(Counter::ListCacheMisses);
+        const auto start = std::chrono::steady_clock::now();
+        for (int round = 0; round < Rounds; ++round) {
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            Access::ResolveLists(submission, true);
+            Access::RecycleLists(submission);
+        }
+        const auto elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+        perList[mode] = elapsed / (static_cast<double>(Rounds) * static_cast<double>(lists.size()));
+        misses[mode] = LeanFront::Total(Counter::ListCacheMisses) - missed;
+        answers.push_back(resolveListsOnce(submission));
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanListDirect, false);
+    for (std::size_t mode = 1; mode < Modes.size(); ++mode) {
+        check(answers[mode].size() == answers[0].size(), "the timed register list paths resolved different list counts");
+        for (std::size_t list = 0; list < answers[0].size(); ++list) {
+            check(answers[mode][list].words == answers[0][list].words && (answers[mode][list].flags & 1u) == (answers[0][list].flags & 1u), "the timed register list paths resolved different words or validity");
+        }
+    }
+    std::printf("register list timing, %s (%zu lists of %u pairs, %d rounds): today %.3f us per list (%llu misses), batched %.3f us per list (%llu misses), direct %.3f us per list\n", layout, lists.size(), pairs, Rounds,
+        perList[0], static_cast<unsigned long long>(misses[0]), perList[1], static_cast<unsigned long long>(misses[1]), perList[2]);
+}
+
+void testListBatchTiming() {
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    using Access = AgcDriver::DriverDetail::DriverTestAccess;
+    warmQueueWorker();
+    constexpr std::size_t Count = 4096;
+    constexpr std::uint32_t Pairs = 16;
+    constexpr std::size_t BlockWords = 16384;
+    const bool batch = RuntimeSwitches::Set(RuntimeSwitch::LeanListBatch);
+    auto* packed = allocateWatchedWords(Count * Pairs * 2);
+    if (!AgcDriver::GuestMemory::WriteWatched() || !watchedWords(packed, Count * Pairs * 2)) {
+        std::puts("register list timing: guest memory is not write-watched, nothing to time");
+        return;
+    }
+    ListPointers contiguous;
+    for (std::size_t list = 0; list < Count; ++list) {
+        fillList(packed + list * Pairs * 2, Pairs, static_cast<std::uint32_t>(list + 1));
+        contiguous.push_back(packed + list * Pairs * 2);
+    }
+    constexpr std::size_t PerBlock = 64;
+    auto* spread = allocateWatchedWords(Count / PerBlock * 2 * BlockWords);
+    ListPointers scattered;
+    for (std::size_t list = 0; list < Count; ++list) {
+        auto* at = spread + list / PerBlock * 2 * BlockWords + list % PerBlock * 256;
+        fillList(at, Pairs, static_cast<std::uint32_t>(list + 1));
+        scattered.push_back(at);
+    }
+    timeLists("contiguous blocks", contiguous, Pairs);
+    timeLists("one block in two", scattered, Pairs);
+    auto* busy = allocateWatchedWords(4 * BlockWords);
+    std::atomic<bool> stop{false};
+    std::thread collector([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            for (std::size_t block = 0; block < 4; ++block) {
+                std::atomic_ref<std::uint32_t>(busy[block * BlockWords]).store(static_cast<std::uint32_t>(block));
+                static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(reinterpret_cast<std::uintptr_t>(busy + block * BlockWords), 4096));
+            }
+        }
+    });
+    try {
+        timeLists("one block in two, another thread collecting", scattered, Pairs);
+    } catch (...) {
+        stop.store(true);
+        collector.join();
+        throw;
+    }
+    stop.store(true);
+    collector.join();
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanListBatch, batch);
+    Access::ClearListCache();
+}
+
 void testFrontLatch() {
     namespace LeanFront = AgcDriver::DriverDetail::LeanFront;
     namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
@@ -3197,7 +3457,7 @@ int main(int argc, char** argv) {
             {"stall-watchdog-invalid", testInvalidStallWatchdog}, {"stall-watchdog-rewind", testStallWatchdogRewind}, {"stall-watchdog-order", testStallWatchdogOrder}, {"stall-clock", testStallClock}, {"stall-prompt-invalid", testInvalidStallPrompt}, {"stall-prompt-off", testStallPromptOff}, {"stall-prompt-zero", testStallPromptOff}, {"stall-prompt-rearm", testStallPromptRearm}, {"stall-prompt-real", testStallPromptRealPath}, {"stall-prompt-reentry", testStallPromptOneAtATime}, {"stall-prompt-quit", testStallPromptQuit}, {"stall-prompt-lock", testStallPromptLock}, {"stall-prompt-lock-unavailable", testStallPromptLockUnavailable}, {"rewind-trace", testRewindTailTrace}, {"rewind-flip", testRewindFrontFlips}, {"rewind-lists", testRewindRegisterLists},
             {"rewind-kept-tails", testRewindKeptTails}, {"rewind-kept-cpu-write", testRewindKeptCpuWrite}, {"rewind-list-cache", testRewindListCache},
             {"rewind-chain", testRewindChainLoop}, {"rewind-kick", testRewindKick}, {"rewind-labels", testRewindLabels}, {"rewind-presents", testRewindPresents},
-            {"rewind-cap-moved", testRewindCapMoved}};
+            {"rewind-cap-moved", testRewindCapMoved}, {"list-batch", testListBatch}, {"list-batch-timing", testListBatchTiming}};
         if (argc == 2 && std::string(argv[1]) == "ring-report-heap") {
 #ifdef _WIN32
             testSubmissionRingFailureReportHeap();

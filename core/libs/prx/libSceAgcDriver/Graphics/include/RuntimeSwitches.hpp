@@ -103,6 +103,8 @@ enum class RuntimeSwitch : std::size_t {
     XpNoCommits,
     FourthFinisher,
     FifthFinisher,
+    LeanListBatch,
+    LeanListDirect,
     Count,
 };
 

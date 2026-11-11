@@ -2219,6 +2219,105 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
     return collectWrites(address, bytes, false);
 }
 
+CollectBatchCounts CollectWritesBatch(std::span<CollectRange> ranges) {
+    CollectBatchCounts counts;
+    if (ranges.empty()) return counts;
+    const bool epochal = HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0;
+    if (!epochal || !collectMemoEnabled() || sharedCollectMemo() || CleanCollects()) {
+        for (auto& range : ranges) range.generation = collectWrites(range.address, range.bytes, true);
+        counts.alone = ranges.size();
+        return counts;
+    }
+    struct Pending {
+        std::uint64_t first;
+        std::uint64_t stop;
+        std::uint32_t id;
+    };
+    constexpr std::uint32_t NoOwner = ~std::uint32_t{0};
+    struct PendingSlot {};
+    struct OwnerSlot {};
+    struct GenerationSlot {};
+    struct AloneSlot {};
+    auto& pending = ThreadScratch<std::vector<Pending>, PendingSlot>();
+    auto& owners = ThreadScratch<std::vector<std::uint32_t>, OwnerSlot>();
+    auto& generations = ThreadScratch<std::vector<std::uint64_t>, GenerationSlot>();
+    auto& alone = ThreadScratch<std::vector<std::size_t>, AloneSlot>();
+    pending.clear();
+    owners.assign(ranges.size(), NoOwner);
+    alone.clear();
+    auto& tracker = Tracker();
+    constexpr std::uint64_t page = 4096;
+    const auto epoch = currentCollectEpoch();
+    const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
+    const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const bool mapped = epochCollectMapEnabled();
+    auto& ring = threadCollectMemo();
+    const auto* map = mapped ? &epochCollectMap(epoch, unwatched, mapping) : nullptr;
+    for (std::size_t index = 0; index < ranges.size(); ++index) {
+        auto& range = ranges[index];
+        range.generation = 0;
+        if (range.bytes == 0 || range.bytes > std::numeric_limits<std::uint64_t>::max() - range.address) continue;
+        const auto first = range.address & ~(page - 1);
+        const auto stop = (range.address + range.bytes + page - 1) & ~(page - 1);
+        if (stop <= first) continue;
+        bool memo = map != nullptr && map->Covers(first, stop);
+        for (std::size_t slot = 0; map == nullptr && !memo && slot < ring.entries.size(); ++slot) {
+            const auto& entry = ring.entries[slot];
+            memo = entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end;
+        }
+        if (memo) {
+            collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+            range.generation = tracker.stable.load(std::memory_order_acquire);
+            ++counts.memo;
+            continue;
+        }
+        const auto widenedFirst = first & ~(WriteBlockBytes - 1);
+        const auto widenedStop = (stop + WriteBlockBytes - 1) & ~(WriteBlockBytes - 1);
+        if (range.bytes > WriteBlockBytes || widenedStop <= widenedFirst) {
+            alone.push_back(index);
+            continue;
+        }
+        if (pending.empty() || pending.back().first != widenedFirst || pending.back().stop != widenedStop) pending.push_back({widenedFirst, widenedStop, static_cast<std::uint32_t>(pending.size())});
+        owners[index] = pending.back().id;
+    }
+    const auto before = [](const Pending& left, const Pending& right) { return left.first < right.first; };
+    if (!std::is_sorted(pending.begin(), pending.end(), before)) std::sort(pending.begin(), pending.end(), before);
+    generations.assign(pending.size(), 0);
+    if (!pending.empty()) {
+        const auto lock = lockTracker(tracker);
+        tracker.initialize();
+        for (std::size_t at = 0; tracker.watched && at < pending.size();) {
+            const auto spanFirst = pending[at].first;
+            auto spanStop = pending[at].stop;
+            auto end = at + 1;
+            while (end < pending.size() && pending[end].first <= spanStop) spanStop = std::max(spanStop, pending[end++].stop);
+            bool walked = tracker.covers(spanFirst, static_cast<std::size_t>(spanStop - spanFirst));
+            if (walked) {
+                const TimedAccess timed(CounterCollect, static_cast<std::size_t>(spanStop - spanFirst));
+                walked = walkWrites(tracker, spanFirst, spanStop, StampKind::Cpu);
+            }
+            if (walked) {
+                const std::uint64_t generation = tracker.generation;
+                for (auto member = at; member < end; ++member) generations[pending[member].id] = generation;
+                const auto serial = unwatchSerial.load(std::memory_order_relaxed);
+                ring.entries[ring.next++ % ring.entries.size()] = {spanFirst, spanStop, epoch, serial, mapping};
+                if (mapped) epochCollectMap(epoch, serial, mapping).Record(spanFirst, spanStop);
+                ++counts.spans;
+                counts.bytes += spanStop - spanFirst;
+            }
+            at = end;
+        }
+    }
+    for (std::size_t index = 0; index < ranges.size(); ++index) {
+        if (owners[index] == NoOwner) continue;
+        if (const auto generation = generations[owners[index]]; generation != 0) ranges[index].generation = generation;
+        else alone.push_back(index);
+    }
+    for (const auto index : alone) ranges[index].generation = collectWrites(ranges[index].address, ranges[index].bytes, true);
+    counts.alone = alone.size();
+    return counts;
+}
+
 std::uint64_t WriteGeneration() {
     return Tracker().generation.load(std::memory_order_acquire);
 }

@@ -76,6 +76,9 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "segment slots created", "segment slots held past their segment", "lean draws", "draws on today's path", "indirect draws on today's path",
     "shape records built", "shape records restamped", "shape records evicted", "shapes refused", "finisher ring room waits",
     "finisher waits for earlier jobs", "finisher same-key waits", "finisher store switches", "lean draws that ran the precheck",
+    "list hits on a batched query", "list hits on today's walk", "batched list queries", "batched list ranges", "batched ranges in the collect memo",
+    "batched spans walked", "batched bytes walked", "batched ranges collected alone", "list misses of evicted lists", "list verify checks",
+    "list verify differences", "list verify rewrites inside a collect epoch", "tails with their lists read directly",
 };
 
 static_assert(ItemNames.back() != nullptr && FieldInfos.back().name != nullptr && AllowedNames.back() != nullptr && CounterNames.back() != nullptr, "every lean front item, field, by-design case and counter needs a name");

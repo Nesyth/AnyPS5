@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/RegisterLists.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -32,6 +33,9 @@ public:
     static constexpr std::size_t BlockSlots = 4096;
     static constexpr std::uint32_t VolatileDeclines = 2;
     static constexpr std::uint64_t DeclineWindow = 4096;
+    static constexpr std::size_t WideSets = 4096;
+    static constexpr std::size_t WideWays = 8;
+    static constexpr std::size_t GhostSlots = 16384;
 
     struct Entry {
         std::uint64_t address = 0;
@@ -55,6 +59,11 @@ public:
     void Tick();
     void Clear();
     std::uint64_t Clock() const { return clock; }
+    bool Wide() const { return wide; }
+    void Widen();
+    bool Evicted(std::uint64_t address, std::uint32_t mode, std::uint32_t count) const;
+    bool Refused(std::uint64_t address) const { return !refused.empty() && std::find(refused.begin(), refused.end(), address) != refused.end(); }
+    void Refuse(std::uint64_t address);
 
     std::uint64_t stamp = 0;
 
@@ -63,11 +72,18 @@ private:
         std::uint64_t block = ~std::uint64_t{0};
         std::uint32_t declines = 0;
     };
-    static std::size_t setOf(std::uint64_t address, std::uint32_t mode, std::uint32_t count);
+    static std::uint64_t mix(std::uint64_t address, std::uint32_t mode, std::uint32_t count);
+    std::size_t setOf(std::uint64_t address, std::uint32_t mode, std::uint32_t count) const;
     std::vector<Entry> entries;
     std::vector<Block> blocks;
+    std::vector<std::uint64_t> ghosts;
+    std::vector<std::uint64_t> refused;
     std::uint64_t clock = 0;
     std::uint64_t declinesSince = 0;
+    std::size_t sets = Sets;
+    std::size_t ways = Ways;
+    unsigned shift = 53;
+    bool wide = false;
 };
 
 struct PendingListHit {
@@ -78,6 +94,16 @@ struct PendingListHit {
     std::uint32_t count = 0;
     std::uint64_t tracked = 0;
     RegisterListCache::Entry* entry = nullptr;
+};
+
+struct BatchedList {
+    std::uint32_t cursor = 0;
+    std::uint32_t query = 0;
+    RegisterListCache::Entry* entry = nullptr;
+    bool lean = false;
+    bool due = false;
+    bool looked = false;
+    bool bypass = false;
 };
 
 class LeanTails {
@@ -98,6 +124,11 @@ public:
     std::vector<PendingListHit> hits;
     std::vector<GuestMemory::UnchangedQuery> queries;
     std::vector<std::uint32_t> scratch;
+    std::vector<BatchedList> plan;
+    std::vector<GuestMemory::CollectRange> collects;
+    std::vector<PendingListHit> served;
+    std::vector<std::uint8_t> servedBatched;
+    std::uint64_t verifyOrdinal = 0;
 
 private:
     std::vector<KeptTail> kept;

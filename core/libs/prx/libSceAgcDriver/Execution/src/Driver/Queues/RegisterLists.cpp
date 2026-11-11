@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -83,6 +85,22 @@ std::string hex(std::uint64_t value) {
     return text;
 }
 
+std::uint64_t listVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_LEAN_LISTS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+void noteListDifference(const std::string& detail) {
+    static std::atomic<std::int64_t> window{-1};
+    static std::atomic<std::uint32_t> printed{0};
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (window.exchange(now, std::memory_order_relaxed) != now) printed.store(0, std::memory_order_relaxed);
+    if (printed.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[lean-lists-verify] register list differs: %s\n", detail.c_str());
+}
+
 void store(LeanTails& tails, const ListShape& list, const std::uint32_t* pairs, std::uint64_t tracked, std::uint64_t epoch) {
     auto* entry = tails.cache.Find(list.address, list.mode, list.count);
     if (entry == nullptr) {
@@ -152,16 +170,19 @@ std::optional<RegisterListView> FindRegisterList(const Submission& submission, s
     return submission.lists.View(*ref);
 }
 
-std::size_t RegisterListCache::setOf(std::uint64_t address, std::uint32_t mode, std::uint32_t count) {
-    auto mixed = (address >> 2u) ^ (static_cast<std::uint64_t>(mode) << 21u) ^ (static_cast<std::uint64_t>(count) << 47u);
-    mixed *= 0x9e3779b97f4a7c15ull;
-    return static_cast<std::size_t>(mixed >> 53u) % Sets;
+std::uint64_t RegisterListCache::mix(std::uint64_t address, std::uint32_t mode, std::uint32_t count) {
+    const auto mixed = (address >> 2u) ^ (static_cast<std::uint64_t>(mode) << 21u) ^ (static_cast<std::uint64_t>(count) << 47u);
+    return mixed * 0x9e3779b97f4a7c15ull;
+}
+
+std::size_t RegisterListCache::setOf(std::uint64_t address, std::uint32_t mode, std::uint32_t count) const {
+    return static_cast<std::size_t>(mix(address, mode, count) >> shift) & (sets - 1);
 }
 
 RegisterListCache::Entry* RegisterListCache::Find(std::uint64_t address, std::uint32_t mode, std::uint32_t count) {
     if (entries.empty()) return nullptr;
-    auto* set = entries.data() + setOf(address, mode, count) * Ways;
-    for (std::size_t way = 0; way < Ways; ++way) {
+    auto* set = entries.data() + setOf(address, mode, count) * ways;
+    for (std::size_t way = 0; way < ways; ++way) {
         if (set[way].Is(address, mode, count)) {
             set[way].used = clock;
             return &set[way];
@@ -171,20 +192,24 @@ RegisterListCache::Entry* RegisterListCache::Find(std::uint64_t address, std::ui
 }
 
 RegisterListCache::Entry& RegisterListCache::Place(std::uint64_t address, std::uint32_t mode, std::uint32_t count, bool& evicted) {
-    if (entries.empty()) entries.resize(Sets * Ways);
-    auto* set = entries.data() + setOf(address, mode, count) * Ways;
+    if (entries.empty()) entries.resize(sets * ways);
+    auto* set = entries.data() + setOf(address, mode, count) * ways;
     Entry* chosen = nullptr;
-    for (std::size_t way = 0; way < Ways && chosen == nullptr; ++way) {
+    for (std::size_t way = 0; way < ways && chosen == nullptr; ++way) {
         if (set[way].Is(address, mode, count)) chosen = &set[way];
     }
-    for (std::size_t way = 0; way < Ways && chosen == nullptr; ++way) {
+    for (std::size_t way = 0; way < ways && chosen == nullptr; ++way) {
         if (!set[way].live) chosen = &set[way];
     }
     evicted = chosen == nullptr;
     if (chosen == nullptr) {
         chosen = set;
-        for (std::size_t way = 1; way < Ways; ++way) {
+        for (std::size_t way = 1; way < ways; ++way) {
             if (set[way].used < chosen->used) chosen = &set[way];
+        }
+        if (wide) {
+            const auto tag = mix(chosen->address, chosen->mode, chosen->count);
+            ghosts[static_cast<std::size_t>(tag >> 50u) % GhostSlots] = tag | 1u;
         }
     }
     chosen->address = address;
@@ -224,9 +249,46 @@ void RegisterListCache::Clear() {
     }
     std::fill(blocks.begin(), blocks.end(), Block{});
     declinesSince = 0;
+    if (!wide) return;
+    wide = false;
+    sets = Sets;
+    ways = Ways;
+    shift = 53;
+    entries.clear();
+    std::vector<std::uint64_t>().swap(ghosts);
+    refused.clear();
+}
+
+void RegisterListCache::Widen() {
+    if (wide) return;
+    wide = true;
+    sets = WideSets;
+    ways = WideWays;
+    shift = 52;
+    entries.clear();
+    ghosts.assign(GhostSlots, 0);
+    refused.clear();
+}
+
+bool RegisterListCache::Evicted(std::uint64_t address, std::uint32_t mode, std::uint32_t count) const {
+    if (!wide) return false;
+    const auto tag = mix(address, mode, count);
+    return ghosts[static_cast<std::size_t>(tag >> 50u) % GhostSlots] == (tag | 1u);
+}
+
+void RegisterListCache::Refuse(std::uint64_t address) {
+    if (!Refused(address)) refused.push_back(address);
 }
 
 void Driver::resolveLeanLists(Submission& submission, bool cacheable) {
+    if (cacheable && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::LeanListDirect)) {
+        cacheable = false;
+        LeanFront::AddOnWorker(LeanFront::Counter::DirectListTails);
+    }
+    if (cacheable && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::LeanListBatch) && !countedReads()) {
+        resolveBatchedLists(submission);
+        return;
+    }
     using LeanFront::Counter;
     auto& lists = submission.lists;
     lists = leanTails.TakeLists();
@@ -335,6 +397,217 @@ void Driver::resolveLeanLists(Submission& submission, bool cacheable) {
     }
     LeanFront::AddOnWorker(Counter::LeanLists, resolved);
     if (!hits.empty()) settleListHits(submission);
+}
+
+void Driver::resolveBatchedLists(Submission& submission) {
+    using LeanFront::Counter;
+    auto& lists = submission.lists;
+    lists = leanTails.TakeLists();
+    submission.leanLists = true;
+    auto& cache = leanTails.cache;
+    cache.Widen();
+    auto& hits = leanTails.hits;
+    hits.clear();
+    cache.Tick();
+    const auto epoch = GuestMemory::ThreadCollectEpoch();
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Registers);
+    const auto& commands = submission.commands;
+    auto& plan = leanTails.plan;
+    auto& collects = leanTails.collects;
+    auto& servedBatched = leanTails.servedBatched;
+    plan.clear();
+    collects.clear();
+    servedBatched.clear();
+    for (std::size_t cursor = 0; cursor < commands.size(); cursor += Pm4::PacketWords(commands[cursor])) {
+        const auto header = commands[cursor];
+        if ((header >> 30u) != 3u || !Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) continue;
+        const auto packet = std::span<const std::uint32_t>(commands).subspan(cursor, Pm4::PacketWords(header));
+        BatchedList item;
+        item.cursor = static_cast<std::uint32_t>(cursor);
+        if (const auto shape = leanShape(packet)) {
+            item.lean = true;
+            item.due = LeanFront::Due(frontLatch, LeanFront::Item::RegisterList);
+            if (!item.due && shape->count != 0) {
+                try {
+                    hookList(*shape);
+                } catch (const std::exception& error) {
+                    throw std::runtime_error(listError(header, cursor, error));
+                }
+                const bool candidate = RegisterListCache::Cacheable(shape->count);
+                item.looked = true;
+                item.bypass = candidate && (cache.Refused(shape->address) || cache.Volatile(shape->address));
+                item.entry = candidate && !item.bypass ? cache.Find(shape->address, shape->mode, shape->count) : nullptr;
+                if (item.entry != nullptr && item.entry->epoch != epoch) {
+                    collects.push_back({shape->address, shape->Bytes(), 0});
+                    item.query = static_cast<std::uint32_t>(collects.size());
+                }
+            }
+        }
+        plan.push_back(item);
+    }
+    if (!collects.empty()) {
+        const auto counts = GuestMemory::CollectWritesBatch(collects);
+        LeanFront::AddOnWorker(Counter::ListBatchQueries);
+        LeanFront::AddOnWorker(Counter::ListBatchRanges, collects.size());
+        LeanFront::AddOnWorker(Counter::ListBatchMemo, counts.memo);
+        LeanFront::AddOnWorker(Counter::ListBatchSpans, counts.spans);
+        LeanFront::AddOnWorker(Counter::ListBatchBytes, counts.bytes);
+        LeanFront::AddOnWorker(Counter::ListBatchAlone, counts.alone);
+    }
+    std::uint64_t resolved = 0;
+    std::uint64_t mutations = 0;
+    for (const auto& item : plan) {
+        const std::size_t cursor = item.cursor;
+        const auto header = commands[cursor];
+        const auto packet = std::span<const std::uint32_t>(commands).subspan(cursor, Pm4::PacketWords(header));
+        ++resolved;
+        try {
+            const auto first = lists.words.size();
+            if (!item.lean) {
+                const auto pairs = Pm4::ReadIndirectRegisters(packet);
+                lists.words.insert(lists.words.end(), pairs.begin(), pairs.end());
+                lists.refs.push_back({static_cast<std::uint32_t>(cursor), static_cast<std::uint32_t>(first), static_cast<std::uint32_t>(pairs.size() / 2), Pm4::IndirectRegistersValid(pairs) ? RegisterLists::Valid : 0u});
+                continue;
+            }
+            const auto shape = *leanShape(packet);
+            const bool candidate = RegisterListCache::Cacheable(shape.count);
+            const bool carried = item.looked && mutations == 0;
+            const bool bypass = carried ? item.bypass : candidate && (cache.Refused(shape.address) || cache.Volatile(shape.address));
+            auto* entry = carried ? item.entry : candidate && !bypass ? cache.Find(shape.address, shape.mode, shape.count) : nullptr;
+            if (item.due) {
+                ++mutations;
+                const auto ownWrites = GuestMemory::OwnWriteSerial();
+                const auto tracked = candidate && !bypass ? GuestMemory::CollectWrites(shape.address, shape.Bytes()) : 0;
+                const auto pairs = Pm4::ReadIndirectRegisters(packet);
+                const bool valid = Pm4::IndirectRegistersValid(pairs);
+                lists.words.insert(lists.words.end(), pairs.begin(), pairs.end());
+                lists.refs.push_back({static_cast<std::uint32_t>(cursor), static_cast<std::uint32_t>(first), shape.count, valid ? RegisterLists::Valid : 0u});
+                auto& lean = leanTails.scratch;
+                lean.assign(shape.Words(), 0);
+                RegisterListCache::Entry* cached = nullptr;
+                if (entry != nullptr && tracked == 0) entry->live = false;
+                if (entry != nullptr && tracked != 0) {
+                    entry->epoch = epoch;
+                    if (GuestMemory::UnchangedSince(shape.address, shape.Bytes(), entry->tracked)) {
+                        std::copy(entry->pairs.begin(), entry->pairs.end(), lean.begin());
+                        cached = entry;
+                    }
+                }
+                bool answered = true;
+                try {
+                    if (cached == nullptr) copyList(shape, lean.data());
+                } catch (const std::exception& error) {
+                    answered = false;
+                    LeanFront::NoteChecked(LeanFront::Item::RegisterList);
+                    LeanFront::NoteDifference(LeanFront::Field::RegisterLists, "serial " + std::to_string(submission.serial) + " " + listError(header, cursor, error) + " in the lean read after today's read succeeded");
+                }
+                if (answered) checkAnswer(shape, pairs, lean, cached, header, cursor, submission.serial, ownWrites);
+                if (tracked != 0 && valid) store(leanTails, shape, pairs.data(), tracked, epoch);
+                else if (candidate && !bypass && tracked == 0) cache.Decline(shape.address, RegisterListCache::VolatileDeclines);
+                continue;
+            }
+            lists.words.resize(first + shape.Words());
+            auto* out = lists.words.data() + first;
+            std::uint32_t flags = 0;
+            if (shape.count == 0) {
+                flags = RegisterLists::Valid;
+            } else if (entry != nullptr) {
+                bool batched = false;
+                if (entry->epoch != epoch) {
+                    std::uint64_t collected = 0;
+                    if (item.query != 0) {
+                        collected = collects[item.query - 1].generation;
+                        batched = true;
+                    } else {
+                        collected = GuestMemory::CollectWrites(shape.address, shape.Bytes());
+                    }
+                    if (collected == 0) entry->live = false;
+                    else entry->epoch = epoch;
+                }
+                if (entry->live) {
+                    std::copy(entry->pairs.begin(), entry->pairs.end(), out);
+                    hits.push_back({static_cast<std::uint32_t>(lists.refs.size()), static_cast<std::uint32_t>(cursor), shape.address, shape.mode, shape.count, entry->tracked, entry});
+                    servedBatched.push_back(batched ? 1 : 0);
+                    flags = RegisterLists::Valid | RegisterLists::Cached;
+                } else {
+                    ++mutations;
+                    cache.Decline(shape.address, RegisterListCache::VolatileDeclines);
+                    copyList(shape, out);
+                    flags = Pm4::IndirectRegistersValid(std::span<const std::uint32_t>(out, shape.Words())) ? RegisterLists::Valid : 0u;
+                    LeanFront::AddOnWorker(Counter::ListCacheMisses);
+                }
+            } else {
+                std::uint64_t tracked = 0;
+                if (candidate && !bypass) tracked = GuestMemory::CollectWrites(shape.address, shape.Bytes());
+                copyList(shape, out);
+                const bool valid = Pm4::IndirectRegistersValid(std::span<const std::uint32_t>(out, shape.Words()));
+                flags = valid ? RegisterLists::Valid : 0u;
+                if (bypass) {
+                    LeanFront::AddOnWorker(Counter::ListCacheBypassed);
+                } else if (candidate) {
+                    ++mutations;
+                    LeanFront::AddOnWorker(Counter::ListCacheMisses);
+                    if (cache.Evicted(shape.address, shape.mode, shape.count)) LeanFront::AddOnWorker(Counter::ListMissesEvicted);
+                    if (tracked != 0 && valid) store(leanTails, shape, out, tracked, epoch);
+                    else if (tracked == 0) cache.Decline(shape.address, RegisterListCache::VolatileDeclines);
+                }
+            }
+            lists.refs.push_back({static_cast<std::uint32_t>(cursor), static_cast<std::uint32_t>(first), shape.count, flags});
+        } catch (const std::exception& error) {
+            throw std::runtime_error(listError(header, cursor, error));
+        }
+    }
+    LeanFront::AddOnWorker(Counter::LeanLists, resolved);
+    if (hits.empty()) return;
+    leanTails.served.assign(hits.begin(), hits.end());
+    settleListHits(submission);
+    countServedLists(submission);
+}
+
+void Driver::countServedLists(const Submission& submission) {
+    using LeanFront::Counter;
+    const auto every = listVerifyEvery();
+    auto& cache = leanTails.cache;
+    const auto& lists = submission.lists;
+    const auto& served = leanTails.served;
+    for (std::size_t index = 0; index < served.size(); ++index) {
+        const auto& hit = served[index];
+        const bool batched = leanTails.servedBatched[index] != 0;
+        const auto& ref = lists.refs[hit.ref];
+        if ((ref.flags & RegisterLists::Cached) == 0) continue;
+        LeanFront::AddOnWorker(batched ? Counter::ListBatchHits : Counter::ListWalkHits);
+        if (every == 0 || ++leanTails.verifyOrdinal % every != 0) continue;
+        const ListShape shape{hit.address, hit.mode, hit.count};
+        auto& fresh = leanTails.scratch;
+        fresh.assign(shape.Words(), 0);
+        const auto where = [&] { return "serial " + std::to_string(submission.serial) + " " + Pm4::Name(submission.commands[hit.cursor]) + " at DWORD " + std::to_string(hit.cursor) + ", list " + hex(hit.address) + " mode " + hex(hit.mode) + " count " + std::to_string(hit.count) + (batched ? " (batched query)" : " (today's walk)"); };
+        LeanFront::AddOnWorker(Counter::ListVerifyChecked);
+        try {
+            copyList(shape, fresh.data());
+        } catch (const std::exception& error) {
+            LeanFront::AddOnWorker(Counter::ListVerifyDiffering);
+            cache.Refuse(hit.address);
+            noteListDifference(where() + ": today's read failed: " + error.what());
+            continue;
+        }
+        const auto answer = std::span<const std::uint32_t>(lists.words).subspan(ref.first, shape.Words());
+        const bool valid = Pm4::IndirectRegistersValid(fresh);
+        if (std::equal(answer.begin(), answer.end(), fresh.begin()) && valid == ((ref.flags & RegisterLists::Valid) != 0)) continue;
+        if (auto* entry = cache.Find(hit.address, hit.mode, hit.count); entry != nullptr && entry->tracked == hit.tracked) entry->live = false;
+        if (GuestMemory::CollectWritesUncached(hit.address, shape.Bytes()) != 0 && !GuestMemory::UnchangedSince(hit.address, shape.Bytes(), hit.tracked)) {
+            LeanFront::AddOnWorker(Counter::ListVerifyRewritten);
+            continue;
+        }
+        LeanFront::AddOnWorker(Counter::ListVerifyDiffering);
+        cache.Refuse(hit.address);
+        std::size_t at = 0;
+        while (at < answer.size() && answer[at] == fresh[at]) ++at;
+        auto detail = where();
+        if (at < answer.size()) detail += ": first difference at word " + std::to_string(at) + ": lean " + hex(answer[at]) + ", today " + hex(fresh[at]);
+        else detail += std::string(": the lean flag says ") + (valid ? "invalid" : "valid") + ", today's read is " + (valid ? "valid" : "invalid");
+        noteListDifference(detail);
+    }
+    leanTails.served.clear();
 }
 
 void Driver::settleListHits(Submission& submission) {

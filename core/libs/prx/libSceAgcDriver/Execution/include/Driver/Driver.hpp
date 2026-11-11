@@ -210,6 +210,8 @@ private:
     static bool copyLink(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget, std::size_t depth, const std::uint32_t*& chained, std::size_t& chainedWords, GuestRanges* sources);
     static void readRegisterLists(Submission& submission);
     void resolveLeanLists(Submission& submission, bool cacheable);
+    void resolveBatchedLists(Submission& submission);
+    void countServedLists(const Submission& submission);
     void settleListHits(Submission& submission);
     void verifyLeanLists(const Submission& submission, bool cacheable, std::uint64_t ownWrites);
     bool keptTailCurrent(const KeptTail& kept, const Submission& stalled) const;
