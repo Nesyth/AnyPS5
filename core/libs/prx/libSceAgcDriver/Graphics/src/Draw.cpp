@@ -6036,7 +6036,7 @@ void fillRepeatBlock(const Context& context, const State& state, std::span<const
 
 bool fragmentModes() {
     static const bool timeEachDraw = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
-    return !timeEachDraw && RecordDraws() && DumpTargetLimit() == 0 && !DrawFaultTokens() && !CaptureInputsEnabled() && !CaptureTrace::Enabled() && !ReplayCensusEnabled() && !PassAccessMemoVerify() && !GuestMemory::WriteIndexEnabled() && RuntimeSwitches::Set(RuntimeSwitch::CommitFragments) && RuntimeSwitches::Set(RuntimeSwitch::CommitBindings) && !RuntimeSwitches::Set(RuntimeSwitch::CommitBindingsDynamic) && !RuntimeSwitches::Set(RuntimeSwitch::XpBindingsAsIs) && !RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor) && !RuntimeSwitches::Set(RuntimeSwitch::XpInputsAsIs);
+    return !timeEachDraw && !DescriptorHeapEnabled() && RecordDraws() && DumpTargetLimit() == 0 && !DrawFaultTokens() && !CaptureInputsEnabled() && !CaptureTrace::Enabled() && !ReplayCensusEnabled() && !PassAccessMemoVerify() && !GuestMemory::WriteIndexEnabled() && RuntimeSwitches::Set(RuntimeSwitch::CommitFragments) && RuntimeSwitches::Set(RuntimeSwitch::CommitBindings) && !RuntimeSwitches::Set(RuntimeSwitch::CommitBindingsDynamic) && !RuntimeSwitches::Set(RuntimeSwitch::XpBindingsAsIs) && !RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor) && !RuntimeSwitches::Set(RuntimeSwitch::XpInputsAsIs);
 }
 
 struct FragmentStreamStorage {};
