@@ -114,6 +114,9 @@ enum class RuntimeSwitch : std::size_t {
     DirectRepeatStores,
     DirectRepeatShared,
     FinisherDeposit,
+    CommitBindings,
+    CommitBindingsStamps,
+    CommitBindingsSets,
     Count,
 };
 

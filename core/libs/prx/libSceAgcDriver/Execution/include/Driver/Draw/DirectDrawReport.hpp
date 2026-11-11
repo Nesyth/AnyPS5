@@ -168,6 +168,35 @@ enum class Counter : std::uint8_t {
     RepeatStoresTimed,
     RepeatSharedNanoseconds,
     RepeatSharedTimed,
+    BindingsPlaced,
+    BindingsNotPlaced,
+    BindingsTaken,
+    BindingsTakenWritten,
+    BindingsCopied,
+    BindingsOtherDevice,
+    BindingsHazard,
+    BindingsDepthGuards,
+    BindingsReturned,
+    BindingsBytes,
+    BindingsObjects,
+    BindingsTested,
+    BindingsStamped,
+    BindingsGuards,
+    BindingsSetsLent,
+    BindingsSetsWritten,
+    BindingsVerifyChecked,
+    BindingsVerifyDiffering,
+    BindingsRefuted,
+    BindingsTodayPushedNanoseconds,
+    BindingsTodayPushedTimed,
+    BindingsTodayWrittenNanoseconds,
+    BindingsTodayWrittenTimed,
+    BindingsNewPushedNanoseconds,
+    BindingsNewPushedTimed,
+    BindingsNewWrittenNanoseconds,
+    BindingsNewWrittenTimed,
+    BindingsKeepNanoseconds,
+    BindingsKeepTimed,
     Count,
 };
 
@@ -181,6 +210,7 @@ std::uint64_t BufferVerifyEvery();
 std::uint64_t InputVerifyEvery();
 std::uint64_t RepeatVerifyEvery();
 void NoteRepeatDifference(std::string_view field, std::string_view detail);
+void NoteBindingsDifference(std::string_view field, std::string_view detail);
 
 inline bool Due(LeanFront::Latch& latch) {
     if (latch.directVerifyEvery == 0) return false;

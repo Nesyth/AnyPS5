@@ -1629,6 +1629,70 @@ void noteRepeatDifference(DrawRecords::Field field, std::string_view detail) {
 
 void noteRepeatAllowed(DrawRecords::Allowed) {}
 
+void noteBindingsDifference(DrawRecords::Field field, std::string_view detail) {
+    DirectDraws::NoteBindingsDifference(DrawRecords::FieldName(field), detail);
+}
+
+void NoteCommitBindings(const DrawRecord& record, DrawRecordCommit& commit, const Graphics::ShaderResources::PreparedBuffers* prepared) {
+    using DirectDraws::Counter;
+    using Taken = Graphics::ShaderResources::BindingTaken;
+    auto& noted = commit.effects.bindings;
+    if (prepared != nullptr && prepared->placed != nullptr) DirectDraws::Add(Counter::BindingsReturned);
+    if (noted.timed && (noted.pushed || noted.written)) {
+        const bool placed = noted.taken == Taken::Placed;
+        const auto nanoseconds = noted.written ? (placed ? Counter::BindingsNewWrittenNanoseconds : Counter::BindingsTodayWrittenNanoseconds) : (placed ? Counter::BindingsNewPushedNanoseconds : Counter::BindingsTodayPushedNanoseconds);
+        DirectDraws::Add(nanoseconds, noted.nanoseconds);
+        DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(nanoseconds) + 1u));
+    }
+    if (noted.timed && noted.keepNanoseconds != 0) {
+        DirectDraws::Add(Counter::BindingsKeepNanoseconds, noted.keepNanoseconds);
+        DirectDraws::Add(Counter::BindingsKeepTimed);
+    }
+    if (!noted.routed) return;
+    switch (noted.taken) {
+    case Taken::Placed:
+        DirectDraws::Add(Counter::BindingsTaken);
+        if (noted.written) DirectDraws::Add(Counter::BindingsTakenWritten);
+        DirectDraws::Add(Counter::BindingsBytes, noted.bytes);
+        DirectDraws::Add(Counter::BindingsObjects, noted.objects);
+        break;
+    case Taken::Copied: DirectDraws::Add(Counter::BindingsCopied); break;
+    case Taken::OtherDevice: DirectDraws::Add(Counter::BindingsOtherDevice); break;
+    default:
+        if (commit.effects.buffers == DrawRecordBuffers::UnmovedHazard) DirectDraws::Add(Counter::BindingsHazard);
+        else if (commit.effects.buffers == DrawRecordBuffers::DepthGuards) DirectDraws::Add(Counter::BindingsDepthGuards);
+        break;
+    }
+    if (noted.tested != 0) DirectDraws::Add(Counter::BindingsTested, noted.tested);
+    if (noted.stamped != 0) DirectDraws::Add(Counter::BindingsStamped, noted.stamped);
+    if (noted.guards != 0) DirectDraws::Add(Counter::BindingsGuards, noted.guards);
+    if (noted.setsLent != 0) DirectDraws::Add(Counter::BindingsSetsLent, noted.setsLent);
+    if (noted.setsWritten != 0) DirectDraws::Add(Counter::BindingsSetsWritten, noted.setsWritten);
+    bool differs = false;
+    if (noted.refuted != 0) {
+        DirectDraws::Add(Counter::BindingsRefuted, noted.refuted);
+        DirectDraws::NoteBindingsDifference("stamp claim", keyText(record.key) + ": an unmoved range the stamp held clear has a pending write");
+        differs = true;
+    }
+    if (noted.checked) {
+        DirectDraws::Add(Counter::BindingsVerifyChecked);
+        DrawCommitView mine;
+        DrawCommitView today;
+        mine.filled = today.filled = true;
+        mine.bound = today.bound = true;
+        mine.bindings = std::move(noted.mine);
+        today.bindings = std::move(noted.today);
+        if (compareCommitViews(record, mine, today, &noteBindingsDifference, &noteRepeatAllowed, false)) differs = true;
+        if (noted.taken == Taken::Placed && !noted.todayTaken) {
+            DirectDraws::NoteBindingsDifference("stamp claim", keyText(record.key) + ": today's tests refused the prepared buffers the finisher's bindings were bound for");
+            differs = true;
+        }
+    }
+    if (!differs) return;
+    DirectDraws::Add(Counter::BindingsVerifyDiffering);
+    commit.bindingsRefused = true;
+}
+
 void noteRepeatRefusal(const Graphics::RepeatOutcome& repeated) {
     using DirectDraws::Counter;
     if (repeated.refusal == Graphics::RepeatRefusal::Count) return;
@@ -1780,6 +1844,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
             NoteDirectCommit(commit, outcome.recorded);
             NoteDirectBuffers(commit, prepared != nullptr);
             NoteDirectInputs(commit, inputs != nullptr);
+            NoteCommitBindings(*hit.record, commit, prepared);
         }
         if (outcome.recorded) {
             if (hit.direct) {
@@ -1800,6 +1865,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         DrawRecords::AddOnCommitter(CommitMiss(outcome.miss));
     }
     if ((commit.recipe == nullptr || verify) && hit.preparedBuffers.has_value()) DirectDraws::Add(DirectDraws::Counter::BuffersDropped);
+    if ((commit.recipe == nullptr || verify) && hit.preparedBuffers.has_value() && hit.preparedBuffers->placed != nullptr) DirectDraws::Add(DirectDraws::Counter::BindingsReturned);
     if ((commit.recipe == nullptr || verify) && hit.preparedInputs.has_value()) DirectDraws::Add(DirectDraws::Counter::InputsDropped);
     if (hit.planned || hit.direct) ThreadReport::MarkItem(ThreadReport::ItemMark::PlanFallback);
     DrawCommitView answer;

@@ -3278,6 +3278,8 @@ struct RecordedDraw {
     DrawRecordBuffers* buffers = nullptr;
     ShaderResources::PreparedDifference* bufferDifference = nullptr;
     BindingsAsIs* bindingsAsIs = nullptr;
+    ShaderResources::BindingRoute* route = nullptr;
+    DrawRecordBindings* bindings = nullptr;
 };
 
 // A remapped viewport depth range reads its scale and offset from the draw's push block (the vertex shader's
@@ -3573,7 +3575,40 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     std::shared_ptr<ShaderResources::DrawBindings> keptBindings;
     const bool bindingsKept = record.bindingsAsIs != nullptr && faultRecord == nullptr && !record.replay && record.view == nullptr && record.preparedCheck == nullptr;
     if (bindingsKept && record.bindingsAsIs->resources == &resources && record.bindingsAsIs->push == record.push) keptBindings = record.bindingsAsIs->bindings;
-    const auto drawBindings = keptBindings != nullptr ? keptBindings : record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, selectedOut, record.prepared, &preparedSelection) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus, selectedOut, record.prepared, &preparedSelection);
+    auto* route = keptBindings == nullptr && !record.replay && record.prepared != nullptr ? record.route : nullptr;
+    auto* bindingsCheck = route != nullptr && record.bindings != nullptr && record.bindings->verify ? record.bindings : nullptr;
+    std::vector<std::size_t> routeSelected;
+    if (bindingsCheck != nullptr && selectedOut == nullptr) selectedOut = &routeSelected;
+    const bool bindingsTimed = keptBindings == nullptr && record.bindings != nullptr && record.bindings->timed;
+    const auto bindingsBegan = bindingsTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto drawBindings = keptBindings != nullptr ? keptBindings : record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, selectedOut, record.prepared, &preparedSelection, route) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus, selectedOut, record.prepared, &preparedSelection, route);
+    if (bindingsTimed) record.bindings->nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - bindingsBegan).count());
+    if (bindingsTimed || route != nullptr) {
+        auto& noted = *record.bindings;
+        noted.written = drawBindings != nullptr && (drawBindings->allocation.set != VK_NULL_HANDLE || drawBindings->fragmentAllocation.set != VK_NULL_HANDLE);
+        noted.pushed = drawBindings != nullptr && drawBindings->pushedSet >= 0;
+    }
+    if (route != nullptr && record.bindings != nullptr) {
+        auto& noted = *record.bindings;
+        noted.taken = route->taken;
+        noted.tested = route->tested;
+        noted.stamped = route->stamped;
+        noted.refuted = route->refuted;
+        noted.bytes = route->bytes;
+        noted.setsLent = route->setsLent;
+        noted.setsWritten = route->setsWritten;
+        noted.guards = route->guards;
+        if (route->taken == ShaderResources::BindingTaken::Placed && drawBindings != nullptr) noted.objects = 1u + (drawBindings->snapshots.empty() ? 0u : 1u) + (drawBindings->pushedSet >= 0 && !drawBindings->pushSelected.empty() ? 1u : 0u);
+    }
+    if (bindingsCheck != nullptr && (route->taken == ShaderResources::BindingTaken::Placed || route->setsLent != 0)) {
+        std::vector<std::size_t> todaySelected;
+        auto todaySelection = PreparedSelection::Hazard;
+        const auto todays = record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, &todaySelected, record.prepared, &todaySelection) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, false, &todaySelected, record.prepared, &todaySelection);
+        resources.DescribeDrawBindings(drawBindings.get(), *selectedOut, record.push, bindingsCheck->mine, true);
+        resources.DescribeDrawBindings(todays.get(), todaySelected, record.push, bindingsCheck->today, true);
+        bindingsCheck->checked = true;
+        bindingsCheck->todayTaken = todaySelection == PreparedSelection::Taken;
+    }
     if (keptBindings != nullptr) preparedSelection = PreparedSelection::Taken;
     else if (bindingsKept) *record.bindingsAsIs = {&resources, record.push, drawBindings};
     if (record.prepared != nullptr && record.buffers != nullptr) *record.buffers = preparedSelection == PreparedSelection::Taken ? DrawRecordBuffers::Used : preparedSelection == PreparedSelection::DepthGuards ? DrawRecordBuffers::DepthGuards : DrawRecordBuffers::UnmovedHazard;
@@ -3810,7 +3845,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
     timer.phase(PhaseRecord);
+    const auto keepBegan = bindingsTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), state.scissor, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, drawUse, record.spaceKeep != nullptr && *record.spaceKeep != nullptr ? record.spaceKeep->get() : nullptr, record.keeping);
+    if (bindingsTimed) record.bindings->keepNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - keepBegan).count());
     timer.phase(PhaseKeep);
     if (!record.staged.empty()) {
         const auto merged = recorder->Commands();
@@ -5790,6 +5827,15 @@ DrawRecordHold recordPassHold(const DrawRecordPass& pass, const Recorder& record
     return DrawRecordHold::Held;
 }
 
+bool CommitBindingTimings() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return stats;
+}
+
+std::uint64_t commitBindingTimingOrdinal = 0;
+std::uint64_t commitBindingVerifyOrdinal = 0;
+std::atomic<CommitBindingsHookForTest> commitBindingsHook{nullptr};
+
 bool proveRecordTemplate(DrawRecordCommit& record, ShaderResources& resources, std::span<const CompiledShader> shaders, DrawRecipeOutcome& result, bool injected) {
     if (injected) return false;
     record.effects.proved = true;
@@ -6260,12 +6306,31 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     drawn.preparedCheck = checked;
     drawn.buffers = &record.effects.buffers;
     drawn.bufferDifference = &record.effects.bufferDifference;
+    ShaderResources::BindingRoute route;
+    if (bound != nullptr) {
+        auto& noted = record.effects.bindings;
+        drawn.bindings = &noted;
+        noted.timed = CommitBindingTimings() && (++commitBindingTimingOrdinal & 7u) == 0;
+        if (RuntimeSwitches::Set(RuntimeSwitch::CommitBindings) && !record.bindingsRefused) {
+            route.placed = bound->placed != nullptr;
+            route.stamps = RuntimeSwitches::Set(RuntimeSwitch::CommitBindingsStamps);
+            route.sets = RuntimeSwitches::Set(RuntimeSwitch::CommitBindingsSets);
+            const auto every = CommitBindingsVerifyEvery();
+            noted.verify = every != 0 && (route.placed || route.stamps || route.sets) && ++commitBindingVerifyOrdinal % every == 0;
+            route.verifyStamps = noted.verify;
+            if (route.placed || route.stamps || route.sets) drawn.route = &route;
+            noted.routed = drawn.route != nullptr;
+        }
+    }
     drawn.multisampleImages = std::move(multisampleImages);
     for (auto& owner : multisampleOwners) {
         if (owner != nullptr) drawn.multisampleTargets.push_back(std::move(owner));
     }
     if (RuntimeSwitches::Set(RuntimeSwitch::XpBindingsAsIs)) drawn.bindingsAsIs = &bindingsAsIs()[&record];
     else if (!bindingsAsIs().empty()) bindingsAsIs().clear();
+    if (drawn.route != nullptr) {
+        if (const auto hook = commitBindingsHook.exchange(nullptr, std::memory_order_acq_rel); hook != nullptr) hook(record);
+    }
     recordDraw(context, state, draw, shaders, inputs, drawn, outcome, timer, ownWaitedMs, trace);
     record.effects.passHeld = held;
     if ((!multisampleRecipe || RuntimeSwitches::Set(RuntimeSwitch::MsaaRecordHold)) && recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {
@@ -6345,6 +6410,18 @@ std::atomic<RepeatHookForTest> repeatHook{nullptr};
 
 void SetRepeatHookForTest(RepeatHookForTest hook) {
     repeatHook.store(hook, std::memory_order_release);
+}
+
+void SetCommitBindingsHookForTest(CommitBindingsHookForTest hook) {
+    commitBindingsHook.store(hook, std::memory_order_release);
+}
+
+std::uint64_t CommitBindingsVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_COMMIT_BINDINGS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
 }
 
 RepeatOutcome RepeatCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs, const DrawTraceContext* trace, DrawCommitView* describe, std::uint64_t verifyEvery) {

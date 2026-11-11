@@ -125,6 +125,29 @@ enum class DrawRecordBuffers : std::uint8_t { None, Used, PlanDiffers, MovedHaza
 
 enum class DrawRecordInputs : std::uint8_t { None, Used, Rechecked, ImportChanged, Shape, Refused, Checked, Differs, Count };
 
+struct DrawRecordBindings {
+    bool timed = false;
+    bool routed = false;
+    bool verify = false;
+    bool checked = false;
+    bool todayTaken = false;
+    bool written = false;
+    bool pushed = false;
+    Graphics::ShaderResources::BindingTaken taken = Graphics::ShaderResources::BindingTaken::None;
+    std::uint32_t tested = 0;
+    std::uint32_t stamped = 0;
+    std::uint32_t refuted = 0;
+    std::uint32_t objects = 0;
+    std::uint32_t setsLent = 0;
+    std::uint32_t setsWritten = 0;
+    std::uint32_t guards = 0;
+    std::size_t bytes = 0;
+    std::uint64_t nanoseconds = 0;
+    std::uint64_t keepNanoseconds = 0;
+    std::vector<Graphics::ShaderResources::BoundBuffer> mine;
+    std::vector<Graphics::ShaderResources::BoundBuffer> today;
+};
+
 struct DrawRecordEffects {
     bool pushed = false;
     bool unpushed = false;
@@ -140,6 +163,7 @@ struct DrawRecordEffects {
     DrawRecordBuffers buffers = DrawRecordBuffers::None;
     Graphics::ShaderResources::PreparedDifference bufferDifference;
     DrawRecordInputs inputs = DrawRecordInputs::None;
+    DrawRecordBindings bindings;
 };
 
 struct DrawRecordAccess {
@@ -265,6 +289,7 @@ struct DrawRecordCommit {
     AtomicSharedPtr<const DrawRecipe> inputsRecipe;
     bool inputsRecipeAsked = false;
     std::shared_ptr<DrawRepeatBlock> repeat;
+    bool bindingsRefused = false;
 
     void Adopt(std::shared_ptr<const DrawRecipe> built) {
         recipe = std::move(built);

@@ -6290,6 +6290,8 @@ public:
         std::vector<std::uint8_t> sets;
         std::vector<std::size_t> buffers;
         std::vector<std::vector<std::size_t>> slots;
+        std::vector<std::uint8_t> allocationSets;
+        std::array<bool, 2> lendable{};
     };
 
     OwnDrawSets(DescriptorCache& cache, std::array<VkDescriptorSetLayout, 2> layouts, Plan plan) : plan(std::move(plan)), cache(cache), layouts(layouts) {
@@ -7835,7 +7837,7 @@ ShaderResources::DrawBindings::~DrawBindings() {
     if (cache == nullptr) return;
     const bool park = ownSets != nullptr && RuntimeSwitches::Set(RuntimeSwitch::OwnDrawSets);
     const auto release = [&](std::size_t index, VkDescriptorSetLayout setLayout, DescriptorCache::SetAllocation& set) {
-        if (set.set == VK_NULL_HANDLE) return;
+        if (set.set == VK_NULL_HANDLE || lent[index]) return;
         if (park && owned[index] && ownSets->Park(index, set)) return;
         if (setLayout != VK_NULL_HANDLE) cache->Recycle(setLayout, set);
         else cache->Free(set);
@@ -8063,15 +8065,16 @@ ShaderResources::MovedSnapshotCounts ShaderResources::TakeMovedSnapshotCounts() 
     return {tally.cached.exchange(0, std::memory_order_relaxed), tally.reused.exchange(0, std::memory_order_relaxed), tally.cachedBytes.exchange(0, std::memory_order_relaxed), tally.uploaded.exchange(0, std::memory_order_relaxed), tally.uploadedBytes.exchange(0, std::memory_order_relaxed)};
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord, bool census, std::vector<std::size_t>* selectedOut, const PreparedBuffers* prepared, PreparedBuffers::Selection* preparedSelection) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord, bool census, std::vector<std::size_t>* selectedOut, const PreparedBuffers* prepared, PreparedBuffers::Selection* preparedSelection, BindingRoute* route) const {
     struct SelectedStorage {};
     auto& selected = HostThreadLocal<std::vector<std::size_t>, SelectedStorage>();
     auto selection = PreparedBuffers::Selection::Hazard;
-    auto result = prepared != nullptr && !movedOnly ? selectPreparedSnapshots(recorder, moved, *prepared, selected, true, selection) : nullptr;
+    auto result = prepared != nullptr && !movedOnly ? selectPreparedSnapshots(recorder, moved, *prepared, selected, true, selection, route) : nullptr;
+    if (result != nullptr && route != nullptr && route->taken == BindingTaken::Placed) result->pushSelected.clear();
     if (preparedSelection != nullptr) *preparedSelection = selection;
     if (result == nullptr) result = selectDrawSnapshots(recorder, moved, movedOnly, selected, census);
     if (selectedOut != nullptr) selectedOut->assign(selected.begin(), selected.end());
-    return finishDrawBindings(recorder, std::move(result), selected, faultRecord);
+    return finishDrawBindings(recorder, std::move(result), selected, faultRecord, -1, route);
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareReplayDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, std::span<const CompiledShader> shaders, const BdaResources* faultRecord, HeapReplayProof& proof, bool census, std::span<const std::uint32_t> contentKey) {
@@ -8085,14 +8088,120 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareReplayDra
     return finishDrawBindings(recorder, std::move(result), selected, faultRecord);
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::finishDrawBindings(Recorder& recorder, std::shared_ptr<DrawBindings> result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet) const {
+bool ShaderResources::lendsSets(std::int32_t pushedSet, const BdaResources* faultRecord) const {
+    static_cast<void>(pushedSet);
+    return faultRecord == nullptr && completed && !heapStage && !addressedBuffers && !rebound && context.descriptorCache != nullptr && RuntimeSwitches::Set(RuntimeSwitch::OwnDrawSets);
+}
+
+namespace {
+
+constexpr std::size_t LentSetBytes = 16384;
+
+}
+
+void ShaderResources::lendDrawSets(DrawBindings& result, std::span<const std::size_t> selected, std::int32_t pushedSet, BindingRoute& route) const {
+    const auto* prepared = route.selection;
+    if (prepared == nullptr || prepared->selected.size() != selected.size() || selected.size() > result.snapshots.size()) return;
+    if (ownDrawSets == nullptr) ownDrawSets = makeOwnDrawSets();
+    const auto& plan = ownDrawSets->plan;
+    for (std::size_t set = 0; set < 2u; ++set) {
+        if (static_cast<std::int32_t>(set) == pushedSet || !plan.lendable[set] || !(plan.described[set] || splitSets)) continue;
+        const auto& lender = setLenders[set];
+        if (lender.set == VK_NULL_HANDLE) continue;
+        const auto held = lender.bindings.lock();
+        if (held == nullptr) continue;
+        if (lender.buffers.size() != descriptorBuffers.size() || std::memcmp(lender.buffers.data(), descriptorBuffers.data(), descriptorBuffers.size() * sizeof(VkDescriptorBufferInfo)) != 0) continue;
+        std::size_t matched = 0;
+        std::size_t at = 0;
+        bool same = true;
+        for (std::size_t index = 0; same && index < selected.size(); ++index) {
+            const auto allocationSet = selected[index] < plan.allocationSets.size() ? plan.allocationSets[selected[index]] : std::uint8_t{0xffu};
+            if (allocationSet == 0xfeu) same = false;
+            if (allocationSet != set) continue;
+            if (matched >= lender.allocations.size() || lender.allocations[matched] != selected[index] || lender.snapshots[matched] >= held->snapshots.size()) {
+                same = false;
+                continue;
+            }
+            const auto& mine = result.snapshots[index];
+            const auto& theirs = held->snapshots[lender.snapshots[matched]];
+            const auto& item = prepared->selected[index];
+            same = item.allocation == selected[index] && item.bytes == mine.bytes && mine.address == theirs.address && mine.bytes == theirs.bytes && at + mine.bytes <= lender.bytes.size() && (mine.bytes == 0 || std::memcmp(prepared->blob.data() + item.offset, lender.bytes.data() + at, mine.bytes) == 0);
+            at += mine.bytes;
+            ++matched;
+        }
+        if (!same || matched != lender.allocations.size()) continue;
+        matched = 0;
+        for (std::size_t index = 0; index < selected.size(); ++index) {
+            if (selected[index] < plan.allocationSets.size() && plan.allocationSets[selected[index]] == set) result.snapshots[index] = held->snapshots[lender.snapshots[matched++]];
+        }
+        result.lent[set] = true;
+        if (set == 0) {
+            result.allocation.set = lender.set;
+            result.layout = lender.layout;
+        } else {
+            result.fragmentAllocation.set = lender.set;
+            result.fragmentLayout = lender.layout;
+        }
+        result.lenders[set] = held;
+        ++route.setsLent;
+    }
+}
+
+void ShaderResources::noteSetLenders(const std::shared_ptr<DrawBindings>& result, std::span<const std::size_t> selected, BindingRoute& route) const {
+    if (ownDrawSets == nullptr) return;
+    const auto& plan = ownDrawSets->plan;
+    const auto* prepared = route.selection;
+    const bool copied = prepared != nullptr && prepared->selected.size() == selected.size();
+    for (std::size_t set = 0; set < 2u; ++set) {
+        const auto handle = set == 0 ? result->allocation.set : result->fragmentAllocation.set;
+        if (handle == VK_NULL_HANDLE || result->lent[set]) continue;
+        ++route.setsWritten;
+        auto& lender = setLenders[set];
+        lender.bindings.reset();
+        lender.set = VK_NULL_HANDLE;
+        if (!plan.lendable[set] || !copied) continue;
+        lender.allocations.clear();
+        lender.snapshots.clear();
+        lender.bytes.clear();
+        bool lendable = selected.size() <= result->snapshots.size();
+        for (std::size_t index = 0; lendable && index < selected.size(); ++index) {
+            const auto allocationSet = selected[index] < plan.allocationSets.size() ? plan.allocationSets[selected[index]] : std::uint8_t{0xffu};
+            if (allocationSet == 0xfeu) lendable = false;
+            if (allocationSet != set) continue;
+            const auto& item = prepared->selected[index];
+            const auto bytes = result->snapshots[index].bytes;
+            if (item.allocation != selected[index] || item.bytes != bytes || lender.bytes.size() + bytes > LentSetBytes) {
+                lendable = false;
+                continue;
+            }
+            lender.allocations.push_back(selected[index]);
+            lender.snapshots.push_back(index);
+            lender.bytes.insert(lender.bytes.end(), prepared->blob.begin() + static_cast<std::ptrdiff_t>(item.offset), prepared->blob.begin() + static_cast<std::ptrdiff_t>(item.offset + bytes));
+        }
+        if (!lendable) continue;
+        lender.bindings = result;
+        lender.set = handle;
+        lender.layout = set == 0 ? result->layout : result->fragmentLayout;
+        lender.buffers.assign(descriptorBuffers.begin(), descriptorBuffers.end());
+    }
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::finishDrawBindings(Recorder& recorder, std::shared_ptr<DrawBindings> result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet, BindingRoute* route) const {
     if (result == nullptr || (selected.empty() && !rebound)) return {};
+    const bool lends = route != nullptr && route->sets && lendsSets(pushedSet, faultRecord);
     if (pushedSet < 0) {
+        if (lends) lendDrawSets(*result, selected, pushedSet, *route);
         writeDrawSets(*result, selected, faultRecord);
+        if (lends) noteSetLenders(result, selected, *route);
     } else {
         const auto& sets = pushPlan->allocationSets;
-        if (std::ranges::any_of(selected, [&](std::size_t index) { return index >= sets.size() || sets[index] != static_cast<std::uint8_t>(pushedSet); })) writeDrawSets(*result, selected, faultRecord, pushedSet);
-        else result->cache = context.descriptorCache;
+        if (std::ranges::any_of(selected, [&](std::size_t index) { return index >= sets.size() || sets[index] != static_cast<std::uint8_t>(pushedSet); })) {
+            if (lends) lendDrawSets(*result, selected, pushedSet, *route);
+            writeDrawSets(*result, selected, faultRecord, pushedSet);
+            if (lends) noteSetLenders(result, selected, *route);
+        } else {
+            result->cache = context.descriptorCache;
+        }
     }
     if (heapStage && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind) && !RuntimeSwitches::Set(RuntimeSwitch::NoHeapSetSkip)) {
         for (const auto& snapshot : result->snapshots) recorder.KeepOnce(snapshot.buffer, snapshot.buffer->Bytes().size());
@@ -8231,7 +8340,87 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
     return result;
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, std::vector<std::size_t>& selected, bool binds, PreparedBuffers::Selection& selection) const {
+bool ShaderResources::unmovedClear(const Recorder& recorder, const PreparedBuffers& prepared, BindingRoute* route) const {
+    const bool stamps = route != nullptr && route->stamps;
+    if (stamps && (clearRecorder != recorder.Id() || clearNote != recorder.WriteNoteCount() || clearWrites != guestMemory.Writes().size() || clearAllocations.size() != allocations.size())) {
+        clearRecorder = recorder.Id();
+        clearNote = recorder.WriteNoteCount();
+        clearWrites = guestMemory.Writes().size();
+        clearAllocations.assign(allocations.size(), false);
+    }
+    for (const auto& item : prepared.selected) {
+        if (item.moved || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) continue;
+        const auto& allocation = allocations[item.allocation];
+        if (route != nullptr) ++route->tested;
+        if (stamps && clearAllocations[item.allocation]) {
+            ++route->stamped;
+            if (route->verifyStamps && (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size))) {
+                ++route->refuted;
+                return false;
+            }
+            continue;
+        }
+        if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return false;
+        if (stamps) clearAllocations[item.allocation] = true;
+    }
+    return true;
+}
+
+namespace {
+
+std::atomic<std::size_t> placedUploadChunks{0};
+
+}
+
+std::size_t ShaderResources::PlacedUploadChunks() {
+    return placedUploadChunks.load(std::memory_order_acquire);
+}
+
+bool ShaderResources::PlaceDirectBuffers(const Context& context, PreparedBuffers& prepared) {
+    prepared.placed.reset();
+    prepared.placedDevice = VK_NULL_HANDLE;
+    if (prepared.plan == nullptr) return false;
+    struct Upload {
+        std::weak_ptr<Buffer> chunk;
+        VkDevice device = VK_NULL_HANDLE;
+        std::size_t used = 0;
+    };
+    struct UploadStorage {};
+    auto& upload = HostThreadLocal<Upload, UploadStorage>();
+    const auto bytes = prepared.blob.size();
+    std::shared_ptr<Buffer> buffer;
+    std::size_t offset = 0;
+    if (!prepared.selected.empty()) {
+        const auto alignment = prepared.plan->alignment;
+        buffer = upload.device == context.device ? upload.chunk.lock() : nullptr;
+        offset = (upload.used + alignment - 1) & ~(alignment - 1);
+        if (buffer == nullptr || offset + bytes > buffer->Bytes().size()) {
+            auto* made = new Buffer(context, std::max(Recorder::DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            placedUploadChunks.fetch_add(1, std::memory_order_acq_rel);
+            buffer = std::shared_ptr<Buffer>(made, [](Buffer* chunk) {
+                delete chunk;
+                placedUploadChunks.fetch_sub(1, std::memory_order_acq_rel);
+            });
+            upload.chunk = buffer;
+            upload.device = context.device;
+            offset = 0;
+        }
+        upload.used = offset + bytes;
+        std::memcpy(buffer->Bytes().data() + offset, prepared.blob.data(), bytes);
+    }
+    auto placed = std::make_shared<DrawBindings>();
+    placed->snapshots.reserve(prepared.selected.size());
+    placed->pushSelected.reserve(prepared.selected.size());
+    for (const auto& item : prepared.selected) {
+        placed->snapshots.push_back({item.begin, buffer, offset + item.offset, item.bytes});
+        placed->pushSelected.push_back(item.allocation);
+    }
+    prepared.placed = std::move(placed);
+    prepared.placedDevice = context.device;
+    return true;
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, std::vector<std::size_t>& selected, bool binds, PreparedBuffers::Selection& selection, BindingRoute* route) const {
     using Selection = PreparedBuffers::Selection;
     selected.clear();
     selection = Selection::Hazard;
@@ -8246,15 +8435,48 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSn
         selection = Selection::DepthGuards;
         return {};
     }
-    requireGuestBuffers(moved);
+    if (route != nullptr && route->stamps && requireMovedGuestBuffers(moved)) {
+        ++route->guards;
+        if (route->verifyStamps && std::ranges::any_of(moved, [&](const MovedBuffer& entry) { return allocations[entry.allocation].guest && MayOverlapDepthGuards_nid_no_patch(entry.address, entry.size); })) {
+            ++route->refuted;
+            requireGuestBuffers(moved);
+        }
+    } else {
+        requireGuestBuffers(moved);
+    }
     prepareFaultSlot();
     bindingsChecked = heapStage && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind);
-    for (const auto& item : prepared.selected) {
-        if (item.moved || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) continue;
-        const auto& allocation = allocations[item.allocation];
-        if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return {};
+    if (route != nullptr) {
+        if (!unmovedClear(recorder, prepared, route)) return {};
+    } else {
+        for (const auto& item : prepared.selected) {
+            if (item.moved || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) continue;
+            const auto& allocation = allocations[item.allocation];
+            if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return {};
+        }
     }
     selection = Selection::Taken;
+    if (route != nullptr) route->selection = &prepared;
+    if (route != nullptr && route->placed && binds && prepared.placed != nullptr) {
+        if (prepared.placedDevice != context.device) {
+            route->taken = BindingTaken::OtherDevice;
+        } else {
+            route->taken = BindingTaken::Placed;
+            route->bytes = prepared.blob.size();
+            auto result = std::move(prepared.placed);
+            for (const auto& item : prepared.selected) {
+                selected.push_back(item.allocation);
+                if (item.begin == 0) continue;
+                if (item.moved && item.bytes > plan.uploadLimit && MovedSnapshotStats()) {
+                    movedSnapshotTally().uploaded.fetch_add(1, std::memory_order_relaxed);
+                    movedSnapshotTally().uploadedBytes.fetch_add(item.bytes, std::memory_order_relaxed);
+                }
+                CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(item.begin), item.bytes);
+            }
+            return result;
+        }
+    }
+    if (route != nullptr && route->taken == BindingTaken::None) route->taken = BindingTaken::Copied;
     auto result = std::make_shared<DrawBindings>();
     if (prepared.selected.empty()) return result;
     auto slice = recorder.DrawUpload(prepared.blob.size());
@@ -8284,6 +8506,7 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         writeOwnDrawSets(result, selected, faultRecord, pushedSet);
         return;
     }
+    result.lent = {};
     if (ownDrawSets != nullptr && ownDrawSets->Parked() != 0) ownDrawSets->Drain(false);
     std::array<bool, 2> described{};
     struct CountsStorage {};
@@ -8371,12 +8594,18 @@ std::shared_ptr<OwnDrawSets> ShaderResources::makeOwnDrawSets() const {
     plan.sets.assign(descriptorWrites.size(), 0);
     plan.buffers.assign(descriptorWrites.size(), std::numeric_limits<std::size_t>::max());
     plan.slots.resize(allocations.size());
+    plan.allocationSets.assign(allocations.size(), 0xffu);
+    plan.lendable = {true, true};
     std::size_t next = 0;
     for (const auto& binding : bindings) {
         if (binding.heap) continue;
         const auto set = setOf(binding);
         const auto original = set == 0 ? _set : fragment.set;
+        for (const auto index : binding.allocations) {
+            if (index < plan.allocationSets.size()) plan.allocationSets[index] = plan.allocationSets[index] == 0xffu || plan.allocationSets[index] == set ? static_cast<std::uint8_t>(set) : 0xfeu;
+        }
         while (next < descriptorWrites.size() && descriptorWrites[next].dstBinding == binding.layout.binding && descriptorWrites[next].dstSet == original) {
+            if (descriptorWrites[next].pTexelBufferView != nullptr || (!binding.allocations.empty() && descriptorWrites[next].descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)) plan.lendable[set] = false;
             plan.sets[next] = static_cast<std::uint8_t>(set);
             if (!binding.allocations.empty()) {
                 const auto offset = static_cast<std::size_t>(descriptorWrites[next].pBufferInfo - descriptorBuffers.data());
@@ -8395,14 +8624,19 @@ void ShaderResources::writeOwnDrawSets(DrawBindings& result, std::span<const std
     const auto& plan = ownDrawSets->plan;
     result.cache = context.descriptorCache;
     result.ownSets = ownDrawSets;
+    if ((result.lent[0] || result.lent[1]) && !((plan.described[0] || splitSets) && pushedSet != 0 && !result.lent[0]) && !(!heapStage && (plan.described[1] || splitSets) && pushedSet != 1 && !result.lent[1])) {
+        writeAddressedOverlay(result, selected);
+        result.owned = {};
+        return;
+    }
     std::array<bool, 2> pooled{};
-    if ((plan.described[0] || splitSets) && pushedSet != 0) {
+    if ((plan.described[0] || splitSets) && pushedSet != 0 && !result.lent[0]) {
         pooled[0] = ownDrawSets->Take(0, result.allocation);
         if (!pooled[0]) result.allocation = result.cache->AllocateRewritten(_layout, plan.sizes[0], updateAfterBind, plan.variable[0]);
         result.layout = _layout;
         Require(result.allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
-    if (!heapStage && (plan.described[1] || splitSets) && pushedSet != 1) {
+    if (!heapStage && (plan.described[1] || splitSets) && pushedSet != 1 && !result.lent[1]) {
         pooled[1] = ownDrawSets->Take(1, result.fragmentAllocation);
         if (!pooled[1]) result.fragmentAllocation = result.cache->AllocateRewritten(fragment.layout, plan.sizes[1], updateAfterBind, plan.variable[1]);
         result.fragmentLayout = fragment.layout;
@@ -8424,14 +8658,15 @@ void ShaderResources::writeOwnDrawSets(DrawBindings& result, std::span<const std
     for (std::size_t index = 0; index < descriptorWrites.size(); ++index) {
         const auto set = plan.sets[index];
         if (static_cast<std::int32_t>(set) == pushedSet) continue;
+        if (result.lent[set]) continue;
         if (pooled[set] && descriptorWrites[index].descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) continue;
         auto& write = writes.emplace_back(descriptorWrites[index]);
         write.dstSet = set == 0 ? result.allocation.set : result.fragmentAllocation.set;
         if (plan.buffers[index] != std::numeric_limits<std::size_t>::max()) write.pBufferInfo = buffers.data() + plan.buffers[index];
     }
     writeAddressedOverlay(result, selected);
-    context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    result.owned = {result.allocation.set != VK_NULL_HANDLE, result.fragmentAllocation.set != VK_NULL_HANDLE};
+    if (!writes.empty() || (!result.lent[0] && !result.lent[1])) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    result.owned = {result.allocation.set != VK_NULL_HANDLE && !result.lent[0], result.fragmentAllocation.set != VK_NULL_HANDLE && !result.lent[1]};
 }
 
 void ShaderResources::writeAddressedOverlay(DrawBindings& result, std::span<const std::size_t> selected) const {
@@ -8586,6 +8821,19 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
     }
     if (depthClear && !depthHeld) depthGuardsClear.store(depthGeneration, std::memory_order_relaxed);
     if (multisampleClear && !multisampleHeld) multisampleGuardsClear.store(multisampleGeneration, std::memory_order_relaxed);
+}
+
+bool ShaderResources::requireMovedGuestBuffers(std::span<const MovedBuffer> moved) const {
+    if (moved.empty() || !completed || !RuntimeSwitches::Set(RuntimeSwitch::GuardRangeMemo) || RuntimeSwitches::Set(RuntimeSwitch::NoGuardSpans) || VerifyGuardSpans()) return false;
+    if (depthGuardsClear.load(std::memory_order_relaxed) != DepthGuardsGeneration_nid_no_patch() || multisampleGuardsClear.load(std::memory_order_relaxed) != MultisampleGuardsGeneration()) return false;
+    for (std::size_t index = 0; index < moved.size(); ++index) {
+        if (moved[index].allocation >= allocations.size() || (index != 0 && moved[index - 1].allocation >= moved[index].allocation)) return false;
+    }
+    for (const auto& entry : moved) {
+        if (!allocations[entry.allocation].guest) continue;
+        if (MayOverlapMultisampleGuards(entry.address, entry.size)) RequireNoMultisampleColorTarget(entry.address, entry.size, "a shader buffer access");
+    }
+    return true;
 }
 
 void ShaderResources::BindDescriptorHeaps(VkCommandBuffer commands) const {
@@ -8915,21 +9163,25 @@ ShaderResources::PreparedDifference ShaderResources::ComparePreparedBinding(Reco
     return {};
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut, const PreparedBuffers* prepared, PreparedBuffers::Selection* preparedSelection) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut, const PreparedBuffers* prepared, PreparedBuffers::Selection* preparedSelection, BindingRoute* route) const {
     struct SelectedStorage {};
     auto& selected = HostThreadLocal<std::vector<std::size_t>, SelectedStorage>();
     auto selection = PreparedBuffers::Selection::Hazard;
-    auto result = prepared != nullptr ? selectPreparedSnapshots(recorder, moved, *prepared, selected, true, selection) : nullptr;
+    auto result = prepared != nullptr ? selectPreparedSnapshots(recorder, moved, *prepared, selected, true, selection, route) : nullptr;
+    const bool placed = result != nullptr && route != nullptr && route->taken == BindingTaken::Placed;
     if (preparedSelection != nullptr) *preparedSelection = selection;
     if (result == nullptr) result = selectDrawSnapshots(recorder, moved, false, selected, false);
     if (selectedOut != nullptr) selectedOut->assign(selected.begin(), selected.end());
     if (result == nullptr || (selected.empty() && !rebound)) return {};
     const bool pushes = std::ranges::any_of(selected, [&](std::size_t index) { return index < plan.allocationSets.size() && plan.allocationSets[index] == plan.set; });
-    if (!pushes) return finishDrawBindings(recorder, std::move(result), selected, nullptr);
+    if (!pushes) {
+        if (placed) result->pushSelected.clear();
+        return finishDrawBindings(recorder, std::move(result), selected, nullptr, -1, route);
+    }
     const auto pushed = static_cast<std::int32_t>(plan.set);
     result->pushedSet = pushed;
-    result->pushSelected.assign(selected.begin(), selected.end());
-    return finishDrawBindings(recorder, std::move(result), selected, nullptr, pushed);
+    if (!placed) result->pushSelected.assign(selected.begin(), selected.end());
+    return finishDrawBindings(recorder, std::move(result), selected, nullptr, pushed, route);
 }
 
 void ShaderResources::PushDrawBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const {
@@ -9259,7 +9511,7 @@ void ShaderResources::overlayPushedBuffers(const DrawBindings& result, const Pus
     }
 }
 
-void ShaderResources::DescribeDrawBindings(const DrawBindings* bound, std::span<const std::size_t> selected, const PushPlan* plan, std::vector<BoundBuffer>& out) const {
+void ShaderResources::DescribeDrawBindings(const DrawBindings* bound, std::span<const std::size_t> selected, const PushPlan* plan, std::vector<BoundBuffer>& out, bool contents) const {
     out.clear();
     constexpr auto none = std::numeric_limits<std::size_t>::max();
     std::vector<VkDescriptorBufferInfo> buffers = descriptorBuffers;
@@ -9305,7 +9557,7 @@ void ShaderResources::DescribeDrawBindings(const DrawBindings* bound, std::span<
                 entry.snapshot = true;
                 entry.address = snapshot.address;
                 entry.bytes = snapshot.bytes;
-                if (snapshot.address == 0) {
+                if (snapshot.address == 0 || contents) {
                     std::uint64_t hash = 0xcbf29ce484222325ull;
                     for (const auto byte : snapshot.Bytes()) hash = (hash ^ std::to_integer<std::uint8_t>(byte)) * 0x100000001b3ull;
                     entry.content = hash;
