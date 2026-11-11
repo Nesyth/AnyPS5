@@ -1484,10 +1484,17 @@ int PreparedInputsMatch() {
         vertex.vertexAttributes = kept;
         PreparedInputs rechecked;
         prepare(indexed, rechecked, "an indexed draw before another import");
+        const auto* before = Graphics::HostImportFor(context, block.At(0), BlockBytes);
+        Require(before != nullptr, "prepared inputs: the first block has no import");
+        const auto beforeBuffer = before->buffer;
+        const auto beforeOffset = Graphics::HostImportOffset(*before, block.At(0));
         GuestBlock other;
         Require(Graphics::HostImportFor(context, other.At(0), BlockBytes) != nullptr, "prepared inputs: the second block was not imported");
         Require(Graphics::HostImportSetGeneration() != rechecked.imports, "prepared inputs: a new import did not move the import set generation");
-        verify(state, indexed, rechecked, DrawRecordInputs::Checked, "an indexed draw after another block's import", DrawRecordInputs::Rechecked);
+        const auto* after = Graphics::HostImportFor(context, block.At(0), BlockBytes);
+        const bool replaced = after == nullptr || after->buffer != beforeBuffer || Graphics::HostImportOffset(*after, block.At(0)) != beforeOffset;
+        if (replaced) std::cout << "the second block's import replaced the first block's, so the committer drops the prepared inputs\n";
+        verify(state, indexed, rechecked, replaced ? DrawRecordInputs::ImportChanged : DrawRecordInputs::Checked, "an indexed draw after another block's import", replaced ? DrawRecordInputs::ImportChanged : DrawRecordInputs::Rechecked);
     }
     PreparedInputs moved;
     {
