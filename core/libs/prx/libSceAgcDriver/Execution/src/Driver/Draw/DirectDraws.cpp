@@ -310,6 +310,39 @@ void prepareInputs(const LeanDrawJob& job, const LeanAnchor& anchor, const Direc
     DirectDraws::Add(Counter::InputsPrepared);
 }
 
+void recordFragment(const LeanDrawJob& job, const LeanAnchor& anchor, DrawRecordHit& hit) {
+    if (!hit.preparedBuffers.has_value() || hit.preparedBuffers->placed == nullptr || !hit.preparedInputs.has_value()) return;
+    const auto block = hit.record->commit->fragmentBlock.load(std::memory_order_acquire);
+    if (block == nullptr) {
+        DirectDraws::Add(Counter::FragmentsNoBlock);
+        return;
+    }
+    struct SampleStorage {};
+    auto& sampled = HostThreadLocal<std::uint64_t, SampleStorage>();
+    const bool timed = (sampled++ & 7u) == 0;
+    const auto began = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto& fragment = hit.fragment.emplace();
+    auto refusal = DrawFragmentRefusal::Thrown;
+    bool made = false;
+    try {
+        made = anchor.device->RecordDrawFragment(job.shape->decode->state, hit.parameters, hit.stages, *block, *hit.preparedBuffers, *hit.preparedInputs, fragment, refusal);
+    } catch (const std::exception&) {
+        refusal = DrawFragmentRefusal::Thrown;
+        made = false;
+    }
+    if (!made) {
+        hit.fragment.reset();
+        const auto reason = refusal == DrawFragmentRefusal::None || refusal == DrawFragmentRefusal::Count ? DrawFragmentRefusal::Thrown : refusal;
+        DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::FragmentsNoBlock) + static_cast<std::size_t>(reason) - static_cast<std::size_t>(DrawFragmentRefusal::NoBlock)));
+        return;
+    }
+    DirectDraws::Add(Counter::FragmentsMade);
+    if (fragment.written) DirectDraws::Add(Counter::FragmentsWritten);
+    if (!timed) return;
+    DirectDraws::Add(Counter::FragmentsFinisherNanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count()));
+    DirectDraws::Add(Counter::FragmentsFinisherTimed);
+}
+
 }
 
 std::size_t DirectStageStore::KeyHash::operator()(const std::pair<std::uint64_t, std::uint64_t>& key) const {
@@ -501,7 +534,7 @@ std::uint64_t DirectStores::Follow(std::uint64_t serial) {
     auto live = Graphics::RuntimeSwitches::Snapshot();
     // Switches that change only what the committer does with a hit, or only dispatch packets,
     // leave the stages and classes as they are, so an in-run A/B of one keeps the stores.
-    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic}) live.Assign(id, false);
+    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic, Graphics::RuntimeSwitch::CommitFragments}) live.Assign(id, false);
     if (!tagged || deviceSerial != serial || !(live == switches)) {
         tagged = true;
         deviceSerial = serial;
@@ -850,6 +883,7 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
             prepareInputs(job, anchor, resolved, *hit);
             lap(Step::Inputs);
         }
+        if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::CommitFragments)) recordFragment(job, anchor, *hit);
         commitRecordDraw(job, anchor, std::move(hit));
         lap(Step::HandOff);
         if (timer != nullptr) timer->Report();

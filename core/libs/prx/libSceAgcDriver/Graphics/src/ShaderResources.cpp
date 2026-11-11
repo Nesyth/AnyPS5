@@ -8544,20 +8544,25 @@ bool ShaderResources::PlaceDirectBuffers(const Context& context, PreparedBuffers
     return true;
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, std::vector<std::size_t>& selected, bool binds, PreparedBuffers::Selection& selection, BindingRoute* route) const {
+ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route) const {
+    auto selection = PreparedBuffers::Selection::Hazard;
+    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, route));
+    return selection;
+}
+
+bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route) const {
     using Selection = PreparedBuffers::Selection;
-    selected.clear();
     selection = Selection::Hazard;
     const auto& plan = *prepared.plan;
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
-    if (alignment != 0 && plan.alignment % alignment != 0) return {};
+    if (alignment != 0 && plan.alignment % alignment != 0) return false;
     // requireGuestBuffers publishes the host-written samples of a resident depth surface into the
     // memory it overlaps, after the finisher read that memory; a guard set up or dropped since the
     // read may have published them already.
     const bool guardsMoved = DepthGuardsGeneration_nid_no_patch() != prepared.depthGuards;
     if ((guardsMoved || HasResidentDepthGuards_nid_no_patch()) && std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && (guardsMoved || MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes)); })) {
         selection = Selection::DepthGuards;
-        return {};
+        return false;
     }
     if (route != nullptr && route->stamps && requireMovedGuestBuffers(moved)) {
         ++route->guards;
@@ -8571,16 +8576,23 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSn
     prepareFaultSlot();
     bindingsChecked = heapStage && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind);
     if (route != nullptr) {
-        if (!unmovedClear(recorder, prepared, route)) return {};
+        if (!unmovedClear(recorder, prepared, route)) return false;
     } else {
         for (const auto& item : prepared.selected) {
             if (item.moved || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) continue;
             const auto& allocation = allocations[item.allocation];
-            if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return {};
+            if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return false;
         }
     }
     selection = Selection::Taken;
     if (route != nullptr) route->selection = &prepared;
+    return true;
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, std::vector<std::size_t>& selected, bool binds, PreparedBuffers::Selection& selection, BindingRoute* route) const {
+    selected.clear();
+    if (!preparedSelectionHolds(recorder, moved, prepared, selection, route)) return {};
+    const auto& plan = *prepared.plan;
     if (route != nullptr && route->placed && binds && prepared.placed != nullptr) {
         if (prepared.placedDevice != context.device) {
             route->taken = BindingTaken::OtherDevice;
@@ -8632,6 +8644,16 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
     }
     result.lent = {};
     if (ownDrawSets != nullptr && ownDrawSets->Parked() != 0) ownDrawSets->Drain(false);
+    writeFreshDrawSets(result, selected, faultRecord, pushedSet);
+}
+
+void ShaderResources::WriteFragmentSets(DrawBindings& result, std::span<const std::size_t> selected, std::int32_t pushedSet) const {
+    Require(context.descriptorCache != nullptr && !heapStage, "a fragment's sets need a descriptor cache and no heap stage");
+    result.lent = {};
+    writeFreshDrawSets(result, selected, nullptr, pushedSet);
+}
+
+void ShaderResources::writeFreshDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet) const {
     std::array<bool, 2> described{};
     struct CountsStorage {};
     auto& counts = HostThreadLocal<std::array<std::vector<VkDescriptorPoolSize>, 2>, CountsStorage>();
@@ -9657,6 +9679,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PreparePushedDra
 void ShaderResources::PushDrawBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const {
     requireGuestBuffers();
     prepareFaultSlot();
+    pushBindings(commands, layout, result, plan);
+}
+
+void ShaderResources::PushFragmentBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const {
+    pushBindings(commands, layout, result, plan);
+}
+
+void ShaderResources::pushBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const {
     const auto fragmentSet = ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet;
     if (plan.set == 1u) {
         const auto set = result.allocation.set != VK_NULL_HANDLE ? result.allocation.set : _set;

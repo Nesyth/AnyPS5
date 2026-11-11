@@ -1545,6 +1545,37 @@ void NoteDirectCommit(const DrawRecordCommit& commit, bool recorded) {
     else if (effects.hold != DrawRecordHold::Count) DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::HoldFirst) + static_cast<std::size_t>(effects.hold) - static_cast<std::size_t>(DrawRecordHold::First)));
 }
 
+void NoteCommitFragments(const DrawRecord& record, DrawRecordCommit& commit, bool timed, std::uint64_t nanoseconds) {
+    using DirectDraws::Counter;
+    const auto& note = commit.effects.fragment;
+    if (note.spliced) DirectDraws::Add(Counter::FragmentsSpliced);
+    if (note.replayed) DirectDraws::Add(Counter::FragmentsReplayed);
+    if (note.offered && !note.spliced && !note.replayed) {
+        const auto drop = note.drop == DrawFragmentDrop::None || note.drop == DrawFragmentDrop::Count ? DrawFragmentDrop::Modes : note.drop;
+        DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::FragmentsDropObjects) + static_cast<std::size_t>(drop) - static_cast<std::size_t>(DrawFragmentDrop::Objects)));
+    }
+    if (note.verified) {
+        DirectDraws::Add(Counter::FragmentsVerifyChecked);
+        if (note.differs) {
+            DirectDraws::Add(Counter::FragmentsVerifyDiffering);
+            commit.fragmentsRefused = true;
+            static std::atomic<std::int64_t> window{0};
+            static std::atomic<std::uint32_t> printed{0};
+            const auto now = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
+            if (window.exchange(now, std::memory_order_relaxed) != now) printed.store(0, std::memory_order_relaxed);
+            if (printed.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[commit-fragments-verify] %s differs: record %s; fragments are off for it\n", note.what != nullptr ? note.what : "a command", hex(record.probe).c_str());
+        }
+    }
+    if (!timed) return;
+    if (note.spliced || note.replayed) {
+        DirectDraws::Add(Counter::FragmentsSplicedNanoseconds, nanoseconds);
+        DirectDraws::Add(Counter::FragmentsSplicedTimed);
+        return;
+    }
+    DirectDraws::Add(Counter::FragmentsTodayNanoseconds, nanoseconds);
+    DirectDraws::Add(Counter::FragmentsTodayTimed);
+}
+
 // A hit that carries prepared buffers counts once: used, not used by reason (dropped when its
 // commit did not get as far as the prepared buffers), or verified.
 void NoteDirectBuffers(const DrawRecordCommit& commit, bool prepared) {
@@ -1842,7 +1873,13 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
             }
         }
         const auto fullBegan = timed && !repeatedOutcome.has_value() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const auto outcome = repeatedOutcome.has_value() ? *repeatedOutcome : localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, nullptr, prepared, fullInputs);
+        const bool fragmentsOn = hit.direct && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::CommitFragments);
+        static std::uint64_t fragmentTimingOrdinal = 0;
+        const bool fragmentTimed = fragmentsOn && !repeatedOutcome.has_value() && (++fragmentTimingOrdinal & 7u) == 0;
+        const auto fragmentBegan = fragmentTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        auto* fragment = fragmentsOn && hit.fragment.has_value() ? &*hit.fragment : nullptr;
+        const auto outcome = repeatedOutcome.has_value() ? *repeatedOutcome : localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, nullptr, prepared, fullInputs, fragment);
+        if (fragmentsOn) NoteCommitFragments(*hit.record, commit, fragmentTimed && outcome.recorded, fragmentTimed ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - fragmentBegan).count()) : 0u);
         if (timed && !repeatedOutcome.has_value() && outcome.recorded && commit.effects.hold == DrawRecordHold::Held && !commit.effects.sharedHold) {
             DirectDraws::Add(DirectDraws::Counter::RepeatFullNanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - fullBegan).count()));
             DirectDraws::Add(DirectDraws::Counter::RepeatFullTimed);

@@ -219,6 +219,7 @@ struct DrawRecordHit {
     // into `stages`, so they stay valid until the commit ran.
     std::optional<Graphics::ShaderResources::PreparedBuffers> preparedBuffers;
     std::optional<Graphics::PreparedInputs> preparedInputs;
+    std::optional<DrawFragment> fragment;
 };
 
 namespace DrawRecordFlags {

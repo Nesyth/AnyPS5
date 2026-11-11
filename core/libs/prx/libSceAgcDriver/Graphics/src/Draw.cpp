@@ -3284,6 +3284,9 @@ struct RecordedDraw {
     std::shared_ptr<Pipeline> pushDynamicPipeline;
     std::shared_ptr<Framebuffer> pushDynamicFramebuffer;
     DrawRecordBindings* bindings = nullptr;
+    DrawFragment* fragment = nullptr;
+    bool fragmentVerify = false;
+    DrawRecordFragment* fragmentNote = nullptr;
 };
 
 // A remapped viewport depth range reads its scale and offset from the draw's push block (the vertex shader's
@@ -3506,6 +3509,21 @@ void noteReplayPassCensus(const Recorder* recorder, const ShaderResources* resou
     last = now;
 }
 
+bool sameFragmentBound(const ShaderResources::BoundBuffer& left, const ShaderResources::BoundBuffer& right) {
+    if (left.set != right.set || left.binding != right.binding || left.element != right.element || left.snapshot != right.snapshot || left.info.range != right.info.range) return false;
+    if (!left.snapshot) return left.info.buffer == right.info.buffer && left.info.offset == right.info.offset;
+    return left.address == right.address && left.bytes == right.bytes && left.content == right.content;
+}
+
+void keepFragmentBindings(Recorder& recorder, const std::shared_ptr<ShaderResources::DrawBindings>& bindings) {
+    recorder.Keep(bindings);
+    if (RuntimeSwitches::Set(RuntimeSwitch::KeepBytesOnce)) {
+        for (const auto& snapshot : bindings->snapshots) recorder.KeepSnapshotBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+        return;
+    }
+    for (const auto& snapshot : bindings->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
@@ -3580,12 +3598,35 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool bindingsKept = record.bindingsAsIs != nullptr && faultRecord == nullptr && !record.replay && record.view == nullptr && record.preparedCheck == nullptr;
     if (bindingsKept && record.bindingsAsIs->resources == &resources && record.bindingsAsIs->push == record.push) keptBindings = record.bindingsAsIs->bindings;
     auto* route = keptBindings == nullptr && !record.replay && record.prepared != nullptr ? record.route : nullptr;
-    auto* bindingsCheck = route != nullptr && record.bindings != nullptr && record.bindings->verify ? record.bindings : nullptr;
+    auto* fragment = record.fragment;
+    const auto dropFragment = [&](DrawFragmentDrop why) {
+        if (record.fragmentNote != nullptr) record.fragmentNote->drop = why;
+        fragment = nullptr;
+    };
+    if (fragment != nullptr && (faultRecord != nullptr || record.replay || keptBindings != nullptr || record.view != nullptr || record.preparedCheck != nullptr || record.prepared == nullptr || hitCensus || capture)) dropFragment(DrawFragmentDrop::Modes);
+    std::shared_ptr<ShaderResources::DrawBindings> fragmentBindings;
+    if (fragment != nullptr && !record.fragmentVerify) {
+        const auto held = resources.FragmentSelectionHolds(*recorder, record.moved, *record.prepared, route);
+        if (held == PreparedSelection::Taken) {
+            fragmentBindings = fragment->bindings;
+            preparedSelection = held;
+            if (route != nullptr) {
+                route->taken = ShaderResources::BindingTaken::Placed;
+                route->bytes = record.prepared->blob.size();
+            }
+        } else {
+            preparedSelection = held;
+            dropFragment(DrawFragmentDrop::Selection);
+        }
+    }
+    auto* bindingsCheck = fragment == nullptr && route != nullptr && record.bindings != nullptr && record.bindings->verify ? record.bindings : nullptr;
     std::vector<std::size_t> routeSelected;
     if (bindingsCheck != nullptr && selectedOut == nullptr) selectedOut = &routeSelected;
     const bool bindingsTimed = keptBindings == nullptr && record.bindings != nullptr && record.bindings->timed;
     const auto bindingsBegan = bindingsTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const auto drawBindings = keptBindings != nullptr ? keptBindings : record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, selectedOut, record.prepared, &preparedSelection, route) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus, selectedOut, record.prepared, &preparedSelection, route);
+    const auto drawBindings = fragmentBindings != nullptr ? fragmentBindings : keptBindings != nullptr ? keptBindings : record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, selectedOut, record.prepared, &preparedSelection, route) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus, selectedOut, record.prepared, &preparedSelection, route);
+    if (fragmentBindings != nullptr) keepFragmentBindings(*recorder, fragmentBindings);
+    if (fragment != nullptr && record.fragmentVerify && preparedSelection != PreparedSelection::Taken) dropFragment(DrawFragmentDrop::Selection);
     if (bindingsTimed) record.bindings->nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - bindingsBegan).count());
     if (bindingsTimed || route != nullptr || (record.bindings != nullptr && record.bindings->dynamicLeave != 0)) {
         auto& noted = *record.bindings;
@@ -3741,8 +3782,15 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
+    if (fragment != nullptr && (gpuIndirect || meshIndirect || captured || meshArguments != nullptr || !record.stencilReplay.empty())) dropFragment(DrawFragmentDrop::Modes);
+    auto* batchStream = fragment != nullptr ? CommandStream::FromHandle(commands) : nullptr;
+    const bool verifyFragment = fragment != nullptr && record.fragmentVerify && batchStream != nullptr;
+    const bool spliceFragment = fragment != nullptr && !record.fragmentVerify && fragmentBindings != nullptr;
+    if (fragment != nullptr && record.fragmentVerify && batchStream == nullptr) dropFragment(DrawFragmentDrop::Verify);
+    std::uint64_t fragmentMark = 0;
     if (continued) {
-        record.pipeline->Continue(commands, state);
+        if (verifyFragment) fragmentMark = batchStream->MarkOps();
+        if (!spliceFragment) record.pipeline->Continue(commands, state);
     } else {
         for (const auto& proxy : record.proxies) {
             proxy->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL);
@@ -3780,11 +3828,30 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         for (const auto& write : record.staged) RecordStagedClear(context, commands, *write.temporary);
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
-        record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
+        if (spliceFragment) {
+            record.pipeline->BeginPass(commands, *record.framebuffer, state.renderExtent, state);
+        } else if (verifyFragment) {
+            record.pipeline->BeginPass(commands, *record.framebuffer, state.renderExtent, state);
+            fragmentMark = batchStream->MarkOps();
+            record.pipeline->Continue(commands, state);
+        } else {
+            record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
+        }
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     const bool heapPipeline = record.pipeline->DescriptorHeap();
     NoteHeapRecord(false, heapPipeline);
+    if (spliceFragment) {
+        if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);
+        if (batchStream != nullptr) {
+            batchStream->Splice(std::move(fragment->commands));
+            if (record.fragmentNote != nullptr) record.fragmentNote->spliced = true;
+        } else {
+            CommandStream::ReplayFragment(fragment->commands, commands);
+            if (record.fragmentNote != nullptr) record.fragmentNote->replayed = true;
+        }
+        NoteGuestWorkIn(context, commands);
+    } else {
     if (heapPipeline) {
         resources.BindDescriptorHeaps(commands);
         NoteEmptyResourceSet();
@@ -3829,6 +3896,27 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
     }
     recorder->EndGpuTiming(eachDrawTiming);
+    if (verifyFragment) {
+        auto& note = *record.fragmentNote;
+        note.verified = true;
+        const char* what = nullptr;
+        bool same = CommandStream::SameRecords(fragment->commands, *batchStream, fragmentMark, true, &what);
+        if (same) {
+            std::vector<std::size_t> chosen;
+            chosen.reserve(record.prepared->selected.size());
+            for (const auto& item : record.prepared->selected) chosen.push_back(item.allocation);
+            std::vector<ShaderResources::BoundBuffer> mine;
+            std::vector<ShaderResources::BoundBuffer> today;
+            resources.DescribeDrawBindings(fragment->bindings.get(), chosen, record.push, mine, true);
+            resources.DescribeDrawBindings(drawBindings.get(), chosen, record.push, today, true);
+            same = std::ranges::equal(mine, today, sameFragmentBound);
+            if (!same) what = "the bindings";
+        }
+        note.differs = !same;
+        note.what = what;
+        note.drop = DrawFragmentDrop::Verify;
+    }
+    }
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (state.tessellationCapture != nullptr) {
         recorder->Keep(state.tessellationCapture->header);
@@ -5946,9 +6034,135 @@ void fillRepeatBlock(const Context& context, const State& state, std::span<const
     block.simple = DrawRepeatClass::Simple;
 }
 
+bool fragmentModes() {
+    static const bool timeEachDraw = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
+    return !timeEachDraw && RecordDraws() && DumpTargetLimit() == 0 && !DrawFaultTokens() && !CaptureInputsEnabled() && !CaptureTrace::Enabled() && !ReplayCensusEnabled() && !PassAccessMemoVerify() && !GuestMemory::WriteIndexEnabled() && RuntimeSwitches::Set(RuntimeSwitch::CommitFragments) && RuntimeSwitches::Set(RuntimeSwitch::CommitBindings) && !RuntimeSwitches::Set(RuntimeSwitch::CommitBindingsDynamic) && !RuntimeSwitches::Set(RuntimeSwitch::XpBindingsAsIs) && !RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor) && !RuntimeSwitches::Set(RuntimeSwitch::XpInputsAsIs);
 }
 
-DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs) {
+struct FragmentStreamStorage {};
+struct FragmentSelectedStorage {};
+
+CommandStream& fragmentStream() {
+    auto& stream = HostThreadLocal<std::unique_ptr<CommandStream>, FragmentStreamStorage>();
+    if (stream == nullptr) stream = std::make_unique<CommandStream>(CommandStream::Mode::Fragments);
+    return *stream;
+}
+
+void recordFragmentDraw(const Context& context, VkCommandBuffer commands, const Pm4::DrawParameters& draw, const PreparedInputs& inputs) {
+    if (!inputs.vertexHandles.empty()) context.Resolved(&DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(inputs.vertexHandles.size()), inputs.vertexHandles.data(), inputs.vertexOffsets.data());
+    if (draw.indexed) {
+        const auto& range = inputs.ranges.front();
+        context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, range.handle, range.offset, draw.indexSize == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+        CountVkDraw(VkDrawKind::Indexed);
+        context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, draw.indexCount, draw.instanceCount, 0, static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
+        return;
+    }
+    CountVkDraw(VkDrawKind::Direct);
+    context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, draw.indexCount, draw.instanceCount, draw.firstVertex, draw.firstInstance);
+}
+
+void publishFragmentBlock(const Context& context, DrawRecordCommit& record, const std::shared_ptr<ShaderResources>& resources, const std::weak_ptr<Pipeline>& pipeline, const std::weak_ptr<Pipeline>& pushPipeline, const void* pipelineKey, const void* pushKey, const ShaderResources::PushPlan* push, bool eligible) {
+    const bool wanted = eligible && !record.fragmentsRefused && resources != nullptr && resources->FragmentEligible() && fragmentModes();
+    if (!wanted) {
+        if (record.fragmentResources != nullptr) {
+            record.fragmentBlock.store(nullptr);
+            record.fragmentResources = nullptr;
+            record.fragmentPipeline = nullptr;
+            record.fragmentPushPipeline = nullptr;
+        }
+        return;
+    }
+    if (record.fragmentResources == resources.get() && record.fragmentPipeline == pipelineKey && record.fragmentPushPipeline == pushKey) return;
+    auto block = std::make_shared<DrawFragmentBlock>();
+    block->resources = resources;
+    block->pipeline = pipeline;
+    block->pushPipeline = pushPipeline;
+    block->push = push;
+    block->device = context.device;
+    record.fragmentBlock.store(std::shared_ptr<const DrawFragmentBlock>(std::move(block)));
+    record.fragmentResources = resources.get();
+    record.fragmentPipeline = pipelineKey;
+    record.fragmentPushPipeline = pushKey;
+}
+
+std::uint64_t commitFragmentVerifyOrdinal = 0;
+
+}
+
+std::uint64_t CommitFragmentsVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_COMMIT_FRAGMENTS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+bool RecordDrawFragment(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawFragmentBlock& block, const ShaderResources::PreparedBuffers& prepared, const PreparedInputs& inputs, DrawFragment& out, DrawFragmentRefusal& refusal) {
+    const auto refuse = [&](DrawFragmentRefusal why) {
+        refusal = why;
+        return false;
+    };
+    refusal = DrawFragmentRefusal::None;
+    if (block.device != context.device || prepared.placedDevice != context.device || prepared.placed == nullptr || inputs.device != context.device) return refuse(DrawFragmentRefusal::Device);
+    if (!fragmentModes()) return refuse(DrawFragmentRefusal::Modes);
+    if (draw.indirect || state.quadList || StripPatches(state, shaders) || state.stages.mesh || state.stages.tessellation || state.stages.tessellationGeometry || state.tessellationCapture != nullptr || (draw.indexed && inputs.ranges.empty())) return refuse(DrawFragmentRefusal::Stages);
+    if (UsesMeshWindow(shaders) || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && (!shader.program->stencilReferences.empty() || shader.program->functionLdsBuffer); })) return refuse(DrawFragmentRefusal::Stages);
+    const auto resources = block.resources.lock();
+    const auto pipeline = block.pipeline.lock();
+    if (resources == nullptr || pipeline == nullptr) return refuse(DrawFragmentRefusal::Gone);
+    const auto pushPipeline = block.push != nullptr ? block.pushPipeline.lock() : std::shared_ptr<Pipeline>{};
+    const auto* push = pushPipeline != nullptr ? block.push : nullptr;
+    const auto splits = [](const Pipeline& candidate) { return candidate.DescriptorHeap() || candidate.SplitsFaces() || candidate.SplitsSecondChannel(); };
+    if (splits(*pipeline) || (pushPipeline != nullptr && splits(*pushPipeline))) return refuse(DrawFragmentRefusal::Pipeline);
+    if (!resources->FragmentEligible()) return refuse(DrawFragmentRefusal::Stages);
+    auto& selected = HostThreadLocal<std::vector<std::size_t>, FragmentSelectedStorage>();
+    selected.clear();
+    for (const auto& item : prepared.selected) selected.push_back(item.allocation);
+    if (selected.empty()) return refuse(DrawFragmentRefusal::Selection);
+    const bool pushing = push != nullptr && std::ranges::any_of(selected, [&](std::size_t index) { return index < push->allocationSets.size() && push->allocationSets[index] == push->set; });
+    const auto& bound = pushing ? *pushPipeline : *pipeline;
+    auto bindings = std::move(prepared.placed);
+    auto& stream = fragmentStream();
+    try {
+        if (pushing) {
+            const auto pushedSet = static_cast<std::int32_t>(push->set);
+            bindings->pushedSet = pushedSet;
+            const auto& sets = push->allocationSets;
+            if (std::ranges::any_of(selected, [&](std::size_t index) { return index >= sets.size() || sets[index] != static_cast<std::uint8_t>(pushedSet); })) resources->WriteFragmentSets(*bindings, selected, pushedSet);
+            else bindings->cache = resources->FragmentDescriptorCache();
+        } else {
+            bindings->pushSelected.clear();
+            resources->WriteFragmentSets(*bindings, selected, -1);
+        }
+        stream.BeginFragment();
+        const auto commands = stream.Handle();
+        bound.Continue(commands, state);
+        if (pushing) {
+            resources->PushFragmentBindings(commands, bound.Layout(), *bindings, *push);
+        } else {
+            const auto set = bindings->allocation.set;
+            const auto fragmentSet = bindings->fragmentAllocation.set;
+            if (set != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, bound.Layout(), 0, 1, &set, SetBindSite::Draw, bindings->DynamicCount(0), bindings->DynamicOffsets(0));
+            if (fragmentSet != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, bound.Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, SetBindSite::Draw, bindings->DynamicCount(1), bindings->DynamicOffsets(1));
+        }
+        pushDrawConstants(bound, commands, state, draw, shaders, *resources, nullptr, 0, 0, false, 0, bindings.get());
+        recordFragmentDraw(context, commands, draw, inputs);
+    } catch (const std::exception&) {
+        static_cast<void>(stream.EndFragment());
+        return refuse(DrawFragmentRefusal::Thrown);
+    }
+    out.commands = stream.EndFragment();
+    out.written = bindings->allocation.set != VK_NULL_HANDLE || bindings->fragmentAllocation.set != VK_NULL_HANDLE;
+    out.bindings = std::move(bindings);
+    out.resources = resources;
+    out.pipeline = pushing ? std::shared_ptr<const Pipeline>(pushPipeline) : std::shared_ptr<const Pipeline>(pipeline);
+    out.push = push;
+    out.pushing = pushing;
+    out.device = context.device;
+    return true;
+}
+
+DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs, DrawFragment* fragment) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     auto* recorder = Recorder::Active();
     const bool recording = answer == nullptr;
@@ -6286,6 +6500,20 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         }
     }
     record.effects.unpushed = lean && push == nullptr && !moved.empty();
+    DrawFragment* usableFragment = nullptr;
+    if (fragment != nullptr && recording) {
+        auto& note = record.effects.fragment;
+        note.offered = true;
+        const Pipeline* expected = fragment->pushing ? pushPipeline.get() : pipeline.get();
+        auto drop = DrawFragmentDrop::None;
+        if (record.fragmentsRefused) drop = DrawFragmentDrop::Refused;
+        else if (fragment->device != context.device || fragment->resources.get() != resources.get() || fragment->push != push || fragment->pipeline.get() != expected || fragment->bindings == nullptr) drop = DrawFragmentDrop::Objects;
+        else if (bound == nullptr) drop = DrawFragmentDrop::Selection;
+        else if (record.effects.inputs != DrawRecordInputs::Used && record.effects.inputs != DrawRecordInputs::Rechecked) drop = DrawFragmentDrop::Inputs;
+        else if (!lean || dynamicRoute || trace != nullptr || stencilReferences || UsesMeshWindow(shaders) || !fragmentModes()) drop = DrawFragmentDrop::Modes;
+        note.drop = drop;
+        if (drop == DrawFragmentDrop::None) usableFragment = fragment;
+    }
     timer.phase(PhasePipeline);
     if (!recording) {
         answer->filled = true;
@@ -6409,7 +6637,18 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     if (drawn.route != nullptr) {
         if (const auto hook = commitBindingsHook.exchange(nullptr, std::memory_order_acq_rel); hook != nullptr) hook(record);
     }
+    drawn.fragment = usableFragment;
+    drawn.fragmentNote = &record.effects.fragment;
+    if (usableFragment != nullptr) {
+        const auto every = CommitFragmentsVerifyEvery();
+        drawn.fragmentVerify = every != 0 && ++commitFragmentVerifyOrdinal % every == 0;
+    }
+    const std::weak_ptr<Pipeline> blockPipeline = drawn.pipeline;
+    const std::weak_ptr<Pipeline> blockPushPipeline = drawn.pushPipeline;
+    const void* blockPipelineKey = drawn.pipeline.get();
+    const void* blockPushKey = drawn.pushPipeline.get();
     recordDraw(context, state, draw, shaders, inputs, drawn, outcome, timer, ownWaitedMs, trace);
+    if (RuntimeSwitches::Set(RuntimeSwitch::CommitFragments) || record.fragmentResources != nullptr) publishFragmentBlock(context, record, drawn.resources, blockPipeline, blockPushPipeline, blockPipelineKey, blockPushKey, push, lean && bound != nullptr && !stencilReferences && !UsesMeshWindow(shaders));
     if (dynamicRoute && drawn.bindings != nullptr && drawn.bindings->pushed && drawn.bindings->written) record.secondSetWritten = true;
     record.effects.passHeld = held;
     if ((!multisampleRecipe || RuntimeSwitches::Set(RuntimeSwitch::MsaaRecordHold)) && recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {

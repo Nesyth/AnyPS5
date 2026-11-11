@@ -456,6 +456,11 @@ public:
     // `preparedSelection` tells whether it did.
     std::shared_ptr<DrawBindings> PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut = nullptr, const PreparedBuffers* prepared = nullptr, PreparedBuffers::Selection* preparedSelection = nullptr, BindingRoute* route = nullptr) const;
     void PushDrawBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
+    bool FragmentEligible() const { return reusable && !heapStage && bda == nullptr && !addressedBuffers && !rebound && context.descriptorCache != nullptr; }
+    PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route) const;
+    void PushFragmentBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
+    void WriteFragmentSets(DrawBindings& result, std::span<const std::size_t> selected, std::int32_t pushedSet) const;
+    DescriptorCache* FragmentDescriptorCache() const { return context.descriptorCache; }
     struct RepeatPush {
         RepeatPush() = default;
         RepeatPush(const RepeatPush&) = delete;
@@ -1208,6 +1213,9 @@ private:
     mutable std::atomic<std::uint64_t> depthGuardsClear{std::numeric_limits<std::uint64_t>::max()};
     mutable std::atomic<std::uint64_t> multisampleGuardsClear{std::numeric_limits<std::uint64_t>::max()};
     void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
+    void writeFreshDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet) const;
+    bool preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route) const;
+    void pushBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const;
     void writeOwnDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     mutable std::unique_ptr<PushPlan> pushPlan;
     void overlayPushedBuffers(const DrawBindings& result, const PushPlan& plan, std::span<VkDescriptorBufferInfo> buffers, std::span<std::size_t> owners = {}) const;

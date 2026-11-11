@@ -5188,7 +5188,7 @@ std::vector<std::uint32_t> VulkanDevice::DrawContentKey(const Graphics::State& g
     return Graphics::DrawResourceContentKey(state->context, graphics, draw, shaders);
 }
 
-Graphics::DrawRecipeOutcome VulkanDevice::DrawFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer, const Graphics::ShaderResources::PreparedBuffers* prepared, Graphics::PreparedInputs* preparedInputs) {
+Graphics::DrawRecipeOutcome VulkanDevice::DrawFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer, const Graphics::ShaderResources::PreparedBuffers* prepared, Graphics::PreparedInputs* preparedInputs, DrawFragment* fragment) {
     PerformanceTimer timing("Vulkan.DrawFromRecord");
     if (record.recipe == nullptr || record.recipe->device != state->device) {
         Graphics::DrawRecipeOutcome outcome;
@@ -5197,7 +5197,15 @@ Graphics::DrawRecipeOutcome VulkanDevice::DrawFromRecord(const Graphics::State& 
     }
     startJournalReplay();
     const auto context = graphicsContext();
-    return Graphics::DrawWithRecord(context, graphics, draw, shaders, record, trace, answer, prepared, preparedInputs);
+    return Graphics::DrawWithRecord(context, graphics, draw, shaders, record, trace, answer, prepared, preparedInputs, fragment);
+}
+
+bool VulkanDevice::RecordDrawFragment(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, const DrawFragmentBlock& block, const Graphics::ShaderResources::PreparedBuffers& prepared, const Graphics::PreparedInputs& inputs, DrawFragment& out, DrawFragmentRefusal& refusal) const {
+    if (!state->contextReady) {
+        refusal = DrawFragmentRefusal::Device;
+        return false;
+    }
+    return Graphics::RecordDrawFragment(state->context, graphics, draw, shaders, block, prepared, inputs, out, refusal);
 }
 
 Graphics::RepeatOutcome VulkanDevice::RepeatFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, const Graphics::ShaderResources::PreparedBuffers* prepared, Graphics::PreparedInputs* preparedInputs, DrawCommitView* describe, std::uint64_t verifyEvery) {

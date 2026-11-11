@@ -3,6 +3,7 @@
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+#include "prx/libSceAgcDriver/Graphics/include/CommandStream.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -153,6 +154,43 @@ struct DrawRecordBindings {
     std::vector<Graphics::ShaderResources::BoundBuffer> today;
 };
 
+struct DrawFragmentBlock {
+    std::weak_ptr<const Graphics::ShaderResources> resources;
+    std::weak_ptr<Graphics::Pipeline> pipeline;
+    std::weak_ptr<Graphics::Pipeline> pushPipeline;
+    const Graphics::ShaderResources::PushPlan* push = nullptr;
+    VkDevice device = VK_NULL_HANDLE;
+};
+
+enum class DrawFragmentRefusal : std::uint8_t { None, NoBlock, Gone, Device, Modes, Stages, Pipeline, Selection, Thrown, Count };
+inline constexpr std::array<const char*, static_cast<std::size_t>(DrawFragmentRefusal::Count)> DrawFragmentRefusalNames{"none", "no emit block", "objects gone", "another device", "modes", "stages", "pipeline", "selection", "thrown"};
+enum class DrawFragmentDrop : std::uint8_t { None, Objects, Selection, Inputs, Bindings, Modes, Refused, Verify, Count };
+inline constexpr std::array<const char*, static_cast<std::size_t>(DrawFragmentDrop::Count)> DrawFragmentDropNames{"none", "other objects", "selection", "inputs", "bindings", "modes", "record refused", "verify"};
+
+struct DrawFragment {
+    Graphics::CommandStream::Fragment commands;
+    std::shared_ptr<Graphics::ShaderResources::DrawBindings> bindings;
+    std::shared_ptr<const Graphics::ShaderResources> resources;
+    std::shared_ptr<const Graphics::Pipeline> pipeline;
+    const Graphics::ShaderResources::PushPlan* push = nullptr;
+    bool pushing = false;
+    bool written = false;
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint64_t nanoseconds = 0;
+};
+
+struct DrawRecordFragment {
+    bool offered = false;
+    bool spliced = false;
+    bool replayed = false;
+    bool verified = false;
+    bool differs = false;
+    bool timed = false;
+    DrawFragmentDrop drop = DrawFragmentDrop::None;
+    const char* what = nullptr;
+    std::uint64_t nanoseconds = 0;
+};
+
 struct DrawRecordEffects {
     bool pushed = false;
     bool unpushed = false;
@@ -169,6 +207,7 @@ struct DrawRecordEffects {
     Graphics::ShaderResources::PreparedDifference bufferDifference;
     DrawRecordInputs inputs = DrawRecordInputs::None;
     DrawRecordBindings bindings;
+    DrawRecordFragment fragment;
 };
 
 struct DrawRecordAccess {
@@ -303,10 +342,19 @@ struct DrawRecordCommit {
     const void* pushDynamicTemplate = nullptr;
     bool secondSetWritten = false;
     DrawRepeatClass repeatSeen = DrawRepeatClass::NotRecorded;
+    AtomicSharedPtr<const DrawFragmentBlock> fragmentBlock;
+    const void* fragmentResources = nullptr;
+    const void* fragmentPipeline = nullptr;
+    const void* fragmentPushPipeline = nullptr;
+    bool fragmentsRefused = false;
 
     void Adopt(std::shared_ptr<const DrawRecipe> built) {
         recipe = std::move(built);
         repeat.reset();
+        if (fragmentResources != nullptr) fragmentBlock.store(nullptr);
+        fragmentResources = nullptr;
+        fragmentPipeline = nullptr;
+        fragmentPushPipeline = nullptr;
         if (std::exchange(bufferPlanAsked, false)) bufferPlan.store(nullptr);
         if (std::exchange(inputsRecipeAsked, false)) inputsRecipe.store(nullptr);
         pass = {};

@@ -118,6 +118,7 @@ enum class RuntimeSwitch : std::size_t {
     CommitBindingsStamps,
     CommitBindingsSets,
     CommitBindingsDynamic,
+    CommitFragments,
     Count,
 };
 
