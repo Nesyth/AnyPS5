@@ -63,14 +63,17 @@ void print(std::int64_t now, std::int64_t since, const char* why) {
             items(Count::FinisherPlannedJobs), per(Count::FinisherPlannedJobNs, Count::FinisherPlannedJobs), net(Count::FinisherPlannedJobNs, Count::FinisherPlannedJobs, value(Count::FinisherPlannedWaitNs)), items(Count::FinisherPlanMisses), per(Count::FinisherPlanMissNs, Count::FinisherPlanMisses));
         planned = text;
     }
+    char handOff[256];
+    std::snprintf(handOff, sizeof(handOff), "; finisher turn waits %llu (%.1f ms), items forwarded from deposits %llu (%.1f ms, committer room waits %llu, %.1f ms)",
+        items(Count::FinisherTurnWaits), ms(Count::FinisherTurnNs), items(Count::FinisherForwards), ms(Count::FinisherForwardNs), items(Count::FinisherForwardRoomWaits), ms(Count::FinisherForwardRoomNs));
     AgcDriver::ProfilePrint_nid_no_patch(
-        "[threads] %.1f s%s: committer %llu draws at %.2f us and %llu other items at %.2f us, idle %.1f ms (with the retire, the dequeue and the hand-off spin); finisher %llu jobs at %.2f us, %.2f us net of its waits for committer room (%llu, %.1f ms) and its drains of the committer (%llu, %.1f ms), idle %.1f ms; queue-0 worker %llu submissions at %.1f us, %.1f us net of its drains and room waits, idle %.1f ms, %llu draw packets at %.2f us with the waits inside them; worker drains of the finisher %llu (%.1f ms), of the committer %llu (%.1f ms); worker room waits for the finisher %llu (%.1f ms), for the committer %llu (%.1f ms); other threads' drains %llu (%.1f ms) and room waits %llu (%.1f ms)%s\n",
+        "[threads] %.1f s%s: committer %llu draws at %.2f us and %llu other items at %.2f us, idle %.1f ms (with the retire, the dequeue and the hand-off spin); finisher %llu jobs at %.2f us, %.2f us net of its waits for committer room (%llu, %.1f ms) and its drains of the committer (%llu, %.1f ms), idle %.1f ms; queue-0 worker %llu submissions at %.1f us, %.1f us net of its drains and room waits, idle %.1f ms, %llu draw packets at %.2f us with the waits inside them; worker drains of the finisher %llu (%.1f ms), of the committer %llu (%.1f ms); worker room waits for the finisher %llu (%.1f ms), for the committer %llu (%.1f ms); other threads' drains %llu (%.1f ms) and room waits %llu (%.1f ms)%s%s\n",
         seconds, why, items(Count::CommitterDraws), per(Count::CommitterDrawNs, Count::CommitterDraws), items(Count::CommitterOther), per(Count::CommitterOtherNs, Count::CommitterOther), ms(Count::CommitterIdleNs),
         items(Count::FinisherJobs), per(Count::FinisherJobNs, Count::FinisherJobs), net(Count::FinisherJobNs, Count::FinisherJobs, finisherWaits), items(Count::FinisherRoomWaits), ms(Count::FinisherRoomNs), items(Count::FinisherCommitterDrains), ms(Count::FinisherCommitterDrainNs), ms(Count::FinisherIdleNs),
         items(Count::WorkerSubmissions), per(Count::WorkerSubmissionNs, Count::WorkerSubmissions), net(Count::WorkerSubmissionNs, Count::WorkerSubmissions, workerWaits), ms(Count::WorkerIdleNs), items(Count::WorkerDrawPackets), per(Count::WorkerDrawPacketNs, Count::WorkerDrawPackets),
         items(Count::WorkerFinisherDrains), ms(Count::WorkerFinisherDrainNs), items(Count::WorkerCommitterDrains), ms(Count::WorkerCommitterDrainNs),
         items(Count::WorkerFinisherRoomWaits), ms(Count::WorkerFinisherRoomNs), items(Count::WorkerCommitterRoomWaits), ms(Count::WorkerCommitterRoomNs),
-        items(Count::OtherDrains), ms(Count::OtherDrainNs), items(Count::OtherRoomWaits), ms(Count::OtherRoomNs), planned.c_str());
+        items(Count::OtherDrains), ms(Count::OtherDrainNs), items(Count::OtherRoomWaits), ms(Count::OtherRoomNs), planned.c_str(), handOff);
     std::array<double, StateCount + 1> idle{};
     for (std::size_t index = 0; index < idle.size(); ++index) idle[index] = static_cast<double>(committerIdleBy[index].value.exchange(0, std::memory_order_relaxed)) / 1e6;
     const auto state = [&](WorkerState which) { return idle[static_cast<std::size_t>(which)]; };

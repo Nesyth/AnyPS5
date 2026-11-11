@@ -47,6 +47,12 @@ enum class Count : std::size_t {
     FinisherPlannedWaitNs,
     FinisherPlanMisses,
     FinisherPlanMissNs,
+    FinisherTurnWaits,
+    FinisherTurnNs,
+    FinisherForwards,
+    FinisherForwardNs,
+    FinisherForwardRoomWaits,
+    FinisherForwardRoomNs,
     Count
 };
 
