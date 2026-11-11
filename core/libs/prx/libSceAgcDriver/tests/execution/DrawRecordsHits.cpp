@@ -1142,7 +1142,7 @@ constexpr std::array<std::uint32_t, 4> RepeatVertexCounts{3u, 6u, 9u, 6u};
 constexpr std::size_t StillSlot = 15;
 constexpr std::uint32_t StillDraws = 48;
 
-enum class RepeatScene { Constants, Sets, Ring, Shared, Lend, Still };
+enum class RepeatScene { Constants, Sets, Ring, Shared, Lend, Still, Mixed };
 
 const char* RepeatSceneName(RepeatScene scene) {
     switch (scene) {
@@ -1151,6 +1151,7 @@ const char* RepeatSceneName(RepeatScene scene) {
     case RepeatScene::Ring: return "per-draw constant buffers";
     case RepeatScene::Lend: return "per-draw data beside a constant buffer in place";
     case RepeatScene::Still: return "a constant buffer in place, rewritten per pass";
+    case RepeatScene::Mixed: return "per-draw data in both sets, the pushed set at rest every other pass";
     default: return "two classes and a pass break";
     }
 }
@@ -1169,11 +1170,13 @@ std::vector<std::uint8_t> RenderScene(RepeatScene scene, std::uint32_t round) {
     RegisterWrites registers{{0x8b, 0}, {0x8c, 0}, {0x00b, 3u << 1u}, {0x00c, static_cast<std::uint32_t>(first)}, {0x00d, static_cast<std::uint32_t>(first >> 32u)}, {0x00e, 0u}};
     auto vertex = reinterpret_cast<std::uintptr_t>(PlainVertex.data());
     auto pixel = reinterpret_cast<std::uintptr_t>(ConstantPixel.data());
-    if (scene == RepeatScene::Sets || scene == RepeatScene::Lend) {
+    if (scene == RepeatScene::Sets || scene == RepeatScene::Lend || scene == RepeatScene::Mixed) {
         for (std::uint32_t draw = 0; draw < RepeatDraws; ++draw) {
             const float shift = 0.0009765625f * static_cast<float>(1 + draw + round * RepeatDraws);
             std::memcpy(blocks.data.Bytes(RepeatVertexOffset + draw * 0x40u), &shift, sizeof(shift));
         }
+        const float rest = 0.0009765625f;
+        std::memcpy(blocks.data.Bytes(RepeatVertexOffset + RepeatDraws * 0x40u), &rest, sizeof(rest));
         const auto shifts = blocks.data.At(RepeatVertexOffset);
         registers = {{0x8b, 2u << 1u}, {0x8c, static_cast<std::uint32_t>(shifts)}, {0x8d, static_cast<std::uint32_t>(shifts >> 32u)}, {0x00b, 3u << 1u}, {0x00c, static_cast<std::uint32_t>(first)}, {0x00d, static_cast<std::uint32_t>(first >> 32u)}, {0x00e, 0u}};
         vertex = reinterpret_cast<std::uintptr_t>(DataVertex.data());
@@ -1211,8 +1214,8 @@ std::vector<std::uint8_t> RenderScene(RepeatScene scene, std::uint32_t round) {
         const auto pointer = blocks.data.At(RepeatConstantsOffset + draw * 0x40u);
         Append(commands, 0x76, {0x00c, static_cast<std::uint32_t>(pointer)});
         Append(commands, 0x76, {0x00d, static_cast<std::uint32_t>(pointer >> 32u)});
-        if (scene == RepeatScene::Sets) {
-            const auto shift = blocks.data.At(RepeatVertexOffset + draw * 0x40u);
+        if (scene == RepeatScene::Sets || scene == RepeatScene::Mixed) {
+            const auto shift = blocks.data.At(RepeatVertexOffset + (scene == RepeatScene::Mixed && round % 2u == 1u ? RepeatDraws : draw) * 0x40u);
             Append(commands, 0x76, {0x8c, static_cast<std::uint32_t>(shift)});
             Append(commands, 0x76, {0x8d, static_cast<std::uint32_t>(shift >> 32u)});
             return 3;
@@ -1421,13 +1424,20 @@ void QueuedStore(AgcDriver::DrawRecordCommit& record) {
 
 constexpr std::size_t LingeringChunks = 2;
 constexpr std::size_t SmallChunkBytes = 128;
+constexpr std::size_t RingChunkBytes = 1536;
+
+std::size_t LooseChunks() {
+    const auto placed = AgcDriver::Graphics::ShaderResources::PlacedUploadChunks();
+    const auto ring = static_cast<std::size_t>(AgcDriver::Graphics::ShaderResources::UploadRingTotals().chunks);
+    return placed > ring ? placed - ring : 0;
+}
 
 std::size_t PlacedChunksAfterIdle(std::size_t bound) {
-    for (std::uint32_t attempt = 0; attempt < 400 && AgcDriver::Graphics::ShaderResources::PlacedUploadChunks() > bound; ++attempt) {
+    for (std::uint32_t attempt = 0; attempt < 400 && LooseChunks() > bound; ++attempt) {
         AgcDriverWaitIdle_nid_postfix();
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    return AgcDriver::Graphics::ShaderResources::PlacedUploadChunks();
+    return LooseChunks();
 }
 
 void CommitBindings(bool ring) {
@@ -1451,7 +1461,7 @@ void CommitBindings(bool ring) {
         const auto count = now.Since(base, timed);
         return count == 0 ? 0.0 : static_cast<double>(now.Since(base, nanoseconds)) / static_cast<double>(count);
     };
-    for (const auto scene : {RepeatScene::Constants, RepeatScene::Sets, RepeatScene::Ring, RepeatScene::Lend}) {
+    for (const auto scene : {RepeatScene::Constants, RepeatScene::Sets, RepeatScene::Ring, RepeatScene::Lend, RepeatScene::Mixed}) {
         const std::string name = RepeatSceneName(scene);
         RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
         RuntimeSwitches::Assign(RuntimeSwitch::CommitBindings, false);
@@ -1475,7 +1485,9 @@ void CommitBindings(bool ring) {
         const auto [placedBefore, placedAfter] = render(true, false, false, false, "with finisher slices");
         const auto [stampedBefore, stampedAfter] = render(true, true, true, false, "with finisher slices, stamps and lent sets");
         const auto [dynamicBefore, dynamicAfter] = render(true, true, true, true, "with every sub-switch");
-        if (committed && verifyEvery != 0 && dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsDynamicBound) != 0) Require(dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsVerifyChecked) != 0, "commit bindings, " + name + ": the verify checked no commit with dynamic sets" + DescribeDirect(dynamicAfter, dynamicBefore));
+        if (committed && scene == RepeatScene::Sets) Require(dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsDynamicPushedBound) != 0, "commit bindings, " + name + ": no pushed draw with a written second set bound dynamic sets" + DescribeDirect(dynamicAfter, dynamicBefore));
+        if (committed && scene == RepeatScene::Mixed) Require(dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsDynamicBound) != 0 && dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsDynamicPushedBound) != 0 && dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsLeftUnpushedPushHeld) == 0, "commit bindings, " + name + ": a record that holds a push pipeline did not bind dynamic sets both when its pushed set moved and when only its other set did" + DescribeDirect(dynamicAfter, dynamicBefore));
+        if (committed && verifyEvery != 0 && dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsDynamicBound) + dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsDynamicPushedBound) != 0) Require(dynamicAfter.Since(dynamicBefore, DirectCounter::BindingsVerifyChecked) != 0, "commit bindings, " + name + ": the verify checked no commit with dynamic sets" + DescribeDirect(dynamicAfter, dynamicBefore));
         if (committed && scene == RepeatScene::Lend) Require(stampedAfter.Since(stampedBefore, DirectCounter::BindingsSetsLent) != 0, "commit bindings, " + name + ": no draw borrowed the set an earlier draw wrote" + DescribeDirect(stampedAfter, stampedBefore));
         if (!committed) continue;
         Require(placedAfter.Since(placedBefore, DirectCounter::BindingsTaken) != 0 && placedAfter.Since(placedBefore, DirectCounter::BindingsCopied) == 0, "commit bindings, " + name + ": no commit bound the finisher's slice, or one copied the block" + DescribeDirect(placedAfter, placedBefore));
@@ -1577,6 +1589,24 @@ void CommitBindings(bool ring) {
             const auto [limitBefore, limitAfter] = run(true, true, "with dynamic sets over the device limit");
             ShaderResources::SetDynamicLimitForTest(std::nullopt);
             Require(limitAfter.Since(limitBefore, DirectCounter::BindingsDynamicBound) == 0 && limitAfter.Since(limitBefore, DirectCounter::BindingsDynamicRefused) != 0, "commit bindings, " + name + ": a template over the dynamic descriptor limit bound a dynamic set or was not counted" + DescribeDirect(limitAfter, limitBefore));
+            ShaderResources::SetUploadChunkBytesForTest(SmallChunkBytes);
+            RuntimeSwitches::Assign(RuntimeSwitch::CommitBindingsDynamic, true);
+            const auto fullBefore = ShaderResources::UploadRingTotals();
+            Require(RenderScene(scene, 0) == today[0], "commit bindings, " + name + ": a pass that overflows the upload ring rendered differently from today's path");
+            const auto fullAfter = ShaderResources::UploadRingTotals();
+            Require(RenderScene(scene, 1) == today[1], "commit bindings, " + name + ": the pass after an overflowing one rendered differently from today's path");
+            const auto nextAfter = ShaderResources::UploadRingTotals();
+            std::cout << "commit bindings, " << name << ", upload ring with " << SmallChunkBytes << "-byte chunks: first pass " << fullAfter.added - fullBefore.added << " chunks added, " << fullAfter.reused - fullBefore.reused << " reused, " << fullAfter.overflow - fullBefore.overflow << " overflow; next pass " << nextAfter.reused - fullAfter.reused << " reused, " << nextAfter.overflow - fullAfter.overflow << " overflow\n";
+            Require(fullAfter.reused == fullBefore.reused && fullAfter.overflow > fullBefore.overflow && nextAfter.reused > fullAfter.reused, "commit bindings, " + name + ": the upload ring reused a chunk while its batch was open, did not overflow, or did not reuse its chunks once the batch completed");
+            ShaderResources::SetUploadChunkBytesForTest(RingChunkBytes);
+            const auto ringBefore = ShaderResources::UploadRingTotals();
+            const auto [ringPassBefore, ringPassAfter] = run(true, true, "with dynamic sets and a ring of small chunks");
+            const auto ringAfter = ShaderResources::UploadRingTotals();
+            ShaderResources::SetUploadChunkBytesForTest(0);
+            const auto ringWritten = ringPassAfter.Since(ringPassBefore, DirectCounter::BindingsDynamicWritten);
+            const auto ringHits = ringPassAfter.Since(ringPassBefore, DirectCounter::BindingsDynamicHits);
+            std::cout << "commit bindings, " << name << ", upload ring with " << RingChunkBytes << "-byte chunks: " << ringAfter.added - ringBefore.added << " chunks added, " << ringAfter.reused - ringBefore.reused << " reused, " << ringWritten << " tuples written, " << ringHits << " tuple hits\n";
+            Require(ringAfter.reused > ringBefore.reused && ringHits != 0 && ringWritten <= 2u * (ringAfter.added - ringBefore.added), "commit bindings, " + name + ": a tuple written for a ring chunk was not hit again when the ring came round to it" + DescribeDirect(ringPassAfter, ringPassBefore));
         }
         if (std::getenv("APS5_PIPELINE_STATS") != nullptr && verifyEvery == 0) {
             constexpr std::uint32_t TimingRuns = 7;
