@@ -164,6 +164,14 @@ void FailRecordChecks(DrawRecipeMiss check, std::uint32_t count);
 DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace = nullptr, DrawCommitView* answer = nullptr, const ShaderResources::PreparedBuffers* prepared = nullptr, PreparedInputs* preparedInputs = nullptr, DrawFragment* fragment = nullptr);
 bool RecordDrawFragment(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawFragmentBlock& block, const ShaderResources::PreparedBuffers& prepared, const PreparedInputs& inputs, DrawFragment& out, DrawFragmentRefusal& refusal);
 std::uint64_t CommitFragmentsVerifyEvery();
+struct ExpressOutcome {
+    bool taken = false;
+    bool verify = false;
+    DrawExpressMiss miss = DrawExpressMiss::None;
+    DrawRecipeOutcome result;
+};
+ExpressOutcome ExpressCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs, DrawFragment* fragment, bool verifyDue);
+std::uint64_t ExpressVerifyEvery();
 enum class RepeatRefusal : std::uint8_t { NoBlock, NotSimple, VerifyDue, Shape, Objects, Batch, Pass, Epoch, ProofSerial, Pending, Depth, Target, Access, Stores, Linear, Buffers, Selection, DepthGuards, Inputs, Changed, MovedHazard, UnmovedHazard, Count };
 inline constexpr std::array<const char*, static_cast<std::size_t>(RepeatRefusal::Count)> RepeatRefusalNames{"no block", "not simple", "verify due", "shape", "objects", "another batch", "pass", "collect epoch", "proof serial", "pending stores", "depth surfaces", "target changed", "pass access", "queued stores", "drawn linear targets", "no prepared buffers", "selection", "depth guards", "inputs", "changed by the inputs", "moved-range hazard", "unmoved-range hazard"};
 inline constexpr std::array<const char*, static_cast<std::size_t>(DrawRepeatClass::Count)> RepeatClassNames{"simple", "not recorded", "template", "stages", "pipeline", "targets", "not pushed", "sets", "buffers", "inputs", "keep", "pass", "access", "notes", "modes"};

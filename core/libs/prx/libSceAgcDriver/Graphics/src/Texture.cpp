@@ -1811,7 +1811,7 @@ private:
     }
 
     void changed() {
-        ++version; NoteStateChange();
+        ++version;
         changes.store(version, std::memory_order_release);
     }
 

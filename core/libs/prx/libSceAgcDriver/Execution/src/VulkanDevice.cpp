@@ -5200,6 +5200,16 @@ Graphics::DrawRecipeOutcome VulkanDevice::DrawFromRecord(const Graphics::State& 
     return Graphics::DrawWithRecord(context, graphics, draw, shaders, record, trace, answer, prepared, preparedInputs, fragment);
 }
 
+Graphics::ExpressOutcome VulkanDevice::ExpressFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const Graphics::ShaderResources::PreparedBuffers* prepared, Graphics::PreparedInputs* preparedInputs, DrawFragment* fragment, bool verifyDue) {
+    if (!state->contextReady || record.recipe == nullptr || record.recipe->device != state->device) {
+        Graphics::ExpressOutcome outcome;
+        outcome.miss = DrawExpressMiss::Shape;
+        return outcome;
+    }
+    startJournalReplay();
+    return Graphics::ExpressCommit(state->context, graphics, draw, shaders, record, prepared, preparedInputs, fragment, verifyDue);
+}
+
 bool VulkanDevice::RecordDrawFragment(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, const DrawFragmentBlock& block, const Graphics::ShaderResources::PreparedBuffers& prepared, const Graphics::PreparedInputs& inputs, DrawFragment& out, DrawFragmentRefusal& refusal) const {
     if (!state->contextReady) {
         refusal = DrawFragmentRefusal::Device;

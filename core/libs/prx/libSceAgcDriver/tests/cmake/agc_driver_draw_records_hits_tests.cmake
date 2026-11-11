@@ -58,6 +58,14 @@ if(BUILD_TESTING)
     agc_add_env_test(agc_driver_draw_records_hits_commit_fragments_late agc_driver_draw_records_hits_tests
             ENV ${agcCommitFragmentsEnvironment} ${agcLateStackEnvironment} APS5_COMMIT_BINDINGS_SETS=1 APS5_ASYNC_SUBMIT=1 APS5_DEFERRED_ENCODE=1 APS5_VERIFY_COMMIT_FRAGMENTS=3)
     set_tests_properties(agc_driver_draw_records_hits_commit_fragments agc_driver_draw_records_hits_commit_fragments_verify agc_driver_draw_records_hits_commit_fragments_replayed agc_driver_draw_records_hits_commit_fragments_late PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDrawRecordsDifference};${agcStagePlansDifference};${agcDirectDrawsDifference};${agcDirectDrawsBuildDifference};${agcDirectBuffersDifference};${agcCommitBindingsDifference};${agcCommitFragmentsDifference}")
+    set(agcExpressCommitsDifference "\\[express-commits-verify\\] ")
+    agc_add_env_test(agc_driver_draw_records_hits_express_commits agc_driver_draw_records_hits_tests
+            ENV ${agcCommitFragmentsEnvironment} APS5_ASYNC_SUBMIT=1 APS5_DEFERRED_ENCODE=1 APS5_DIRECT_CLEAN_PROOFS=1 APS5_CLEAN_PRECISE_SERIALS=1 APS5_EXPRESS_COMMITS=1 APS5_PIPELINE_STATS=1)
+    agc_add_env_test(agc_driver_draw_records_hits_express_commits_verify agc_driver_draw_records_hits_tests
+            ENV ${agcCommitFragmentsEnvironment} APS5_ASYNC_SUBMIT=1 APS5_DEFERRED_ENCODE=1 APS5_DIRECT_CLEAN_PROOFS=1 APS5_CLEAN_PRECISE_SERIALS=1 APS5_EXPRESS_COMMITS=1 APS5_VERIFY_EXPRESS_COMMITS=1 APS5_VERIFY_COMMIT_FRAGMENTS=7)
+    agc_add_env_test(agc_driver_draw_records_hits_express_commits_late agc_driver_draw_records_hits_tests
+            ENV ${agcCommitFragmentsEnvironment} ${agcLateStackEnvironment} APS5_ASYNC_SUBMIT=1 APS5_DEFERRED_ENCODE=1 APS5_DIRECT_CLEAN_PROOFS=1 APS5_CLEAN_PRECISE_SERIALS=1 APS5_EXPRESS_COMMITS=1 APS5_VERIFY_EXPRESS_COMMITS=3)
+    set_tests_properties(agc_driver_draw_records_hits_express_commits agc_driver_draw_records_hits_express_commits_verify agc_driver_draw_records_hits_express_commits_late PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDrawRecordsDifference};${agcStagePlansDifference};${agcDirectDrawsDifference};${agcDirectDrawsBuildDifference};${agcDirectBuffersDifference};${agcCommitBindingsDifference};${agcCommitFragmentsDifference};${agcExpressCommitsDifference}")
     agc_add_env_test(agc_driver_draw_records_hits_inject agc_driver_draw_records_hits_tests ARGS --inject
             ENV ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1 ${agcLeanFrontEnvironment} APS5_DRAW_RECORDS=1 APS5_VERIFY_DRAW_RECORDS=1)
     agc_add_env_test(agc_driver_draw_records_hits_inject_commit agc_driver_draw_records_hits_tests ARGS --inject-commit

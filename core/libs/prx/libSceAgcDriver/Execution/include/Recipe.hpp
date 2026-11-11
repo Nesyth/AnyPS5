@@ -179,6 +179,40 @@ struct DrawFragment {
     std::uint64_t nanoseconds = 0;
 };
 
+struct DrawExpressKeep {
+    std::shared_ptr<Graphics::ShaderResources> resources;
+    std::shared_ptr<const Graphics::Pipeline> pipeline;
+    std::shared_ptr<Graphics::Framebuffer> framebuffer;
+    std::vector<std::shared_ptr<Graphics::StorageTexture>> targets;
+};
+
+struct DrawExpress {
+    bool valid = false;
+    const DrawRecipe* recipe = nullptr;
+    const Graphics::State* state = nullptr;
+    std::uint64_t switches = 0;
+    VkDevice device = VK_NULL_HANDLE;
+    std::shared_ptr<DrawExpressKeep> keep;
+    std::vector<std::uint64_t> targetEpochs;
+    std::vector<std::uint64_t> targetVersions;
+    std::vector<std::uint64_t> dccAddresses;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> slices;
+    std::uint64_t passKey = 0;
+    bool fenced = false;
+    bool hasDepth = false;
+    std::uint64_t depthSerial = 0;
+    std::uint64_t depthReleased = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writeOnly;
+    std::vector<std::pair<VkImage, bool>> images;
+    std::uint64_t keptRecorder = 0;
+    std::uint64_t keptBatch = 0;
+};
+
+enum class DrawExpressMiss : std::uint8_t { None, NoState, Shape, Objects, Template, Targets, Depth, Stores, Linear, Buffers, Inputs, Moved, Selection, Staging, Verify, Count };
+inline constexpr std::array<const char*, static_cast<std::size_t>(DrawExpressMiss::Count)> DrawExpressMissNames{"none", "no express state", "shape", "objects", "template", "targets", "depth", "queued stores", "drawn linear", "buffers", "inputs", "moved hazard", "selection", "staging", "verify"};
+
 struct DrawRecordFragment {
     bool offered = false;
     bool spliced = false;
@@ -342,6 +376,8 @@ struct DrawRecordCommit {
     const void* pushDynamicTemplate = nullptr;
     bool secondSetWritten = false;
     DrawRepeatClass repeatSeen = DrawRepeatClass::NotRecorded;
+    std::shared_ptr<DrawExpress> express;
+    bool expressRefused = false;
     AtomicSharedPtr<const DrawFragmentBlock> fragmentBlock;
     const void* fragmentResources = nullptr;
     const void* fragmentPipeline = nullptr;
@@ -351,6 +387,7 @@ struct DrawRecordCommit {
     void Adopt(std::shared_ptr<const DrawRecipe> built) {
         recipe = std::move(built);
         repeat.reset();
+        express.reset();
         if (fragmentResources != nullptr) fragmentBlock.store(nullptr);
         fragmentResources = nullptr;
         fragmentPipeline = nullptr;

@@ -5206,7 +5206,6 @@ ShaderResources::ExpressBefore ShaderResources::expressBefore() {
         for (const auto& image : storageTextures) {
             if (image != nullptr) ranges.emplace_back(image->Descriptor().baseAddress, image->Descriptor().baseAddress + image->GuestBytes());
         }
-        if (ranges.empty()) return before;
         expressWatch = GuestMemory::SubscribeWriteGeneration(ranges);
     }
     before.generation = GuestMemory::SubscriptionGeneration(*expressWatch);
