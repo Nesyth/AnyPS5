@@ -35,6 +35,8 @@ namespace AgcDriver::Graphics {
 
 class Recorder;
 class OwnDrawSets;
+class RepeatSets;
+class RepeatSetLease;
 struct ShaderResourcesTestAccess;
 
 void FlushCachedTextures(VkDevice device);
@@ -377,6 +379,32 @@ public:
     // `preparedSelection` tells whether it did.
     std::shared_ptr<DrawBindings> PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut = nullptr, const PreparedBuffers* prepared = nullptr, PreparedBuffers::Selection* preparedSelection = nullptr) const;
     void PushDrawBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
+    struct RepeatPush {
+        RepeatPush() = default;
+        RepeatPush(const RepeatPush&) = delete;
+        RepeatPush& operator=(const RepeatPush&) = delete;
+        std::vector<VkDescriptorBufferInfo> buffers;
+        std::vector<VkWriteDescriptorSet> writes;
+        std::vector<std::pair<std::size_t, std::size_t>> patches;
+        std::vector<std::size_t> allocations;
+        VkDescriptorSet boundSet = VK_NULL_HANDLE;
+        std::uint32_t boundIndex = 0;
+        std::uint32_t pushIndex = 0;
+        RepeatSets* sets = nullptr;
+        std::vector<std::size_t> outsideAt;
+        RepeatSetLease* lease = nullptr;
+        std::uint64_t leaseRecorder = 0;
+        std::uint64_t leaseBatch = 0;
+    };
+    bool BuildRepeatPush(const PushPlan& plan, std::span<const PreparedBuffers::Selected> selected, RepeatPush& out, bool sets = false) const;
+    void RepeatPushBindings(VkCommandBuffer commands, VkPipelineLayout layout, RepeatPush& push, std::span<const PreparedBuffers::Selected> selected, VkBuffer buffer, VkDeviceSize base, Recorder& recorder) const;
+    PreparedDifference CompareRepeatPush(RepeatPush& push, const DrawBindings& bound, const PushPlan& plan) const;
+    PreparedBuffers::Selection RepeatGuards(const PreparedBuffers& prepared) const;
+    void RepeatRequire(std::span<const MovedBuffer> moved) const;
+    bool RepeatUnmovedClear(const Recorder& recorder, const PreparedBuffers& prepared) const;
+    std::shared_ptr<Buffer> RepeatUpload(Recorder& recorder, const PreparedBuffers& prepared, VkDeviceSize& offset) const;
+    bool ProofHeld() const;
+    bool HoldsDepthCopies() const;
     struct BoundBuffer {
         std::uint32_t set = 0;
         std::uint32_t binding = 0;
@@ -562,6 +590,21 @@ public:
         std::uint64_t depthSurfaces = 0;
         std::uint64_t generation = 0;
     };
+    struct CleanRuleCounts {
+        std::uint64_t viewHits = 0;
+        std::uint64_t pendingHits = 0;
+        std::uint64_t exemptRecords = 0;
+        std::uint64_t viewDrops = 0;
+        std::uint64_t sourceDrops = 0;
+        std::uint64_t verified = 0;
+        std::uint64_t differs = 0;
+        std::uint64_t requiredNotClean = 0;
+        std::uint64_t exemptUnsettled = 0;
+        std::uint64_t noSources = 0;
+        std::uint64_t snapshotOverView = 0;
+        std::uint64_t unrecordedViews = 0;
+    };
+    static CleanRuleCounts CleanRuleCounted();
     bool AsIsCurrent();
     // Objects whose fast proof came from another template's stamp (FastProofStamp), so far.
     static std::uint64_t FastProofStampsTaken();
@@ -1074,6 +1117,7 @@ private:
     mutable bool bufferPlanBuilt = false;
     std::shared_ptr<OwnDrawSets> makeOwnDrawSets() const;
     mutable std::shared_ptr<OwnDrawSets> ownDrawSets;
+    mutable std::vector<std::shared_ptr<RepeatSets>> repeatSets;
     void writeAddressedOverlay(DrawBindings& result, std::span<const std::size_t> selected) const;
     std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
@@ -1126,12 +1170,21 @@ private:
     void recordClean(bool proved, const CleanStamp& stamp);
     bool cleanEligible();
     bool cleanUnchangedSince(std::uint64_t generation) const;
+    bool cleanUnchangedSince(std::uint64_t generation, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const;
+    void noteCleanSources();
+    std::uint8_t cleanViewsKept(const CleanStamp& stamp);
+    bool cleanSourcesCurrent(FastFail& reason);
     bool cleanProved = false;
     std::uint8_t cleanEligibility = 0;
     std::uint32_t cleanMisses = 0;
     CleanProof cleanRefusal = CleanProof::FirstProof;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> cleanRangeList;
     CleanStamp cleanAt;
+    std::vector<std::size_t> cleanSourced;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> cleanRequired;
+    bool cleanSourcesEligible = false;
+    bool cleanExempt = false;
+    std::uint8_t cleanHitRule = 0;
     std::uint64_t provedEpoch = 0;
     std::uint64_t provedProof = 0;
     std::uint64_t provedPending = 0;

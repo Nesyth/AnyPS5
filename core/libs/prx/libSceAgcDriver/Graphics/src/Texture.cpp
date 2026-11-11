@@ -5582,6 +5582,10 @@ std::size_t StorageTexture::StoreDrawnLinearTouching(const char* reason, const s
     return stored;
 }
 
+bool StorageTexture::DrawnLinearPending() {
+    return Pending().drawnCount.load(std::memory_order_acquire) != 0 && !Recorder::InCompletion();
+}
+
 bool StorageTexture::AnyPending() {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);

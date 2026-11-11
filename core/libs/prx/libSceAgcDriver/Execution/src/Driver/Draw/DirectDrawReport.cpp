@@ -39,11 +39,22 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "buffers used", "plan differs", "moved-range hazard", "unmoved-range hazard", "depth guards", "dropped", "buffers verified", "buffers differing", "buffer memory changed", "buffers differing unwatched",
     "inputs prepared", "no published recipe", "outside the shape", "not imported in place", "inputs not accessible", "inputs threw", "indices not settled",
     "inputs used", "inputs rechecked", "import changed", "commit shape", "refused in place", "inputs dropped", "inputs verified", "inputs differing",
+    "repeats taken", "repeat blocks built", "repeats beginning a pass", "repeats refused after a side effect", "repeat proof misses", "repeat proofs skipped", "repeat unmoved tests skipped", "repeats verified", "repeats differing", "repeat claims refuted",
+    "no block", "not simple", "verify due", "shape", "objects", "another batch", "pass", "collect epoch", "proof serial", "pending stores", "depth surfaces", "target changed", "pass access", "queued stores", "drawn linear targets", "no prepared buffers", "selection", "depth guards", "inputs", "changed by the inputs", "moved-range hazard", "unmoved-range hazard",
+    "not recorded", "template", "stages", "pipeline", "targets", "not pushed", "sets", "buffers", "inputs", "keep", "pass", "access", "notes", "modes",
+    "full commit ns", "full commits timed", "repeat ns", "repeats timed",
+    "repeats with a written set", "repeats beside queued stores", "repeats under the shared hold",
+    "not reusable", "heap stage", "lease", "address table", "copied writes", "fault checks", "space reuse", "GPU writes", "GPU copies", "depth copies",
+    "multisampled", "multisampled depth", "not the recipe's", "linear", "fmask",
+    "set repeat ns", "set repeats timed", "store repeat ns", "store repeats timed", "shared repeat ns", "shared repeats timed",
 };
 
 constexpr std::array<const char*, StepCount> StepNames{"request", "invocation", "walk", "key", "side", "class", "checks", "buffers", "inputs", "hand-off"};
 
 static_assert(CounterNames.back() != nullptr && StepNames.back() != nullptr, "every direct draw counter and step needs a name");
+static_assert(static_cast<std::size_t>(Counter::RepeatUnmovedHazard) - static_cast<std::size_t>(Counter::RepeatNoBlock) + 1 == static_cast<std::size_t>(Graphics::RepeatRefusal::Count), "every repeat refusal needs a counter");
+static_assert(static_cast<std::size_t>(Counter::RepeatClassModes) - static_cast<std::size_t>(Counter::RepeatClassNotRecorded) + 2 == static_cast<std::size_t>(DrawRepeatClass::Count), "every repeat class refusal needs a counter");
+static_assert(static_cast<std::size_t>(Counter::RepeatDetailFmask) - static_cast<std::size_t>(Counter::RepeatDetailNotReusable) + 2 == static_cast<std::size_t>(DrawRepeatDetail::Count), "every repeat class condition needs a counter");
 
 struct Block {
     std::array<std::atomic<std::uint64_t>, CounterCount> counters{};
@@ -136,6 +147,7 @@ std::array<std::atomic<std::uint64_t>, FieldCount> buildDifferences{};
 std::array<std::atomic<std::uint64_t>, AllowedKinds> allowed{};
 std::atomic<std::uint64_t> printed{0};
 std::atomic<std::uint64_t> bufferPrinted{0};
+std::atomic<std::uint64_t> repeatPrinted{0};
 std::atomic<std::uint64_t> classesKnown{0};
 std::atomic<std::uint64_t> classBytes{0};
 std::atomic<std::uint64_t> stagesKnown{0};
@@ -184,6 +196,18 @@ std::uint64_t InputVerifyEvery() {
         return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
     }();
     return every;
+}
+
+std::uint64_t RepeatVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_DIRECT_REPEAT");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+void NoteRepeatDifference(std::string_view field, std::string_view detail) {
+    if (repeatPrinted.fetch_add(1, std::memory_order_relaxed) < PrintedPerWindow) std::fprintf(stderr, "[direct-repeat-verify] %.*s differs: %.*s\n", static_cast<int>(field.size()), field.data(), static_cast<int>(detail.size()), detail.data());
 }
 
 void Add(Counter counter, std::uint64_t count) {
@@ -243,6 +267,7 @@ void Report(bool force) {
     reported = current;
     printed.store(0, std::memory_order_relaxed);
     bufferPrinted.store(0, std::memory_order_relaxed);
+    repeatPrinted.store(0, std::memory_order_relaxed);
     const auto& counts = since.counters;
     const auto at = [&](Counter counter) { return counts[static_cast<std::size_t>(counter)]; };
     const auto draws = at(Counter::Draws);
@@ -295,6 +320,16 @@ void Report(bool force) {
             static_cast<unsigned long long>(sum(Counter::InputsNoRecipe, Counter::InputsUnsettled)), reasons(counts, Counter::InputsNoRecipe, Counter::InputsUnsettled).c_str(),
             static_cast<unsigned long long>(sum(Counter::InputsImportChanged, Counter::InputsDropped)), reasons(counts, Counter::InputsImportChanged, Counter::InputsDropped).c_str(),
             static_cast<unsigned long long>(at(Counter::InputsVerifyChecked)), static_cast<unsigned long long>(at(Counter::InputsVerifyDiffering)));
+    }
+    if (sum(Counter::RepeatTaken, Counter::RepeatSharedTimed) != 0) {
+        const auto perCommit = [&](Counter nanoseconds, Counter timed) { return at(timed) == 0 ? 0.0 : static_cast<double>(at(nanoseconds)) / static_cast<double>(at(timed)) / 1000.0; };
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] repeats: %llu taken (%llu beginning a pass, %llu proof misses, %llu proofs skipped, %llu unmoved tests skipped, %llu with a written set, %llu beside queued stores, %llu under the shared hold), %llu not taken%s, not simple%s, by condition%s; %llu blocks built, %llu refused after a side effect; verify %llu checked, %llu differing, %llu claims refuted; us per commit: full %.2f, repeat %.2f (with a written set %.2f, beside queued stores %.2f, under the shared hold %.2f)\n",
+            static_cast<unsigned long long>(at(Counter::RepeatTaken)), static_cast<unsigned long long>(at(Counter::RepeatPassBegun)), static_cast<unsigned long long>(at(Counter::RepeatProofMisses)), static_cast<unsigned long long>(at(Counter::RepeatProofsSkipped)), static_cast<unsigned long long>(at(Counter::RepeatUnmovedSkipped)),
+            static_cast<unsigned long long>(at(Counter::RepeatTakenSets)), static_cast<unsigned long long>(at(Counter::RepeatTakenStores)), static_cast<unsigned long long>(at(Counter::RepeatTakenShared)),
+            static_cast<unsigned long long>(sum(Counter::RepeatNoBlock, Counter::RepeatUnmovedHazard)), reasons(counts, Counter::RepeatNoBlock, Counter::RepeatUnmovedHazard).c_str(), reasons(counts, Counter::RepeatClassNotRecorded, Counter::RepeatClassModes).c_str(), reasons(counts, Counter::RepeatDetailNotReusable, Counter::RepeatDetailFmask).c_str(),
+            static_cast<unsigned long long>(at(Counter::RepeatBlocks)), static_cast<unsigned long long>(at(Counter::RepeatLate)),
+            static_cast<unsigned long long>(at(Counter::RepeatVerifyChecked)), static_cast<unsigned long long>(at(Counter::RepeatVerifyDiffering)), static_cast<unsigned long long>(at(Counter::RepeatRefuted)),
+            perCommit(Counter::RepeatFullNanoseconds, Counter::RepeatFullTimed), perCommit(Counter::RepeatNanoseconds, Counter::RepeatTimed), perCommit(Counter::RepeatSetsNanoseconds, Counter::RepeatSetsTimed), perCommit(Counter::RepeatStoresNanoseconds, Counter::RepeatStoresTimed), perCommit(Counter::RepeatSharedNanoseconds, Counter::RepeatSharedTimed));
     }
     if (commits == 0) return;
     static std::array<std::uint64_t, static_cast<std::size_t>(Graphics::RecipeRefusal::Count)> refusalsReported{};

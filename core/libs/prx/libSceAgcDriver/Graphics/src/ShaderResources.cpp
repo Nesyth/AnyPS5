@@ -4819,6 +4819,98 @@ void noteCleanSerials(std::array<bool, 6> moved) {
 
 }
 
+namespace {
+
+enum class CleanRuleEvent : std::size_t { ViewHits, PendingHits, BothHits, ExemptRecords, ExemptOverPending, RequiredNotClean, ExemptUnsettled, NoSources, SnapshotOverView, UnrecordedViews, ViewsReleased, ViewsPending, ViewsShadowed, ViewsRewritten, SourcesFailed, SourcesAccepted, SourcesRewritten, ExemptForgotten, ViewsVerified, ViewsDiffers, PendingVerified, PendingDiffers, Count };
+
+constexpr std::size_t CleanRuleEvents = static_cast<std::size_t>(CleanRuleEvent::Count);
+constexpr std::size_t CleanSourceReasons = static_cast<std::size_t>(FastFail::Count) + 1;
+
+struct CleanRuleCensus {
+    std::array<std::atomic<std::uint64_t>, CleanRuleEvents> events{};
+    std::array<std::atomic<std::uint64_t>, CleanSourceReasons> failed{};
+    std::array<std::uint64_t, CleanRuleEvents> eventsReported{};
+    std::array<std::uint64_t, CleanSourceReasons> failedReported{};
+    std::atomic<std::int64_t> reportedAt{0};
+    std::mutex mutex;
+};
+
+CleanRuleCensus& cleanRuleCensus() {
+    static auto* census = new CleanRuleCensus;
+    return *census;
+}
+
+void reportCleanRules() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!stats) return;
+    auto& census = cleanRuleCensus();
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    const auto previous = census.reportedAt.exchange(tenSeconds, std::memory_order_relaxed);
+    if (previous == tenSeconds) return;
+    std::array<std::uint64_t, CleanRuleEvents> events{};
+    std::array<std::uint64_t, CleanSourceReasons> failed{};
+    {
+        std::lock_guard lock(census.mutex);
+        for (std::size_t index = 0; index < CleanRuleEvents; ++index) {
+            const auto now = census.events[index].load(std::memory_order_relaxed);
+            events[index] = now - census.eventsReported[index];
+            census.eventsReported[index] = now;
+        }
+        for (std::size_t index = 0; index < CleanSourceReasons; ++index) {
+            const auto now = census.failed[index].load(std::memory_order_relaxed);
+            failed[index] = now - census.failedReported[index];
+            census.failedReported[index] = now;
+        }
+    }
+    if (previous == 0) return;
+    const auto at = [&](CleanRuleEvent event) { return static_cast<unsigned long long>(events[static_cast<std::size_t>(event)]); };
+    std::string reasons;
+    for (std::size_t index = 0; index < CleanSourceReasons; ++index) {
+        if (failed[index] == 0) continue;
+        char item[64];
+        std::snprintf(item, sizeof(item), "%s%s %llu", reasons.empty() ? "" : ", ", index < FastFailNames.size() ? FastFailNames[index] : "other", static_cast<unsigned long long>(failed[index]));
+        reasons += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[clean-rules] 10 s: hits through resident views %llu, through pending ranges %llu, through both %llu; records with pending ranges %llu (%llu over a pending surface), refused for other ranges not clean %llu, written during the proof %llu; not eligible: no viewed surface %llu, a snapshot over a viewed surface %llu, unrecorded elements %llu; resident-view keeps dropped: released %llu, pending over other ranges %llu, shadowed regions %llu, rewritten %llu; element proofs failed %llu (%s), with an accepted overlap %llu; rewritten after the element proof %llu; pending-range records forgotten %llu; verify: resident views %llu agreed, %llu differed, pending ranges %llu agreed, %llu differed\n",
+        at(CleanRuleEvent::ViewHits), at(CleanRuleEvent::PendingHits), at(CleanRuleEvent::BothHits), at(CleanRuleEvent::ExemptRecords), at(CleanRuleEvent::ExemptOverPending), at(CleanRuleEvent::RequiredNotClean), at(CleanRuleEvent::ExemptUnsettled),
+        at(CleanRuleEvent::NoSources), at(CleanRuleEvent::SnapshotOverView), at(CleanRuleEvent::UnrecordedViews),
+        at(CleanRuleEvent::ViewsReleased), at(CleanRuleEvent::ViewsPending), at(CleanRuleEvent::ViewsShadowed), at(CleanRuleEvent::ViewsRewritten),
+        at(CleanRuleEvent::SourcesFailed), reasons.empty() ? "none" : reasons.c_str(), at(CleanRuleEvent::SourcesAccepted), at(CleanRuleEvent::SourcesRewritten), at(CleanRuleEvent::ExemptForgotten),
+        at(CleanRuleEvent::ViewsVerified), at(CleanRuleEvent::ViewsDiffers), at(CleanRuleEvent::PendingVerified), at(CleanRuleEvent::PendingDiffers));
+}
+
+void noteCleanRule(CleanRuleEvent event) {
+    cleanRuleCensus().events[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+    reportCleanRules();
+}
+
+void noteCleanSourceFailure(FastFail reason) {
+    const auto index = std::min(static_cast<std::size_t>(reason), CleanSourceReasons - 1);
+    cleanRuleCensus().failed[index].fetch_add(1, std::memory_order_relaxed);
+    noteCleanRule(CleanRuleEvent::SourcesFailed);
+}
+
+}
+
+ShaderResources::CleanRuleCounts ShaderResources::CleanRuleCounted() {
+    auto& census = cleanRuleCensus();
+    const auto at = [&](CleanRuleEvent event) { return census.events[static_cast<std::size_t>(event)].load(std::memory_order_relaxed); };
+    CleanRuleCounts counts;
+    counts.viewHits = at(CleanRuleEvent::ViewHits) + at(CleanRuleEvent::BothHits);
+    counts.pendingHits = at(CleanRuleEvent::PendingHits) + at(CleanRuleEvent::BothHits);
+    counts.exemptRecords = at(CleanRuleEvent::ExemptRecords);
+    counts.viewDrops = at(CleanRuleEvent::ViewsReleased) + at(CleanRuleEvent::ViewsPending) + at(CleanRuleEvent::ViewsShadowed) + at(CleanRuleEvent::ViewsRewritten);
+    counts.sourceDrops = at(CleanRuleEvent::SourcesFailed) + at(CleanRuleEvent::SourcesAccepted) + at(CleanRuleEvent::SourcesRewritten) + at(CleanRuleEvent::ExemptForgotten);
+    counts.verified = at(CleanRuleEvent::ViewsVerified) + at(CleanRuleEvent::PendingVerified);
+    counts.differs = at(CleanRuleEvent::ViewsDiffers) + at(CleanRuleEvent::PendingDiffers);
+    counts.requiredNotClean = at(CleanRuleEvent::RequiredNotClean);
+    counts.exemptUnsettled = at(CleanRuleEvent::ExemptUnsettled);
+    counts.noSources = at(CleanRuleEvent::NoSources);
+    counts.snapshotOverView = at(CleanRuleEvent::SnapshotOverView);
+    counts.unrecordedViews = at(CleanRuleEvent::UnrecordedViews);
+    return counts;
+}
+
 ShaderResources::CleanStamp ShaderResources::cleanStampNow() const {
     return {GuestMemory::CleanForgetSerial(), TextureReleaseSerial().load(std::memory_order_acquire), StorageTexture::PendingSerial(), HostImportSetGeneration(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), GuestMemory::UnwatchSerial(), DepthSurfacesSerial()};
 }
@@ -4856,6 +4948,110 @@ bool ShaderResources::cleanUnchangedSince(std::uint64_t generation) const {
     return queries.empty() || GuestMemory::UnchangedSinceAll(queries);
 }
 
+bool ShaderResources::cleanUnchangedSince(std::uint64_t generation, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const {
+    if (generation == 0) return false;
+    struct CleanQueriesStorage {};
+    auto& queries = HostThreadLocal<std::vector<GuestMemory::UnchangedQuery>, CleanQueriesStorage>();
+    queries.clear();
+    for (const auto& [begin, end] : ranges) queries.push_back({begin, static_cast<std::size_t>(end - begin), generation});
+    return queries.empty() || GuestMemory::UnchangedSinceAll(queries);
+}
+
+void ShaderResources::noteCleanSources() {
+    cleanSourced.clear();
+    cleanRequired.clear();
+    cleanSourcesEligible = false;
+    if (validatedTextures.size() != textures.size()) {
+        noteCleanRule(CleanRuleEvent::UnrecordedViews);
+        return;
+    }
+    for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
+        const auto& surface = validatedTextures[i];
+        if (!surface.valid) {
+            noteCleanRule(CleanRuleEvent::UnrecordedViews);
+            cleanSourced.clear();
+            return;
+        }
+        if (surface.source != nullptr && !surface.depth) cleanSourced.push_back(i);
+    }
+    if (cleanSourced.empty()) {
+        noteCleanRule(CleanRuleEvent::NoSources);
+        return;
+    }
+    const auto viewed = [&](std::uint64_t begin, std::uint64_t end) {
+        return std::any_of(cleanSourced.begin(), cleanSourced.end(), [&](std::size_t i) {
+            const auto& surface = validatedTextures[i];
+            return begin < surface.resource.baseAddress + surface.bytes && surface.resource.baseAddress < end;
+        });
+    };
+    for (const auto& surface : validatedTextures) {
+        if (surface.source != nullptr && !surface.depth) continue;
+        const auto begin = surface.resource.baseAddress;
+        const auto end = begin + std::max<std::uint64_t>(surface.bytes, 1u);
+        const auto keys = surface.resource.dccAddress;
+        if (viewed(begin, end) || (keys != 0 && viewed(keys, keys + std::max<std::uint64_t>(DccKeyBytes(surface.bytes), 1u)))) {
+            noteCleanRule(CleanRuleEvent::SnapshotOverView);
+            cleanSourced.clear();
+            return;
+        }
+    }
+    const auto ownSurface = [&](const std::pair<std::uint64_t, std::uint64_t>& range) {
+        return std::any_of(cleanSourced.begin(), cleanSourced.end(), [&](std::size_t i) {
+            const auto& surface = validatedTextures[i];
+            return range.first == surface.resource.baseAddress && range.second == surface.resource.baseAddress + surface.bytes;
+        });
+    };
+    for (const auto& range : cleanRangeList) {
+        if (!ownSurface(range)) cleanRequired.push_back(range);
+    }
+    cleanSourcesEligible = true;
+}
+
+std::uint8_t ShaderResources::cleanViewsKept(const CleanStamp& stamp) {
+    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->Released(); })) {
+        noteCleanRule(CleanRuleEvent::ViewsReleased);
+        return 1;
+    }
+    struct PendingRangesStorage {};
+    auto& ranges = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, PendingRangesStorage>();
+    ranges.assign(cleanRequired.begin(), cleanRequired.end());
+    for (const auto& region : directRegions) ranges.emplace_back(region.begin, region.end);
+    if (StorageTexture::AnyPendingOverlaps(ranges)) {
+        noteCleanRule(CleanRuleEvent::ViewsPending);
+        return 2;
+    }
+    ranges.clear();
+    for (const auto& region : directRegions) ranges.emplace_back(region.begin, region.end);
+    if (!ranges.empty() && AnyShadowedOverlaps(ranges)) {
+        noteCleanRule(CleanRuleEvent::ViewsShadowed);
+        return 3;
+    }
+    if (!cleanUnchangedSince(cleanAt.generation, cleanExempt ? cleanRequired : cleanRangeList)) {
+        noteCleanRule(CleanRuleEvent::ViewsRewritten);
+        return 4;
+    }
+    cleanAt.release = stamp.release;
+    cleanAt.pending = stamp.pending;
+    return 0;
+}
+
+bool ShaderResources::cleanSourcesCurrent(FastFail& reason) {
+    const auto serialBefore = StorageTexture::PendingSerial();
+    struct CleanOverlapStorage {};
+    auto& overlapping = ThreadScratch<std::vector<PendingOverlap>, CleanOverlapStorage>();
+    bool accepted = false;
+    reason = FastFail::Count;
+    if (!fastRevalidate(serialBefore, {}, reason, overlapping, accepted, &cleanSourced, false)) {
+        noteCleanSourceFailure(reason);
+        return false;
+    }
+    if (accepted) {
+        noteCleanRule(CleanRuleEvent::SourcesAccepted);
+        return false;
+    }
+    return true;
+}
+
 bool ShaderResources::cleanCurrent(const CleanStamp& stamp, CleanProof& outcome) {
     const auto refuse = [&](CleanEvent event, CleanProof why) {
         cleanProved = false;
@@ -4869,13 +5065,23 @@ bool ShaderResources::cleanCurrent(const CleanStamp& stamp, CleanProof& outcome)
         return false;
     }
     if (!registeredImageViewsCurrent(registeredImageViews)) return refuse(CleanEvent::Views, CleanProof::Views);
+    cleanHitRule = 0;
+    if (cleanExempt && !RuntimeSwitches::Set(RuntimeSwitch::CleanPendingRanges)) return refuse(CleanEvent::NotClean, CleanProof::NotClean);
+    const bool storeSerialsOnly = (stamp.release != cleanAt.release || stamp.pending != cleanAt.pending) && stamp.imports == cleanAt.imports && stamp.allocations == cleanAt.allocations && stamp.unwatched == cleanAt.unwatched && stamp.depthSurfaces == cleanAt.depthSurfaces;
+    bool proveSources = cleanExempt;
+    bool viewsKept = false;
     // APS5_CLEAN_PRECISE_SERIALS: the release and pending-store serials are global, and one of them
     // moves between most uses of a template. What they stand for here is narrower: one of this
     // template's own textures was released, or a pending surface now lies over one of its ranges
     // (its snapshot texture would be stale against it). When only those two moved and neither is
     // the case, the kept proof stays and adopts the new serials.
     static const bool preciseSerials = std::getenv("APS5_CLEAN_PRECISE_SERIALS") != nullptr;
-    if (preciseSerials && (stamp.release != cleanAt.release || stamp.pending != cleanAt.pending) && stamp.imports == cleanAt.imports && stamp.allocations == cleanAt.allocations && stamp.unwatched == cleanAt.unwatched && stamp.depthSurfaces == cleanAt.depthSurfaces) {
+    if (storeSerialsOnly && cleanSourcesEligible && RuntimeSwitches::Set(RuntimeSwitch::CleanResidentViews)) {
+        const auto dropped = cleanViewsKept(stamp);
+        if (dropped == 4) return refuse(CleanEvent::Rewritten, CleanProof::Rewritten);
+        viewsKept = dropped == 0;
+        proveSources = proveSources || viewsKept;
+    } else if (preciseSerials && storeSerialsOnly) {
         const bool released = std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->Released(); });
         // A view of a resident image follows that image's own state (its keys and pending results),
         // which these checks do not see: a template with such a view keeps the plain serial rule.
@@ -4893,10 +5099,13 @@ bool ShaderResources::cleanCurrent(const CleanStamp& stamp, CleanProof& outcome)
         return refuse(CleanEvent::Serials, CleanProof::Serials);
     }
     outcome = CleanProof::Skipped;
-    const auto* ranges = &cleanRangeList;
+    const auto* ranges = cleanExempt ? &cleanRequired : &cleanRangeList;
     if (stamp.forget != cleanAt.forget) {
-        if (!GuestMemory::AllClean(*ranges)) return refuse(CleanEvent::Forgotten, CleanProof::Forgotten);
-        if (!cleanUnchangedSince(cleanAt.generation)) return refuse(CleanEvent::Rewritten, CleanProof::Rewritten);
+        if (!GuestMemory::AllClean(*ranges)) {
+            if (cleanExempt) noteCleanRule(CleanRuleEvent::ExemptForgotten);
+            return refuse(CleanEvent::Forgotten, CleanProof::Forgotten);
+        }
+        if (!cleanUnchangedSince(cleanAt.generation, *ranges)) return refuse(CleanEvent::Rewritten, CleanProof::Rewritten);
         cleanAt.forget = stamp.forget;
         noteClean(CleanEvent::Requeried);
         outcome = CleanProof::Requeried;
@@ -4905,13 +5114,22 @@ bool ShaderResources::cleanCurrent(const CleanStamp& stamp, CleanProof& outcome)
         if (Recorder::InCompletion() || Recorder::Active() == nullptr) return false;
         return (context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0;
     }();
-    for (const auto& [begin, end] : *ranges) {
+    for (const auto& [begin, end] : cleanRangeList) {
         if (!pendingCpu) break;
         if (CompletePendingCpuWrites(context, begin, static_cast<std::size_t>(end - begin))) return refuse(CleanEvent::PendingWrites, CleanProof::PendingWrites);
     }
     for (const auto& region : directRegions) {
         static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
         if (pendingCpu && CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin))) return refuse(CleanEvent::PendingWrites, CleanProof::PendingWrites);
+    }
+    if (proveSources) {
+        auto reason = FastFail::Count;
+        if (!cleanSourcesCurrent(reason)) return reason == FastFail::Changed ? refuse(CleanEvent::Rewritten, CleanProof::Rewritten) : refuse(CleanEvent::Serials, CleanProof::Serials);
+        if (cleanExempt && !cleanUnchangedSince(cleanAt.generation, cleanRequired)) {
+            noteCleanRule(CleanRuleEvent::SourcesRewritten);
+            return refuse(CleanEvent::Rewritten, CleanProof::Rewritten);
+        }
+        cleanHitRule = static_cast<std::uint8_t>((viewsKept ? 1u : 0u) | (cleanExempt ? 2u : 0u));
     }
     if (!guestMemory.StagingDecisionsCurrent()) return refuse(CleanEvent::PendingWrites, CleanProof::PendingWrites);
     if (auto* recorder = Recorder::Active(); recorder != nullptr) {
@@ -4924,6 +5142,7 @@ bool ShaderResources::cleanCurrent(const CleanStamp& stamp, CleanProof& outcome)
             return false;
         }
     }
+    if (cleanHitRule != 0) noteCleanRule(cleanHitRule == 1 ? CleanRuleEvent::ViewHits : cleanHitRule == 2 ? CleanRuleEvent::PendingHits : CleanRuleEvent::BothHits);
     return true;
 }
 
@@ -4934,25 +5153,39 @@ void ShaderResources::recordClean(bool proved, const CleanStamp& stamp) {
         return;
     }
     if (!cleanEligible()) return;
-    if (cleanMisses != 0 && (++cleanMisses & 15u) != 0) {
+    const bool pendingRule = RuntimeSwitches::Set(RuntimeSwitch::CleanPendingRanges);
+    if (pendingRule || RuntimeSwitches::Set(RuntimeSwitch::CleanResidentViews)) noteCleanSources();
+    else if (cleanSourcesEligible) cleanSourcesEligible = false;
+    if (!(pendingRule && cleanSourcesEligible) && cleanMisses != 0 && (++cleanMisses & 15u) != 0) {
         cleanRefusal = CleanProof::NotClean;
         return;
     }
+    bool exempt = false;
     if (!GuestMemory::AllClean(cleanRangeList)) {
-        if (cleanMisses == 0) cleanMisses = 1;
-        noteClean(CleanEvent::NotClean);
-        noteUncleanRanges(cleanRangeList);
-        cleanRefusal = CleanProof::NotClean;
-        return;
+        exempt = pendingRule && cleanSourcesEligible && GuestMemory::AllClean(cleanRequired);
+        if (!exempt) {
+            if (pendingRule && cleanSourcesEligible) noteCleanRule(CleanRuleEvent::RequiredNotClean);
+            if (cleanMisses == 0) cleanMisses = 1;
+            noteClean(CleanEvent::NotClean);
+            noteUncleanRanges(pendingRule && cleanSourcesEligible ? cleanRequired : cleanRangeList);
+            cleanRefusal = CleanProof::NotClean;
+            return;
+        }
     }
     cleanMisses = 0;
-    if (!cleanUnchangedSince(stamp.generation)) {
+    if (!cleanUnchangedSince(stamp.generation, exempt ? cleanRequired : cleanRangeList)) {
+        if (exempt) noteCleanRule(CleanRuleEvent::ExemptUnsettled);
         noteClean(CleanEvent::Unsettled);
         cleanRefusal = CleanProof::Unsettled;
         return;
     }
     cleanProved = true;
     cleanAt = stamp;
+    cleanExempt = exempt;
+    if (!exempt) return;
+    noteCleanRule(CleanRuleEvent::ExemptRecords);
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (stats && std::any_of(cleanSourced.begin(), cleanSourced.end(), [&](std::size_t i) { return StorageTexture::FindPending(validatedTextures[i].resource.baseAddress, validatedTextures[i].bytes).get() == validatedTextures[i].source; })) noteCleanRule(CleanRuleEvent::ExemptOverPending);
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report, CleanProof* clean) {
@@ -4971,6 +5204,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             return true;
         }
         stamp.generation = GuestMemory::TrackerGeneration();
+        const auto rule = cleanHitRule;
         std::vector<std::pair<const StorageTexture*, std::uint64_t>> versions;
         for (const auto& surface : validatedTextures) {
             if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
@@ -4980,8 +5214,13 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         const bool moved = std::any_of(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
         const bool same = ok && !moved && textures == before;
         noteClean(same ? CleanEvent::Verified : CleanEvent::Differs);
+        if ((rule & 1u) != 0) noteCleanRule(same ? CleanRuleEvent::ViewsVerified : CleanRuleEvent::ViewsDiffers);
+        if ((rule & 2u) != 0) noteCleanRule(same ? CleanRuleEvent::PendingVerified : CleanRuleEvent::PendingDiffers);
         static std::atomic<int> reports{0};
-        if (!same && reports.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[clean-currency] verify: a clean-currency hit disagrees with the full proof (proved %d, an upload %d, other objects %d, %zu ranges)\n", ok ? 1 : 0, moved ? 1 : 0, textures == before ? 0 : 1, cleanRangeList.size());
+        if (!same && reports.fetch_add(1, std::memory_order_relaxed) < 20) {
+            std::fprintf(stderr, "[clean-currency] verify: a clean-currency hit disagrees with the full proof (proved %d, an upload %d, other objects %d, %zu ranges)\n", ok ? 1 : 0, moved ? 1 : 0, textures == before ? 0 : 1, cleanRangeList.size());
+            if (rule != 0) std::fprintf(stderr, "[clean-currency] verify: the disagreeing hit came through the %s rule\n", rule == 1 ? "resident views" : rule == 2 ? "pending ranges" : "resident views and pending ranges");
+        }
         if (clean != nullptr) *clean = same ? CleanProof::Verified : CleanProof::Differs;
         recordClean(ok, stamp);
         return ok;
@@ -6097,6 +6336,75 @@ private:
     std::array<std::vector<DescriptorCache::SetAllocation>, 2> parked;
     bool closed = false;
     std::atomic<std::size_t> count{0};
+};
+
+class RepeatSets : public std::enable_shared_from_this<RepeatSets> {
+public:
+    static constexpr std::size_t Capacity = 256;
+
+    RepeatSets(DescriptorCache& cache, VkDescriptorSetLayout layout, std::vector<VkDescriptorPoolSize> sizes, std::optional<std::uint32_t> variable) : cache(cache), layout(layout), sizes(std::move(sizes)), variable(variable) {}
+
+    RepeatSets(const RepeatSets&) = delete;
+    RepeatSets& operator=(const RepeatSets&) = delete;
+
+    ~RepeatSets() {
+        for (const auto& allocation : free) cache.Recycle(layout, allocation);
+    }
+
+    DescriptorCache::SetAllocation Take(bool& fresh) {
+        {
+            std::lock_guard lock(mutex);
+            if (!free.empty()) {
+                auto allocation = std::move(free.back());
+                free.pop_back();
+                fresh = false;
+                return allocation;
+            }
+        }
+        fresh = true;
+        auto allocation = cache.AllocateRewritten(layout, sizes, false, variable);
+        Require(allocation.set != VK_NULL_HANDLE, "repeat descriptor allocation failed");
+        return allocation;
+    }
+
+    void Return(std::vector<DescriptorCache::SetAllocation>& used) noexcept {
+        std::lock_guard lock(mutex);
+        for (auto& allocation : used) {
+            if (free.size() < Capacity) free.push_back(std::move(allocation));
+            else cache.Recycle(layout, allocation);
+        }
+        used.clear();
+    }
+
+    std::uint32_t set = 0;
+    std::vector<std::size_t> allocations;
+    std::vector<VkDescriptorBufferInfo> buffers;
+    std::vector<VkWriteDescriptorSet> writes;
+    std::vector<VkDescriptorBufferInfo> patchInfos;
+    std::vector<VkWriteDescriptorSet> patches;
+    std::vector<std::size_t> patchSelected;
+    std::vector<std::size_t> patchSlots;
+
+private:
+    DescriptorCache& cache;
+    const VkDescriptorSetLayout layout;
+    const std::vector<VkDescriptorPoolSize> sizes;
+    const std::optional<std::uint32_t> variable;
+    AgcDriver::Mutex mutex;
+    std::vector<DescriptorCache::SetAllocation> free;
+};
+
+class RepeatSetLease {
+public:
+    RepeatSetLease() = default;
+    RepeatSetLease(const RepeatSetLease&) = delete;
+    RepeatSetLease& operator=(const RepeatSetLease&) = delete;
+    ~RepeatSetLease() {
+        if (owner != nullptr) owner->Return(sets);
+    }
+
+    std::shared_ptr<RepeatSets> owner;
+    std::vector<DescriptorCache::SetAllocation> sets;
 };
 
 std::uint64_t ShaderResources::guestBufferBytes(std::span<const std::uint32_t> words) const {
@@ -8648,6 +8956,295 @@ void ShaderResources::PushDrawBindings(VkCommandBuffer commands, VkPipelineLayou
         if (write.pBufferInfo != nullptr) write.pBufferInfo = buffers.data() + (descriptorWrites[index].pBufferInfo - descriptorBuffers.data());
     }
     CmdPushDescriptorSet(context.Resolved(&DeviceFunctions::cmdPushDescriptorSet, "vkCmdPushDescriptorSetKHR"), commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, plan.set == 0 ? 0u : fragmentSet, static_cast<std::uint32_t>(writes.size()), writes.data(), SetBindSite::Draw);
+}
+
+bool ShaderResources::BuildRepeatPush(const PushPlan& plan, std::span<const PreparedBuffers::Selected> selected, RepeatPush& out, bool sets) const {
+    out.allocations.clear();
+    out.patches.clear();
+    out.writes.clear();
+    out.sets = nullptr;
+    if (bda != nullptr || selected.empty()) return false;
+    const std::uint32_t other = plan.set == 0 ? 1u : 0u;
+    std::vector<std::size_t> outside;
+    std::vector<std::size_t> outsideAt;
+    for (std::size_t index = 0; index < selected.size(); ++index) {
+        const auto allocation = selected[index].allocation;
+        if (allocation >= plan.allocationSets.size() || allocation >= plan.slots.size()) return false;
+        out.allocations.push_back(allocation);
+        if (plan.allocationSets[allocation] != plan.set) {
+            if (!sets || plan.allocationSets[allocation] != other) return false;
+            outside.push_back(allocation);
+            outsideAt.push_back(index);
+            continue;
+        }
+        for (const auto slot : plan.slots[allocation]) out.patches.emplace_back(slot, index);
+    }
+    if (!outside.empty()) {
+        if (!splitSets || heapStage || updateAfterBind || context.descriptorCache == nullptr) return false;
+        RepeatSets* found = nullptr;
+        for (const auto& pool : repeatSets) {
+            if (pool->set == other && pool->allocations == outside) found = pool.get();
+        }
+        if (found == nullptr) {
+            if (repeatSets.size() >= 8) return false;
+            std::vector<VkDescriptorPoolSize> sizes;
+            for (const auto& binding : bindings) {
+                if (binding.heap || setOf(binding) != other) continue;
+                const auto count = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
+                if (count == 0) continue;
+                const auto held = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
+                if (held != sizes.end()) held->descriptorCount += count;
+                else sizes.push_back({binding.layout.descriptorType, count});
+            }
+            std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+            std::optional<std::uint32_t> variable;
+            if (tableBindings[other] != std::numeric_limits<std::size_t>::max()) variable = std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[other]].imageAllocations.size()));
+            auto pool = std::make_shared<RepeatSets>(*context.descriptorCache, other == 0 ? _layout : fragment.layout, std::move(sizes), variable);
+            pool->set = other;
+            pool->allocations = outside;
+            pool->buffers = descriptorBuffers;
+            std::vector<std::size_t> setWrites;
+            std::vector<std::vector<std::size_t>> slotsOf(allocations.size());
+            std::size_t next = 0;
+            for (const auto& binding : bindings) {
+                if (binding.heap) continue;
+                const auto set = setOf(binding);
+                const auto original = set == 0 ? _set : fragment.set;
+                while (next < descriptorWrites.size() && descriptorWrites[next].dstBinding == binding.layout.binding && descriptorWrites[next].dstSet == original) {
+                    if (set == other) {
+                        setWrites.push_back(next);
+                        if (!binding.allocations.empty() && descriptorWrites[next].pBufferInfo != nullptr) {
+                            const auto offset = static_cast<std::size_t>(descriptorWrites[next].pBufferInfo - descriptorBuffers.data());
+                            for (std::size_t element = 0; element < binding.allocations.size(); ++element) slotsOf[binding.allocations[element]].push_back(offset + element);
+                        }
+                    }
+                    ++next;
+                }
+            }
+            if (next != descriptorWrites.size()) return false;
+            for (const auto index : setWrites) {
+                auto& write = pool->writes.emplace_back(descriptorWrites[index]);
+                if (write.pBufferInfo != nullptr) write.pBufferInfo = pool->buffers.data() + (descriptorWrites[index].pBufferInfo - descriptorBuffers.data());
+            }
+            for (std::size_t at = 0; at < outside.size(); ++at) {
+                if (slotsOf[outside[at]].empty()) return false;
+                for (const auto slot : slotsOf[outside[at]]) {
+                    const auto write = std::find_if(setWrites.begin(), setWrites.end(), [&](std::size_t index) {
+                        const auto& candidate = descriptorWrites[index];
+                        if (candidate.pBufferInfo == nullptr) return false;
+                        const auto offset = static_cast<std::size_t>(candidate.pBufferInfo - descriptorBuffers.data());
+                        return slot >= offset && slot < offset + candidate.descriptorCount;
+                    });
+                    if (write == setWrites.end() || descriptorWrites[*write].descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) return false;
+                    auto patch = descriptorWrites[*write];
+                    patch.dstArrayElement += static_cast<std::uint32_t>(slot - static_cast<std::size_t>(patch.pBufferInfo - descriptorBuffers.data()));
+                    patch.descriptorCount = 1;
+                    patch.pImageInfo = nullptr;
+                    patch.pTexelBufferView = nullptr;
+                    pool->patches.push_back(patch);
+                    pool->patchInfos.push_back(descriptorBuffers[slot]);
+                    pool->patchSlots.push_back(slot);
+                    pool->patchSelected.push_back(at);
+                }
+            }
+            for (std::size_t at = 0; at < pool->patches.size(); ++at) pool->patches[at].pBufferInfo = &pool->patchInfos[at];
+            found = pool.get();
+            repeatSets.push_back(std::move(pool));
+        }
+        out.sets = found;
+        out.outsideAt = outsideAt;
+    }
+    out.buffers = descriptorBuffers;
+    out.writes.reserve(plan.writes.size());
+    for (const auto index : plan.writes) {
+        auto& write = out.writes.emplace_back(descriptorWrites[index]);
+        write.dstSet = VK_NULL_HANDLE;
+        if (write.pBufferInfo != nullptr) write.pBufferInfo = out.buffers.data() + (descriptorWrites[index].pBufferInfo - descriptorBuffers.data());
+    }
+    const auto fragmentSet = ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet;
+    out.boundSet = VK_NULL_HANDLE;
+    out.boundIndex = 0;
+    if (plan.set == 1u) {
+        out.boundSet = _set;
+    } else if (splitSets) {
+        out.boundSet = fragment.set;
+        out.boundIndex = fragmentSet;
+    }
+    out.pushIndex = plan.set == 0 ? 0u : fragmentSet;
+    return true;
+}
+
+void ShaderResources::RepeatPushBindings(VkCommandBuffer commands, VkPipelineLayout layout, RepeatPush& push, std::span<const PreparedBuffers::Selected> selected, VkBuffer buffer, VkDeviceSize base, Recorder& recorder) const {
+    requireGuestBuffers();
+    prepareFaultSlot();
+    auto bound = push.boundSet;
+    if (push.sets != nullptr) {
+        auto& pool = *push.sets;
+        bool fresh = false;
+        auto allocation = pool.Take(fresh);
+        bound = allocation.set;
+        if (push.lease == nullptr || push.leaseRecorder != recorder.Id() || push.leaseBatch != recorder.OpenSerial()) {
+            auto lease = std::make_shared<RepeatSetLease>();
+            lease->owner = pool.shared_from_this();
+            push.lease = lease.get();
+            push.leaseRecorder = recorder.Id();
+            push.leaseBatch = recorder.OpenSerial();
+            recorder.Keep(std::move(lease));
+        }
+        push.lease->sets.push_back(std::move(allocation));
+        const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
+        if (fresh) {
+            for (auto& write : pool.writes) write.dstSet = bound;
+            update(context.device, static_cast<std::uint32_t>(pool.writes.size()), pool.writes.data(), 0, nullptr);
+        }
+        for (std::size_t at = 0; at < pool.patches.size(); ++at) {
+            const auto& item = selected[push.outsideAt[pool.patchSelected[at]]];
+            pool.patchInfos[at] = wholeDwordRange({buffer, base + item.offset, item.bytes});
+            pool.patches[at].dstSet = bound;
+        }
+        update(context.device, static_cast<std::uint32_t>(pool.patches.size()), pool.patches.data(), 0, nullptr);
+    }
+    if (bound != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, push.boundIndex, 1, &bound, SetBindSite::Draw);
+    for (const auto& [slot, index] : push.patches) push.buffers[slot] = wholeDwordRange({buffer, base + selected[index].offset, selected[index].bytes});
+    CmdPushDescriptorSet(context.Resolved(&DeviceFunctions::cmdPushDescriptorSet, "vkCmdPushDescriptorSetKHR"), commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, push.pushIndex, static_cast<std::uint32_t>(push.writes.size()), push.writes.data(), SetBindSite::Draw);
+}
+
+ShaderResources::PreparedDifference ShaderResources::CompareRepeatPush(RepeatPush& push, const DrawBindings& bound, const PushPlan& plan) const {
+    std::vector<VkDescriptorBufferInfo> buffers = descriptorBuffers;
+    overlayPushedBuffers(bound, plan, buffers);
+    for (std::size_t index = 0; index < push.allocations.size(); ++index) {
+        if (index >= bound.snapshots.size() || index >= bound.pushSelected.size() || bound.pushSelected[index] != push.allocations[index]) return {"push writes", "the block's selection of " + std::to_string(push.allocations.size()) + " allocations is not the one today's way pushes (" + std::to_string(bound.pushSelected.size()) + ")"};
+    }
+    for (const auto& [slot, index] : push.patches) {
+        const auto& snapshot = bound.snapshots[index];
+        push.buffers[slot] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+    }
+    const VkDescriptorSet today = plan.set == 1u ? _set : splitSets ? fragment.set : VK_NULL_HANDLE;
+    if (push.sets == nullptr && push.boundSet != today) return {"push writes", "the block binds another set beside the pushed one than today's way"};
+    if (push.sets != nullptr) {
+        const auto& pool = *push.sets;
+        const std::uint32_t other = plan.set == 0 ? 1u : 0u;
+        if (pool.set != other || push.boundIndex != (other == 0 ? 0u : static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet))) return {"set writes", "the block writes set " + std::to_string(pool.set) + " at index " + std::to_string(push.boundIndex) + ", today's way the set beside the pushed one"};
+        std::vector<VkDescriptorBufferInfo> expected = descriptorBuffers;
+        std::vector<std::size_t> setWrites;
+        std::size_t next = 0;
+        for (const auto& binding : bindings) {
+            if (binding.heap) continue;
+            const auto set = setOf(binding);
+            const auto original = set == 0 ? _set : fragment.set;
+            while (next < descriptorWrites.size() && descriptorWrites[next].dstBinding == binding.layout.binding && descriptorWrites[next].dstSet == original) {
+                if (set == other) {
+                    setWrites.push_back(next);
+                    if (!binding.allocations.empty() && descriptorWrites[next].pBufferInfo != nullptr) {
+                        const auto offset = static_cast<std::size_t>(descriptorWrites[next].pBufferInfo - descriptorBuffers.data());
+                        for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+                            const auto chosen = std::find(bound.pushSelected.begin(), bound.pushSelected.end(), binding.allocations[element]);
+                            if (chosen == bound.pushSelected.end()) continue;
+                            const auto& snapshot = bound.snapshots[static_cast<std::size_t>(chosen - bound.pushSelected.begin())];
+                            expected[offset + element] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+                        }
+                    }
+                }
+                ++next;
+            }
+        }
+        std::vector<VkDescriptorBufferInfo> content = pool.buffers;
+        for (std::size_t at = 0; at < pool.patches.size(); ++at) {
+            const auto& snapshot = bound.snapshots[push.outsideAt[pool.patchSelected[at]]];
+            const auto slot = pool.patchSlots[at];
+            content[slot] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+            const auto write = std::find_if(setWrites.begin(), setWrites.end(), [&](std::size_t index) {
+                const auto& candidate = descriptorWrites[index];
+                if (candidate.pBufferInfo == nullptr) return false;
+                const auto offset = static_cast<std::size_t>(candidate.pBufferInfo - descriptorBuffers.data());
+                return slot >= offset && slot < offset + candidate.descriptorCount;
+            });
+            if (write == setWrites.end()) return {"set writes", "the block rewrites a buffer entry outside the set beside the pushed one"};
+            const auto& theirs = descriptorWrites[*write];
+            const auto element = theirs.dstArrayElement + static_cast<std::uint32_t>(slot - static_cast<std::size_t>(theirs.pBufferInfo - descriptorBuffers.data()));
+            const auto& mine = pool.patches[at];
+            if (mine.dstBinding != theirs.dstBinding || mine.dstArrayElement != element || mine.descriptorCount != 1 || mine.descriptorType != theirs.descriptorType) return {"set writes", "the block's rewrite of binding " + std::to_string(theirs.dstBinding) + "[" + std::to_string(element) + "] has another shape than the entry it replaces"};
+        }
+        if (pool.writes.size() != setWrites.size()) return {"set writes", "the block writes " + std::to_string(pool.writes.size()) + " entries of the set beside the pushed one, today's way " + std::to_string(setWrites.size())};
+        for (std::size_t at = 0; at < setWrites.size(); ++at) {
+            const auto& mine = pool.writes[at];
+            const auto& theirs = descriptorWrites[setWrites[at]];
+            if (mine.dstBinding != theirs.dstBinding || mine.dstArrayElement != theirs.dstArrayElement || mine.descriptorCount != theirs.descriptorCount || mine.descriptorType != theirs.descriptorType || mine.pImageInfo != theirs.pImageInfo || mine.pTexelBufferView != theirs.pTexelBufferView || mine.pNext != theirs.pNext || (mine.pBufferInfo == nullptr) != (theirs.pBufferInfo == nullptr)) return {"set writes", "write " + std::to_string(at) + " (binding " + std::to_string(theirs.dstBinding) + ") of the set beside the pushed one has another shape than today's"};
+            if (theirs.pBufferInfo == nullptr) continue;
+            const auto offset = static_cast<std::size_t>(theirs.pBufferInfo - descriptorBuffers.data());
+            for (std::uint32_t element = 0; element < theirs.descriptorCount; ++element) {
+                const auto& a = content[offset + element];
+                const auto& b = expected[offset + element];
+                if (a.buffer != b.buffer || a.offset != b.offset || a.range != b.range) return {"set writes", "binding " + std::to_string(theirs.dstBinding) + "[" + std::to_string(theirs.dstArrayElement + element) + "]: the block's set holds range " + std::to_string(a.range) + " at " + std::to_string(a.offset) + ", today's way range " + std::to_string(b.range) + " at " + std::to_string(b.offset) + (a.buffer == b.buffer ? "" : " of another buffer")};
+            }
+        }
+    }
+    if (push.writes.size() != plan.writes.size()) return {"push writes", "the block holds " + std::to_string(push.writes.size()) + " writes, today's way pushes " + std::to_string(plan.writes.size())};
+    for (std::size_t at = 0; at < plan.writes.size(); ++at) {
+        const auto& mine = push.writes[at];
+        const auto& theirs = descriptorWrites[plan.writes[at]];
+        if (mine.dstBinding != theirs.dstBinding || mine.dstArrayElement != theirs.dstArrayElement || mine.descriptorCount != theirs.descriptorCount || mine.descriptorType != theirs.descriptorType || mine.pImageInfo != theirs.pImageInfo || mine.pTexelBufferView != theirs.pTexelBufferView || mine.pNext != theirs.pNext || (mine.pBufferInfo == nullptr) != (theirs.pBufferInfo == nullptr)) return {"push writes", "write " + std::to_string(at) + " (binding " + std::to_string(theirs.dstBinding) + ") has another shape than today's"};
+        if (theirs.pBufferInfo == nullptr) continue;
+        const auto offset = static_cast<std::size_t>(theirs.pBufferInfo - descriptorBuffers.data());
+        for (std::uint32_t element = 0; element < theirs.descriptorCount; ++element) {
+            const auto& a = mine.pBufferInfo[element];
+            const auto& b = buffers[offset + element];
+            if (a.buffer != b.buffer || a.offset != b.offset || a.range != b.range) return {"push writes", "binding " + std::to_string(theirs.dstBinding) + "[" + std::to_string(theirs.dstArrayElement + element) + "]: the block pushes range " + std::to_string(a.range) + " at " + std::to_string(a.offset) + ", today's way range " + std::to_string(b.range) + " at " + std::to_string(b.offset) + (a.buffer == b.buffer ? "" : " of another buffer")};
+        }
+    }
+    return {};
+}
+
+ShaderResources::PreparedBuffers::Selection ShaderResources::RepeatGuards(const PreparedBuffers& prepared) const {
+    using Selection = PreparedBuffers::Selection;
+    const auto alignment = context.limits.minStorageBufferOffsetAlignment;
+    if (prepared.plan == nullptr || (alignment != 0 && prepared.plan->alignment % alignment != 0)) return Selection::Hazard;
+    const bool guardsMoved = DepthGuardsGeneration_nid_no_patch() != prepared.depthGuards;
+    if ((guardsMoved || HasResidentDepthGuards_nid_no_patch()) && std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && (guardsMoved || MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes)); })) return Selection::DepthGuards;
+    return Selection::Taken;
+}
+
+void ShaderResources::RepeatRequire(std::span<const MovedBuffer> moved) const {
+    requireGuestBuffers(moved);
+    prepareFaultSlot();
+    bindingsChecked = heapStage && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind);
+}
+
+bool ShaderResources::RepeatUnmovedClear(const Recorder& recorder, const PreparedBuffers& prepared) const {
+    for (const auto& item : prepared.selected) {
+        if (item.moved || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) continue;
+        const auto& allocation = allocations[item.allocation];
+        if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return false;
+    }
+    return true;
+}
+
+std::shared_ptr<Buffer> ShaderResources::RepeatUpload(Recorder& recorder, const PreparedBuffers& prepared, VkDeviceSize& offset) const {
+    auto slice = recorder.DrawUpload(prepared.blob.size());
+    std::memcpy(slice.bytes, prepared.blob.data(), prepared.blob.size());
+    const auto& plan = *prepared.plan;
+    for (const auto& item : prepared.selected) {
+        if (item.begin == 0) continue;
+        if (item.moved && item.bytes > plan.uploadLimit && MovedSnapshotStats()) {
+            movedSnapshotTally().uploaded.fetch_add(1, std::memory_order_relaxed);
+            movedSnapshotTally().uploadedBytes.fetch_add(item.bytes, std::memory_order_relaxed);
+        }
+        CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(item.begin), item.bytes);
+    }
+    offset = slice.offset;
+    return std::move(slice.buffer);
+}
+
+bool ShaderResources::ProofHeld() const {
+    static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+    if (!EpochProofs() || verify) return false;
+    const auto epoch = GuestMemory::CollectEpoch();
+    if (epoch == 0 || provedEpoch != epoch || provedPending != StorageTexture::PendingSerial() || provedProof != GuestMemory::ProofSerial() || HoldsDepthCopies()) return false;
+    return registeredImageViewsCurrent(registeredImageViews);
+}
+
+bool ShaderResources::HoldsDepthCopies() const {
+    return std::ranges::any_of(textures, [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->IsDepthCopy(); });
 }
 
 void ShaderResources::overlayPushedBuffers(const DrawBindings& result, const PushPlan& plan, std::span<VkDescriptorBufferInfo> buffers, std::span<std::size_t> owners) const {

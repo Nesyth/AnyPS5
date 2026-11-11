@@ -111,6 +111,14 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_FIFTH_FINISHER",
     "APS5_LEAN_LIST_BATCH",
     "APS5_LEAN_LIST_DIRECT",
+    "APS5_DIRECT_REPEAT",
+    "APS5_CLEAN_RESIDENT_VIEWS",
+    "APS5_CLEAN_PENDING_RANGES",
+    "APS5_REFUSED_COLLECT_MEMO",
+    "APS5_WORKER_CORE",
+    "APS5_DIRECT_REPEAT_SETS",
+    "APS5_DIRECT_REPEAT_STORES",
+    "APS5_DIRECT_REPEAT_SHARED",
 };
 static_assert(SwitchNames.back() != nullptr, "every runtime switch needs a name");
 
@@ -222,6 +230,14 @@ struct SwitchValues {
             std::getenv("APS5_FIFTH_FINISHER") != nullptr,
             std::getenv("APS5_LEAN_LIST_BATCH") != nullptr,
             std::getenv("APS5_LEAN_LIST_DIRECT") != nullptr,
+            std::getenv("APS5_DIRECT_REPEAT") != nullptr,
+            std::getenv("APS5_CLEAN_RESIDENT_VIEWS") != nullptr,
+            std::getenv("APS5_CLEAN_PENDING_RANGES") != nullptr,
+            std::getenv("APS5_REFUSED_COLLECT_MEMO") != nullptr,
+            std::getenv("APS5_WORKER_CORE") != nullptr,
+            std::getenv("APS5_DIRECT_REPEAT_SETS") != nullptr,
+            std::getenv("APS5_DIRECT_REPEAT_STORES") != nullptr,
+            std::getenv("APS5_DIRECT_REPEAT_SHARED") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

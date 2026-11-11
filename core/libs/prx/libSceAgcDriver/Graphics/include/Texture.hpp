@@ -370,6 +370,7 @@ public:
     static std::size_t StoreDrawnLinear(const char* reason);
     static void NoteFlip();
     static std::size_t StoreDrawnLinearTouching(const char* reason, const std::function<bool(std::uint64_t, std::uint64_t)>& touches, bool all);
+    static bool DrawnLinearPending();
     static bool AnyPending();
     static void FlushDumpSelected(const char* reason);
     static bool StoreAtFlipRequested(const char* value);

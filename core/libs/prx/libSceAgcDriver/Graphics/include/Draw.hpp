@@ -162,6 +162,31 @@ void FailRecordChecks(DrawRecipeMiss check, std::uint32_t count);
 // `prepared`: the buffers a finisher prepared for a direct hit (APS5_DIRECT_BUFFERS), bound in place
 // of today's moved-buffer check and snapshot selection while they hold for the draw.
 DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace = nullptr, DrawCommitView* answer = nullptr, const ShaderResources::PreparedBuffers* prepared = nullptr, PreparedInputs* preparedInputs = nullptr);
+enum class RepeatRefusal : std::uint8_t { NoBlock, NotSimple, VerifyDue, Shape, Objects, Batch, Pass, Epoch, ProofSerial, Pending, Depth, Target, Access, Stores, Linear, Buffers, Selection, DepthGuards, Inputs, Changed, MovedHazard, UnmovedHazard, Count };
+inline constexpr std::array<const char*, static_cast<std::size_t>(RepeatRefusal::Count)> RepeatRefusalNames{"no block", "not simple", "verify due", "shape", "objects", "another batch", "pass", "collect epoch", "proof serial", "pending stores", "depth surfaces", "target changed", "pass access", "queued stores", "drawn linear targets", "no prepared buffers", "selection", "depth guards", "inputs", "changed by the inputs", "moved-range hazard", "unmoved-range hazard"};
+inline constexpr std::array<const char*, static_cast<std::size_t>(DrawRepeatClass::Count)> RepeatClassNames{"simple", "not recorded", "template", "stages", "pipeline", "targets", "not pushed", "sets", "buffers", "inputs", "keep", "pass", "access", "notes", "modes"};
+inline constexpr std::array<const char*, static_cast<std::size_t>(DrawRepeatDetail::Count)> RepeatDetailNames{"none", "not reusable", "heap stage", "lease", "address table", "copied writes", "fault checks", "space reuse", "GPU writes", "GPU copies", "depth copies", "multisampled", "multisampled depth", "not the recipe's", "linear", "fmask"};
+struct RepeatOutcome {
+    bool taken = false;
+    RepeatRefusal refusal = RepeatRefusal::Count;
+    DrawRepeatClass simple = DrawRepeatClass::Simple;
+    DrawRepeatDetail detail = DrawRepeatDetail::None;
+    bool sets = false;
+    bool stores = false;
+    bool shared = false;
+    DrawRecordInputs inputs = DrawRecordInputs::None;
+    bool late = false;
+    bool passBegun = false;
+    PassBreak passBreak = PassBreak::Continued;
+    bool proofSkipped = false;
+    bool unmovedSkipped = false;
+    const char* refuted = nullptr;
+    ShaderResources::PreparedDifference pushDifference;
+    DrawRecipeOutcome result;
+};
+RepeatOutcome RepeatCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs, const DrawTraceContext* trace = nullptr, DrawCommitView* describe = nullptr, std::uint64_t verifyEvery = 0);
+using RepeatHookForTest = void (*)(DrawRecordCommit& record);
+void SetRepeatHookForTest(RepeatHookForTest hook);
 // Whether DrawWithRecord can record a draw at all (APS5_SYNC_DRAWS and APS5_DUMP_TARGETS unset).
 bool DrawsRecordable();
 // Why a full draw asked for a record's recipe built none, counted per reason since the start:

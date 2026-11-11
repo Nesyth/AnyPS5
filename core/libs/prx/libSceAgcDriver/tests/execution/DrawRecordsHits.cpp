@@ -163,6 +163,15 @@ alignas(8) Header ReadPixelHeader{};
 alignas(8) Header RingPixelHeader{};
 alignas(8) Header SamplePixelHeader{};
 
+alignas(256) constexpr std::array<std::uint32_t, 17> DataVertex{
+    0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
+    0x7e060280u, 0x7e0802f2u,
+    0xf4000284u, 0xfa000000u, 0xbf8cc07fu, 0x0602020au,
+    0xf80008cfu, 0x04030201u, 0xbf810000u,
+};
+
+alignas(8) Header DataVertexHeader{};
+
 void Register(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
     header.shader.file_header = 0x34333231u;
     header.shader.version = 0x18u;
@@ -307,7 +316,9 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-void SubmitDraws(std::uint64_t vertex, std::uint64_t pixel, const RegisterWrites& userConfig, const RegisterWrites& shaderRegisters, const GuestBlock& target, std::uint32_t draws, std::uint32_t vertices = 3) {
+using DrawStep = std::function<std::uint32_t(std::vector<std::uint32_t>&, std::uint32_t)>;
+
+void SubmitDraws(std::uint64_t vertex, std::uint64_t pixel, const RegisterWrites& userConfig, const RegisterWrites& shaderRegisters, const GuestBlock& target, std::uint32_t draws, std::uint32_t vertices = 3, std::uint32_t blend = 0, const DrawStep& step = {}) {
     const auto color = target.At(0);
     const float scale = 32.0f;
     const RegisterWrites context{
@@ -320,7 +331,7 @@ void SubmitDraws(std::uint64_t vertex, std::uint64_t pixel, const RegisterWrites
         {0x8e, 0xf}, {0x8f, 0xf}, {0x202, 0xcc0010},
         {0x1c4, 0}, {0x1c5, 9}, {0x1c3, 4}, {0x31c, 0x28028},
         {0x31b, 0}, {0x31d, 0}, {0x3b0, (63u << 14u) | 3u},
-        {0x3b8, 0x9000000u | (RenderTargetTileMode << 14u)}, {0x1e0, 0},
+        {0x3b8, 0x9000000u | (RenderTargetTileMode << 14u)}, {0x1e0, blend},
         {0xc, 0}, {0xd, 0x40040},
         {0x81, 0x80000000}, {0x82, 0x40040},
         {0x90, 0x80000000}, {0x91, 0x40040},
@@ -339,7 +350,10 @@ void SubmitDraws(std::uint64_t vertex, std::uint64_t pixel, const RegisterWrites
     Append(commands, 0x76, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)});
     Append(commands, 0x76, {0x008, static_cast<std::uint32_t>(pixel >> 8u), static_cast<std::uint32_t>(pixel >> 40u)});
     for (const auto& [offset, value] : shaderRegisters) Append(commands, 0x76, {offset, value});
-    for (std::uint32_t draw = 0; draw < draws; ++draw) Append(commands, 0x2d, {vertices, 2});
+    for (std::uint32_t draw = 0; draw < draws; ++draw) {
+        const auto count = step ? step(commands, draw) : vertices;
+        Append(commands, 0x2d, {count, 2});
+    }
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "draw record hits: a draw submission failed");
     AgcDriverWaitIdle_nid_postfix();
@@ -384,6 +398,7 @@ struct Blocks {
     GuestBlock fetch;
     GuestBlock output;
     GuestBlock ring;
+    GuestBlock other;
     std::unique_ptr<TextureBlock> texture;
 };
 
@@ -1030,6 +1045,7 @@ void Direct(bool ring) {
     const bool exact = std::getenv("APS5_DIRECT_DRAWS_EXACT_KEY") != nullptr;
     const bool buffers = RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers);
     const bool inputs = RuntimeSwitches::Set(RuntimeSwitch::DirectInputs);
+    const bool repeat = RuntimeSwitches::Set(RuntimeSwitch::DirectRepeat);
     std::vector<State> cycled;
     for (std::uint32_t format = 0; format < RawFormats.size(); ++format) cycled.push_back({Kind::Format, format, 16, 3});
     const std::vector<std::pair<std::string, std::vector<State>>> sets{
@@ -1060,6 +1076,11 @@ void Direct(bool ring) {
             RuntimeSwitches::Assign(RuntimeSwitch::DirectInputs, false);
             for (std::size_t index = 0; index < states.size(); ++index) Require(Render(states[index], DrawsPerSubmission) == today[index], "direct draws without prepared inputs, " + name + ": submission " + std::to_string(index) + " rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before));
             RuntimeSwitches::Assign(RuntimeSwitch::DirectInputs, true);
+        }
+        if (repeat) {
+            RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, false);
+            for (std::size_t index = 0; index < states.size(); ++index) Require(Render(states[index], DrawsPerSubmission) == today[index], "direct draws without repeat commits, " + name + ": submission " + std::to_string(index) + " rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before));
+            RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, true);
         }
         for (std::size_t index = 0; index < states.size(); ++index) Require(Render(states[index], DrawsPerSubmission) == today[index], "direct draws, " + name + ": submission " + std::to_string(index) + " rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before));
         RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
@@ -1104,6 +1125,240 @@ void Direct(bool ring) {
     if (DirectReport::BufferVerifyEvery() == 1) Require(used == 0 && checked != 0, "direct draws: with every prepared hit due for a verify, a commit bound prepared buffers or none was verified" + DescribeDirect(now, base));
     else Require(used != 0, "direct draws: no commit bound prepared buffers" + DescribeDirect(now, base));
     if (DirectReport::BufferVerifyEvery() > 1) Require(checked != 0, "direct draws: the prepared buffers verify checked no hit" + DescribeDirect(now, base));
+}
+
+constexpr std::size_t RepeatConstantsOffset = 0x2000;
+constexpr std::size_t RepeatStoreOffset = 0x8000;
+constexpr std::size_t RepeatVertexOffset = 0x3000;
+constexpr std::uint32_t RepeatDraws = 12;
+constexpr std::uint32_t SharedDraws = 13;
+constexpr std::uint32_t RepeatRounds = 4;
+constexpr std::uint32_t RepeatTimingRounds = 24;
+constexpr std::uint32_t AdditiveBlend = 0x40000101u;
+constexpr std::array<std::uint32_t, 4> RepeatVertexCounts{3u, 6u, 9u, 6u};
+
+enum class RepeatScene { Constants, Sets, Ring, Shared };
+
+const char* RepeatSceneName(RepeatScene scene) {
+    switch (scene) {
+    case RepeatScene::Constants: return "per-draw constants";
+    case RepeatScene::Sets: return "per-draw data in both sets";
+    case RepeatScene::Ring: return "per-draw constant buffers";
+    default: return "two classes and a pass break";
+    }
+}
+
+std::vector<std::uint8_t> RenderScene(RepeatScene scene, std::uint32_t round) {
+    auto& blocks = *Scene;
+    std::memset(blocks.target.Bytes(0), 0, ColorBytes);
+    std::memset(blocks.other.Bytes(0), 0, ColorBytes);
+    for (std::uint32_t draw = 0; draw < SharedDraws; ++draw) {
+        const float value = 0.0009765625f * static_cast<float>(1 + draw + round * SharedDraws);
+        std::memcpy(blocks.data.Bytes(RepeatConstantsOffset + draw * 0x40u), &value, sizeof(value));
+    }
+    const auto first = blocks.data.At(RepeatConstantsOffset);
+    const auto target = blocks.target.At(0);
+    const auto other = blocks.other.At(0);
+    RegisterWrites registers{{0x8b, 0}, {0x8c, 0}, {0x00b, 3u << 1u}, {0x00c, static_cast<std::uint32_t>(first)}, {0x00d, static_cast<std::uint32_t>(first >> 32u)}, {0x00e, 0u}};
+    auto vertex = reinterpret_cast<std::uintptr_t>(PlainVertex.data());
+    auto pixel = reinterpret_cast<std::uintptr_t>(ConstantPixel.data());
+    if (scene == RepeatScene::Sets) {
+        for (std::uint32_t draw = 0; draw < RepeatDraws; ++draw) {
+            const float shift = 0.0009765625f * static_cast<float>(1 + draw + round * RepeatDraws);
+            std::memcpy(blocks.data.Bytes(RepeatVertexOffset + draw * 0x40u), &shift, sizeof(shift));
+        }
+        const auto shifts = blocks.data.At(RepeatVertexOffset);
+        registers = {{0x8b, 2u << 1u}, {0x8c, static_cast<std::uint32_t>(shifts)}, {0x8d, static_cast<std::uint32_t>(shifts >> 32u)}, {0x00b, 3u << 1u}, {0x00c, static_cast<std::uint32_t>(first)}, {0x00d, static_cast<std::uint32_t>(first >> 32u)}, {0x00e, 0u}};
+        vertex = reinterpret_cast<std::uintptr_t>(DataVertex.data());
+    }
+    if (scene == RepeatScene::Ring) {
+        const auto constants = RawDescriptor(blocks.ring.At(RingSlotsOffset + (round % 6) * RingSlotBytes), ConstantRecords);
+        registers = {{0x8b, 0}, {0x8c, 0}, {0x00b, 4u << 1u}, {0x00c, constants[0]}, {0x00d, constants[1]}, {0x00e, constants[2]}, {0x00f, constants[3]}};
+        pixel = reinterpret_cast<std::uintptr_t>(RingPixel.data());
+    }
+    const auto draws = scene == RepeatScene::Shared ? SharedDraws : RepeatDraws;
+    SubmitDraws(vertex, pixel, {{0x242, 4}}, registers, blocks.target, draws, 3, AdditiveBlend, [&](std::vector<std::uint32_t>& commands, std::uint32_t draw) -> std::uint32_t {
+        if (scene == RepeatScene::Ring) return RepeatVertexCounts[(draw + round) % RepeatVertexCounts.size()];
+        const auto pointer = blocks.data.At(RepeatConstantsOffset + draw * 0x40u);
+        Append(commands, 0x76, {0x00c, static_cast<std::uint32_t>(pointer)});
+        Append(commands, 0x76, {0x00d, static_cast<std::uint32_t>(pointer >> 32u)});
+        if (scene == RepeatScene::Sets) {
+            const auto shift = blocks.data.At(RepeatVertexOffset + draw * 0x40u);
+            Append(commands, 0x76, {0x8c, static_cast<std::uint32_t>(shift)});
+            Append(commands, 0x76, {0x8d, static_cast<std::uint32_t>(shift >> 32u)});
+            return 3;
+        }
+        if (scene == RepeatScene::Shared) {
+            const bool second = (draw >= 3 && draw < 6) || draw >= 10;
+            const bool away = draw == 6;
+            Append(commands, 0x69, {0x1e0, second ? 0u : AdditiveBlend});
+            Append(commands, 0x69, {0x318, static_cast<std::uint32_t>((away ? other : target) >> 8u)});
+            Append(commands, 0x69, {0x390, static_cast<std::uint32_t>((away ? other : target) >> 40u)});
+            return 3;
+        }
+        return RepeatVertexCounts[(draw + round) % RepeatVertexCounts.size()];
+    });
+    auto image = Image(blocks.target);
+    if (scene == RepeatScene::Shared) {
+        const auto away = Image(blocks.other);
+        image.insert(image.end(), away.begin(), away.end());
+    }
+    return image;
+}
+
+std::vector<std::uint8_t> RenderRepeats(std::uint32_t round) {
+    return RenderScene(RepeatScene::Constants, round);
+}
+
+namespace RepeatHooks {
+
+std::atomic<int> fired{0};
+
+void QueueStore(AgcDriver::DrawRecordCommit&) {
+    if (auto* recorder = AgcDriver::Graphics::Recorder::Active(); recorder != nullptr) {
+        const auto address = Scene->ring.At(RepeatStoreOffset);
+        recorder->QueueKeyStore(VK_NULL_HANDLE, 0, 0, nullptr, address, address + 4u);
+    }
+    fired.fetch_add(1);
+}
+
+void QueueTouchingStore(AgcDriver::DrawRecordCommit& record) {
+    auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    if (recorder != nullptr && record.repeat != nullptr && record.repeat->resources != nullptr) {
+        const auto reads = record.repeat->resources->InPlaceReads();
+        if (!reads.empty()) {
+            recorder->QueueKeyStore(VK_NULL_HANDLE, 0, 0, nullptr, reads.front().first, reads.front().first + 4u);
+            fired.fetch_add(1);
+        }
+    }
+}
+
+void Collect(AgcDriver::DrawRecordCommit&) {
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    fired.fetch_add(1);
+}
+
+void Refresh(AgcDriver::DrawRecordCommit& record) {
+    if (!record.pass.versions.empty()) ++record.pass.versions.front();
+    fired.fetch_add(1);
+}
+
+void Batch(AgcDriver::DrawRecordCommit&) {
+    if (auto* recorder = AgcDriver::Graphics::Recorder::Active(); recorder != nullptr) recorder->Submit();
+    fired.fetch_add(1);
+}
+
+void Toggle(AgcDriver::DrawRecordCommit&) {
+    const bool set = RuntimeSwitches::Set(RuntimeSwitch::DirectRepeat);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, !set);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, set);
+    fired.fetch_add(1);
+}
+
+}
+
+struct RepeatSwitches {
+    bool sets = false;
+    bool stores = false;
+    bool shared = false;
+
+    void Apply() const {
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeatSets, sets);
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeatStores, stores);
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeatShared, shared);
+    }
+};
+
+void Repeats(bool ring) {
+    using AgcDriver::Graphics::SetRepeatHookForTest;
+    const auto verifyEvery = DirectReport::RepeatVerifyEvery();
+    const bool repeatEnvironment = RuntimeSwitches::Set(RuntimeSwitch::DirectRepeat);
+    const RepeatSwitches environment{RuntimeSwitches::Set(RuntimeSwitch::DirectRepeatSets), RuntimeSwitches::Set(RuntimeSwitch::DirectRepeatStores), RuntimeSwitches::Set(RuntimeSwitch::DirectRepeatShared)};
+    const bool passTargets = RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets);
+    const bool committed = ring && DirectReport::VerifyEvery() != 1 && DrawRecords::VerifyEvery() != 1 && RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) && RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) && DirectReport::BufferVerifyEvery() == 0 && DirectReport::InputVerifyEvery() == 0;
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectPassTargets, true);
+    const auto perCommit = [](const DirectTotals& now, const DirectTotals& base, DirectCounter nanoseconds, DirectCounter timed) {
+        const auto count = now.Since(base, timed);
+        return count == 0 ? 0.0 : static_cast<double>(now.Since(base, nanoseconds)) / static_cast<double>(count) / 1000.0;
+    };
+    for (const auto scene : {RepeatScene::Constants, RepeatScene::Sets, RepeatScene::Ring, RepeatScene::Shared}) {
+        const std::string name = RepeatSceneName(scene);
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, false);
+        std::vector<std::vector<std::uint8_t>> today;
+        for (std::uint32_t round = 0; round < RepeatRounds; ++round) today.push_back(RenderScene(scene, round));
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, true);
+        const auto render = [&](const RepeatSwitches& switches, const std::string& what) {
+            switches.Apply();
+            const auto before = DirectTotals::Now();
+            for (std::uint32_t round = 0; round < RepeatRounds; ++round) Require(RenderScene(scene, round) == today[round], "repeat commits, " + name + ", " + what + ": round " + std::to_string(round) + " rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before));
+            const auto after = DirectTotals::Now();
+            std::cout << "repeat commits, " << name << ", " << what << ": " << after.Since(before, DirectCounter::RepeatTaken) << " taken, " << after.Since(before, DirectCounter::RepeatVerifyChecked) << " verified" << DescribeDirect(after, before) << '\n';
+            Require(after.Since(before, DirectCounter::RepeatVerifyDiffering) == 0 && after.Since(before, DirectCounter::RepeatRefuted) == 0, "repeat commits, " + name + ", " + what + ": the verify found differences or refuted claims" + DescribeDirect(after, before));
+            return std::pair{before, after};
+        };
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, false);
+        static_cast<void>(render({}, "without repeats"));
+        RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, true);
+        const auto [plainBefore, plainAfter] = render({}, "without the sub-switches");
+        const auto [allBefore, allAfter] = render({true, true, true}, "with every sub-switch");
+        if (!committed) continue;
+        const auto taken = allAfter.Since(allBefore, DirectCounter::RepeatTaken);
+        const auto checked = allAfter.Since(allBefore, DirectCounter::RepeatVerifyChecked);
+        Require(allAfter.Since(allBefore, DirectCounter::RepeatBlocks) != 0, "repeat commits, " + name + ": no full commit built a repeat block" + DescribeDirect(allAfter, allBefore));
+        if (verifyEvery == 1) Require(taken == 0 && checked != 0, "repeat commits, " + name + ": with every repeat due for a verify, a repeat was taken or none was verified" + DescribeDirect(allAfter, allBefore));
+        else Require(taken != 0, "repeat commits, " + name + ": no repeat was taken" + DescribeDirect(allAfter, allBefore));
+        if (verifyEvery > 1) Require(checked != 0, "repeat commits, " + name + ": the verify checked no repeat" + DescribeDirect(allAfter, allBefore));
+        if (scene == RepeatScene::Sets) {
+            Require(plainAfter.Since(plainBefore, DirectCounter::RepeatClassSets) != 0, "repeat commits, " + name + ": without APS5_DIRECT_REPEAT_SETS no class was refused for its second set" + DescribeDirect(plainAfter, plainBefore));
+            if (verifyEvery != 1) Require(allAfter.Since(allBefore, DirectCounter::RepeatTakenSets) != 0, "repeat commits, " + name + ": with APS5_DIRECT_REPEAT_SETS no repeat wrote the second set" + DescribeDirect(allAfter, allBefore));
+        }
+        if (scene == RepeatScene::Shared && verifyEvery != 1) Require(allAfter.Since(allBefore, DirectCounter::RepeatTakenShared) != 0 && plainAfter.Since(plainBefore, DirectCounter::RepeatTakenShared) == 0, "repeat commits, " + name + ": no repeat began under the shared pass memo with APS5_DIRECT_REPEAT_SHARED, or one did without it" + DescribeDirect(allAfter, allBefore));
+        const auto expectHook = [&](const std::string& what, AgcDriver::Graphics::RepeatHookForTest hook, DirectCounter counter, const RepeatSwitches& switches) {
+            switches.Apply();
+            const auto before = DirectTotals::Now();
+            RepeatHooks::fired.store(0);
+            SetRepeatHookForTest(hook);
+            const auto image = RenderScene(scene, 0);
+            SetRepeatHookForTest(nullptr);
+            const auto after = DirectTotals::Now();
+            Require(RepeatHooks::fired.load() == 1, "repeat commits, " + name + ", " + what + ": the hook did not run once before a repeat");
+            Require(after.Since(before, counter) != 0, "repeat commits, " + name + ", " + what + ": no repeat was counted as " + DirectReport::CounterName(counter) + DescribeDirect(after, before));
+            Require(image == today[0], "repeat commits, " + name + ", " + what + ": the pass rendered differently from today's path" + DescribeDirect(after, before));
+            std::cout << "repeat commits, " << name << ", " << what << ": counted as " << DirectReport::CounterName(counter) << '\n';
+        };
+        if (scene == RepeatScene::Constants) {
+            expectHook("a store queued between two draws", &RepeatHooks::QueueStore, DirectCounter::RepeatStores, {});
+            expectHook("a collect between two draws", &RepeatHooks::Collect, DirectCounter::RepeatEpoch, {});
+            expectHook("a target refreshed between two draws", &RepeatHooks::Refresh, DirectCounter::RepeatTarget, {});
+            expectHook("a new batch between two draws", &RepeatHooks::Batch, DirectCounter::RepeatBatch, {});
+            expectHook("a switch toggled between two draws", &RepeatHooks::Toggle, DirectCounter::RepeatShape, {});
+        }
+        if (scene == RepeatScene::Ring) {
+            if (verifyEvery != 1) expectHook("a store queued away from the class, with APS5_DIRECT_REPEAT_STORES", &RepeatHooks::QueueStore, DirectCounter::RepeatTakenStores, {true, true, true});
+            expectHook("a store queued over the class's reads, with APS5_DIRECT_REPEAT_STORES", &RepeatHooks::QueueTouchingStore, DirectCounter::RepeatStores, {true, true, true});
+        }
+        if (std::getenv("APS5_PIPELINE_STATS") != nullptr && verifyEvery != 1) {
+            RepeatSwitches{}.Apply();
+            RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, false);
+            const auto fullBase = DirectTotals::Now();
+            for (std::uint32_t round = 0; round < RepeatTimingRounds; ++round) static_cast<void>(RenderScene(scene, round % RepeatRounds));
+            const auto full = DirectTotals::Now();
+            RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, true);
+            RepeatSwitches{true, true, true}.Apply();
+            for (std::uint32_t round = 0; round < RepeatTimingRounds; ++round) static_cast<void>(RenderScene(scene, round % RepeatRounds));
+            const auto repeated = DirectTotals::Now();
+            std::cout << "repeat commit timing, " << name << ": full route " << perCommit(full, fullBase, DirectCounter::RepeatFullNanoseconds, DirectCounter::RepeatFullTimed) << " us per commit held by the record (" << full.Since(fullBase, DirectCounter::RepeatFullTimed) << " sampled), repeat " << perCommit(repeated, full, DirectCounter::RepeatNanoseconds, DirectCounter::RepeatTimed) << " us (" << repeated.Since(full, DirectCounter::RepeatTimed) << " sampled; with a written set " << perCommit(repeated, full, DirectCounter::RepeatSetsNanoseconds, DirectCounter::RepeatSetsTimed) << " us, " << repeated.Since(full, DirectCounter::RepeatSetsTimed) << " sampled; under the shared hold " << perCommit(repeated, full, DirectCounter::RepeatSharedNanoseconds, DirectCounter::RepeatSharedTimed) << " us, " << repeated.Since(full, DirectCounter::RepeatSharedTimed) << " sampled)\n";
+            Require(full.Since(fullBase, DirectCounter::RepeatFullTimed) != 0 && repeated.Since(full, DirectCounter::RepeatTimed) != 0, "repeat commit timing, " + name + ": no full commit or no repeat was timed" + DescribeDirect(repeated, fullBase));
+        }
+    }
+    environment.Apply();
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectPassTargets, passTargets);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, repeatEnvironment);
 }
 
 constexpr std::uint32_t PlannedBufferBytes = 256;
@@ -1564,11 +1819,13 @@ int main(int argc, char** argv) {
         Register(ReadPixelHeader, ReadPixel.data(), sizeof(ReadPixel), 1);
         Register(RingPixelHeader, RingPixel.data(), sizeof(RingPixel), 1);
         Register(SamplePixelHeader, SamplePixel.data(), sizeof(SamplePixel), 1);
+        Register(DataVertexHeader, DataVertex.data(), sizeof(DataVertex), 2);
         RegisterFetchVertex();
         Blocks blocks;
         Scene = &blocks;
         Prepare();
         if (directEnvironment) Direct(arms.ring);
+        if (directEnvironment && RuntimeSwitches::Set(RuntimeSwitch::DirectRepeat)) Repeats(arms.ring);
         if (inject) {
             Injected(arms);
         } else if (injectCommit) {

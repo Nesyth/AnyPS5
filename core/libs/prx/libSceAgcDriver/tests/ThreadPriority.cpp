@@ -7,6 +7,15 @@
 #include <stdexcept>
 #include <string>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <algorithm>
+#include <cstring>
+#include <exception>
+#include <thread>
+#include <vector>
+#endif
+
 namespace {
 
 using namespace AgcDriver;
@@ -67,6 +76,73 @@ void RefusalTest() {
     Require(threw, "a refused priority request must throw");
 }
 
+#ifdef _WIN32
+template <typename Function>
+Function Kernel32(const char* name) {
+    return reinterpret_cast<Function>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), name)));
+}
+
+std::vector<ULONG> ProcessDefaultCpuSets() {
+    const auto get = Kernel32<BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG)>("GetProcessDefaultCpuSets");
+    Require(get != nullptr, "GetProcessDefaultCpuSets is missing");
+    ULONG count = 0;
+    get(GetCurrentProcess(), nullptr, 0, &count);
+    std::vector<ULONG> sets(count);
+    Require(count == 0 || get(GetCurrentProcess(), sets.data(), count, &count), "GetProcessDefaultCpuSets failed");
+    sets.resize(count);
+    std::sort(sets.begin(), sets.end());
+    return sets;
+}
+
+std::size_t CpuSetCount() {
+    const auto get = Kernel32<BOOL(WINAPI*)(void*, ULONG, PULONG, HANDLE, ULONG)>("GetSystemCpuSetInformation");
+    Require(get != nullptr, "GetSystemCpuSetInformation is missing");
+    ULONG bytes = 0;
+    get(nullptr, 0, &bytes, GetCurrentProcess(), 0);
+    std::vector<unsigned char> buffer(bytes);
+    Require(bytes != 0 && get(buffer.data(), bytes, &bytes, GetCurrentProcess(), 0), "GetSystemCpuSetInformation failed");
+    std::size_t count = 0;
+    for (ULONG offset = 0; offset + 8 <= bytes;) {
+        ULONG size = 0;
+        ULONG type = 0;
+        std::memcpy(&size, buffer.data() + offset, sizeof(size));
+        std::memcpy(&type, buffer.data() + offset + 4, sizeof(type));
+        if (size == 0) break;
+        if (type == 0) ++count;
+        offset += size;
+    }
+    return count;
+}
+
+// Queue worker 0's core: a reservation takes one core's CPU sets out of the process default, a second one
+// by the same thread changes nothing, and a release puts every CPU set back. On a thread of its own, so
+// the main thread keeps its CPU sets.
+void PlacementTests() {
+    std::exception_ptr failure;
+    std::thread([&] {
+        try {
+            const auto all = CpuSetCount();
+            PlaceQueueWorkerThread("test worker", true);
+            const auto reserved = ProcessDefaultCpuSets();
+            if (reserved.empty()) {
+                std::cout << "no core reserved on this host (" << all << " CPU sets)\n";
+                return;
+            }
+            Require(reserved.size() < all, "a reserved core did not leave the process default");
+            PlaceQueueWorkerThread("test worker", true);
+            Require(ProcessDefaultCpuSets() == reserved, "a second reservation by the same thread changed the process default");
+            PlaceQueueWorkerThread("test worker", false);
+            Require(ProcessDefaultCpuSets().size() == all, "a released core did not return to the process default");
+            PlaceQueueWorkerThread("test worker", false);
+            Require(ProcessDefaultCpuSets().size() == all, "a second release changed the process default");
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    }).join();
+    if (failure) std::rethrow_exception(failure);
+}
+#endif
+
 }
 
 int main(int argc, char** argv) {
@@ -77,6 +153,9 @@ int main(int argc, char** argv) {
         }
         ParseTests();
         PlanTests();
+#ifdef _WIN32
+        PlacementTests();
+#endif
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

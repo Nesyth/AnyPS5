@@ -105,6 +105,14 @@ enum class RuntimeSwitch : std::size_t {
     FifthFinisher,
     LeanListBatch,
     LeanListDirect,
+    DirectRepeat,
+    CleanResidentViews,
+    CleanPendingRanges,
+    RefusedCollectMemo,
+    WorkerCore,
+    DirectRepeatSets,
+    DirectRepeatStores,
+    DirectRepeatShared,
     Count,
 };
 

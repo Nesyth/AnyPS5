@@ -77,6 +77,15 @@ void SetFreshCollectHook(FreshCollectHook hook);
 #endif
 bool Watched(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);
+struct CollectWalkCounts {
+    std::uint64_t complete = 0;
+    std::uint64_t refused = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t answered = 0;
+    std::uint64_t checked = 0;
+    std::uint64_t differing = 0;
+};
+CollectWalkCounts CollectWalksCounted();
 struct WriteSubscription;
 bool WriteIndexEnabled();
 std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);

@@ -341,30 +341,94 @@ void RaiseWorkerThreadPriority(const char* role) {
 #ifdef _WIN32
 namespace {
 
-// Cores reserved for driver threads (CoreIndex values) and the threads that took them: a later
-// reservation keeps the earlier ones out of the process default and leaves their threads where they are.
+// Cores reserved for driver threads (CoreIndex values) and the threads that hold them, with their cores:
+// a later reservation keeps the earlier ones out of the process default and leaves their threads where
+// they are, and a thread that releases its core gives it back to the process default.
 std::mutex reservationMutex;
 std::set<unsigned> reservedCores;
-std::set<DWORD> reservedThreads;
+std::map<DWORD, unsigned> reservedThreads;
+
+using GetInformation = BOOL(WINAPI*)(void*, ULONG, PULONG, HANDLE, ULONG);
+using SetCpuSets = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
+
+struct CpuSetCalls {
+    GetInformation getInformation = nullptr;
+    SetCpuSets setDefault = nullptr;
+    SetCpuSets setSelected = nullptr;
+};
+
+std::optional<CpuSetCalls> loadCpuSetCalls() {
+    const auto kernel = GetModuleHandleW(L"kernel32.dll");
+    CpuSetCalls calls;
+    calls.getInformation = reinterpret_cast<GetInformation>(reinterpret_cast<void*>(GetProcAddress(kernel, "GetSystemCpuSetInformation")));
+    calls.setDefault = reinterpret_cast<SetCpuSets>(reinterpret_cast<void*>(GetProcAddress(kernel, "SetProcessDefaultCpuSets")));
+    calls.setSelected = reinterpret_cast<SetCpuSets>(reinterpret_cast<void*>(GetProcAddress(kernel, "SetThreadSelectedCpuSets")));
+    if (calls.getInformation == nullptr || calls.setDefault == nullptr || calls.setSelected == nullptr) return std::nullopt;
+    return calls;
+}
+
+std::vector<unsigned char> cpuSetInformation(const CpuSetCalls& calls) {
+    ULONG bytes = 0;
+    calls.getInformation(nullptr, 0, &bytes, GetCurrentProcess(), 0);
+    std::vector<unsigned char> buffer(bytes);
+    if (bytes == 0 || !calls.getInformation(buffer.data(), bytes, &bytes, GetCurrentProcess(), 0)) return {};
+    buffer.resize(bytes);
+    return buffer;
+}
+
+ULONG cpuSetWord(const std::vector<unsigned char>& buffer, std::size_t at) {
+    ULONG value = 0;
+    std::memcpy(&value, buffer.data() + at, sizeof(value));
+    return value;
+}
+
+struct Applied {
+    bool process = false;
+    std::size_t moved = 0;
+    std::size_t others = 0;
+};
+
+// The CPU sets of the cores no driver thread holds become the process default. Threads already running
+// (the title's spinning job workers among them) may stay on a reserved core until the scheduler moves
+// them, so they select those CPU sets explicitly; later threads take the process default. A thread pinned
+// with an affinity mask keeps its mask.
+Applied applyReservations(const CpuSetCalls& calls, const std::vector<unsigned char>& buffer) {
+    std::vector<ULONG> others;
+    for (std::size_t offset = 0; offset + 16 <= buffer.size() && cpuSetWord(buffer, offset) != 0; offset += cpuSetWord(buffer, offset)) {
+        if (cpuSetWord(buffer, offset + 4) == 0 && !reservedCores.contains(buffer[offset + 15])) others.push_back(cpuSetWord(buffer, offset + 8));
+    }
+    Applied applied;
+    applied.others = others.size();
+    applied.process = calls.setDefault(GetCurrentProcess(), others.data(), static_cast<ULONG>(others.size())) != 0;
+    if (const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0); snapshot != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+        const DWORD processId = GetCurrentProcessId();
+        for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+            if (entry.th32OwnerProcessID != processId || reservedThreads.contains(entry.th32ThreadID)) continue;
+            if (const HANDLE other = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, entry.th32ThreadID); other != nullptr) {
+                if (calls.setSelected(other, others.data(), static_cast<ULONG>(others.size()))) ++applied.moved;
+                CloseHandle(other);
+            }
+        }
+        CloseHandle(snapshot);
+    }
+    return applied;
+}
 
 void reserveCore(const char* role, const char* cpuVariable) {
     const char* text = cpuVariable != nullptr ? std::getenv(cpuVariable) : nullptr;
-    using GetInformation = BOOL(WINAPI*)(void*, ULONG, PULONG, HANDLE, ULONG);
-    using SetCpuSets = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
-    const auto kernel = GetModuleHandleW(L"kernel32.dll");
-    const auto getInformation = reinterpret_cast<GetInformation>(reinterpret_cast<void*>(GetProcAddress(kernel, "GetSystemCpuSetInformation")));
-    const auto setDefault = reinterpret_cast<SetCpuSets>(reinterpret_cast<void*>(GetProcAddress(kernel, "SetProcessDefaultCpuSets")));
-    const auto setSelected = reinterpret_cast<SetCpuSets>(reinterpret_cast<void*>(GetProcAddress(kernel, "SetThreadSelectedCpuSets")));
-    if (getInformation == nullptr || setDefault == nullptr || setSelected == nullptr) return;
+    const auto calls = loadCpuSetCalls();
+    if (!calls) return;
     std::lock_guard lock(reservationMutex);
-    ULONG bytes = 0;
-    getInformation(nullptr, 0, &bytes, GetCurrentProcess(), 0);
-    std::vector<unsigned char> buffer(bytes);
-    if (bytes == 0 || !getInformation(buffer.data(), bytes, &bytes, GetCurrentProcess(), 0)) return;
+    if (reservedThreads.contains(GetCurrentThreadId())) return;
+    const auto buffer = cpuSetInformation(*calls);
+    const auto bytes = static_cast<ULONG>(buffer.size());
+    if (bytes == 0) return;
     // SYSTEM_CPU_SET_INFORMATION: Size at 0, Type at 4 (0 = CpuSetInformation), Id at 8,
     // LogicalProcessorIndex at 14, CoreIndex at 15, EfficiencyClass at 18.
     const auto byteAt = [&](ULONG at) { return static_cast<unsigned>(buffer[at]); };
-    const auto wordAt = [&](ULONG at) { ULONG value = 0; std::memcpy(&value, buffer.data() + at, sizeof(value)); return value; };
+    const auto wordAt = [&](ULONG at) { return cpuSetWord(buffer, at); };
     // Without the variable: the first logical processor of the highest-numbered physical core not reserved
     // yet among those of the highest efficiency class (so a hybrid host keeps it off its efficiency cores),
     // on a host with at least six cores (fewer would leave the title's spinning job workers too little room).
@@ -399,31 +463,27 @@ void reserveCore(const char* role, const char* cpuVariable) {
     }
     if (core == 0x100) return;
     reservedCores.insert(core);
-    reservedThreads.insert(GetCurrentThreadId());
-    std::vector<ULONG> others;
-    for (ULONG offset = 0; offset + 16 <= bytes && wordAt(offset) != 0; offset += wordAt(offset)) {
-        if (wordAt(offset + 4) == 0 && !reservedCores.contains(byteAt(offset + 15))) others.push_back(wordAt(offset + 8));
-    }
-    const bool process = setDefault(GetCurrentProcess(), others.data(), static_cast<ULONG>(others.size())) != 0;
-    const bool thread = setSelected(GetCurrentThread(), &own, 1) != 0;
-    // Threads already running (the title's spinning job workers among them) may stay on the reserved core
-    // until the scheduler moves them, so they select the other CPU sets explicitly; later threads take the
-    // process default. A thread pinned with an affinity mask keeps its mask.
-    std::size_t moved = 0;
-    if (const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0); snapshot != INVALID_HANDLE_VALUE) {
-        THREADENTRY32 entry{};
-        entry.dwSize = sizeof(entry);
-        const DWORD processId = GetCurrentProcessId();
-        for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
-            if (entry.th32OwnerProcessID != processId || reservedThreads.contains(entry.th32ThreadID)) continue;
-            if (const HANDLE other = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, entry.th32ThreadID); other != nullptr) {
-                if (setSelected(other, others.data(), static_cast<ULONG>(others.size()))) ++moved;
-                CloseHandle(other);
-            }
-        }
-        CloseHandle(snapshot);
-    }
-    std::fprintf(stderr, "[placement] %s on logical %u (core %u reserved, %zu reserved in all: process default %s, thread %s, %zu running threads moved; %zu other CPU sets)\n", role, wanted, core, reservedCores.size(), process ? "set" : "failed", thread ? "set" : "failed", moved, others.size());
+    reservedThreads.emplace(GetCurrentThreadId(), core);
+    const bool thread = calls->setSelected(GetCurrentThread(), &own, 1) != 0;
+    const auto applied = applyReservations(*calls, buffer);
+    std::fprintf(stderr, "[placement] %s on logical %u (core %u reserved, %zu reserved in all: process default %s, thread %s, %zu running threads moved; %zu other CPU sets)\n", role, wanted, core, reservedCores.size(), applied.process ? "set" : "failed", thread ? "set" : "failed", applied.moved, applied.others);
+}
+
+// Gives the calling thread's core back: it joins the process default again, and the running threads
+// (the calling one among them) select the CPU sets of the cores still unreserved, that core included.
+void releaseCore(const char* role) {
+    const auto calls = loadCpuSetCalls();
+    if (!calls) return;
+    std::lock_guard lock(reservationMutex);
+    const auto held = reservedThreads.find(GetCurrentThreadId());
+    if (held == reservedThreads.end()) return;
+    const unsigned core = held->second;
+    const auto buffer = cpuSetInformation(*calls);
+    if (buffer.empty()) return;
+    reservedThreads.erase(held);
+    reservedCores.erase(core);
+    const auto applied = applyReservations(*calls, buffer);
+    std::fprintf(stderr, "[placement] %s released core %u (%zu reserved in all: process default %s, %zu running threads moved; %zu other CPU sets)\n", role, core, reservedCores.size(), applied.process ? "set" : "failed", applied.moved, applied.others);
 }
 
 }
@@ -444,6 +504,16 @@ void PlaceFinisherThread(const char* role) {
     reserveCore(role, nullptr);
 #else
     (void)role;
+#endif
+}
+
+void PlaceQueueWorkerThread(const char* role, bool reserve) {
+#ifdef _WIN32
+    if (reserve) reserveCore(role, nullptr);
+    else releaseCore(role);
+#else
+    (void)role;
+    (void)reserve;
 #endif
 }
 
