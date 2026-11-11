@@ -8650,6 +8650,125 @@ void ShaderResources::PushDrawBindings(VkCommandBuffer commands, VkPipelineLayou
     CmdPushDescriptorSet(context.Resolved(&DeviceFunctions::cmdPushDescriptorSet, "vkCmdPushDescriptorSetKHR"), commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, plan.set == 0 ? 0u : fragmentSet, static_cast<std::uint32_t>(writes.size()), writes.data(), SetBindSite::Draw);
 }
 
+bool ShaderResources::BuildRepeatPush(const PushPlan& plan, std::span<const PreparedBuffers::Selected> selected, RepeatPush& out) const {
+    out.allocations.clear();
+    out.patches.clear();
+    out.writes.clear();
+    if (bda != nullptr || selected.empty()) return false;
+    for (std::size_t index = 0; index < selected.size(); ++index) {
+        const auto allocation = selected[index].allocation;
+        if (allocation >= plan.allocationSets.size() || allocation >= plan.slots.size() || plan.allocationSets[allocation] != plan.set) return false;
+        out.allocations.push_back(allocation);
+        for (const auto slot : plan.slots[allocation]) out.patches.emplace_back(slot, index);
+    }
+    out.buffers = descriptorBuffers;
+    out.writes.reserve(plan.writes.size());
+    for (const auto index : plan.writes) {
+        auto& write = out.writes.emplace_back(descriptorWrites[index]);
+        write.dstSet = VK_NULL_HANDLE;
+        if (write.pBufferInfo != nullptr) write.pBufferInfo = out.buffers.data() + (descriptorWrites[index].pBufferInfo - descriptorBuffers.data());
+    }
+    const auto fragmentSet = ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet;
+    out.boundSet = VK_NULL_HANDLE;
+    out.boundIndex = 0;
+    if (plan.set == 1u) {
+        out.boundSet = _set;
+    } else if (splitSets) {
+        out.boundSet = fragment.set;
+        out.boundIndex = fragmentSet;
+    }
+    out.pushIndex = plan.set == 0 ? 0u : fragmentSet;
+    return true;
+}
+
+void ShaderResources::RepeatPushBindings(VkCommandBuffer commands, VkPipelineLayout layout, RepeatPush& push, std::span<const PreparedBuffers::Selected> selected, VkBuffer buffer, VkDeviceSize base) const {
+    requireGuestBuffers();
+    prepareFaultSlot();
+    if (push.boundSet != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, push.boundIndex, 1, &push.boundSet, SetBindSite::Draw);
+    for (const auto& [slot, index] : push.patches) push.buffers[slot] = wholeDwordRange({buffer, base + selected[index].offset, selected[index].bytes});
+    CmdPushDescriptorSet(context.Resolved(&DeviceFunctions::cmdPushDescriptorSet, "vkCmdPushDescriptorSetKHR"), commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, push.pushIndex, static_cast<std::uint32_t>(push.writes.size()), push.writes.data(), SetBindSite::Draw);
+}
+
+ShaderResources::PreparedDifference ShaderResources::CompareRepeatPush(RepeatPush& push, const DrawBindings& bound, const PushPlan& plan) const {
+    std::vector<VkDescriptorBufferInfo> buffers = descriptorBuffers;
+    overlayPushedBuffers(bound, plan, buffers);
+    for (std::size_t index = 0; index < push.allocations.size(); ++index) {
+        if (index >= bound.snapshots.size() || index >= bound.pushSelected.size() || bound.pushSelected[index] != push.allocations[index]) return {"push writes", "the block's selection of " + std::to_string(push.allocations.size()) + " allocations is not the one today's way pushes (" + std::to_string(bound.pushSelected.size()) + ")"};
+    }
+    for (const auto& [slot, index] : push.patches) {
+        const auto& snapshot = bound.snapshots[index];
+        push.buffers[slot] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+    }
+    const VkDescriptorSet today = plan.set == 1u ? _set : splitSets ? fragment.set : VK_NULL_HANDLE;
+    if (push.boundSet != today) return {"push writes", "the block binds another set beside the pushed one than today's way"};
+    if (push.writes.size() != plan.writes.size()) return {"push writes", "the block holds " + std::to_string(push.writes.size()) + " writes, today's way pushes " + std::to_string(plan.writes.size())};
+    for (std::size_t at = 0; at < plan.writes.size(); ++at) {
+        const auto& mine = push.writes[at];
+        const auto& theirs = descriptorWrites[plan.writes[at]];
+        if (mine.dstBinding != theirs.dstBinding || mine.dstArrayElement != theirs.dstArrayElement || mine.descriptorCount != theirs.descriptorCount || mine.descriptorType != theirs.descriptorType || mine.pImageInfo != theirs.pImageInfo || mine.pTexelBufferView != theirs.pTexelBufferView || mine.pNext != theirs.pNext || (mine.pBufferInfo == nullptr) != (theirs.pBufferInfo == nullptr)) return {"push writes", "write " + std::to_string(at) + " (binding " + std::to_string(theirs.dstBinding) + ") has another shape than today's"};
+        if (theirs.pBufferInfo == nullptr) continue;
+        const auto offset = static_cast<std::size_t>(theirs.pBufferInfo - descriptorBuffers.data());
+        for (std::uint32_t element = 0; element < theirs.descriptorCount; ++element) {
+            const auto& a = mine.pBufferInfo[element];
+            const auto& b = buffers[offset + element];
+            if (a.buffer != b.buffer || a.offset != b.offset || a.range != b.range) return {"push writes", "binding " + std::to_string(theirs.dstBinding) + "[" + std::to_string(theirs.dstArrayElement + element) + "]: the block pushes range " + std::to_string(a.range) + " at " + std::to_string(a.offset) + ", today's way range " + std::to_string(b.range) + " at " + std::to_string(b.offset) + (a.buffer == b.buffer ? "" : " of another buffer")};
+        }
+    }
+    return {};
+}
+
+ShaderResources::PreparedBuffers::Selection ShaderResources::RepeatGuards(const PreparedBuffers& prepared) const {
+    using Selection = PreparedBuffers::Selection;
+    const auto alignment = context.limits.minStorageBufferOffsetAlignment;
+    if (prepared.plan == nullptr || (alignment != 0 && prepared.plan->alignment % alignment != 0)) return Selection::Hazard;
+    const bool guardsMoved = DepthGuardsGeneration_nid_no_patch() != prepared.depthGuards;
+    if ((guardsMoved || HasResidentDepthGuards_nid_no_patch()) && std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && (guardsMoved || MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes)); })) return Selection::DepthGuards;
+    return Selection::Taken;
+}
+
+void ShaderResources::RepeatRequire(std::span<const MovedBuffer> moved) const {
+    requireGuestBuffers(moved);
+    prepareFaultSlot();
+    bindingsChecked = heapStage && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind);
+}
+
+bool ShaderResources::RepeatUnmovedClear(const Recorder& recorder, const PreparedBuffers& prepared) const {
+    for (const auto& item : prepared.selected) {
+        if (item.moved || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) continue;
+        const auto& allocation = allocations[item.allocation];
+        if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return false;
+    }
+    return true;
+}
+
+std::shared_ptr<Buffer> ShaderResources::RepeatUpload(Recorder& recorder, const PreparedBuffers& prepared, VkDeviceSize& offset) const {
+    auto slice = recorder.DrawUpload(prepared.blob.size());
+    std::memcpy(slice.bytes, prepared.blob.data(), prepared.blob.size());
+    const auto& plan = *prepared.plan;
+    for (const auto& item : prepared.selected) {
+        if (item.begin == 0) continue;
+        if (item.moved && item.bytes > plan.uploadLimit && MovedSnapshotStats()) {
+            movedSnapshotTally().uploaded.fetch_add(1, std::memory_order_relaxed);
+            movedSnapshotTally().uploadedBytes.fetch_add(item.bytes, std::memory_order_relaxed);
+        }
+        CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(item.begin), item.bytes);
+    }
+    offset = slice.offset;
+    return std::move(slice.buffer);
+}
+
+bool ShaderResources::ProofHeld() const {
+    static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+    if (!EpochProofs() || verify) return false;
+    const auto epoch = GuestMemory::CollectEpoch();
+    if (epoch == 0 || provedEpoch != epoch || provedPending != StorageTexture::PendingSerial() || provedProof != GuestMemory::ProofSerial() || HoldsDepthCopies()) return false;
+    return registeredImageViewsCurrent(registeredImageViews);
+}
+
+bool ShaderResources::HoldsDepthCopies() const {
+    return std::ranges::any_of(textures, [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->IsDepthCopy(); });
+}
+
 void ShaderResources::overlayPushedBuffers(const DrawBindings& result, const PushPlan& plan, std::span<VkDescriptorBufferInfo> buffers, std::span<std::size_t> owners) const {
     for (std::size_t index = 0; index < result.pushSelected.size(); ++index) {
         const auto allocation = result.pushSelected[index];

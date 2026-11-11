@@ -5200,6 +5200,17 @@ Graphics::DrawRecipeOutcome VulkanDevice::DrawFromRecord(const Graphics::State& 
     return Graphics::DrawWithRecord(context, graphics, draw, shaders, record, trace, answer, prepared, preparedInputs);
 }
 
+Graphics::RepeatOutcome VulkanDevice::RepeatFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, const Graphics::ShaderResources::PreparedBuffers* prepared, Graphics::PreparedInputs* preparedInputs, DrawCommitView* describe, std::uint64_t verifyEvery) {
+    if (record.recipe == nullptr || record.recipe->device != state->device) {
+        Graphics::RepeatOutcome outcome;
+        outcome.refusal = Graphics::RepeatRefusal::Shape;
+        return outcome;
+    }
+    startJournalReplay();
+    std::optional<Graphics::Context> scratch;
+    return Graphics::RepeatCommit(contextRef(scratch), graphics, draw, shaders, record, prepared, preparedInputs, trace, describe, verifyEvery);
+}
+
 bool VulkanDevice::PrepareDrawInputs(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, Graphics::PreparedInputs& prepared) const {
     if (!state->contextReady) {
         prepared.refusal = Graphics::PreparedInputs::Refusal::NotInPlace;
