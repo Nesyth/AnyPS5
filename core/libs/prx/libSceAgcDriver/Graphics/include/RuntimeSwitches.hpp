@@ -104,6 +104,9 @@ enum class RuntimeSwitch : std::size_t {
     FourthFinisher,
     FifthFinisher,
     DirectRepeat,
+    CleanResidentViews,
+    CleanPendingRanges,
+    RefusedCollectMemo,
     Count,
 };
 

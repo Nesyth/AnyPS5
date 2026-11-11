@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -6,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -185,6 +187,19 @@ void Store(std::uint64_t address) {
     auto* byte = reinterpret_cast<volatile std::uint8_t*>(address);
     *byte = static_cast<std::uint8_t>(*byte + 1);
 }
+
+struct RefusedView {
+    static constexpr std::size_t Bytes = 4 * Block;
+    std::uint8_t* memory = nullptr;
+    RefusedView() {
+        memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(Bytes, Block));
+        Require(memory != nullptr, "the refused view's reservation failed");
+    }
+    ~RefusedView() {
+        GuestArena::GuestArenaRelease_nid_postfix(memory, Bytes);
+    }
+    std::uint64_t At(std::size_t offset) const { return reinterpret_cast<std::uint64_t>(memory) + offset; }
+};
 #endif
 
 bool Walked(std::uint64_t address, std::size_t bytes, std::uint64_t probe, bool cached = true) {
@@ -298,6 +313,67 @@ void CheckCoverageGapsAndInvalidations() {
     Require(Walked(Base + Block, 3 * Block, probe), "an unwatch retained a merged observation");
 }
 
+void CheckRefusedWalkMemo() {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+#ifdef _WIN32
+    const RefusedView view;
+    const auto address = view.At(0);
+    const auto bytes = static_cast<std::size_t>(3 * Page);
+    const auto refuse = [] {};
+    const auto accept = [] {};
+#else
+    const auto address = Base + 40 * Block;
+    const auto bytes = static_cast<std::size_t>(3 * Page);
+    const auto refuse = [] { SetFailing(true); };
+    const auto accept = [] { SetFailing(false); };
+#endif
+    const char* every = std::getenv("APS5_VERIFY_REFUSED_COLLECT_MEMO");
+    const bool verify = every != nullptr && std::strtoull(every, nullptr, 10) <= 1u;
+    if (every != nullptr && !verify) {
+        std::cout << "refused memo: skipped, the verify checks only every " << every << "-th remembered refused collect\n";
+        return;
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::RefusedCollectMemo, true);
+    BumpCollectEpoch();
+    refuse();
+    Require(CollectWrites(address, bytes) == 0, "refused memo: a refused walk returned a generation");
+    const auto first = CollectWalksCounted();
+    Require(first.refused != 0, "refused memo: the refused walk was not counted");
+    Require(CollectWrites(address, bytes) == 0, "refused memo: a remembered refused collect returned a generation");
+    const auto second = CollectWalksCounted();
+    if (verify) {
+        Require(second.checked == first.checked + 1 && second.differing == first.differing && second.refused > first.refused, "refused memo: the verify did not walk the remembered refused collect and agree");
+    } else {
+        Require(second.answered == first.answered + 1 && second.refused == first.refused, "refused memo: a second refused collect in the same epoch walked again instead of answering from the memo");
+    }
+    Require(CollectWrites(address + Page, Page) == 0, "refused memo: a refused sub-range returned a generation");
+    Require(CollectWalksCounted().refused > second.refused, "refused memo: a different range was answered from the memo");
+    const auto sub = CollectWalksCounted();
+    BumpCollectEpoch();
+    Require(CollectWrites(address, bytes) == 0, "refused memo: the refused walk in a new epoch returned a generation");
+    const auto epoch = CollectWalksCounted();
+    Require(epoch.refused > sub.refused && epoch.answered == sub.answered, "refused memo: a new epoch answered a refused collect from the memo of the last one");
+    Require(CollectWrites(address, bytes) == 0, "refused memo: a remembered refused collect in the new epoch returned a generation");
+    const auto again = CollectWalksCounted();
+    Unwatch(Base + 92 * Block, Page);
+    Require(CollectWrites(address, bytes) == 0, "refused memo: the refused walk after an unwatch returned a generation");
+    const auto unwatched = CollectWalksCounted();
+    Require(unwatched.refused > again.refused && unwatched.answered == again.answered, "refused memo: an unwatch did not drop the remembered refused collect");
+    RuntimeSwitches::Assign(RuntimeSwitch::RefusedCollectMemo, false);
+    Require(CollectWrites(address, bytes) == 0 && CollectWrites(address, bytes) == 0, "refused memo: refused walks with the memo off returned a generation");
+    const auto off = CollectWalksCounted();
+    Require(off.answered == unwatched.answered, "refused memo: the memo answered with its switch off");
+    accept();
+    RuntimeSwitches::Assign(RuntimeSwitch::RefusedCollectMemo, true);
+    BumpCollectEpoch();
+#ifndef _WIN32
+    Require(CollectWrites(address, bytes) != 0, "refused memo: an accepted walk returned no generation");
+#endif
+    RuntimeSwitches::Assign(RuntimeSwitch::RefusedCollectMemo, false);
+    std::cout << "refused memo: " << epoch.complete << " complete walks, " << off.refused << " refused, " << off.answered << " answered from the memo, " << off.checked << " verified, " << off.differing << " differing\n";
+}
+
 void CheckCoverageThreadAndDriverWrites() {
     BumpCollectEpoch();
     Require(CollectWrites(Base, 4 * Block) != 0, "the covering collection failed");
@@ -339,6 +415,8 @@ int main(int argc, char** argv) {
             } else if (selected == "--invalidation") {
                 CheckCoverageGapsAndInvalidations();
                 CheckCoverageThreadAndDriverWrites();
+            } else if (selected == "--refused") {
+                CheckRefusedWalkMemo();
             } else throw std::runtime_error("unknown collect coverage test");
             std::cout << "collect coverage test passed\n";
             return 0;

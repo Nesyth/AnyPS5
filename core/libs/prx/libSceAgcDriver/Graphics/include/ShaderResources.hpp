@@ -583,6 +583,21 @@ public:
         std::uint64_t depthSurfaces = 0;
         std::uint64_t generation = 0;
     };
+    struct CleanRuleCounts {
+        std::uint64_t viewHits = 0;
+        std::uint64_t pendingHits = 0;
+        std::uint64_t exemptRecords = 0;
+        std::uint64_t viewDrops = 0;
+        std::uint64_t sourceDrops = 0;
+        std::uint64_t verified = 0;
+        std::uint64_t differs = 0;
+        std::uint64_t requiredNotClean = 0;
+        std::uint64_t exemptUnsettled = 0;
+        std::uint64_t noSources = 0;
+        std::uint64_t snapshotOverView = 0;
+        std::uint64_t unrecordedViews = 0;
+    };
+    static CleanRuleCounts CleanRuleCounted();
     bool AsIsCurrent();
     // Objects whose fast proof came from another template's stamp (FastProofStamp), so far.
     static std::uint64_t FastProofStampsTaken();
@@ -1147,12 +1162,21 @@ private:
     void recordClean(bool proved, const CleanStamp& stamp);
     bool cleanEligible();
     bool cleanUnchangedSince(std::uint64_t generation) const;
+    bool cleanUnchangedSince(std::uint64_t generation, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const;
+    void noteCleanSources();
+    std::uint8_t cleanViewsKept(const CleanStamp& stamp);
+    bool cleanSourcesCurrent(FastFail& reason);
     bool cleanProved = false;
     std::uint8_t cleanEligibility = 0;
     std::uint32_t cleanMisses = 0;
     CleanProof cleanRefusal = CleanProof::FirstProof;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> cleanRangeList;
     CleanStamp cleanAt;
+    std::vector<std::size_t> cleanSourced;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> cleanRequired;
+    bool cleanSourcesEligible = false;
+    bool cleanExempt = false;
+    std::uint8_t cleanHitRule = 0;
     std::uint64_t provedEpoch = 0;
     std::uint64_t provedProof = 0;
     std::uint64_t provedPending = 0;
