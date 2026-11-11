@@ -39,7 +39,7 @@ if(BUILD_TESTING)
             ENV ${agcDirectRepeatEnvironment} ${agcLateStackEnvironment} APS5_VERIFY_DIRECT_REPEAT=3)
     set_tests_properties(agc_driver_draw_records_hits_direct_repeat agc_driver_draw_records_hits_direct_repeat_verify agc_driver_draw_records_hits_direct_repeat_late PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDrawRecordsDifference};${agcStagePlansDifference};${agcDirectDrawsDifference};${agcDirectDrawsBuildDifference};${agcDirectBuffersDifference};${agcDirectInputsDifference};${agcDirectRepeatDifference}")
     set(agcCommitBindingsDifference "\\[commit-bindings-verify\\] ")
-    set(agcCommitBindingsEnvironment ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1 ${agcLeanFrontEnvironment} APS5_DIRECT_DRAWS=1 APS5_DIRECT_BUFFERS=1 APS5_DIRECT_INPUTS=1 APS5_COMMIT_BINDINGS=1 APS5_COMMIT_BINDINGS_STAMPS=1 APS5_COMMIT_BINDINGS_SETS=1)
+    set(agcCommitBindingsEnvironment ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1 ${agcLeanFrontEnvironment} APS5_DIRECT_DRAWS=1 APS5_DIRECT_BUFFERS=1 APS5_DIRECT_INPUTS=1 APS5_COMMIT_BINDINGS=1 APS5_COMMIT_BINDINGS_STAMPS=1 APS5_COMMIT_BINDINGS_SETS=1 APS5_COMMIT_BINDINGS_DYNAMIC=1)
     agc_add_env_test(agc_driver_draw_records_hits_commit_bindings agc_driver_draw_records_hits_tests
             ENV ${agcCommitBindingsEnvironment} APS5_PIPELINE_STATS=1)
     agc_add_env_test(agc_driver_draw_records_hits_commit_bindings_verify agc_driver_draw_records_hits_tests
