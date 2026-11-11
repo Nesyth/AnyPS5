@@ -8096,6 +8096,8 @@ bool ShaderResources::lendsSets(std::int32_t pushedSet, const BdaResources* faul
 namespace {
 
 constexpr std::size_t LentSetBytes = 16384;
+constexpr std::uint32_t LenderMisses = 8;
+constexpr std::uint32_t LenderRest = 64;
 
 }
 
@@ -8106,11 +8108,23 @@ void ShaderResources::lendDrawSets(DrawBindings& result, std::span<const std::si
     const auto& plan = ownDrawSets->plan;
     for (std::size_t set = 0; set < 2u; ++set) {
         if (static_cast<std::int32_t>(set) == pushedSet || !plan.lendable[set] || !(plan.described[set] || splitSets)) continue;
-        const auto& lender = setLenders[set];
+        auto& lender = setLenders[set];
+        if (lender.resting != 0) {
+            --lender.resting;
+            continue;
+        }
         if (lender.set == VK_NULL_HANDLE) continue;
         const auto held = lender.bindings.lock();
         if (held == nullptr) continue;
-        if (lender.buffers.size() != descriptorBuffers.size() || std::memcmp(lender.buffers.data(), descriptorBuffers.data(), descriptorBuffers.size() * sizeof(VkDescriptorBufferInfo)) != 0) continue;
+        const auto missed = [&] {
+            if (++lender.misses < LenderMisses) return;
+            lender.misses = 0;
+            lender.resting = LenderRest;
+        };
+        if (lender.buffers.size() != descriptorBuffers.size() || std::memcmp(lender.buffers.data(), descriptorBuffers.data(), descriptorBuffers.size() * sizeof(VkDescriptorBufferInfo)) != 0) {
+            missed();
+            continue;
+        }
         std::size_t matched = 0;
         std::size_t at = 0;
         bool same = true;
@@ -8129,7 +8143,11 @@ void ShaderResources::lendDrawSets(DrawBindings& result, std::span<const std::si
             at += mine.bytes;
             ++matched;
         }
-        if (!same || matched != lender.allocations.size()) continue;
+        if (!same || matched != lender.allocations.size()) {
+            missed();
+            continue;
+        }
+        lender.misses = 0;
         matched = 0;
         for (std::size_t index = 0; index < selected.size(); ++index) {
             if (selected[index] < plan.allocationSets.size() && plan.allocationSets[selected[index]] == set) result.snapshots[index] = held->snapshots[lender.snapshots[matched++]];
@@ -8159,7 +8177,7 @@ void ShaderResources::noteSetLenders(const std::shared_ptr<DrawBindings>& result
         auto& lender = setLenders[set];
         lender.bindings.reset();
         lender.set = VK_NULL_HANDLE;
-        if (!plan.lendable[set] || !copied) continue;
+        if (!plan.lendable[set] || !copied || lender.resting != 0) continue;
         lender.allocations.clear();
         lender.snapshots.clear();
         lender.bytes.clear();

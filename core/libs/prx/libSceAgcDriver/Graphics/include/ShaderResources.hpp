@@ -1087,6 +1087,8 @@ private:
         std::vector<std::size_t> snapshots;
         std::vector<VkDescriptorBufferInfo> buffers;
         std::vector<std::byte> bytes;
+        std::uint32_t misses = 0;
+        std::uint32_t resting = 0;
     };
     mutable std::array<SetLender, 2> setLenders;
     bool lendsSets(std::int32_t pushedSet, const BdaResources* faultRecord) const;
