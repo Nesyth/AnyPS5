@@ -457,7 +457,8 @@ public:
     std::shared_ptr<DrawBindings> PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut = nullptr, const PreparedBuffers* prepared = nullptr, PreparedBuffers::Selection* preparedSelection = nullptr, BindingRoute* route = nullptr) const;
     void PushDrawBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
     bool FragmentEligible() const { return reusable && !heapStage && bda == nullptr && !addressedBuffers && !rebound && context.descriptorCache != nullptr; }
-    enum class ExpressMiss : std::uint8_t { None, NotProved, Watch, Forget, Serials, Sources, Views, PendingCpu, Staging, Count };
+    enum class ExpressMiss : std::uint8_t { None, NotProved, Watch, Forget, Serials, Sources, Views, PendingCpu, Staging, Regions, Count };
+    bool ExpressReady() const { return expressValid && cleanProved; }
     ExpressMiss ExpressCurrent();
     void ExpressStage(Recorder& recorder);
     PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route) const;

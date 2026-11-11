@@ -5189,7 +5189,7 @@ void ShaderResources::recordClean(bool proved, const CleanStamp& stamp) {
 }
 
 bool ShaderResources::expressEligible() const {
-    return reusable && !heapStage && bda == nullptr && !addressedBuffers && !rebound && directRegions.empty() && !GuestMemory::WriteIndexEnabled() && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits);
+    return reusable && !heapStage && bda == nullptr && !addressedBuffers && !rebound && !GuestMemory::WriteIndexEnabled() && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits);
 }
 
 ShaderResources::ExpressBefore ShaderResources::expressBefore() {
@@ -5206,6 +5206,7 @@ ShaderResources::ExpressBefore ShaderResources::expressBefore() {
         for (const auto& image : storageTextures) {
             if (image != nullptr) ranges.emplace_back(image->Descriptor().baseAddress, image->Descriptor().baseAddress + image->GuestBytes());
         }
+        for (const auto& region : directRegions) ranges.emplace_back(region.begin, region.regionEnd != 0 ? std::max(region.end, region.regionEnd) : region.end);
         expressWatch = GuestMemory::SubscribeWriteGeneration(ranges);
     }
     before.generation = GuestMemory::SubscriptionGeneration(*expressWatch);
@@ -5218,7 +5219,7 @@ ShaderResources::ExpressBefore ShaderResources::expressBefore() {
 
 void ShaderResources::expressAfter(bool proved, const ExpressBefore& before) {
     expressValid = false;
-    if (!proved || !before.watched || !cleanProved || !directRegions.empty()) return;
+    if (!proved || !before.watched || !cleanProved) return;
     std::size_t at = 0;
     for (const auto& surface : validatedTextures) {
         if (surface.source == nullptr) continue;
@@ -5243,10 +5244,18 @@ ShaderResources::ExpressMiss ShaderResources::ExpressCurrent() {
     if (!registeredImageViewsCurrent(registeredImageViews)) return ExpressMiss::Views;
     if (!Recorder::InCompletion() && Recorder::Active() != nullptr && ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0)) return ExpressMiss::PendingCpu;
     if (!guestMemory.StagingDecisionsCurrent()) return ExpressMiss::Staging;
+    if (!directRegions.empty()) {
+        struct ExpressRegionsStorage {};
+        auto& ranges = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ExpressRegionsStorage>();
+        ranges.clear();
+        for (const auto& region : directRegions) ranges.emplace_back(region.begin, region.end);
+        if (AnyShadowedOverlaps(ranges)) return ExpressMiss::Regions;
+    }
     return ExpressMiss::None;
 }
 
 void ShaderResources::ExpressStage(Recorder& recorder) {
+    for (const auto& region : directRegions) static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
     guestMemory.RecordStagingCopies(recorder);
 }
 

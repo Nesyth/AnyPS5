@@ -213,7 +213,10 @@ struct DrawExpress {
 enum class DrawExpressMiss : std::uint8_t { None, NoState, Shape, Objects, Template, Targets, Depth, Stores, Linear, Buffers, Inputs, Moved, Selection, Staging, Verify, Count };
 inline constexpr std::array<const char*, static_cast<std::size_t>(DrawExpressMiss::Count)> DrawExpressMissNames{"none", "no express state", "shape", "objects", "template", "targets", "depth", "queued stores", "drawn linear", "buffers", "inputs", "moved hazard", "selection", "staging", "verify"};
 
+enum class DrawExpressCapture : std::uint8_t { None, Captured, NotSpliced, Objects, NotProved, Watch, Forget, Serials, Sources, Views, PendingCpu, Staging, Regions, Access, Count };
+
 struct DrawRecordFragment {
+    DrawExpressCapture expressCapture = DrawExpressCapture::None;
     bool offered = false;
     bool spliced = false;
     bool replayed = false;

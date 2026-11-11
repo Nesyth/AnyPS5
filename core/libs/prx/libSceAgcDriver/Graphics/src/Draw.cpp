@@ -6089,17 +6089,24 @@ std::uint64_t commitFragmentVerifyOrdinal = 0;
 
 void captureExpress(const Context& context, const State& state, const DrawRecipe& recipe, DrawRecordCommit& record, const Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, const DrawFragment& fragment, std::shared_ptr<Framebuffer> framebuffer, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::pair<std::uint32_t, std::uint32_t>> slices) {
     record.express.reset();
-    static int debugged = 0;
-    const auto debug = [&](const char* why, int detail) {
-        if (debugged >= 24 || std::getenv("APS5_DEBUG_EXPRESS") == nullptr) return;
-        ++debugged;
-        std::fprintf(stderr, "[express-debug] capture refused: %s %d\n", why, detail);
-    };
-    if (!record.effects.fragment.spliced && !record.effects.fragment.replayed) return debug("not spliced", 0);
-    if (resources == nullptr || framebuffer == nullptr || fragment.pipeline == nullptr) return debug("objects", 0);
-    if (const auto why = resources->ExpressCurrent(); why != ShaderResources::ExpressMiss::None) return debug("template", static_cast<int>(why));
+    auto& noted = record.effects.fragment.expressCapture;
+    if (!record.effects.fragment.spliced && !record.effects.fragment.replayed) {
+        noted = DrawExpressCapture::NotSpliced;
+        return;
+    }
+    if (resources == nullptr || framebuffer == nullptr || fragment.pipeline == nullptr) {
+        noted = DrawExpressCapture::Objects;
+        return;
+    }
+    if (const auto why = resources->ExpressCurrent(); why != ShaderResources::ExpressMiss::None) {
+        noted = static_cast<DrawExpressCapture>(static_cast<std::size_t>(DrawExpressCapture::NotProved) + static_cast<std::size_t>(why) - static_cast<std::size_t>(ShaderResources::ExpressMiss::NotProved));
+        return;
+    }
     const auto& access = record.access;
-    if (access.resources != resources.get() || access.readsTarget || targets.size() != slices.size() || std::ranges::any_of(targets, [](const std::shared_ptr<StorageTexture>& target) { return target == nullptr; })) return debug("access or targets", access.resources != resources.get() ? 1 : access.readsTarget ? 2 : 3);
+    if (access.resources != resources.get() || access.readsTarget || targets.size() != slices.size() || std::ranges::any_of(targets, [](const std::shared_ptr<StorageTexture>& target) { return target == nullptr; })) {
+        noted = DrawExpressCapture::Access;
+        return;
+    }
     auto express = std::make_shared<DrawExpress>();
     express->recipe = &recipe;
     express->state = &state;
@@ -6130,6 +6137,7 @@ void captureExpress(const Context& context, const State& state, const DrawRecipe
     express->keep = std::move(keep);
     express->valid = true;
     record.express = std::move(express);
+    noted = DrawExpressCapture::Captured;
 }
 
 }
@@ -6692,7 +6700,10 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     std::shared_ptr<Framebuffer> expressFramebuffer;
     std::vector<std::shared_ptr<StorageTexture>> expressTargets;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> expressSlices;
-    if (expressWanted) {
+    if (expressWanted && !drawn.resources->ExpressReady()) {
+        record.effects.fragment.expressCapture = DrawExpressCapture::NotProved;
+        record.express.reset();
+    } else if (expressWanted) {
         expressFramebuffer = usableFragment->pushing ? drawn.pushFramebuffer : drawn.framebuffer;
         expressTargets = drawn.targets;
         expressSlices = drawn.targetSlices;
@@ -6703,7 +6714,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     const void* blockPushKey = drawn.pushPipeline.get();
     recordDraw(context, state, draw, shaders, inputs, drawn, outcome, timer, ownWaitedMs, trace);
     if (RuntimeSwitches::Set(RuntimeSwitch::CommitFragments) || record.fragmentResources != nullptr) publishFragmentBlock(context, record, drawn.resources, blockPipeline, blockPushPipeline, blockPipelineKey, blockPushKey, push, lean && bound != nullptr && !stencilReferences && !UsesMeshWindow(shaders));
-    if (expressWanted) captureExpress(context, state, recipe, record, *recorder, drawn.resources, *usableFragment, std::move(expressFramebuffer), std::move(expressTargets), std::move(expressSlices));
+    if (expressWanted && expressFramebuffer != nullptr) captureExpress(context, state, recipe, record, *recorder, drawn.resources, *usableFragment, std::move(expressFramebuffer), std::move(expressTargets), std::move(expressSlices));
     if (dynamicRoute && drawn.bindings != nullptr && drawn.bindings->pushed && drawn.bindings->written) record.secondSetWritten = true;
     record.effects.passHeld = held;
     if ((!multisampleRecipe || RuntimeSwitches::Set(RuntimeSwitch::MsaaRecordHold)) && recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {
