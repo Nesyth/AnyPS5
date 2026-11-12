@@ -504,6 +504,7 @@ public:
     void DescribeDrawBindings(const DrawBindings* bound, std::span<const std::size_t> selected, const PushPlan* plan, std::vector<BoundBuffer>& out, bool contents = false) const;
     void DescribeDynamicBindings(const DrawBindings& bound, std::span<const std::size_t> selected, const PushPlan* plan, std::vector<BoundBuffer>& out) const;
     bool RecordLean() const;
+    std::uint8_t LeanMiss() const;
     struct DrawUse {
         DrawUse() = default;
         DrawUse(const DrawUse&) = delete;

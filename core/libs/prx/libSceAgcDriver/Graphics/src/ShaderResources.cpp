@@ -9087,6 +9087,19 @@ void ShaderResources::BindDescriptorHeaps(VkCommandBuffer commands) const {
     BindlessHeap::For(context).BindDescriptorHeaps(commands);
 }
 
+std::uint8_t ShaderResources::LeanMiss() const {
+    if (!reusable) return 1;
+    if (spaceReuse) return 2;
+    if (usesBda || bda != nullptr) return 3;
+    if (heapStage) return 4;
+    if (guestMemory.HoldsLease()) return 5;
+    if (guestMemory.HasCopiedWrites()) return 6;
+    if (guestMemory.HasGpuCopies()) return 7;
+    if (!guestMemory.Writes().empty()) return 8;
+    if (std::ranges::any_of(storageWritten, [](bool written) { return written; })) return 9;
+    return 0;
+}
+
 bool ShaderResources::RecordLean() const {
     return reusable && !spaceReuse && !usesBda && !heapStage && bda == nullptr && !guestMemory.HoldsLease() && !guestMemory.HasCopiedWrites() && !guestMemory.HasGpuCopies() && guestMemory.Writes().empty() && std::ranges::none_of(storageWritten, [](bool written) { return written; });
 }

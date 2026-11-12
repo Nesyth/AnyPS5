@@ -1572,6 +1572,7 @@ void NoteCommitFragments(const DrawRecord& record, DrawRecordCommit& commit, boo
     using DirectDraws::Counter;
     const auto& note = commit.effects.fragment;
     if (note.expressCapture != DrawExpressCapture::None && note.expressCapture != DrawExpressCapture::Count) DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::ExpressCaptured) + static_cast<std::size_t>(note.expressCapture) - static_cast<std::size_t>(DrawExpressCapture::Captured)));
+    if (note.blockMiss != DrawFragmentBlockMiss::None && note.blockMiss != DrawFragmentBlockMiss::Count) DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::FragmentsBlockNotReusable) + static_cast<std::size_t>(note.blockMiss) - static_cast<std::size_t>(DrawFragmentBlockMiss::NotReusable)));
     if (note.spliced) DirectDraws::Add(Counter::FragmentsSpliced);
     if (note.replayed) DirectDraws::Add(Counter::FragmentsReplayed);
     if (note.offered && !note.spliced && !note.replayed) {

@@ -217,8 +217,11 @@ inline constexpr std::array<const char*, static_cast<std::size_t>(DrawExpressMis
 
 enum class DrawExpressCapture : std::uint8_t { None, Captured, NotSpliced, Objects, NotProved, Watch, Forget, Serials, Sources, Views, PendingCpu, Staging, Regions, Access, NotLean, Multisampled, Refused, FunctionLds, Fmask, Unreached, Count };
 
+enum class DrawFragmentBlockMiss : std::uint8_t { None, NotReusable, SpaceReuse, Bda, HeapStage, Lease, CopiedWrites, GpuCopies, BufferWrites, StorageWrites, NoBuffers, Stencil, MeshWindow, Ineligible, Refused, Modes, Count };
+
 struct DrawRecordFragment {
     DrawExpressCapture expressCapture = DrawExpressCapture::None;
+    DrawFragmentBlockMiss blockMiss = DrawFragmentBlockMiss::None;
     bool offered = false;
     bool spliced = false;
     bool replayed = false;

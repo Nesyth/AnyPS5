@@ -6740,6 +6740,16 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     const void* blockPushKey = drawn.pushPipeline.get();
     recordDraw(context, state, draw, shaders, inputs, drawn, outcome, timer, ownWaitedMs, trace);
     if (RuntimeSwitches::Set(RuntimeSwitch::CommitFragments) || record.fragmentResources != nullptr) publishFragmentBlock(context, record, drawn.resources, blockPipeline, blockPushPipeline, blockPipelineKey, blockPushKey, push, lean && bound != nullptr && !stencilReferences && !UsesMeshWindow(shaders));
+    if (RuntimeSwitches::Set(RuntimeSwitch::CommitFragments) && drawn.resources != nullptr) {
+        auto& blockMiss = record.effects.fragment.blockMiss;
+        if (!lean) blockMiss = static_cast<DrawFragmentBlockMiss>(std::max<std::uint8_t>(drawn.resources->LeanMiss(), 1u));
+        else if (bound == nullptr) blockMiss = DrawFragmentBlockMiss::NoBuffers;
+        else if (stencilReferences) blockMiss = DrawFragmentBlockMiss::Stencil;
+        else if (UsesMeshWindow(shaders)) blockMiss = DrawFragmentBlockMiss::MeshWindow;
+        else if (!drawn.resources->FragmentEligible()) blockMiss = DrawFragmentBlockMiss::Ineligible;
+        else if (record.fragmentsRefused) blockMiss = DrawFragmentBlockMiss::Refused;
+        else if (!fragmentModes()) blockMiss = DrawFragmentBlockMiss::Modes;
+    }
     if (expressWanted && expressFramebuffer != nullptr) captureExpress(context, state, recipe, record, *recorder, drawn.resources, *usableFragment, std::move(expressFramebuffer), std::move(expressTargets), std::move(expressSlices), std::move(expressMultisample), std::move(expressMultisampleImages));
     if (dynamicRoute && drawn.bindings != nullptr && drawn.bindings->pushed && drawn.bindings->written) record.secondSetWritten = true;
     record.effects.passHeld = held;
