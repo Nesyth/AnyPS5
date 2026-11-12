@@ -120,6 +120,7 @@ enum class RuntimeSwitch : std::size_t {
     CommitBindingsDynamic,
     CommitFragments,
     ExpressCommits,
+    LabelOrderedStores,
     Count,
 };
 

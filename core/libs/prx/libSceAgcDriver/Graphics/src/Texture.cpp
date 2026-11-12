@@ -5545,6 +5545,11 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
 std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {
     auto& pending = Pending();
     if (pending.drawnCount.load(std::memory_order_acquire) == 0 || Recorder::InCompletion()) return 0;
+    struct OrderedScope {
+        bool previous;
+        explicit OrderedScope(bool on) : previous(GpuOrderedFlush()) { GpuOrderedFlush() = previous || on; }
+        ~OrderedScope() { GpuOrderedFlush() = previous; }
+    } ordered{std::strcmp(reason, "label") == 0 && RuntimeSwitches::Set(RuntimeSwitch::LabelOrderedStores)};
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
