@@ -6715,14 +6715,13 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         const auto every = CommitFragmentsVerifyEvery();
         drawn.fragmentVerify = every != 0 && ++commitFragmentVerifyOrdinal % every == 0;
     }
-    const bool expressWanted = usableFragment != nullptr && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits) && lean && !record.expressRefused && PixelFunctionLdsSubgroup(shaders) == 0u && std::ranges::none_of(state.colors, [](const auto& color) { return color.fmaskAddress != 0; });
+    const bool expressWanted = usableFragment != nullptr && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits) && lean && !record.expressRefused && PixelFunctionLdsSubgroup(shaders) == 0u;
     if (!expressWanted && usableFragment != nullptr && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits)) {
         record.express.reset();
         auto& noted = record.effects.fragment.expressCapture;
         if (!lean) noted = DrawExpressCapture::NotLean;
         else if (record.expressRefused) noted = DrawExpressCapture::Refused;
-        else if (PixelFunctionLdsSubgroup(shaders) != 0u) noted = DrawExpressCapture::FunctionLds;
-        else noted = DrawExpressCapture::Fmask;
+        else noted = DrawExpressCapture::FunctionLds;
     }
     std::shared_ptr<Framebuffer> expressFramebuffer;
     std::vector<std::shared_ptr<StorageTexture>> expressTargets;
@@ -7162,6 +7161,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
                 const auto generation = recorder->RenderPassGeneration();
                 std::shared_ptr<void> current;
                 VkImage image = VK_NULL_HANDLE;
+                if (state.colors[index].fmaskAddress != 0) GuardOneFragmentFmask(context, state.colors[index]);
                 const auto view = MultisampleTargetView(context, state.colors[index], current, &image);
                 if (view != recipe->targetViews[index] || current.get() != owner || image != express->multisampleImages[index]) return miss(DrawExpressMiss::Targets);
                 auto& slot = found != checked.end() ? *found : checked[nextChecked++ % checked.size()];
@@ -7178,6 +7178,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         if (dcc != express->dccAddresses[index] || !StorageImageServesKeys(*target, dcc)) return miss(DrawExpressMiss::Targets);
         if (!recorder->RenderPassOpen() || !target->NotedInPass(recorder->Id(), recorder->RenderPassGeneration())) {
             if (!StorageImageCached(context, target.get())) return miss(DrawExpressMiss::Targets);
+            if (color.fmaskAddress != 0) GuardOneFragmentFmask(context, color);
             DrawOutcome refreshed;
             const auto resident = refreshResidentTarget(context, state, color, refreshed, false, [&] {
                 if (color.arrayLastSlice != 0) target->RefreshLayers(color.arraySlice, 1);
