@@ -133,6 +133,12 @@ namespace {
 constexpr std::uint64_t IndexBlockBytes = 65536;
 constexpr std::size_t MaxRecordedBumps = 1024;
 constexpr std::uint64_t SpanGapBytes = std::uint64_t{1} << 20;
+constexpr std::size_t FilterSlots = std::size_t{1} << 20;
+constexpr std::uint64_t FilteredBlocks = 64;
+
+std::size_t filterSlot(std::uint64_t block) {
+    return static_cast<std::size_t>((block * 0x9E3779B97F4A7C15ull) >> 44u) & (FilterSlots - 1u);
+}
 
 struct WriteIndex {
     AgcDriver::Mutex mutex;
@@ -147,6 +153,7 @@ struct WriteIndex {
     std::atomic<std::uint64_t> overflows{0};
     std::atomic<std::uint64_t> lookupNanoseconds{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(WriteBumpSource::Count)> bySource{};
+    std::unique_ptr<std::atomic<std::uint32_t>[]> filter{new std::atomic<std::uint32_t>[FilterSlots]()};
 };
 
 WriteIndex& Index() {
@@ -170,6 +177,11 @@ bool brokenSource(WriteBumpSource source) {
 void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source) {
     auto& index = Index();
     if (bytes == 0 || index.live.load(std::memory_order_acquire) == 0 || brokenSource(source)) return;
+    if (const auto from = address / IndexBlockBytes, to = (address + bytes - 1) / IndexBlockBytes; to - from < FilteredBlocks) {
+        bool subscribed = false;
+        for (auto block = from; !subscribed && block <= to; ++block) subscribed = index.filter[filterSlot(block)].load(std::memory_order_seq_cst) != 0;
+        if (!subscribed) return;
+    }
     static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto first = address / IndexBlockBytes;
@@ -227,6 +239,7 @@ void releaseSubscription(WriteSubscription* subscription) {
             auto& subscribers = found->second;
             subscribers.erase(std::remove(subscribers.begin(), subscribers.end(), subscription), subscribers.end());
             if (subscribers.empty()) index.byBlock.erase(found);
+            index.filter[filterSlot(block)].fetch_sub(1, std::memory_order_seq_cst);
         }
         index.live.fetch_sub(1, std::memory_order_acq_rel);
     }
@@ -3018,7 +3031,10 @@ std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std
     auto& index = Index();
     {
         std::lock_guard lock(index.mutex);
-        for (const auto block : subscription->blocks) index.byBlock[block].push_back(subscription);
+        for (const auto block : subscription->blocks) {
+            index.byBlock[block].push_back(subscription);
+            index.filter[filterSlot(block)].fetch_add(1, std::memory_order_seq_cst);
+        }
         index.live.fetch_add(1, std::memory_order_acq_rel);
     }
     index.subscriptions.fetch_add(1, std::memory_order_relaxed);
