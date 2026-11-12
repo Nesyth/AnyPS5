@@ -155,6 +155,18 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!partialLastGroup && indirectArguments == 0 && (MatchDwordPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchConstantDwordFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchClampedGlobalFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchMemoryValueBufferFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
         if (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
     } else {
+        if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchBeside)) {
+            const auto code = std::span(snapshot.code).subspan(codeOffset);
+            const bool sideEffects = !pipelineCandidate
+                || (indirectArguments == 0 && Graphics::MatchMultisampledSingleClear(code, userData, compute.numThreads))
+                || (!partialLastGroup && matchesFillKernel(code, userData, compute))
+                || (!partialLastGroup && indirectArguments == 0 && (MatchDwordPatternFill(packet, code, userData, compute) || MatchConstantDwordFill(packet, code, userData, compute) || MatchClampedGlobalFill(packet, code, userData, compute) || MatchMemoryValueBufferFill(packet, code, userData, compute)))
+                || (indirectArguments == 0 && (packet[4] & 0x20u) == 0 && Graphics::MatchMemoryValueFill(code, userData, compute.numThreads, {packet[1], packet[2], packet[3]}).has_value())
+                || Graphics::HtileDepthClearAddress(code, userData, compute.numThreads) != 0
+                || Graphics::MatchHtileBufferMaskClear(code, userData, compute, packet, indirectArguments).has_value()
+                || Graphics::MatchHtileZmaskFixup(code, userData, compute, packet, indirectArguments).has_value();
+            if (sideEffects) DrawFinisher::Get().Drain();
+        }
         if (indirectArguments == 0 && Graphics::TakeMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             if (resolvedAhead().empty()) gateOpened() = true;

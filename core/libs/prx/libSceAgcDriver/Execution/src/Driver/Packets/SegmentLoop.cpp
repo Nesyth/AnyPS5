@@ -631,14 +631,15 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
             const bool heldLabelWait = !predicated && orderedWaits() && entry.Has(LeanPacket::Wait) && !entry.Has(LeanPacket::RenderingWait) && PacketRules::waitTakesPendingLabel(packet);
             const bool queuesSampleDump = !predicated && opcode == 0x46 && LeanFront::SwitchSet(frontLatch, RuntimeSwitch::BesideSampleDumps) && sampleDumpQueues(packet, opcode, submission.queue);
             bool keeps = false;
-            if (DrawFinisher::Overlap() && opcode != 0x15 && !queuesLabel && !heldLabelWait && !queuesSampleDump) {
+            const bool dispatchBeside = opcode == 0x15 && LeanFront::SwitchSet(frontLatch, RuntimeSwitch::DispatchBeside);
+            if (DrawFinisher::Overlap() && (opcode != 0x15 || dispatchBeside) && !queuesLabel && !heldLabelWait && !queuesSampleDump) {
                 keeps = pipelineVerdict();
                 if (entry.pipeline == LeanPacket::Pipeline::AsksLists) {
                     listVerdict = keeps;
                     listVerdictKnown = true;
                 }
             }
-            const bool beside = DrawFinisher::Overlap() && opcode != 0x15 && (queuesLabel || heldLabelWait || queuesSampleDump || keeps);
+            const bool beside = DrawFinisher::Overlap() && (opcode != 0x15 || dispatchBeside) && (queuesLabel || heldLabelWait || queuesSampleDump || keeps);
             if (!beside) {
                 DrawFinisher::Get().Drain();
                 listVerdictKnown = false;

@@ -39,7 +39,7 @@ private:
 
 class PublishedKeys {
 public:
-    static constexpr std::uint32_t Capacity = 256;
+    static constexpr std::uint32_t Capacity = 64;
     static constexpr std::uint32_t DeepDepth = 64;
     enum class Answer : std::uint8_t { Clear, Hit, Unsure };
     void Push(std::uint64_t seqNumber, std::uint64_t key, std::uint64_t shape, bool inserts);
@@ -177,7 +177,7 @@ public:
     using LeanRunner = void (*)(const std::byte* payload);
     using LeanRetirer = void (*)(const std::byte* payload, std::shared_ptr<const void>&& answer);
     static constexpr std::size_t LeanPayloadBytes = 1024;
-    static constexpr std::size_t LeanSlots = 256;
+    static constexpr std::size_t LeanSlots = 64;
     class AheadScope {
     public:
         AheadScope();
@@ -206,6 +206,9 @@ public:
     static DepositCounts Deposits();
     static bool Overlap();
     bool PendingOverlaps(std::uint64_t begin, std::uint64_t end);
+    std::uint64_t ParkReads(const std::vector<Range>& reads);
+    void UnparkReads(std::uint64_t id);
+    bool ParkedReadsOverlap(std::uint64_t address, std::size_t bytes);
     LabelLookup PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value);
     bool PendingOverlapsAny(std::span<const Range> ranges);
     bool PendingKey(std::uint64_t key, std::uint64_t shape);
@@ -319,6 +322,10 @@ private:
     std::atomic<std::uint64_t> leanTail{1};
     std::uint64_t leanRetired = 1;
     std::unique_ptr<std::array<LeanSlot, LeanSlots>> lean;
+    std::mutex parkedReadsMutex;
+    std::vector<std::pair<std::uint64_t, std::vector<Range>>> parkedReads;
+    std::uint64_t nextParkedReads = 1;
+    std::atomic<std::uint32_t> parkedReadCount{0};
 };
 
 }

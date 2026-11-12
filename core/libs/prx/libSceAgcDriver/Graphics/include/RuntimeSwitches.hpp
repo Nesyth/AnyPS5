@@ -122,6 +122,7 @@ enum class RuntimeSwitch : std::size_t {
     ExpressCommits,
     LabelOrderedStores,
     DeeperRing,
+    DispatchBeside,
     Count,
 };
 

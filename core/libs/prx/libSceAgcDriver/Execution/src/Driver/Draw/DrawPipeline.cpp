@@ -1055,6 +1055,34 @@ bool DrawFinisher::depositsWrite(std::span<const Range> ranges) {
     return false;
 }
 
+std::uint64_t DrawFinisher::ParkReads(const std::vector<Range>& reads) {
+    std::lock_guard lock(parkedReadsMutex);
+    const auto id = nextParkedReads++;
+    parkedReads.emplace_back(id, reads);
+    parkedReadCount.fetch_add(1, std::memory_order_release);
+    return id;
+}
+
+void DrawFinisher::UnparkReads(std::uint64_t id) {
+    std::lock_guard lock(parkedReadsMutex);
+    const auto found = std::ranges::find_if(parkedReads, [id](const auto& entry) { return entry.first == id; });
+    if (found == parkedReads.end()) return;
+    parkedReads.erase(found);
+    parkedReadCount.fetch_sub(1, std::memory_order_release);
+}
+
+bool DrawFinisher::ParkedReadsOverlap(std::uint64_t address, std::size_t bytes) {
+    if (parkedReadCount.load(std::memory_order_acquire) == 0) return false;
+    const auto end = address + bytes;
+    std::lock_guard lock(parkedReadsMutex);
+    for (const auto& [id, reads] : parkedReads) {
+        for (const auto& [begin, limit] : reads) {
+            if (address < limit && begin < end) return true;
+        }
+    }
+    return false;
+}
+
 bool DrawFinisher::depositsRead(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
     for (const auto& held : ownDeposits()) {
@@ -1338,20 +1366,26 @@ void DrawPipeline::enqueue(Item item) {
         finisher.AwaitTurn();
     }
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) {
-        if (item.reads.empty() && !ItemTurn::Get() && FinisherProducer::Get() && DrawFinisher::Overlap() && !GuestMemory::GpuMutex().HeldByThisThread() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ItemsByTurn)) {
+        const bool dispatchTurn = item.kind == CommitKind::Dispatch && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchBeside);
+        if ((item.reads.empty() || dispatchTurn) && !ItemTurn::Get() && FinisherProducer::Get() && DrawFinisher::Overlap() && !GuestMemory::GpuMutex().HeldByThisThread() && (dispatchTurn || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ItemsByTurn))) {
             DrawFinisher::Pending held;
             held.unknown = false;
             held.writes = item.writes;
             held.labelAddress = item.labelAddress;
             held.labelBytes = item.labelBytes;
             itemsByTurn.fetch_add(1, std::memory_order_relaxed);
+            const auto parked = item.reads.empty() ? std::uint64_t{0} : DrawFinisher::Get().ParkReads(item.reads);
             auto shared = std::make_shared<Item>(std::move(item));
-            DrawFinisher::Get().Enqueue([this, shared] {
+            DrawFinisher::Get().Enqueue([this, shared, parked] {
                 struct Scope {
                     bool previous = ItemTurn::Get();
-                    Scope() { ItemTurn::Set(true); }
-                    ~Scope() { ItemTurn::Set(previous); }
-                } scope;
+                    std::uint64_t parked;
+                    explicit Scope(std::uint64_t id) : parked(id) { ItemTurn::Set(true); }
+                    ~Scope() {
+                        ItemTurn::Set(previous);
+                        if (parked != 0) DrawFinisher::Get().UnparkReads(parked);
+                    }
+                } scope{parked};
                 enqueue(std::move(*shared));
             }, std::move(held));
             return;
@@ -1658,6 +1692,7 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     static const bool unordered = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr;
     if (bytes == 0 || unordered) return false;
     if (FinisherDeposits::Get() && DrawFinisher::Get().depositsRead(address, bytes)) return true;
+    if (DrawFinisher::Get().ParkedReadsOverlap(address, bytes)) return true;
     const auto end = address + bytes;
     auto& pipeline = Queue0();
     const auto lock = lockFor(pipeline.mutex);
