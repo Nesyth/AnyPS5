@@ -561,6 +561,54 @@ void DirectStepClock::Report() const {
     }
 }
 
+namespace {
+
+bool resolveCensus() {
+    static const bool on = std::getenv("APS5_RESOLVE_CENSUS") != nullptr;
+    return on;
+}
+
+struct ResolveCensusShard {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::uint64_t> seen;
+};
+
+void noteResolveCensus(const LeanDrawJob& job, const DirectStages& resolved) {
+    constexpr std::uint64_t Prime = 1099511628211ull;
+    const auto mix = [](std::uint64_t& hash, std::uint64_t value) { hash = (hash ^ value) * Prime; };
+    auto key = LeanExactKey(*job.shape, job.words);
+    const auto& parameters = job.parameters;
+    for (const std::uint64_t value : {parameters.indexAddress, std::uint64_t{parameters.indexCount}, std::uint64_t{parameters.indexSize}, std::uint64_t{parameters.instanceCount}, std::uint64_t{parameters.flags}, std::uint64_t{parameters.indexed}, std::uint64_t{parameters.firstVertex}, std::uint64_t{parameters.firstInstance}}) mix(key, value);
+    std::uint64_t values = 1469598103934665603ull;
+    for (std::size_t index = resolved.memory.size(); index < resolved.regions.size(); ++index) {
+        const auto& region = resolved.regions[index];
+        mix(values, region.guestAddress);
+        const auto bytes = region.bytes;
+        std::size_t at = 0;
+        for (; at + sizeof(std::uint64_t) <= bytes.size(); at += sizeof(std::uint64_t)) {
+            std::uint64_t word = 0;
+            std::memcpy(&word, bytes.data() + at, sizeof(word));
+            mix(values, word);
+        }
+        for (; at < bytes.size(); ++at) mix(values, std::to_integer<std::uint64_t>(bytes[at]));
+    }
+    static std::array<ResolveCensusShard, 16> shards;
+    auto& shard = shards[static_cast<std::size_t>((key >> 7u) & 15u)];
+    auto outcome = Counter::ResolveCensusNew;
+    {
+        std::lock_guard lock(shard.mutex);
+        if (shard.seen.size() > 262144u) shard.seen.clear();
+        const auto [found, inserted] = shard.seen.try_emplace(key, values);
+        if (!inserted) {
+            outcome = found->second == values ? Counter::ResolveCensusSame : Counter::ResolveCensusChanged;
+            found->second = values;
+        }
+    }
+    DirectDraws::Add(outcome);
+}
+
+}
+
 std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const LeanAnchor& anchor, DirectStages& resolved, DirectStepClock* clock) {
     DrawPipeline::FollowEpoch(job.epoch);
     DrawPipeline::Active() = true;
@@ -727,6 +775,7 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
             at += words;
         }
     }
+    if (resolveCensus()) noteResolveCensus(job, resolved);
     lap(Step::Checks);
     return std::nullopt;
 }

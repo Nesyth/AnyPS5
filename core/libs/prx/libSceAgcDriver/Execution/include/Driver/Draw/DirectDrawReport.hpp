@@ -334,6 +334,9 @@ enum class Counter : std::uint16_t {
     FragmentsBlockIneligible,
     FragmentsBlockRefused,
     FragmentsBlockModes,
+    ResolveCensusNew,
+    ResolveCensusSame,
+    ResolveCensusChanged,
     Count,
 };
 
