@@ -580,17 +580,24 @@ void noteResolveCensus(const LeanDrawJob& job, const DirectStages& resolved) {
     const auto& parameters = job.parameters;
     for (const std::uint64_t value : {parameters.indexAddress, std::uint64_t{parameters.indexCount}, std::uint64_t{parameters.indexSize}, std::uint64_t{parameters.instanceCount}, std::uint64_t{parameters.flags}, std::uint64_t{parameters.indexed}, std::uint64_t{parameters.firstVertex}, std::uint64_t{parameters.firstInstance}}) mix(key, value);
     std::uint64_t values = 1469598103934665603ull;
+    std::uint64_t content = job.shape->finalShape;
+    for (const std::uint64_t value : {std::uint64_t{parameters.indexCount}, std::uint64_t{parameters.indexSize}, std::uint64_t{parameters.instanceCount}, std::uint64_t{parameters.flags}, std::uint64_t{parameters.indexed}, std::uint64_t{parameters.firstVertex}, std::uint64_t{parameters.firstInstance}}) mix(content, value);
     for (std::size_t index = resolved.memory.size(); index < resolved.regions.size(); ++index) {
         const auto& region = resolved.regions[index];
         mix(values, region.guestAddress);
+        mix(content, region.bytes.size());
         const auto bytes = region.bytes;
         std::size_t at = 0;
         for (; at + sizeof(std::uint64_t) <= bytes.size(); at += sizeof(std::uint64_t)) {
             std::uint64_t word = 0;
             std::memcpy(&word, bytes.data() + at, sizeof(word));
             mix(values, word);
+            mix(content, word);
         }
-        for (; at < bytes.size(); ++at) mix(values, std::to_integer<std::uint64_t>(bytes[at]));
+        for (; at < bytes.size(); ++at) {
+            mix(values, std::to_integer<std::uint64_t>(bytes[at]));
+            mix(content, std::to_integer<std::uint64_t>(bytes[at]));
+        }
     }
     static std::array<ResolveCensusShard, 16> shards;
     auto& shard = shards[static_cast<std::size_t>((key >> 7u) & 15u)];
@@ -605,6 +612,15 @@ void noteResolveCensus(const LeanDrawJob& job, const DirectStages& resolved) {
         }
     }
     DirectDraws::Add(outcome);
+    static std::array<ResolveCensusShard, 16> contents;
+    auto& contentShard = contents[static_cast<std::size_t>((content >> 7u) & 15u)];
+    bool seen = false;
+    {
+        std::lock_guard lock(contentShard.mutex);
+        if (contentShard.seen.size() > 262144u) contentShard.seen.clear();
+        seen = !contentShard.seen.try_emplace(content, 1u).second;
+    }
+    DirectDraws::Add(seen ? Counter::ResolveCensusContentSeen : Counter::ResolveCensusContentNew);
 }
 
 }

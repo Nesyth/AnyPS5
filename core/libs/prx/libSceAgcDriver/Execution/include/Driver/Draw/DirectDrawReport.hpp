@@ -338,6 +338,8 @@ enum class Counter : std::uint16_t {
     ResolveCensusNew,
     ResolveCensusSame,
     ResolveCensusChanged,
+    ResolveCensusContentNew,
+    ResolveCensusContentSeen,
     Count,
 };
 
