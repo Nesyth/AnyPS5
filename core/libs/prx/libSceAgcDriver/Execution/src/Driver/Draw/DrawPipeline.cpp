@@ -146,6 +146,11 @@ bool deepQueues() {
     return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DeepQueues);
 }
 
+std::uint64_t finisherDepth() {
+    if (!deepQueues()) return 16;
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DeeperRing) ? PublishedKeys::Capacity : PublishedKeys::DeepDepth;
+}
+
 bool spinHandoff() {
     return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SpinHandoff);
 }
@@ -655,7 +660,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         publishLean(slot);
         return;
     }
-    const std::size_t depth = deepQueues() ? PublishedKeys::Capacity : 16;
+    const auto depth = static_cast<std::size_t>(finisherDepth());
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
     const ClearOnExit<Job> clearReclaim{reclaim};
@@ -771,7 +776,7 @@ void DrawFinisher::rethrowLeanFailure() {
 
 void DrawFinisher::awaitLeanRoom() {
     static_assert(PublishedKeys::Capacity <= LeanSlots && 16 <= LeanSlots, "the finisher ring must hold the deepest finisher queue");
-    const std::uint64_t depth = deepQueues() ? PublishedKeys::Capacity : 16;
+    const std::uint64_t depth = finisherDepth();
     const auto full = [&] { return nextSeq - frontSeq.load(std::memory_order_seq_cst) >= depth && !closed.load(std::memory_order_acquire); };
     if (!full()) {
         retireLean();

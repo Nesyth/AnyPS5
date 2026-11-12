@@ -39,7 +39,8 @@ private:
 
 class PublishedKeys {
 public:
-    static constexpr std::uint32_t Capacity = 64;
+    static constexpr std::uint32_t Capacity = 256;
+    static constexpr std::uint32_t DeepDepth = 64;
     enum class Answer : std::uint8_t { Clear, Hit, Unsure };
     void Push(std::uint64_t seqNumber, std::uint64_t key, std::uint64_t shape, bool inserts);
     void Retire(std::uint64_t frontSeq);
@@ -176,7 +177,7 @@ public:
     using LeanRunner = void (*)(const std::byte* payload);
     using LeanRetirer = void (*)(const std::byte* payload, std::shared_ptr<const void>&& answer);
     static constexpr std::size_t LeanPayloadBytes = 1024;
-    static constexpr std::size_t LeanSlots = 64;
+    static constexpr std::size_t LeanSlots = 256;
     class AheadScope {
     public:
         AheadScope();
