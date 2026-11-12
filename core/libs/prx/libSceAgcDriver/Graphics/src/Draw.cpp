@@ -3179,7 +3179,10 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         GuestMemory::BreakProofs(GuestMemory::ProofBreak::Draw);
     } else if (completion) {
         if (use != nullptr) recorder.OnComplete([resources, use] { resources->CompleteDrawUse(*use); });
-        else if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });
+        else if (resources->Reusable()) {
+            if (!resources->FaultBufferLean()) recorder.OnComplete([resources] { resources->CheckFaults(); });
+            else if (resources->TakeFaultCheck(recorder.Id(), recorder.OpenSerial())) recorder.OnComplete([resources] { resources->CheckFaults(); });
+        }
         else recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
     }
     const bool storeMask = residents.size() <= 64 && RuntimeSwitches::Set(RuntimeSwitch::KeepFastPath);
@@ -3606,7 +3609,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (fragment != nullptr && (faultRecord != nullptr || record.replay || keptBindings != nullptr || record.view != nullptr || record.preparedCheck != nullptr || record.prepared == nullptr || hitCensus || capture)) dropFragment(DrawFragmentDrop::Modes);
     std::shared_ptr<ShaderResources::DrawBindings> fragmentBindings;
     if (fragment != nullptr && !record.fragmentVerify) {
-        const auto held = resources.FragmentSelectionHolds(*recorder, record.moved, *record.prepared, route);
+        auto held = resources.FragmentSelectionHolds(*recorder, record.moved, *record.prepared, route);
+        if (held == PreparedSelection::Taken && resources.ChecksFaults() && fragment->faultGeneration != resources.FaultGeneration()) held = PreparedSelection::Hazard;
         if (held == PreparedSelection::Taken) {
             fragmentBindings = fragment->bindings;
             preparedSelection = held;
@@ -6185,6 +6189,7 @@ bool RecordDrawFragment(const Context& context, const State& state, const Pm4::D
     const auto& bound = pushing ? *pushPipeline : *pipeline;
     auto bindings = std::move(prepared.placed);
     auto& stream = fragmentStream();
+    const auto faultBefore = resources->ChecksFaults() ? resources->FaultGeneration() : 0u;
     try {
         if (pushing) {
             const auto pushedSet = static_cast<std::int32_t>(push->set);
@@ -6195,6 +6200,10 @@ bool RecordDrawFragment(const Context& context, const State& state, const Pm4::D
         } else {
             bindings->pushSelected.clear();
             resources->WriteFragmentSets(*bindings, selected, -1);
+        }
+        if (resources->ChecksFaults()) {
+            const auto faultAfter = resources->FaultGeneration();
+            out.faultGeneration = (faultBefore & 1u) == 0 && faultAfter == faultBefore ? faultBefore : ~std::uint64_t{0};
         }
         stream.BeginFragment();
         const auto commands = stream.Handle();
@@ -7272,6 +7281,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     if (recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) recorder->FlushKeyStores();
     if (recorder->HasQueuedStores() && recorder->AnyQueuedStore(touches)) recorder->FlushStores();
     if (resources.FragmentSelectionHolds(*recorder, prepared->moved, *prepared, nullptr) != ShaderResources::PreparedBuffers::Selection::Taken) return giveBack(DrawExpressMiss::Selection);
+    if (resources.ChecksFaults() && fragment->faultGeneration != resources.FaultGeneration()) return giveBack(DrawExpressMiss::Selection);
     try {
         if (!reprove) resources.ExpressStage(*recorder);
     } catch (const std::exception&) {
@@ -7350,6 +7360,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     }
     record.effects.proved = true;
     if (!reprove) record.effects.cleanProof = ShaderResources::CleanProof::Skipped;
+    if (resources.ChecksFaults() && resources.TakeFaultCheck(recorderId, recorder->OpenSerial())) recorder->OnComplete([kept = keep.resources] { kept->CheckFaults(); });
     record.effects.hold = DrawRecordHold::Held;
     record.effects.passHeld = true;
     record.effects.buffers = DrawRecordBuffers::Used;

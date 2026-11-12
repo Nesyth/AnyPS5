@@ -5189,7 +5189,7 @@ void ShaderResources::recordClean(bool proved, const CleanStamp& stamp) {
 }
 
 bool ShaderResources::expressEligible() const {
-    return reusable && cleanEligibility <= 1 && storageTextures.empty() && !heapStage && bda == nullptr && !addressedBuffers && !rebound && !GuestMemory::WriteIndexEnabled() && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits);
+    return reusable && cleanEligibility <= 1 && storageTextures.empty() && !heapStage && (bda == nullptr || FaultBufferLean()) && !addressedBuffers && !rebound && !GuestMemory::WriteIndexEnabled() && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits);
 }
 
 ShaderResources::ExpressBefore ShaderResources::expressBefore() {
@@ -9013,6 +9013,11 @@ void ShaderResources::prepareFaultSlot() const {
     const auto* recorder = Recorder::Active();
     bda->NoteUse(recorder != nullptr && recorder->Device() == context.device ? recorder->OpenSerial() : std::numeric_limits<std::uint64_t>::max());
     if (!bda->TakeFaultSlot(context)) return;
+    faultGeneration.fetch_add(1, std::memory_order_acq_rel);
+    struct Settle {
+        std::atomic<std::uint64_t>& generation;
+        ~Settle() { generation.fetch_add(1, std::memory_order_acq_rel); }
+    } settle{faultGeneration};
     std::vector<VkWriteDescriptorSet> writes;
     writes.reserve(faultDescriptors.size());
     for (const auto& fault : faultDescriptors) {
@@ -9090,7 +9095,8 @@ void ShaderResources::BindDescriptorHeaps(VkCommandBuffer commands) const {
 std::uint8_t ShaderResources::LeanMiss() const {
     if (!reusable) return 1;
     if (spaceReuse) return 2;
-    if (usesBda || bda != nullptr) return 3;
+    if (usesBda) return 3;
+    if (bda != nullptr && !FaultBufferLean()) return 10;
     if (heapStage) return 4;
     if (guestMemory.HoldsLease()) return 5;
     if (guestMemory.HasCopiedWrites()) return 6;
@@ -9100,8 +9106,19 @@ std::uint8_t ShaderResources::LeanMiss() const {
     return 0;
 }
 
+bool ShaderResources::FaultBufferLean() const {
+    return bda != nullptr && !usesBda && usesFaultBuffer && RuntimeSwitches::Set(RuntimeSwitch::FaultFragments);
+}
+
+bool ShaderResources::TakeFaultCheck(std::uint64_t recorder, std::uint64_t batch) const {
+    if (bda == nullptr || (faultCheckRecorder == recorder && faultCheckBatch == batch)) return false;
+    faultCheckRecorder = recorder;
+    faultCheckBatch = batch;
+    return true;
+}
+
 bool ShaderResources::RecordLean() const {
-    return reusable && !spaceReuse && !usesBda && !heapStage && bda == nullptr && !guestMemory.HoldsLease() && !guestMemory.HasCopiedWrites() && !guestMemory.HasGpuCopies() && guestMemory.Writes().empty() && std::ranges::none_of(storageWritten, [](bool written) { return written; });
+    return reusable && !spaceReuse && !usesBda && !heapStage && (bda == nullptr || FaultBufferLean()) && !guestMemory.HoldsLease() && !guestMemory.HasCopiedWrites() && !guestMemory.HasGpuCopies() && guestMemory.Writes().empty() && std::ranges::none_of(storageWritten, [](bool written) { return written; });
 }
 
 const ShaderResources::PushPlan* ShaderResources::PushLayouts() const {

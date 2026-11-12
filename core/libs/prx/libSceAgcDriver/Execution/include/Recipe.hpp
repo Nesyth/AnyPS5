@@ -177,6 +177,7 @@ struct DrawFragment {
     bool written = false;
     VkDevice device = VK_NULL_HANDLE;
     std::uint64_t nanoseconds = 0;
+    std::uint64_t faultGeneration = 0;
 };
 
 struct DrawExpressKeep {
@@ -217,7 +218,7 @@ inline constexpr std::array<const char*, static_cast<std::size_t>(DrawExpressMis
 
 enum class DrawExpressCapture : std::uint8_t { None, Captured, NotSpliced, Objects, NotProved, Watch, Forget, Serials, Sources, Views, PendingCpu, Staging, Regions, Access, NotLean, Multisampled, Refused, FunctionLds, Fmask, Unreached, Count };
 
-enum class DrawFragmentBlockMiss : std::uint8_t { None, NotReusable, SpaceReuse, Bda, HeapStage, Lease, CopiedWrites, GpuCopies, BufferWrites, StorageWrites, NoBuffers, Stencil, MeshWindow, Ineligible, Refused, Modes, Count };
+enum class DrawFragmentBlockMiss : std::uint8_t { None, NotReusable, SpaceReuse, Bda, HeapStage, Lease, CopiedWrites, GpuCopies, BufferWrites, StorageWrites, FaultBuffer, NoBuffers, Stencil, MeshWindow, Ineligible, Refused, Modes, Count };
 
 struct DrawRecordFragment {
     DrawExpressCapture expressCapture = DrawExpressCapture::None;

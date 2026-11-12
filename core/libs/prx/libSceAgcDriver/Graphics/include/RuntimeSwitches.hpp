@@ -123,6 +123,7 @@ enum class RuntimeSwitch : std::size_t {
     LabelOrderedStores,
     DeeperRing,
     DispatchBeside,
+    FaultFragments,
     Count,
 };
 

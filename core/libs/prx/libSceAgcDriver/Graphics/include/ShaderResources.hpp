@@ -456,7 +456,10 @@ public:
     // `preparedSelection` tells whether it did.
     std::shared_ptr<DrawBindings> PreparePushedDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, const PushPlan& plan, std::vector<std::size_t>* selectedOut = nullptr, const PreparedBuffers* prepared = nullptr, PreparedBuffers::Selection* preparedSelection = nullptr, BindingRoute* route = nullptr) const;
     void PushDrawBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
-    bool FragmentEligible() const { return reusable && !heapStage && bda == nullptr && !addressedBuffers && !rebound && context.descriptorCache != nullptr; }
+    bool FragmentEligible() const { return reusable && !heapStage && (bda == nullptr || FaultBufferLean()) && !addressedBuffers && !rebound && context.descriptorCache != nullptr; }
+    bool FaultBufferLean() const;
+    bool TakeFaultCheck(std::uint64_t recorder, std::uint64_t batch) const;
+    std::uint64_t FaultGeneration() const { return faultGeneration.load(std::memory_order_acquire); }
     enum class ExpressMiss : std::uint8_t { None, NotProved, Watch, Forget, Serials, Sources, Views, PendingCpu, Staging, Regions, Count };
     bool ExpressReady() const { return expressValid && cleanProved; }
     ExpressMiss ExpressCurrent();
@@ -1042,6 +1045,9 @@ private:
     std::unique_ptr<BdaResources> bda;
     std::vector<BdaResources::SrtGuardFaults> srtGuardFaults;
     bool usesBda = false;
+    mutable std::uint64_t faultCheckRecorder = 0;
+    mutable std::uint64_t faultCheckBatch = 0;
+    mutable std::atomic<std::uint64_t> faultGeneration{0};
     bool walksPageTables = true;
     bool bdaReadOnly = true;
     bool spaceReuse = false;

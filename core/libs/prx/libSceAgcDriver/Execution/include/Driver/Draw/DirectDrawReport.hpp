@@ -328,6 +328,7 @@ enum class Counter : std::uint16_t {
     FragmentsBlockGpuCopies,
     FragmentsBlockBufferWrites,
     FragmentsBlockStorageWrites,
+    FragmentsBlockFaultBuffer,
     FragmentsBlockNoBuffers,
     FragmentsBlockStencil,
     FragmentsBlockMeshWindow,
