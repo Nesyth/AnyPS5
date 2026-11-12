@@ -1545,17 +1545,18 @@ void NoteDirectCommit(const DrawRecordCommit& commit, bool recorded) {
     else if (effects.hold != DrawRecordHold::Count) DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::HoldFirst) + static_cast<std::size_t>(effects.hold) - static_cast<std::size_t>(DrawRecordHold::First)));
 }
 
-void NoteExpressVerify(const DrawRecord& record, DrawRecordCommit& commit, const Graphics::DrawRecipeOutcome& outcome, const std::shared_ptr<DrawExpressKeep>& keep, const std::vector<std::uint64_t>& versions) {
+void NoteExpressVerify(const DrawRecord& record, DrawRecordCommit& commit, const Graphics::DrawRecipeOutcome& outcome, const std::shared_ptr<DrawExpressKeep>& keep, const std::vector<std::uint64_t>& versions, bool reprove) {
     using DirectDraws::Counter;
     using CleanProof = Graphics::ShaderResources::CleanProof;
     DirectDraws::Add(Counter::ExpressVerifyChecked);
     const char* what = nullptr;
     const auto proof = commit.effects.cleanProof;
-    if (!outcome.recorded && outcome.miss == Graphics::DrawRecipeMiss::Proof) what = "the template proof";
+    if (reprove) what = nullptr;
+    else if (!outcome.recorded && outcome.miss == Graphics::DrawRecipeMiss::Proof) what = "the template proof";
     else if (proof.has_value() && (*proof == CleanProof::Rewritten || *proof == CleanProof::Forgotten || *proof == CleanProof::PendingWrites || *proof == CleanProof::Failed)) what = "the template's memory";
     else if (!outcome.recorded && outcome.miss == Graphics::DrawRecipeMiss::TargetGone) what = "a target";
     for (std::size_t index = 0; what == nullptr && keep != nullptr && index < keep->targets.size() && index < versions.size(); ++index) {
-        if (keep->targets[index]->UploadVersion() != versions[index]) what = "a target's content";
+        if (keep->targets[index] != nullptr && keep->targets[index]->UploadVersion() != versions[index]) what = "a target's content";
     }
     if (what == nullptr) return;
     DirectDraws::Add(Counter::ExpressVerifyDiffering);
@@ -1903,6 +1904,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         auto* fragment = fragmentsOn && hit.fragment.has_value() ? &*hit.fragment : nullptr;
         std::optional<Graphics::DrawRecipeOutcome> expressedOutcome;
         std::shared_ptr<DrawExpressKeep> verifyKeep;
+        bool verifyReprove = false;
         std::vector<std::uint64_t> verifyVersions;
         if (fragment != nullptr && !repeatedOutcome.has_value() && tracePtr == nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ExpressCommits)) {
             using DirectDraws::Counter;
@@ -1925,12 +1927,13 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
                 DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::ExpressNoState) + static_cast<std::size_t>(reason) - static_cast<std::size_t>(DrawExpressMiss::NoState)));
                 if (expressed.verify && commit.express != nullptr && commit.express->keep != nullptr) {
                     verifyKeep = commit.express->keep;
-                    for (const auto& target : verifyKeep->targets) verifyVersions.push_back(target->UploadVersion());
+                    verifyReprove = expressed.reproved;
+                    for (const auto& target : verifyKeep->targets) verifyVersions.push_back(target != nullptr ? target->UploadVersion() : 0u);
                 }
             }
         }
         const auto outcome = expressedOutcome.has_value() ? *expressedOutcome : repeatedOutcome.has_value() ? *repeatedOutcome : localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, nullptr, prepared, fullInputs, fragment);
-        if (verifyKeep != nullptr) NoteExpressVerify(*hit.record, commit, outcome, verifyKeep, verifyVersions);
+        if (verifyKeep != nullptr) NoteExpressVerify(*hit.record, commit, outcome, verifyKeep, verifyVersions, verifyReprove);
         if (fragment != nullptr && !expressedOutcome.has_value() && !repeatedOutcome.has_value() && tracePtr == nullptr && commit.effects.fragment.expressCapture == DrawExpressCapture::None && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ExpressCommits)) DirectDraws::Add(DirectDraws::Counter::ExpressCaptureUnreached);
         if (fragmentsOn) NoteCommitFragments(*hit.record, commit, fragmentTimed && outcome.recorded, fragmentTimed ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - fragmentBegan).count()) : 0u);
         if (timed && !repeatedOutcome.has_value() && outcome.recorded && commit.effects.hold == DrawRecordHold::Held && !commit.effects.sharedHold) {

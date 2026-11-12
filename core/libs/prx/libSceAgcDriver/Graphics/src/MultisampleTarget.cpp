@@ -1555,6 +1555,13 @@ void KeepMultisampleTarget_nid_no_patch(const std::shared_ptr<void>& owner) {
     std::static_pointer_cast<MultisampleTarget>(owner)->Keep();
 }
 
+void NoteMultisampleTargetDrawn_nid_no_patch(const std::shared_ptr<void>& owner) {
+    TargetsLock lock;
+    auto& target = *std::static_pointer_cast<MultisampleTarget>(owner);
+    target.drawn = true;
+    ++target.contents;
+}
+
 namespace {
 
 bool redBlueSwapped(VkFormat rendered, VkFormat sampled) {

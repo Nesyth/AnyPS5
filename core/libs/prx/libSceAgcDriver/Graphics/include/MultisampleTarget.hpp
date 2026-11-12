@@ -112,6 +112,7 @@ VkImageView MultisampleTargetView(const Context& context, const ColorTarget& tar
 VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target, std::shared_ptr<void>& owner, VkImage* image = nullptr);
 void PrepareMultisampleTargetForDraw_nid_no_patch(const Context& context, const ColorTarget& target);
 void KeepMultisampleTarget_nid_no_patch(const std::shared_ptr<void>& owner);
+void NoteMultisampleTargetDrawn_nid_no_patch(const std::shared_ptr<void>& owner);
 void MaterializeMultisampleTargetClear(const Context& context, const ColorTarget& target);
 MultisampleStorage MultisampleTargetStorageView(const Context& context, const GuestTextureResource& resource, bool uintStorage = false);
 bool MultisampleTargetStorable(const Context& context, const ColorTarget& target);

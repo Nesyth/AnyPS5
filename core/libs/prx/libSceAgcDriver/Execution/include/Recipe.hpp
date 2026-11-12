@@ -184,6 +184,7 @@ struct DrawExpressKeep {
     std::shared_ptr<const Graphics::Pipeline> pipeline;
     std::shared_ptr<Graphics::Framebuffer> framebuffer;
     std::vector<std::shared_ptr<Graphics::StorageTexture>> targets;
+    std::vector<std::shared_ptr<void>> multisample;
 };
 
 struct DrawExpress {
@@ -196,6 +197,7 @@ struct DrawExpress {
     std::vector<std::uint64_t> targetEpochs;
     std::vector<std::uint64_t> targetVersions;
     std::vector<std::uint64_t> dccAddresses;
+    std::vector<VkImage> multisampleImages;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> slices;
     std::uint64_t passKey = 0;
     bool fenced = false;

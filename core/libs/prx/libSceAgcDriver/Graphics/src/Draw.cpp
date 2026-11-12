@@ -6087,7 +6087,7 @@ void publishFragmentBlock(const Context& context, DrawRecordCommit& record, cons
 
 std::uint64_t commitFragmentVerifyOrdinal = 0;
 
-void captureExpress(const Context& context, const State& state, const DrawRecipe& recipe, DrawRecordCommit& record, const Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, const DrawFragment& fragment, std::shared_ptr<Framebuffer> framebuffer, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::pair<std::uint32_t, std::uint32_t>> slices) {
+void captureExpress(const Context& context, const State& state, const DrawRecipe& recipe, DrawRecordCommit& record, const Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, const DrawFragment& fragment, std::shared_ptr<Framebuffer> framebuffer, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::pair<std::uint32_t, std::uint32_t>> slices, std::vector<std::shared_ptr<void>> multisample, std::vector<VkImage> multisampleImages) {
     record.express.reset();
     auto& noted = record.effects.fragment.expressCapture;
     if (!record.effects.fragment.spliced && !record.effects.fragment.replayed) {
@@ -6103,7 +6103,13 @@ void captureExpress(const Context& context, const State& state, const DrawRecipe
         return;
     }
     const auto& access = record.access;
-    if (access.resources != resources.get() || access.readsTarget || targets.size() != slices.size() || std::ranges::any_of(targets, [](const std::shared_ptr<StorageTexture>& target) { return target == nullptr; })) {
+    multisample.resize(targets.size());
+    multisampleImages.resize(targets.size(), VK_NULL_HANDLE);
+    bool targetsKnown = true;
+    for (std::size_t index = 0; index < targets.size(); ++index) {
+        if (targets[index] == nullptr && (multisample[index] == nullptr || multisampleImages[index] == VK_NULL_HANDLE)) targetsKnown = false;
+    }
+    if (access.resources != resources.get() || access.readsTarget || targets.size() != slices.size() || !targetsKnown) {
         noted = DrawExpressCapture::Access;
         return;
     }
@@ -6117,9 +6123,12 @@ void captureExpress(const Context& context, const State& state, const DrawRecipe
     keep->pipeline = fragment.pipeline;
     keep->framebuffer = std::move(framebuffer);
     keep->targets = std::move(targets);
+    keep->multisample = std::move(multisample);
+    express->multisampleImages = std::move(multisampleImages);
     for (std::size_t index = 0; index < keep->targets.size(); ++index) {
-        express->targetEpochs.push_back(keep->targets[index]->StateEpoch());
-        express->targetVersions.push_back(keep->targets[index]->UploadVersion());
+        const auto* target = keep->targets[index].get();
+        express->targetEpochs.push_back(target != nullptr ? target->StateEpoch() : 0u);
+        express->targetVersions.push_back(target != nullptr ? target->UploadVersion() : 0u);
         express->dccAddresses.push_back(index < state.colors.size() ? SurfaceForTarget(state.colors[index]).dccAddress : 0u);
     }
     express->slices = std::move(slices);
@@ -6681,6 +6690,16 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         drawn.bindings = &record.effects.bindings;
         record.effects.bindings.dynamicLeave = static_cast<std::uint8_t>(DynamicLeave::Prepared);
     }
+    std::vector<std::shared_ptr<void>> expressMultisample;
+    std::vector<VkImage> expressMultisampleImages;
+    if (multisampleRecipe && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits)) {
+        expressMultisample = multisampleOwners;
+        expressMultisampleImages.assign(recipe.targets.size(), VK_NULL_HANDLE);
+        std::size_t next = 0;
+        for (std::size_t index = 0; index < recipe.targets.size() && index < recipe.multisampled.size(); ++index) {
+            if (recipe.multisampled[index] != 0u && next < multisampleImages.size()) expressMultisampleImages[index] = multisampleImages[next++];
+        }
+    }
     drawn.multisampleImages = std::move(multisampleImages);
     for (auto& owner : multisampleOwners) {
         if (owner != nullptr) drawn.multisampleTargets.push_back(std::move(owner));
@@ -6696,12 +6715,11 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         const auto every = CommitFragmentsVerifyEvery();
         drawn.fragmentVerify = every != 0 && ++commitFragmentVerifyOrdinal % every == 0;
     }
-    const bool expressWanted = usableFragment != nullptr && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits) && lean && !multisampleRecipe && !record.expressRefused && PixelFunctionLdsSubgroup(shaders) == 0u && std::ranges::none_of(state.colors, [](const auto& color) { return color.fmaskAddress != 0; });
+    const bool expressWanted = usableFragment != nullptr && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits) && lean && !record.expressRefused && PixelFunctionLdsSubgroup(shaders) == 0u && std::ranges::none_of(state.colors, [](const auto& color) { return color.fmaskAddress != 0; });
     if (!expressWanted && usableFragment != nullptr && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits)) {
         record.express.reset();
         auto& noted = record.effects.fragment.expressCapture;
         if (!lean) noted = DrawExpressCapture::NotLean;
-        else if (multisampleRecipe) noted = DrawExpressCapture::Multisampled;
         else if (record.expressRefused) noted = DrawExpressCapture::Refused;
         else if (PixelFunctionLdsSubgroup(shaders) != 0u) noted = DrawExpressCapture::FunctionLds;
         else noted = DrawExpressCapture::Fmask;
@@ -6723,7 +6741,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     const void* blockPushKey = drawn.pushPipeline.get();
     recordDraw(context, state, draw, shaders, inputs, drawn, outcome, timer, ownWaitedMs, trace);
     if (RuntimeSwitches::Set(RuntimeSwitch::CommitFragments) || record.fragmentResources != nullptr) publishFragmentBlock(context, record, drawn.resources, blockPipeline, blockPushPipeline, blockPipelineKey, blockPushKey, push, lean && bound != nullptr && !stencilReferences && !UsesMeshWindow(shaders));
-    if (expressWanted && expressFramebuffer != nullptr) captureExpress(context, state, recipe, record, *recorder, drawn.resources, *usableFragment, std::move(expressFramebuffer), std::move(expressTargets), std::move(expressSlices));
+    if (expressWanted && expressFramebuffer != nullptr) captureExpress(context, state, recipe, record, *recorder, drawn.resources, *usableFragment, std::move(expressFramebuffer), std::move(expressTargets), std::move(expressSlices), std::move(expressMultisample), std::move(expressMultisampleImages));
     if (dynamicRoute && drawn.bindings != nullptr && drawn.bindings->pushed && drawn.bindings->written) record.secondSetWritten = true;
     record.effects.passHeld = held;
     if ((!multisampleRecipe || RuntimeSwitches::Set(RuntimeSwitch::MsaaRecordHold)) && recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {
@@ -7129,6 +7147,31 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     if (templateMiss != ShaderResources::ExpressMiss::None && !reprove) return miss(DrawExpressMiss::Template);
     for (std::size_t index = 0; index < keep.targets.size(); ++index) {
         const auto& target = keep.targets[index];
+        if (target == nullptr) {
+            if (index >= state.colors.size() || index >= keep.multisample.size() || keep.multisample[index] == nullptr || index >= express->multisampleImages.size() || index >= recipe->targetViews.size()) return miss(DrawExpressMiss::Targets);
+            struct MultisampleChecked {
+                const void* owner = nullptr;
+                std::uint64_t recorder = 0;
+                std::uint64_t generation = 0;
+            };
+            thread_local std::array<MultisampleChecked, 8> checked{};
+            thread_local std::size_t nextChecked = 0;
+            const auto* owner = keep.multisample[index].get();
+            const auto found = std::ranges::find_if(checked, [&](const MultisampleChecked& entry) { return entry.owner == owner; });
+            if (!recorder->RenderPassOpen() || found == checked.end() || found->recorder != recorder->Id() || found->generation != recorder->RenderPassGeneration()) {
+                const auto generation = recorder->RenderPassGeneration();
+                std::shared_ptr<void> current;
+                VkImage image = VK_NULL_HANDLE;
+                const auto view = MultisampleTargetView(context, state.colors[index], current, &image);
+                if (view != recipe->targetViews[index] || current.get() != owner || image != express->multisampleImages[index]) return miss(DrawExpressMiss::Targets);
+                auto& slot = found != checked.end() ? *found : checked[nextChecked++ % checked.size()];
+                slot = {owner, recorder->Id(), generation};
+                ++out.refreshed;
+            } else {
+                NoteMultisampleTargetDrawn_nid_no_patch(keep.multisample[index]);
+            }
+            continue;
+        }
         if (index >= state.colors.size() || !target->Cached()) return miss(DrawExpressMiss::Targets);
         const auto& color = state.colors[index];
         const auto dcc = SurfaceForTarget(color).dccAddress;
@@ -7169,6 +7212,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     if (preparedInputs == nullptr || !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || record.verifyInputs) return miss(DrawExpressMiss::Inputs);
     if (verifyDue) {
         out.verify = true;
+        out.reproved = reprove;
         return miss(DrawExpressMiss::Verify);
     }
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
@@ -7235,6 +7279,9 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     keepFragmentBindings(*recorder, fragment->bindings);
     if (express->keptRecorder != recorder->Id() || express->keptBatch != recorder->OpenSerial()) {
         recorder->Keep(express->keep);
+        for (const auto& owner : keep.multisample) {
+            if (owner != nullptr) KeepMultisampleTarget_nid_no_patch(owner);
+        }
         express->keptRecorder = recorder->Id();
         express->keptBatch = recorder->OpenSerial();
     }
@@ -7243,7 +7290,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
     auto& passAttachments = HostThreadLocal<std::vector<std::pair<VkImage, bool>>, ExpressAttachmentsStorage>();
     passAttachments.clear();
-    for (const auto& target : keep.targets) passAttachments.emplace_back(target->Image(), true);
+    for (std::size_t index = 0; index < keep.targets.size(); ++index) passAttachments.emplace_back(keep.targets[index] != nullptr ? keep.targets[index]->Image() : express->multisampleImages[index], true);
     const PassAccess passAccess{passReads, express->writes, express->images, passAttachments, false, false, express->writeOnly};
     resources.RequireGuestBuffers();
     const auto start = recorder->StartDrawPass(express->passKey, false, express->fenced, passAccess);
@@ -7281,6 +7328,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     const auto recorderId = recorder->Id();
     for (std::size_t index = 0; index < keep.targets.size(); ++index) {
         auto* target = keep.targets[index].get();
+        if (target == nullptr) continue;
         const auto [slice, count] = express->slices[index];
         if (target->RenoteInPass(recorderId, recorder->RenderPassGeneration(), slice, count)) {
             ++record.effects.notesSkipped;
@@ -7306,7 +7354,8 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         remembered.depthSerial = DepthSurfacesSerial();
         remembered.depthReleased = DepthSurfacesReleased();
         remembered.versions.clear();
-        for (const auto& target : keep.targets) remembered.versions.push_back(target->UploadVersion());
+        for (const auto& target : keep.targets) remembered.versions.push_back(target != nullptr ? target->UploadVersion() : 0u);
+        if (std::ranges::any_of(keep.multisample, [](const std::shared_ptr<void>& owner) { return owner != nullptr; })) remembered.valid = false;
     } else {
         record.pass.valid = false;
     }
