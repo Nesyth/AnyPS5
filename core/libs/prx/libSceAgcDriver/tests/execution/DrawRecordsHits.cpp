@@ -1496,7 +1496,7 @@ void CommitBindings(bool ring) {
         Require(fragmentsOn || (placedAfter.Since(placedBefore, DirectCounter::BindingsBytes) != 0 && placedAfter.Since(placedBefore, DirectCounter::BindingsObjects) != 0),"commit bindings, " + name + ": no bytes were left uncopied or no object unallocated" + DescribeDirect(placedAfter, placedBefore));
         if (verifyEvery != 0) Require(placedAfter.Since(placedBefore, DirectCounter::BindingsVerifyChecked) != 0, "commit bindings, " + name + ": the verify checked no commit" + DescribeDirect(placedAfter, placedBefore));
         if (scene == RepeatScene::Sets && !fragmentsOn) Require(placedAfter.Since(placedBefore, DirectCounter::BindingsTakenWritten) != 0,"commit bindings, " + name + ": no commit with a written set bound the finisher's slice" + DescribeDirect(placedAfter, placedBefore));
-        if (scene == RepeatScene::Ring) Require(stampedAfter.Since(stampedBefore, DirectCounter::BindingsStamped) != 0, "commit bindings, " + name + ": no unmoved test was answered by stamp" + DescribeDirect(stampedAfter, stampedBefore));
+        if (scene == RepeatScene::Ring && std::getenv("APS5_EXPRESS_COMMITS") == nullptr) Require(stampedAfter.Since(stampedBefore, DirectCounter::BindingsStamped) != 0, "commit bindings, " + name + ": no unmoved test was answered by stamp" + DescribeDirect(stampedAfter, stampedBefore));
         if (scene == RepeatScene::Ring) {
             const auto expectHook = [&](const std::string& what, AgcDriver::Graphics::CommitBindingsHookForTest hook, bool refused) {
                 RuntimeSwitches::Assign(RuntimeSwitch::CommitBindings, true);

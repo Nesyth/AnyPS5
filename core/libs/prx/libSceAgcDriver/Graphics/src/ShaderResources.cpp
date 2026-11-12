@@ -5189,7 +5189,7 @@ void ShaderResources::recordClean(bool proved, const CleanStamp& stamp) {
 }
 
 bool ShaderResources::expressEligible() const {
-    return reusable && !heapStage && bda == nullptr && !addressedBuffers && !rebound && !GuestMemory::WriteIndexEnabled() && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits);
+    return reusable && cleanEligibility <= 1 && storageTextures.empty() && !heapStage && bda == nullptr && !addressedBuffers && !rebound && !GuestMemory::WriteIndexEnabled() && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits);
 }
 
 ShaderResources::ExpressBefore ShaderResources::expressBefore() {
@@ -5198,15 +5198,11 @@ ShaderResources::ExpressBefore ShaderResources::expressBefore() {
     if (!expressEligible()) return before;
     if (expressWatch == nullptr) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-        ranges.reserve(describedRanges.size() * 2u + storageTextures.size());
+        ranges.reserve(describedRanges.size() * 2u);
         for (const auto& range : describedRanges) {
             ranges.emplace_back(range.address, range.address + range.bytes);
             if (range.dccAddress != 0) ranges.emplace_back(range.dccAddress, range.dccAddress + DccKeyBytes(range.bytes));
         }
-        for (const auto& image : storageTextures) {
-            if (image != nullptr) ranges.emplace_back(image->Descriptor().baseAddress, image->Descriptor().baseAddress + image->GuestBytes());
-        }
-        for (const auto& region : directRegions) ranges.emplace_back(region.begin, region.regionEnd != 0 ? std::max(region.end, region.regionEnd) : region.end);
         expressWatch = GuestMemory::SubscribeWriteGeneration(ranges);
     }
     before.generation = GuestMemory::SubscriptionGeneration(*expressWatch);
@@ -5260,7 +5256,29 @@ void ShaderResources::ExpressStage(Recorder& recorder) {
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report, CleanProof* clean) {
-    if (!expressValid && expressWatch == nullptr && !RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits)) return revalidateClean(shaders, report, clean);
+    if (!RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits)) {
+        if (expressValid || expressWatch != nullptr) {
+            expressValid = false;
+            expressWatch.reset();
+        }
+        return revalidateClean(shaders, report, clean);
+    }
+    if (clean != nullptr && expressValid && !verifyCleanCurrency() && ExpressCurrent() == ExpressMiss::None) {
+        bool staged = true;
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+            try {
+                ExpressStage(*recorder);
+            } catch (const std::exception&) {
+                staged = false;
+            }
+        }
+        if (staged) {
+            noteClean(CleanEvent::Hit);
+            if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::None};
+            *clean = CleanProof::Skipped;
+            return true;
+        }
+    }
     const auto before = expressBefore();
     const bool proved = revalidateClean(shaders, report, clean);
     expressAfter(proved, before);

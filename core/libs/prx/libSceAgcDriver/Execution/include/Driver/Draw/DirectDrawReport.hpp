@@ -298,6 +298,8 @@ enum class Counter : std::uint16_t {
     ExpressVerifyDiffering,
     ExpressNanoseconds,
     ExpressTimed,
+    ExpressReproved,
+    ExpressRefreshed,
     ExpressCaptured,
     ExpressCaptureNotSpliced,
     ExpressCaptureObjects,
@@ -311,6 +313,12 @@ enum class Counter : std::uint16_t {
     ExpressCaptureStaging,
     ExpressCaptureRegions,
     ExpressCaptureAccess,
+    ExpressCaptureNotLean,
+    ExpressCaptureMultisampled,
+    ExpressCaptureRefused,
+    ExpressCaptureFunctionLds,
+    ExpressCaptureFmask,
+    ExpressCaptureUnreached,
     Count,
 };
 

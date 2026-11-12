@@ -167,6 +167,8 @@ std::uint64_t CommitFragmentsVerifyEvery();
 struct ExpressOutcome {
     bool taken = false;
     bool verify = false;
+    bool reproved = false;
+    std::uint32_t refreshed = 0;
     DrawExpressMiss miss = DrawExpressMiss::None;
     DrawRecipeOutcome result;
 };
