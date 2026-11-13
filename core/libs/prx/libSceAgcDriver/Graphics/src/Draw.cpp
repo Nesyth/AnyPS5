@@ -7519,7 +7519,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     if (recipe->hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     if (const auto present = Recorder::Presents(); record.touchedPresent != present) {
         if ((!atFloor && !RuntimeSwitches::Set(RuntimeSwitch::TemplateTouch)) || resources.TouchedPresent() != present) {
-            SharedResourceCache().Touch(recipe->key);
+            SharedResourceCache().TouchObject(recipe->key, resources);
             resources.NoteTouchedPresent(present);
         }
         record.touchedPresent = present;

@@ -656,6 +656,10 @@ public:
     // The present in which a record commit last touched this template's resource cache entry (APS5_TEMPLATE_TOUCH).
     std::uint64_t TouchedPresent() const { return touchedPresent; }
     void NoteTouchedPresent(std::uint64_t present) { touchedPresent = present; }
+    void NoteCacheUse() const {
+        if (!cacheUsed.load(std::memory_order_relaxed)) cacheUsed.store(true, std::memory_order_relaxed);
+    }
+    bool TakeCacheUse() const { return cacheUsed.exchange(false, std::memory_order_relaxed); }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     static std::uint64_t DepthGuardRefusals();
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
@@ -992,6 +996,7 @@ private:
     // of a Pending failure in element order (empty otherwise), `accepted` whether a foreign overlap
     // was accepted by either rule (the verify switch then runs the full walk beside the proof).
     std::uint64_t touchedPresent = ~std::uint64_t{0};
+    mutable std::atomic<bool> cacheUsed{false};
     bool fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted, const std::vector<std::size_t>* only = nullptr, bool withStorage = true, bool compares = true);
     enum class IndexOutcome : std::uint8_t { Accepted, Partial, Fallback };
     IndexOutcome indexRevalidate(std::span<const CompiledShader> shaders, std::uint64_t serialBefore);
@@ -1410,6 +1415,7 @@ public:
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);
+    bool TouchObject(const Key& key, const ShaderResources& object);
     // Find and Touch calls so far (the [rescache] line: a recipe hit touches instead of finding).
     static std::uint64_t Finds();
     static std::uint64_t Touches();
@@ -1459,6 +1465,7 @@ private:
     std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
     std::size_t capacity = 0;
     bool fixedCapacity = false;
+    std::atomic<bool> lazyTouch{false};
     std::list<std::size_t> evictedOrder;
     std::unordered_map<std::size_t, decltype(evictedOrder)::iterator> evictedKeys;
     std::size_t evictionsSinceCheck = 0;

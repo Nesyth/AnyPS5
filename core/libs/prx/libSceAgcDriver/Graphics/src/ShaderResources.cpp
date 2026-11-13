@@ -6022,8 +6022,15 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         fixedCapacity = parsed != 0;
         capacity = fixedCapacity ? static_cast<std::size_t>(parsed) : baseEntries;
     }
+    lazyTouch.store(fixedCapacity || capacity <= baseEntries, std::memory_order_relaxed);
     noteUse(key);
+    std::size_t spared = 0;
     while (entries.size() > capacity) {
+        if (spared < entries.size() && entries.back().second->TakeCacheUse()) {
+            entries.splice(entries.begin(), entries, std::prev(entries.end()));
+            ++spared;
+            continue;
+        }
         noteEvicted(entries.back().first);
         if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
         index.erase(entries.back().first);
@@ -6034,7 +6041,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     for (const auto& entry : entries) tables += entry.second->TableElements();
     for (auto it = std::prev(entries.end()); tables > TableElementBudget() && it != entries.begin();) {
         const auto elements = it->second->TableElements();
-        if (elements == 0) {
+        if (elements == 0 || it->second->TakeCacheUse()) {
             --it;
             continue;
         }
@@ -6098,6 +6105,13 @@ bool ResourceCache::Touch(const Key& key) {
     if (found == index.end()) return false;
     entries.splice(entries.begin(), entries, found->second);
     noteUse(key);
+    return true;
+}
+
+bool ResourceCache::TouchObject(const Key& key, const ShaderResources& object) {
+    if (!lazyTouch.load(std::memory_order_relaxed)) return Touch(key);
+    resourceCacheTouches.fetch_add(1, std::memory_order_relaxed);
+    object.NoteCacheUse();
     return true;
 }
 
