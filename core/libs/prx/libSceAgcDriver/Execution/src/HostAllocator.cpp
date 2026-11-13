@@ -202,6 +202,52 @@ std::size_t CensusBucket(const void* block) noexcept {
     return static_cast<std::size_t>(((reinterpret_cast<std::uintptr_t>(block) >> 4) * 0x9e3779b97f4a7c15ull) >> 48);
 }
 
+bool CensusWalks() noexcept {
+    const char* text = std::getenv("APS5_HEAP_CENSUS");
+    return text != nullptr && text[0] == 'w';
+}
+
+void CensusWalkHeaps() noexcept {
+    constexpr DWORD MostHeaps = 64;
+    constexpr std::size_t Sizes = 6;
+    static const char* const SizeNames[Sizes] = {"under 1 KiB", "1 to 16 KiB", "16 to 256 KiB", "256 KiB to 1 MiB", "1 to 16 MiB", "16 MiB and more"};
+    HANDLE heaps[MostHeaps];
+    const DWORD count = GetProcessHeaps(MostHeaps, heaps);
+    const HANDLE processHeap = GetProcessHeap();
+    for (DWORD index = 0; index < count && index < MostHeaps; ++index) {
+        std::uint64_t committed = 0, uncommitted = 0, overhead = 0, regions = 0;
+        std::uint64_t bytes[Sizes] = {};
+        std::uint64_t blocks[Sizes] = {};
+        if (!HeapLock(heaps[index])) continue;
+        const std::uint64_t began = GetTickCount64();
+        PROCESS_HEAP_ENTRY entry{};
+        while (HeapWalk(heaps[index], &entry)) {
+            if ((entry.wFlags & PROCESS_HEAP_REGION) != 0) {
+                committed += entry.Region.dwCommittedSize;
+                uncommitted += entry.Region.dwUnCommittedSize;
+                ++regions;
+            } else if ((entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) != 0) {
+                const std::size_t size = entry.cbData < 1024 ? 0 : entry.cbData < 16384 ? 1 : entry.cbData < 262144 ? 2 : entry.cbData < 1048576 ? 3 : entry.cbData < 16777216 ? 4 : 5;
+                bytes[size] += entry.cbData;
+                ++blocks[size];
+                overhead += entry.cbOverhead;
+            }
+        }
+        const std::uint64_t took = GetTickCount64() - began;
+        HeapUnlock(heaps[index]);
+        std::uint64_t busy = 0, busyBlocks = 0;
+        for (std::size_t size = 0; size < Sizes; ++size) {
+            busy += bytes[size];
+            busyBlocks += blocks[size];
+        }
+        if (committed < (std::uint64_t{16} << 20) && busy < (std::uint64_t{16} << 20)) continue;
+        char text[768];
+        int length = std::snprintf(text, sizeof(text), "[heap-census] heap %lu%s: %llu MiB committed and %llu MiB not committed in %llu regions; %llu MiB busy in %llu blocks, %llu MiB of block overhead; walked in %llu ms; busy by block size:", static_cast<unsigned long>(index), heaps[index] == processHeap ? " (the process heap)" : "", static_cast<unsigned long long>(committed >> 20), static_cast<unsigned long long>(uncommitted >> 20), static_cast<unsigned long long>(regions), static_cast<unsigned long long>(busy >> 20), static_cast<unsigned long long>(busyBlocks), static_cast<unsigned long long>(overhead >> 20), static_cast<unsigned long long>(took));
+        for (std::size_t size = 0; size < Sizes && length > 0 && static_cast<std::size_t>(length) < sizeof(text); ++size) length += std::snprintf(text + length, sizeof(text) - static_cast<std::size_t>(length), " %s %llu MiB (%llu)%s", SizeNames[size], static_cast<unsigned long long>(bytes[size] >> 20), static_cast<unsigned long long>(blocks[size]), size + 1 < Sizes ? "," : "\n");
+        std::fputs(text, stderr);
+    }
+}
+
 void CensusReport() noexcept {
     AcquireSRWLockExclusive(&censusReportLock);
     for (auto& site : censusSites) site = {};
@@ -249,6 +295,7 @@ void CensusReport() noexcept {
         std::fputs(text, stderr);
         censusSites[best].bytes = 0;
     }
+    if (CensusWalks()) CensusWalkHeaps();
     ReleaseSRWLockExclusive(&censusReportLock);
 }
 
