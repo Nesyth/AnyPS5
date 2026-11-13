@@ -34,6 +34,8 @@ private:
     std::atomic<std::uint32_t> seq{0};
     std::atomic<std::uint32_t> count{0};
     std::atomic<std::uint32_t> unknown{0};
+    std::atomic<std::uint64_t> lowest{0};
+    std::atomic<std::uint64_t> highest{0};
     std::array<std::atomic<std::uint64_t>, Capacity * 2> bounds{};
 };
 

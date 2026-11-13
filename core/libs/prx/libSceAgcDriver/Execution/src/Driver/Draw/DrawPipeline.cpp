@@ -187,10 +187,16 @@ void PublishedRanges::Publish(std::span<const std::pair<Range, std::uint32_t>> e
     seq.store(before + 1, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
     const auto size = entries.size() <= Capacity ? static_cast<std::uint32_t>(entries.size()) : Capacity + 1;
+    std::uint64_t low = ~std::uint64_t{0};
+    std::uint64_t high = 0;
     for (std::uint32_t index = 0; index < size && index < Capacity; ++index) {
         bounds[index * 2].store(entries[index].first.first, std::memory_order_relaxed);
         bounds[index * 2 + 1].store(entries[index].first.second, std::memory_order_relaxed);
+        low = std::min(low, entries[index].first.first);
+        high = std::max(high, entries[index].first.second);
     }
+    lowest.store(low, std::memory_order_relaxed);
+    highest.store(high, std::memory_order_relaxed);
     count.store(size, std::memory_order_relaxed);
     unknown.store(unknownHeld, std::memory_order_relaxed);
     seq.store(before + 2, std::memory_order_release);
@@ -205,8 +211,11 @@ PublishedRanges::Answer PublishedRanges::Overlaps(std::span<const Range> ranges)
         }
         const auto held = unknown.load(std::memory_order_relaxed);
         const auto size = count.load(std::memory_order_relaxed);
+        const auto low = lowest.load(std::memory_order_relaxed);
+        const auto high = highest.load(std::memory_order_relaxed);
+        const bool outside = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle) && std::none_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.first < high && low < range.second; });
         bool hit = false;
-        for (std::uint32_t index = 0; held == 0 && index < size && index < Capacity && !hit; ++index) {
+        for (std::uint32_t index = 0; held == 0 && !outside && index < size && index < Capacity && !hit; ++index) {
             const auto first = bounds[index * 2].load(std::memory_order_relaxed);
             const auto last = bounds[index * 2 + 1].load(std::memory_order_relaxed);
             hit = std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.first < last && first < range.second; });
@@ -1143,9 +1152,18 @@ void DrawFinisher::run(unsigned index) {
         {
             auto lock = lockFor(mutex);
             if (!finisherTakes(index) && !closing) {
+                lock.unlock();
+                ReleaseFinisherThread(FinisherNames[index]);
+                lock.lock();
                 dormant.fetch_or(1u << index, std::memory_order_seq_cst);
                 dormantWake.wait(lock, [&] { return closing || finisherTakes(index); });
                 dormant.fetch_and(~(1u << index), std::memory_order_seq_cst);
+                const bool leaving = closing;
+                lock.unlock();
+                if (!leaving) {
+                    if (index >= 5) PlaceFinisherSiblingThread(FinisherNames[index]);
+                    else if (index < 3 || std::getenv("APS5_EXTRA_FINISHERS_UNPINNED") == nullptr) PlaceFinisherThread(FinisherNames[index]);
+                }
                 continue;
             }
             ++sleepers;

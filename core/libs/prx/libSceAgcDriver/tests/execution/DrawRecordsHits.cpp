@@ -1423,7 +1423,9 @@ void QueuedStore(AgcDriver::DrawRecordCommit& record) {
 }
 
 std::size_t lingeringChunks() {
-    return 2u + (RuntimeSwitches::Set(RuntimeSwitch::SiblingFinishers) ? 4u : 0u);
+    std::size_t threads = RuntimeSwitches::Set(RuntimeSwitch::SiblingFinishers) ? 5u : 1u;
+    for (const auto id : {RuntimeSwitch::SecondFinisher, RuntimeSwitch::ThirdFinisher, RuntimeSwitch::FourthFinisher, RuntimeSwitch::FifthFinisher}) threads += RuntimeSwitches::Set(id) ? 1u : 0u;
+    return 2u * threads;
 }
 constexpr std::size_t SmallChunkBytes = 128;
 constexpr std::size_t RingChunkBytes = 1536;

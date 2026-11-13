@@ -349,6 +349,7 @@ std::set<unsigned> reservedCores;
 std::map<DWORD, unsigned> reservedThreads;
 std::set<unsigned> finisherCores;
 std::set<unsigned> siblingCores;
+std::set<DWORD> siblingThreads;
 
 using GetInformation = BOOL(WINAPI*)(void*, ULONG, PULONG, HANDLE, ULONG);
 using SetCpuSets = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
@@ -498,6 +499,7 @@ void placeSibling(const char* role) {
                 }
                 if (processors < 2) continue;
                 siblingCores.insert(core);
+                siblingThreads.insert(GetCurrentThreadId());
                 reservedThreads.emplace(GetCurrentThreadId(), core);
                 const bool thread = calls->setSelected(GetCurrentThread(), &own, 1) != 0;
                 std::fprintf(stderr, "[placement] %s on logical %u (second processor of reserved core %u, thread %s)\n", role, logical, core, thread ? "set" : "failed");
@@ -516,10 +518,18 @@ void releaseCore(const char* role) {
     const auto held = reservedThreads.find(GetCurrentThreadId());
     if (held == reservedThreads.end()) return;
     const unsigned core = held->second;
+    if (siblingThreads.erase(GetCurrentThreadId()) != 0) {
+        siblingCores.erase(core);
+        reservedThreads.erase(held);
+        const bool thread = calls->setSelected(GetCurrentThread(), nullptr, 0) != 0;
+        std::fprintf(stderr, "[placement] %s left the second processor of core %u (thread %s)\n", role, core, thread ? "set" : "failed");
+        return;
+    }
     const auto buffer = cpuSetInformation(*calls);
     if (buffer.empty()) return;
     reservedThreads.erase(held);
     reservedCores.erase(core);
+    finisherCores.erase(core);
     const auto applied = applyReservations(*calls, buffer);
     std::fprintf(stderr, "[placement] %s released core %u (%zu reserved in all: process default %s, %zu running threads moved; %zu other CPU sets)\n", role, core, reservedCores.size(), applied.process ? "set" : "failed", applied.moved, applied.others);
 }
@@ -549,6 +559,14 @@ void PlaceFinisherSiblingThread(const char* role) {
 #ifdef _WIN32
     if (std::getenv("APS5_NO_FINISHER_CORE") != nullptr || std::getenv("APS5_NO_COMMITTER_CORE") != nullptr) return;
     placeSibling(role);
+#else
+    (void)role;
+#endif
+}
+
+void ReleaseFinisherThread(const char* role) {
+#ifdef _WIN32
+    releaseCore(role);
 #else
     (void)role;
 #endif

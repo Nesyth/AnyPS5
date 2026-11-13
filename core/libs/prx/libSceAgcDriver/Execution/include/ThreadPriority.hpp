@@ -38,6 +38,7 @@ void PlaceReservedThread(const char* role);
 // (APS5_NO_COMMITTER_CORE=1 turns both off).
 void PlaceFinisherThread(const char* role);
 void PlaceFinisherSiblingThread(const char* role);
+void ReleaseFinisherThread(const char* role);
 // The next free physical core the same way for the calling thread while reserve is set (queue worker 0
 // under APS5_WORKER_CORE, which APS5_AB can flip in a run); with reserve unset the thread gives its core
 // back to the process default and the running threads.

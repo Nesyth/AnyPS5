@@ -250,7 +250,7 @@ void prepareBuffers(const LeanDrawJob& job, const LeanAnchor& anchor, const Dire
     for (const auto& item : prepared.selected) {
         if (item.begin != 0) read.emplace_back(item.begin, item.begin + item.bytes);
     }
-    if (!read.empty() && (!RangesSettled(read, resolved.before.get(), resolved.generation) || !Graphics::Recorder::ReadsSettled(read, pending.get()) || (queued.has_value() && DrawPipeline::Queue0().WrittenSince(*queued, read)))) {
+    if (!read.empty() && (!RangesSettled(read, resolved.before.get(), resolved.generation, Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle) ? pending.get() : nullptr) || (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle) && !Graphics::Recorder::ReadsSettled(read, pending.get())) || (queued.has_value() && DrawPipeline::Queue0().WrittenSince(*queued, read)))) {
         DirectDraws::Add(Counter::BuffersUnsettled);
         hit.preparedBuffers.reset();
         return;
@@ -304,7 +304,7 @@ void prepareInputs(const LeanDrawJob& job, const LeanAnchor& anchor, const Direc
     auto& read = HostThreadLocal<AddressRanges, ReadStorage>();
     read.clear();
     if (hit.parameters.indexed) read.emplace_back(prepared.ranges.front().begin, prepared.ranges.front().end);
-    if (!read.empty() && (!RangesSettled(read, resolved.before.get(), resolved.generation) || !Graphics::Recorder::ReadsSettled(read, pending.get()) || (queued.has_value() && DrawPipeline::Queue0().WrittenSince(*queued, read)))) {
+    if (!read.empty() && (!RangesSettled(read, resolved.before.get(), resolved.generation, Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle) ? pending.get() : nullptr) || (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle) && !Graphics::Recorder::ReadsSettled(read, pending.get())) || (queued.has_value() && DrawPipeline::Queue0().WrittenSince(*queued, read)))) {
         DirectDraws::Add(Counter::InputsUnsettled);
         hit.preparedInputs.reset();
         return;
@@ -536,7 +536,7 @@ std::uint64_t DirectStores::Follow(std::uint64_t serial) {
     auto live = Graphics::RuntimeSwitches::Snapshot();
     // Switches that change only what the committer does with a hit, or only dispatch packets,
     // leave the stages and classes as they are, so an in-run A/B of one keeps the stores.
-    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic, Graphics::RuntimeSwitch::CommitFragments, Graphics::RuntimeSwitch::ExpressCommits, Graphics::RuntimeSwitch::XpStreamSegments, Graphics::RuntimeSwitch::XpNoEagerStore, Graphics::RuntimeSwitch::LabelOrderedStores, Graphics::RuntimeSwitch::DeeperRing, Graphics::RuntimeSwitch::BesideSampleDumps, Graphics::RuntimeSwitch::DispatchBeside, Graphics::RuntimeSwitch::FaultFragments, Graphics::RuntimeSwitch::StageMemo, Graphics::RuntimeSwitch::KeepFaultSlots, Graphics::RuntimeSwitch::SiblingFinishers}) live.Assign(id, false);
+    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic, Graphics::RuntimeSwitch::CommitFragments, Graphics::RuntimeSwitch::ExpressCommits, Graphics::RuntimeSwitch::XpStreamSegments, Graphics::RuntimeSwitch::XpNoEagerStore, Graphics::RuntimeSwitch::LabelOrderedStores, Graphics::RuntimeSwitch::DeeperRing, Graphics::RuntimeSwitch::BesideSampleDumps, Graphics::RuntimeSwitch::DispatchBeside, Graphics::RuntimeSwitch::FaultFragments, Graphics::RuntimeSwitch::StageMemo, Graphics::RuntimeSwitch::KeepFaultSlots, Graphics::RuntimeSwitch::SiblingFinishers, Graphics::RuntimeSwitch::FastSettle}) live.Assign(id, false);
     if (!tagged || deviceSerial != serial || !(live == switches)) {
         tagged = true;
         deviceSerial = serial;
@@ -860,6 +860,7 @@ struct StageMemo {
     std::vector<std::uint64_t> addresses;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> sorted;
     AddressRanges decodeRanges;
+    AddressRanges settled;
     std::uint64_t verifyOrdinal = 0;
     std::uint64_t missKey = 0;
     std::uint64_t patternVersion = 0;
@@ -1106,7 +1107,16 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, const DrawP
         auto& decodeRanges = memo.decodeRanges;
         decodeRanges.clear();
         for (std::size_t read = 0; read < entry.decodeReads.size(); ++read) decodeRanges.emplace_back(addresses[read], addresses[read] + entry.decodeReads[read].size);
-        if (!RangesSettled(stage.ranges, resolved.before.get(), resolved.generation) || (!decodeRanges.empty() && !RangesSettled(decodeRanges, resolved.before.get(), resolved.generation))) return StageMemoOutcome::Unsettled;
+        if (decodeRanges.empty()) {
+            if (!RangesSettled(stage.ranges, resolved.before.get(), resolved.generation)) return StageMemoOutcome::Unsettled;
+        } else if (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle)) {
+            if (!RangesSettled(stage.ranges, resolved.before.get(), resolved.generation) || !RangesSettled(decodeRanges, resolved.before.get(), resolved.generation)) return StageMemoOutcome::Unsettled;
+        } else {
+            auto& settled = memo.settled;
+            settled.assign(stage.ranges.begin(), stage.ranges.end());
+            settled.insert(settled.end(), decodeRanges.begin(), decodeRanges.end());
+            if (!RangesSettled(settled, resolved.before.get(), resolved.generation)) return StageMemoOutcome::Unsettled;
+        }
         stage.side = entry.side;
         bool forwarded = true;
         for (const auto& forward : entry.forwards->forwards) {
@@ -1474,7 +1484,12 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
             if (const char* what = stageMemoDifference(*memoKept, stage, resolved.vertexInfos[i], resolved.decodeReads[i]); what != nullptr) {
                 DirectDraws::Add(Counter::StageMemoVerifyDiffering);
                 static std::atomic<std::uint32_t> printed{0};
-                if (printed.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "[stage-memo-verify] %s differs: stage %zu of a draw with %zu stages\n", what, i, count);
+                if (printed.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    const auto* kept = memoKept->stage.shared.get();
+                    const auto* fresh = stage.shared.get();
+                    const auto wide = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+                    std::fprintf(stderr, "[stage-memo-verify] %s differs: stage %zu of a draw with %zu stages (kept variant %llx key %llx, fresh variant %llx key %llx, donor %s, patch %s)\n", what, i, count, wide(kept != nullptr ? kept->variant : 0), wide(kept != nullptr ? kept->key : 0), wide(fresh != nullptr ? fresh->variant : 0), wide(fresh != nullptr ? fresh->key : 0), kept != nullptr && fresh != nullptr && kept->donor.get() == fresh->donor.get() ? "same" : "other", kept != nullptr && fresh != nullptr && kept->patch.get() == fresh->patch.get() ? "same" : "other");
+                }
             }
         } else if (memoStage && memoAdmitted && slot != nullptr && slot->handle != nullptr) {
             if (const auto stored = rememberStage(job, program, i, cursorBefore, *slot, *invocation, reads, resolved)) DirectDraws::Add(*stored);

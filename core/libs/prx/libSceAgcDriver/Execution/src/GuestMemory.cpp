@@ -3335,6 +3335,10 @@ std::uint64_t TrackerGeneration() {
     return tracker.generation;
 }
 
+std::uint64_t TrackerGenerationNow() {
+    return Tracker().generation.load(std::memory_order_acquire);
+}
+
 void AdvanceTrackerGenerationForTest(std::uint64_t generation) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);

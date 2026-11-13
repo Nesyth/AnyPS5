@@ -127,6 +127,7 @@ enum class RuntimeSwitch : std::size_t {
     StageMemo,
     KeepFaultSlots,
     SiblingFinishers,
+    FastSettle,
     Count,
 };
 
