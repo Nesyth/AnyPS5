@@ -135,6 +135,7 @@ enum class RuntimeSwitch : std::size_t {
     LeanExpress,
     XpAppendCommits,
     PreciseSettle,
+    AppendCommits,
     Count,
 };
 

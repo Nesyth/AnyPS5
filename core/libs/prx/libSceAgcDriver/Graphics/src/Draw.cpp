@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuZones.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StagedMerge.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -7160,6 +7161,38 @@ void noteLeanExpressVerify(bool clear) {
     if (leanExpressDiffering.fetch_add(1, std::memory_order_relaxed) == 0 || printed.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[lean-express-verify] the buffer tests refuse a commit whose buffer ranges lie in memory no GPU write was marked for\n");
 }
 
+struct ExpressDepthChecked {
+    std::uint64_t recorder = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t address = 0;
+    VkImageView view = VK_NULL_HANDLE;
+};
+struct ExpressDepthStorage {};
+
+std::atomic<std::uint64_t> appendVerifyChecked{0};
+std::atomic<std::uint64_t> appendVerifyDiffering{0};
+
+bool appendVerifyDue() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_APPEND_COMMITS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    static std::uint64_t ordinal = 0;
+    return every != 0 && ++ordinal % every == 0;
+}
+
+struct AppendClaim {
+    bool armed = false;
+    bool confirmed = false;
+    ~AppendClaim() {
+        if (!armed) return;
+        const auto checked = appendVerifyChecked.fetch_add(1, std::memory_order_relaxed) + 1u;
+        const auto differing = confirmed ? appendVerifyDiffering.load(std::memory_order_relaxed) : appendVerifyDiffering.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (!confirmed && differing <= 16u) std::fprintf(stderr, "[append-commits-verify] a commit the append conditions accepted was refused, reproved, rechecked or refreshed by the full express commit\n");
+        if (checked % 16384u == 0u) std::fprintf(stderr, "[append-commits-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing));
+    }
+};
+
 std::atomic<std::uint64_t> appendCommitsTaken{0};
 std::atomic<std::uint64_t> appendCommitsFull{0};
 
@@ -7269,7 +7302,39 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     };
     thread_local FloorPass floorPass;
     const bool atFloor = RuntimeSwitches::Set(RuntimeSwitch::XpExpressFloor);
-    const bool sameTargets = atFloor && recorder->RenderPassOpen() && floorPass.recorder == recorder->Id() && floorPass.generation == recorder->RenderPassGeneration() && floorPass.framebuffer == keep.framebuffer.get();
+    AppendClaim appendClaim;
+    bool appended = false;
+    if (RuntimeSwitches::Set(RuntimeSwitch::AppendCommits) && !atFloor && !verifyDue && !reprove && templateMiss == ShaderResources::ExpressMiss::None && prepared != nullptr && preparedInputs != nullptr && !record.verifyBuffers && !record.verifyInputs && RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) && RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) && prepared->plan != nullptr && prepared->plan == resources.DirectBufferPlan(shaders) && context.recorder != nullptr && context.drawInputsInPlace && !StorageTexture::DrawnLinearPending() && !recorder->HasQueuedKeyStores() && !recorder->HasQueuedStores() && recorder->AppendablePass(express->passKey) != VK_NULL_HANDLE) {
+        const auto recorderId = recorder->Id();
+        const auto generation = recorder->RenderPassGeneration();
+        bool holds = !express->hasDepth || (DepthSurfacesSerial() == express->depthSerial && DepthSurfacesReleased() == express->depthReleased);
+        for (std::size_t index = 0; holds && index < keep.targets.size(); ++index) {
+            const auto& target = keep.targets[index];
+            holds = target != nullptr && index < state.colors.size() && target->Cached() && target->NotedInPass(recorderId, generation) && target->UploadVersion() == express->targetVersions[index];
+            if (!holds) break;
+            const auto dcc = SurfaceForTarget(state.colors[index]).dccAddress;
+            holds = dcc == express->dccAddresses[index] && StorageImageServesKeys(*target, dcc);
+        }
+        if (holds && recipe->hasDepth && state.depth.has_value()) {
+            const auto& checked = HostThreadLocal<ExpressDepthChecked, ExpressDepthStorage>();
+            const auto expected = recipe->targetViews.empty() ? VK_NULL_HANDLE : recipe->targetViews.back();
+            holds = checked.recorder == recorderId && checked.generation == generation && checked.address == state.depth->address && checked.view == expected;
+        }
+        if (holds) {
+            const auto& taken = *preparedInputs;
+            const std::size_t indexRanges = draw.indexed ? 1u : 0u;
+            holds = taken.recipe.get() == recipe && taken.device == context.device && taken.state == &state && taken.draw == &draw && taken.shaders == shaders.data() && taken.stages == shaders.size() && taken.ranges.size() >= indexRanges && (taken.forget & 1u) == 0 && GuestMemory::ForgetSerial() == taken.forget && HostImportSetGeneration() == taken.imports && GuestAllocations::GuestAllocationsGeneration_nid_postfix() == taken.mapping && (context.copiedWriters == nullptr || context.copiedWriters->empty()) && DrawCopiedWriters()->empty();
+            for (std::size_t at = 0; holds && at < taken.ranges.size(); ++at) {
+                const auto& range = taken.ranges[at];
+                const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+                holds = range.import != nullptr && (PendingZones::Clear(range.begin, bytes) || (!recorder->PendingWriteOverlaps(range.begin, bytes) && !PendingStorageOverlaps(range.begin, bytes, nullptr))) && !recorder->PendingLabelIn(range.begin, bytes);
+            }
+        }
+        holds = holds && resources.PreparedZonesClear(*prepared, *recorder);
+        if (holds && appendVerifyDue()) appendClaim.armed = true;
+        else appended = holds;
+    }
+    const bool sameTargets = appended || (atFloor && recorder->RenderPassOpen() && floorPass.recorder == recorder->Id() && floorPass.generation == recorder->RenderPassGeneration() && floorPass.framebuffer == keep.framebuffer.get());
     for (std::size_t index = 0; !sameTargets && index < keep.targets.size(); ++index) {
         const auto& target = keep.targets[index];
         if (target == nullptr) {
@@ -7318,13 +7383,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     }
     if (express->hasDepth && (DepthSurfacesSerial() != express->depthSerial || DepthSurfacesReleased() != express->depthReleased)) return miss(DrawExpressMiss::Depth);
     if (!sameTargets && recipe->hasDepth && state.depth.has_value()) {
-        struct DepthChecked {
-            std::uint64_t recorder = 0;
-            std::uint64_t generation = 0;
-            std::uint64_t address = 0;
-            VkImageView view = VK_NULL_HANDLE;
-        };
-        thread_local DepthChecked checked;
+        auto& checked = HostThreadLocal<ExpressDepthChecked, ExpressDepthStorage>();
         const auto expected = recipe->targetViews.empty() ? VK_NULL_HANDLE : recipe->targetViews.back();
         if (!recorder->RenderPassOpen() || checked.recorder != recorder->Id() || checked.generation != recorder->RenderPassGeneration() || checked.address != state.depth->address || checked.view != expected) {
             const auto generation = recorder->RenderPassGeneration();
@@ -7357,21 +7416,32 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     }
     DrawInputs inputs;
     const bool leanOn = RuntimeSwitches::Set(RuntimeSwitch::LeanExpress);
-    const auto taken = takePreparedInputs(context, state, draw, shaders, *recipe, *preparedInputs, inputs, timer, timing, atFloor, leanOn);
+    const auto taken = appended ? DrawRecordInputs::Used : takePreparedInputs(context, state, draw, shaders, *recipe, *preparedInputs, inputs, timer, timing, atFloor, leanOn);
+    if (appended) {
+        inputs.indexBytes = preparedInputs->indexBytes;
+        for (std::size_t at = 0; at < preparedInputs->ranges.size(); ++at) {
+            const auto& range = preparedInputs->ranges[at];
+            const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+            RequireNoMultisampleTarget(range.begin, bytes, at == 0 && draw.indexed ? "an index buffer read" : "a vertex buffer read");
+            recorder->NotePendingRead(range.begin, bytes, Recorder::ReadKind::DrawInput);
+        }
+    }
     if (taken != DrawRecordInputs::Used && taken != DrawRecordInputs::Rechecked) {
         record.effects = {};
         return miss(DrawExpressMiss::Inputs);
     }
     const auto giveBack = [&](DrawExpressMiss why) {
-        preparedInputs->vertexInput = std::move(inputs.vertexInput);
-        preparedInputs->vertexHandles = std::move(inputs.vertexHandles);
-        preparedInputs->vertexOffsets = std::move(inputs.vertexOffsets);
-        preparedInputs->inPlaceReads = std::move(inputs.inPlaceReads);
+        if (!appended) {
+            preparedInputs->vertexInput = std::move(inputs.vertexInput);
+            preparedInputs->vertexHandles = std::move(inputs.vertexHandles);
+            preparedInputs->vertexOffsets = std::move(inputs.vertexOffsets);
+            preparedInputs->inPlaceReads = std::move(inputs.inPlaceReads);
+        }
         record.effects = {};
         return miss(why);
     };
     record.effects.inputs = taken;
-    bool untouched = leanOn && (prepared->forget & 1u) == 0 && GuestMemory::ForgetSerial() == prepared->forget && resources.PreparedUntouched(*prepared);
+    bool untouched = appended || (leanOn && (prepared->forget & 1u) == 0 && GuestMemory::ForgetSerial() == prepared->forget && resources.PreparedUntouched(*prepared));
     if (untouched && leanExpressVerifyDue()) {
         const bool clear = resources.PreparedMovesClear(*prepared, *recorder, nullptr) && resources.UnmovedRangesClear(*prepared, *recorder);
         noteLeanExpressVerify(clear);
@@ -7423,7 +7493,8 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     }
     auto& passReads = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ExpressReadsStorage>();
     passReads.assign(express->reads.begin(), express->reads.end());
-    passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
+    const auto& inPlaceReads = appended ? preparedInputs->inPlaceReads : inputs.inPlaceReads;
+    passReads.insert(passReads.end(), inPlaceReads.begin(), inPlaceReads.end());
     auto& passAttachments = HostThreadLocal<std::vector<std::pair<VkImage, bool>>, ExpressAttachmentsStorage>();
     passAttachments.clear();
     for (std::size_t index = 0; index < keep.targets.size(); ++index) passAttachments.emplace_back(keep.targets[index] != nullptr ? keep.targets[index]->Image() : express->multisampleImages[index], true);
@@ -7498,6 +7569,8 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         record.pass.valid = false;
     }
     timing.Mark("draw_and_resource_release");
+    if (RuntimeSwitches::Set(RuntimeSwitch::AppendCommits)) noteAppendCommit(appended);
+    appendClaim.confirmed = out.refreshed == 0 && taken == DrawRecordInputs::Used && !reprove;
     out.taken = true;
     out.result.recorded = true;
     return out;

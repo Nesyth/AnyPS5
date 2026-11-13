@@ -552,6 +552,7 @@ public:
     // MovedReadOnlyBuffers would leave it.
     bool PreparedMovesClear(const PreparedBuffers& prepared, Recorder& recorder, MoveTicket* ticket) const;
     bool PreparedUntouched(const PreparedBuffers& prepared) const;
+    bool PreparedZonesClear(const PreparedBuffers& prepared, const Recorder& recorder) const;
     bool UnmovedRangesClear(const PreparedBuffers& prepared, Recorder& recorder) const;
     // The ticket PreparedMovesClear left (null: it refused the ranges) against the one today's
     // MovedReadOnlyBuffers left from the same ticket.

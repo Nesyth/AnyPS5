@@ -8073,6 +8073,25 @@ bool ShaderResources::PreparedMovesClear(const PreparedBuffers& prepared, Record
     return movedRangesClear(recorder, ranges, ticket, accessible);
 }
 
+bool ShaderResources::PreparedZonesClear(const PreparedBuffers& prepared, const Recorder& recorder) const {
+    if ((prepared.forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared.forget) return false;
+    for (const auto& entry : prepared.moved) {
+        const auto& item = allocations[entry.allocation];
+        if (!item.guest) continue;
+        const auto begin = entry.address - item.adjustment;
+        const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment));
+        if (!PendingZones::Clear(begin, bytes) && (recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr))) return false;
+        if (guestMemory.WritesOverlap(begin, bytes) || AnyShadowedOverlaps(begin, bytes)) return false;
+    }
+    for (const auto& item : prepared.selected) {
+        if (item.moved) continue;
+        const auto& allocation = allocations[item.allocation];
+        if (!PendingZones::Clear(allocation.address, allocation.size) && recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return false;
+        if (guestMemory.WritesOverlap(allocation.address, allocation.size)) return false;
+    }
+    return true;
+}
+
 bool ShaderResources::PreparedUntouched(const PreparedBuffers& prepared) const {
     for (const auto& entry : prepared.moved) {
         const auto& item = allocations[entry.allocation];
