@@ -1779,16 +1779,20 @@ public:
     iterator end() { return textures.end(); }
     void push_back(StorageTexture* texture) {
         GpuZones::Mark(texture->Descriptor().baseAddress, texture->GuestBytes());
+        PendingZones::Add(texture->Descriptor().baseAddress, texture->GuestBytes());
         textures.push_back(texture);
         changed();
     }
     iterator erase(iterator it) {
+        PendingZones::Remove((*it)->Descriptor().baseAddress, (*it)->GuestBytes());
         const auto next = textures.erase(it);
         changed();
         return next;
     }
     void remove(const StorageTexture* texture) {
-        if (std::erase(textures, texture) != 0) changed();
+        const auto erased = std::erase(textures, texture);
+        for (std::size_t index = 0; index < erased; ++index) PendingZones::Remove(texture->Descriptor().baseAddress, texture->GuestBytes());
+        if (erased != 0) changed();
     }
     bool MayOverlap(std::uint64_t address, std::size_t bytes) {
         if (indexed != version) rebuild();

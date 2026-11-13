@@ -8009,6 +8009,24 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
     return moved;
 }
 
+namespace {
+
+bool zoneCensus() {
+    static const bool on = std::getenv("APS5_ZONE_CENSUS") != nullptr;
+    return on;
+}
+
+void noteZoneCensus(bool countsClear, bool testsBusy) {
+    static std::atomic<std::uint64_t> counts[4];
+    static std::atomic<std::uint64_t> seen{0};
+    counts[(countsClear ? 0u : 2u) + (testsBusy ? 1u : 0u)].fetch_add(1, std::memory_order_relaxed);
+    if ((seen.fetch_add(1, std::memory_order_relaxed) + 1u) % (std::uint64_t{1} << 20) != 0) return;
+    const auto wide = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    std::fprintf(stderr, "[zone-census] per 2^20 moved ranges: %llu clear by the zone counts and by the tests, %llu clear by the counts but busy by the tests (unsound), %llu busy by the counts but clear by the tests, %llu busy by both\n", wide(counts[0]), wide(counts[1]), wide(counts[2]), wide(counts[3]));
+}
+
+}
+
 bool ShaderResources::movedRangesClear(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::size_t>> ranges, MoveTicket* ticket, bool accessible) const {
     const bool ticketed = ticket != nullptr && ticket->ranges != nullptr;
     const bool stamped = ticketed && ticket->valid && ticket->recorder == recorder.Id() && ticket->pending == StorageTexture::PendingSerial() && ticket->allocations == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && ticket->epoch == GuestMemory::CollectEpoch();
@@ -8017,6 +8035,7 @@ bool ShaderResources::movedRangesClear(Recorder& recorder, std::span<const std::
     fresh.clear();
     for (const auto& [begin, bytes] : ranges) {
         const auto range = std::pair<std::uint64_t, std::uint64_t>{begin, begin + bytes};
+        if (zoneCensus()) noteZoneCensus(PendingZones::Clear(begin, bytes), recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr));
         if (ticketed) ++ticket->checked;
         if (stamped && std::find(ticket->ranges->begin(), ticket->ranges->end(), range) != ticket->ranges->end() && !recorder.WriteNotedSince(ticket->note, begin, bytes)) {
             ++ticket->trusted;

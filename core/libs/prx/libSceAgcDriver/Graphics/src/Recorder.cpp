@@ -3725,6 +3725,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     ensureOpen();
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
+    PendingZones::Add(address, bytes);
     open->writeNotes.push_back(++writeNoteCount);
     noteWriterOf(writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, end)) published = nullptr;
@@ -3756,6 +3757,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
     batch.writes.emplace_back(address, address + bytes);
+    PendingZones::Add(address, bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     noteWriterOf(writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, address + bytes)) published = nullptr;
@@ -4976,6 +4978,7 @@ bool Recorder::Reap() {
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
     inFlightKeptBytes -= batch->keptBytes;
+    for (const auto& [begin, end] : batch->writes) PendingZones::Remove(begin, end - begin);
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
         Recorder& recorder;

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 
@@ -67,6 +68,52 @@ inline bool Untouched(std::uint64_t address, std::uint64_t bytes) {
     const auto lastZone = last >> ZoneShift;
     if (lastZone - firstZone >= ZoneCount) return false;
     return EachWord(firstZone, lastZone, [&](std::size_t index, std::uint64_t mask) { return (map.words[index].load(std::memory_order_acquire) & mask) == 0; });
+}
+
+}
+
+namespace AgcDriver::Graphics::PendingZones {
+
+inline constexpr std::uint64_t ZoneShift = 16;
+inline constexpr std::uint64_t ZoneCount = std::uint64_t{1} << 24;
+inline constexpr std::uint16_t Stuck = 0xffff;
+
+static_assert(sizeof(std::atomic<std::uint16_t>) == sizeof(std::uint16_t) && std::atomic<std::uint16_t>::is_always_lock_free);
+
+inline std::atomic<std::uint16_t>* Counts() {
+    static std::atomic<std::uint16_t>* const counts = static_cast<std::atomic<std::uint16_t>*>(std::calloc(static_cast<std::size_t>(ZoneCount), sizeof(std::atomic<std::uint16_t>)));
+    return counts;
+}
+
+template<typename TVisit>
+void EachZone(std::uint64_t address, std::uint64_t bytes, TVisit&& visit) {
+    auto* const counts = Counts();
+    if (bytes == 0 || counts == nullptr) return;
+    const auto last = bytes - 1 > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes - 1;
+    const auto firstZone = address >> ZoneShift;
+    const auto zones = std::min<std::uint64_t>((last >> ZoneShift) - firstZone + 1, ZoneCount);
+    for (std::uint64_t index = 0; index < zones; ++index) visit(counts[(firstZone + index) & (ZoneCount - 1)]);
+}
+
+inline void Add(std::uint64_t address, std::uint64_t bytes) {
+    EachZone(address, bytes, [](std::atomic<std::uint16_t>& count) {
+        auto value = count.load(std::memory_order_relaxed);
+        while (value != Stuck && !count.compare_exchange_weak(value, static_cast<std::uint16_t>(value + 1), std::memory_order_relaxed)) {}
+    });
+}
+
+inline void Remove(std::uint64_t address, std::uint64_t bytes) {
+    EachZone(address, bytes, [](std::atomic<std::uint16_t>& count) {
+        auto value = count.load(std::memory_order_relaxed);
+        while (value != Stuck && value != 0 && !count.compare_exchange_weak(value, static_cast<std::uint16_t>(value - 1), std::memory_order_relaxed)) {}
+    });
+}
+
+inline bool Clear(std::uint64_t address, std::uint64_t bytes) {
+    if (Counts() == nullptr) return false;
+    bool clear = true;
+    EachZone(address, bytes, [&](std::atomic<std::uint16_t>& count) { clear = clear && count.load(std::memory_order_relaxed) == 0; });
+    return clear;
 }
 
 }
