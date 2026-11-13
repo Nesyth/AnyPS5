@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <intrin.h>
 #include <malloc.h>
 #include <new>
@@ -218,6 +219,16 @@ void CensusWalkHeaps() noexcept {
         std::uint64_t committed = 0, uncommitted = 0, overhead = 0, regions = 0;
         std::uint64_t bytes[Sizes] = {};
         std::uint64_t blocks[Sizes] = {};
+        constexpr std::size_t Heads = 1024;
+        constexpr std::size_t HeadFrom = 16384;
+        struct Head {
+            std::uint64_t words;
+            std::uint64_t bytes;
+            std::uint64_t blocks;
+        };
+        static Head heads[Heads];
+        for (auto& head : heads) head = {};
+        std::uint64_t headsBeyond = 0;
         if (!HeapLock(heaps[index])) continue;
         const std::uint64_t began = GetTickCount64();
         PROCESS_HEAP_ENTRY entry{};
@@ -231,6 +242,23 @@ void CensusWalkHeaps() noexcept {
                 bytes[size] += entry.cbData;
                 ++blocks[size];
                 overhead += entry.cbOverhead;
+                if (entry.cbData >= HeadFrom && entry.lpData != nullptr) {
+                    std::uint64_t words = 0;
+                    std::memcpy(&words, entry.lpData, sizeof(words));
+                    auto at = static_cast<std::size_t>((words * 0x9e3779b97f4a7c15ull) >> 54);
+                    std::size_t probes = 0;
+                    while (probes < Heads && heads[at].blocks != 0 && heads[at].words != words) {
+                        at = (at + 1) & (Heads - 1);
+                        ++probes;
+                    }
+                    if (probes == Heads) {
+                        headsBeyond += entry.cbData;
+                    } else {
+                        heads[at].words = words;
+                        heads[at].bytes += entry.cbData;
+                        ++heads[at].blocks;
+                    }
+                }
             }
         }
         const std::uint64_t took = GetTickCount64() - began;
@@ -245,6 +273,26 @@ void CensusWalkHeaps() noexcept {
         int length = std::snprintf(text, sizeof(text), "[heap-census] heap %lu%s: %llu MiB committed and %llu MiB not committed in %llu regions; %llu MiB busy in %llu blocks, %llu MiB of block overhead; walked in %llu ms; busy by block size:", static_cast<unsigned long>(index), heaps[index] == processHeap ? " (the process heap)" : "", static_cast<unsigned long long>(committed >> 20), static_cast<unsigned long long>(uncommitted >> 20), static_cast<unsigned long long>(regions), static_cast<unsigned long long>(busy >> 20), static_cast<unsigned long long>(busyBlocks), static_cast<unsigned long long>(overhead >> 20), static_cast<unsigned long long>(took));
         for (std::size_t size = 0; size < Sizes && length > 0 && static_cast<std::size_t>(length) < sizeof(text); ++size) length += std::snprintf(text + length, sizeof(text) - static_cast<std::size_t>(length), " %s %llu MiB (%llu)%s", SizeNames[size], static_cast<unsigned long long>(bytes[size] >> 20), static_cast<unsigned long long>(blocks[size]), size + 1 < Sizes ? "," : "\n");
         std::fputs(text, stderr);
+        for (int rank = 0; rank < 16; ++rank) {
+            std::size_t best = Heads;
+            for (std::size_t at = 0; at < Heads; ++at) {
+                if (heads[at].bytes != 0 && (best == Heads || heads[at].bytes > heads[best].bytes)) best = at;
+            }
+            if (best == Heads) break;
+            char shown[9];
+            for (std::size_t at = 0; at < 8; ++at) {
+                const auto byte = static_cast<unsigned char>(heads[best].words >> (at * 8));
+                shown[at] = byte >= 32 && byte < 127 ? static_cast<char>(byte) : '.';
+            }
+            shown[8] = 0;
+            std::snprintf(text, sizeof(text), "[heap-census] heap %lu, blocks of 16 KiB and more that begin with 0x%016llx (%s): %llu MiB in %llu blocks\n", static_cast<unsigned long>(index), static_cast<unsigned long long>(heads[best].words), shown, static_cast<unsigned long long>(heads[best].bytes >> 20), static_cast<unsigned long long>(heads[best].blocks));
+            std::fputs(text, stderr);
+            heads[best].bytes = 0;
+        }
+        if (headsBeyond != 0) {
+            std::snprintf(text, sizeof(text), "[heap-census] heap %lu: %llu MiB in blocks whose first words did not fit the table\n", static_cast<unsigned long>(index), static_cast<unsigned long long>(headsBeyond >> 20));
+            std::fputs(text, stderr);
+        }
     }
 }
 
