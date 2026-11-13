@@ -4,6 +4,7 @@
 #include <chrono>
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "ImageTableAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
@@ -146,6 +147,7 @@ bool sharedFaultSlots() {
 }
 
 constexpr VkDeviceSize FaultChunkBytes = VkDeviceSize{512} * 1024;
+constexpr std::uint64_t KeptFaultSlotBatches = 1024;
 
 VkDeviceSize faultSlotBytes(bool reportOnly) {
     return reportOnly ? sizeof(ShaderRecompiler::BdaAbi::Fault) : ShaderRecompiler::BdaAbi::FaultBufferBytes;
@@ -260,8 +262,9 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
     bool reclaimed = false;
     if (shared && source == arena.chunks.rend() && GuestMemory::GpuMutex().HeldByThisThread()) {
         std::vector<BdaResources*> idle;
+        const auto age = RuntimeSwitches::Set(RuntimeSwitch::KeepFaultSlots) ? KeptFaultSlotBatches : std::uint64_t{0};
         for (auto* holder : arena.holders) {
-            if (holder->faultChunk->slotBytes == slotBytes && holder->lastUse <= arena.finished && faultSlotClean(holder->faultBytes())) idle.push_back(holder);
+            if (holder->faultChunk->slotBytes == slotBytes && holder->lastUse <= arena.finished && arena.finished - holder->lastUse >= age && faultSlotClean(holder->faultBytes())) idle.push_back(holder);
         }
         if (!idle.empty()) {
             const auto reclaim = (idle.size() + 1) / 2;
