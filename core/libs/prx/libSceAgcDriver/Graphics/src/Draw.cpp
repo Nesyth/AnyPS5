@@ -7160,6 +7160,17 @@ void noteLeanExpressVerify(bool clear) {
     if (leanExpressDiffering.fetch_add(1, std::memory_order_relaxed) == 0 || printed.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[lean-express-verify] the buffer tests refuse a commit whose buffer ranges lie in memory no GPU write was marked for\n");
 }
 
+std::atomic<std::uint64_t> appendCommitsTaken{0};
+std::atomic<std::uint64_t> appendCommitsFull{0};
+
+void noteAppendCommit(bool appended) {
+    (appended ? appendCommitsTaken : appendCommitsFull).fetch_add(1, std::memory_order_relaxed);
+    static std::uint64_t seen = 0;
+    if ((++seen & 0xfffffu) != 0) return;
+    const auto wide = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    std::fprintf(stderr, "[append-commits] %llu express commits appended to the open pass, %llu taken in full\n", wide(appendCommitsTaken), wide(appendCommitsFull));
+}
+
 void noteLeanExpress(bool untouched) {
     (untouched ? leanExpressTaken : leanExpressTouched).fetch_add(1, std::memory_order_relaxed);
     static std::uint64_t seen = 0;
@@ -7195,6 +7206,62 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     const auto templateMiss = resources.ExpressCurrent();
     const bool reprove = templateMiss != ShaderResources::ExpressMiss::None && templateMiss != ShaderResources::ExpressMiss::NotProved && templateMiss != ShaderResources::ExpressMiss::Regions;
     if (templateMiss != ShaderResources::ExpressMiss::None && !reprove) return miss(DrawExpressMiss::Template);
+    const bool appendOn = RuntimeSwitches::Set(RuntimeSwitch::XpAppendCommits);
+    if (appendOn && !verifyDue && templateMiss == ShaderResources::ExpressMiss::None && prepared != nullptr && preparedInputs != nullptr && !record.verifyBuffers && !record.verifyInputs && prepared->plan != nullptr && prepared->plan == resources.DirectBufferPlan(shaders) && !StorageTexture::DrawnLinearPending() && (!express->hasDepth || (DepthSurfacesSerial() == express->depthSerial && DepthSurfacesReleased() == express->depthReleased))) {
+        if (const auto commands = recorder->AppendablePass(express->passKey); commands != VK_NULL_HANDLE) {
+            if (auto* stream = CommandStream::FromHandle(commands); stream != nullptr) {
+                bool staged = true;
+                try {
+                    resources.ExpressStage(*recorder);
+                } catch (const std::exception&) {
+                    staged = false;
+                }
+                if (staged && resources.FragmentSelectionHolds(*recorder, prepared->moved, *prepared, nullptr, true) == ShaderResources::PreparedBuffers::Selection::Taken && recorder->AppendablePass(express->passKey) == commands) {
+                    if (resources.ChecksFaults() && fragment->faultGeneration != resources.FaultGeneration()) resources.RewriteFragmentFaults(*fragment->bindings);
+                    resources.RequireGuestBuffers();
+                    if (recipe->hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
+                    if (const auto present = Recorder::Presents(); record.touchedPresent != present) {
+                        if (resources.TouchedPresent() != present) {
+                            SharedResourceCache().Touch(recipe->key);
+                            resources.NoteTouchedPresent(present);
+                        }
+                        record.touchedPresent = present;
+                    }
+                    keepFragmentBindings(*recorder, fragment->bindings);
+                    if (express->keptRecorder != recorder->Id() || express->keptBatch != recorder->OpenSerial()) {
+                        recorder->Keep(express->keep);
+                        for (const auto& owner : keep.multisample) {
+                            if (owner != nullptr) KeepMultisampleTarget_nid_no_patch(owner);
+                        }
+                        express->keptRecorder = recorder->Id();
+                        express->keptBatch = recorder->OpenSerial();
+                    }
+                    record.effects = {};
+                    record.access.generation = recorder->RenderPassGeneration();
+                    recorder->NoteSampledDraw(commands);
+                    stream->Splice(std::move(fragment->commands));
+                    NoteGuestWorkIn(context, commands);
+                    record.effects.fragment.spliced = true;
+                    record.effects.fragment.offered = true;
+                    record.effects.inputs = DrawRecordInputs::Used;
+                    record.effects.keptOnce = true;
+                    record.effects.proved = true;
+                    record.effects.cleanProof = ShaderResources::CleanProof::Skipped;
+                    record.effects.hold = DrawRecordHold::Held;
+                    record.effects.passHeld = true;
+                    record.effects.buffers = DrawRecordBuffers::Used;
+                    record.effects.pushed = fragment->pushing;
+                    record.pass.valid = false;
+                    if (resources.ChecksFaults() && resources.TakeFaultCheck(recorder->Id(), recorder->OpenSerial())) recorder->OnComplete([kept = keep.resources] { kept->CheckFaults(); });
+                    noteAppendCommit(true);
+                    out.taken = true;
+                    out.result.recorded = true;
+                    return out;
+                }
+            }
+        }
+    }
+    if (appendOn) noteAppendCommit(false);
     struct FloorPass {
         std::uint64_t recorder = 0;
         std::uint64_t generation = 0;

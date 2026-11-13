@@ -1928,6 +1928,12 @@ void Recorder::SealPassWriteOnly() {
     if (open != nullptr) open->passHazards.SealWriteOnly();
 }
 
+VkCommandBuffer Recorder::AppendablePass(std::uint64_t key) {
+    if (open == nullptr || !open->renderPass.open || open->renderPass.key != key || open->deferredDispatchQueue != 0) return VK_NULL_HANDLE;
+    if (countingSamples && segmentMode() && !segmentSlotReady(*open)) return VK_NULL_HANDLE;
+    return open->commands;
+}
+
 bool Recorder::RenderPassOpen() const {
     return open != nullptr && open->renderPass.open;
 }

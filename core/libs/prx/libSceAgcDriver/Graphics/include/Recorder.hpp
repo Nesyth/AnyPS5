@@ -499,6 +499,7 @@ public:
     // and for helpers that must not recycle resources the recorded work still uses.
     static Recorder* Active();
     bool RenderPassOpen() const;
+    VkCommandBuffer AppendablePass(std::uint64_t key);
     std::uint64_t RenderPassGeneration() const { return passGeneration; }
     VkDevice Device() const { return context.device; }
     std::uint64_t Id() const { return id; }
