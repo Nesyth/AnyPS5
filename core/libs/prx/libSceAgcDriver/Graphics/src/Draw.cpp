@@ -7168,9 +7168,19 @@ struct ExpressDepthChecked {
     VkImageView view = VK_NULL_HANDLE;
 };
 struct ExpressDepthStorage {};
+struct ExpressMultisampleChecked {
+    const void* owner = nullptr;
+    std::uint64_t recorder = 0;
+    std::uint64_t generation = 0;
+};
+struct ExpressMultisampleMemo {
+    std::array<ExpressMultisampleChecked, 8> checked{};
+    std::size_t next = 0;
+};
+struct ExpressMultisampleStorage {};
 
-enum class AppendRefusal : std::uint8_t { None, Prepared, Linear, Pass, Depth, Targets, InputShape, Imports, Writers, InputWrites, InputStores, Buffers, Count };
-constexpr std::array<const char*, static_cast<std::size_t>(AppendRefusal::Count)> AppendRefusalNames{"none", "not prepared", "linear target pending", "pass not open under the key", "depth", "targets", "input shape", "imports or mapping", "copied writers", "pending write over an input", "label or queued store over an input", "buffers"};
+enum class AppendRefusal : std::uint8_t { None, Prepared, Linear, Pass, Depth, Targets, InputShape, Imports, Writers, InputWrites, InputStores, Buffers, Multisample, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(AppendRefusal::Count)> AppendRefusalNames{"none", "not prepared", "linear target pending", "pass not open under the key", "depth", "targets", "input shape", "imports or mapping", "copied writers", "pending write over an input", "label or queued store over an input", "buffers", "multisample target not checked in this pass"};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(AppendRefusal::Count)> appendRefusals{};
 
 void noteAppendRefusal(AppendRefusal refusal) {
@@ -7327,7 +7337,17 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         const auto generation = recorder->RenderPassGeneration();
         for (std::size_t index = 0; refusal == AppendRefusal::None && index < keep.targets.size(); ++index) {
             const auto& target = keep.targets[index];
-            if (target == nullptr || index >= state.colors.size() || !target->Cached() || !target->NotedInPass(recorderId, generation) || target->UploadVersion() != express->targetVersions[index]) {
+            if (target == nullptr) {
+                const auto& memo = HostThreadLocal<ExpressMultisampleMemo, ExpressMultisampleStorage>();
+                const auto* owner = index < keep.multisample.size() ? keep.multisample[index].get() : nullptr;
+                const bool known = owner != nullptr && index < state.colors.size() && index < express->multisampleImages.size() && index < recipe->targetViews.size() && std::ranges::any_of(memo.checked, [&](const ExpressMultisampleChecked& entry) { return entry.owner == owner && entry.recorder == recorderId && entry.generation == generation; });
+                if (!known) {
+                    refusal = AppendRefusal::Multisample;
+                    break;
+                }
+                continue;
+            }
+            if (index >= state.colors.size() || !target->Cached() || !target->NotedInPass(recorderId, generation) || target->UploadVersion() != express->targetVersions[index]) {
                 refusal = AppendRefusal::Targets;
                 break;
             }
@@ -7357,21 +7377,20 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         if (refusal != AppendRefusal::None) noteAppendRefusal(refusal);
         else if (appendVerifyDue()) appendClaim.armed = true;
         else appended = true;
+        for (std::size_t index = 0; appended && index < keep.targets.size(); ++index) {
+            if (keep.targets[index] == nullptr) NoteMultisampleTargetDrawn_nid_no_patch(keep.multisample[index]);
+        }
     }
     const bool sameTargets = appended || (atFloor && recorder->RenderPassOpen() && floorPass.recorder == recorder->Id() && floorPass.generation == recorder->RenderPassGeneration() && floorPass.framebuffer == keep.framebuffer.get());
     for (std::size_t index = 0; !sameTargets && index < keep.targets.size(); ++index) {
         const auto& target = keep.targets[index];
         if (target == nullptr) {
             if (index >= state.colors.size() || index >= keep.multisample.size() || keep.multisample[index] == nullptr || index >= express->multisampleImages.size() || index >= recipe->targetViews.size()) return miss(DrawExpressMiss::Targets);
-            struct MultisampleChecked {
-                const void* owner = nullptr;
-                std::uint64_t recorder = 0;
-                std::uint64_t generation = 0;
-            };
-            thread_local std::array<MultisampleChecked, 8> checked{};
-            thread_local std::size_t nextChecked = 0;
+            auto& multisampleMemo = HostThreadLocal<ExpressMultisampleMemo, ExpressMultisampleStorage>();
+            auto& checked = multisampleMemo.checked;
+            auto& nextChecked = multisampleMemo.next;
             const auto* owner = keep.multisample[index].get();
-            const auto found = std::ranges::find_if(checked, [&](const MultisampleChecked& entry) { return entry.owner == owner; });
+            const auto found = std::ranges::find_if(checked, [&](const ExpressMultisampleChecked& entry) { return entry.owner == owner; });
             if (!recorder->RenderPassOpen() || found == checked.end() || found->recorder != recorder->Id() || found->generation != recorder->RenderPassGeneration()) {
                 const auto generation = recorder->RenderPassGeneration();
                 std::shared_ptr<void> current;
