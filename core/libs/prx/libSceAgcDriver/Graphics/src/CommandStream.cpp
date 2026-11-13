@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <stdexcept>
@@ -175,6 +176,9 @@ PFN_vkVoidFunction realFunction(CommandOp op, std::size_t slot) {
     for (unsigned index = 0; index < count && length > 0 && static_cast<std::size_t>(length) < sizeof(text); ++index) length += std::snprintf(text + length, sizeof(text) - static_cast<std::size_t>(length), " %p", frames[index]);
 #endif
     std::fprintf(stderr, "%s\n", text);
+    std::fflush(stderr);
+    static const bool aborts = std::getenv("APS5_ABORT_ON_CLOSED_STREAM") != nullptr;
+    if (aborts) std::abort();
 }
 
 template<typename T>
