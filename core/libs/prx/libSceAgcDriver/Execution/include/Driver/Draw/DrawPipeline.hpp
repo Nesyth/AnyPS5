@@ -301,7 +301,7 @@ private:
     std::vector<Job> ran;
     std::exception_ptr failure;
     bool running = false;
-    std::array<bool, 4> extraRunning{};
+    std::array<bool, 8> extraRunning{};
     unsigned sleepers = 0;
     unsigned turnSleepers = 0;
     unsigned idleWaiters = 0;
@@ -310,13 +310,15 @@ private:
     bool closing = false;
     std::uint64_t nextSeq = 1;
     std::condition_variable turnWake;
+    std::condition_variable dormantWake;
     std::thread thread;
-    std::array<std::thread, 4> extra;
+    std::array<std::thread, 8> extra;
     std::atomic<bool> ringMode{false};
     std::atomic<bool> closed{false};
     std::atomic<bool> leanFailed{false};
     std::atomic<unsigned> started{0};
     std::atomic<unsigned> parked{0};
+    std::atomic<unsigned> dormant{0};
     std::atomic<unsigned> frontWaiters{0};
     std::atomic<std::uint64_t> leanTake{1};
     std::atomic<std::uint64_t> leanTail{1};

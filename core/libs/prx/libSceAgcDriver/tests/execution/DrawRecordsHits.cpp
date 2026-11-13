@@ -1422,7 +1422,9 @@ void QueuedStore(AgcDriver::DrawRecordCommit& record) {
 
 }
 
-constexpr std::size_t LingeringChunks = 2;
+std::size_t lingeringChunks() {
+    return 2u + (RuntimeSwitches::Set(RuntimeSwitch::SiblingFinishers) ? 4u : 0u);
+}
 constexpr std::size_t SmallChunkBytes = 128;
 constexpr std::size_t RingChunkBytes = 1536;
 
@@ -1478,7 +1480,7 @@ void CommitBindings(bool ring) {
             const auto after = DirectTotals::Now();
             std::cout << "commit bindings, " << name << ", " << what << ": " << after.Since(before, DirectCounter::BindingsTaken) << " finisher slices bound, " << after.Since(before, DirectCounter::BindingsStamped) << " unmoved tests answered by stamp, " << after.Since(before, DirectCounter::BindingsSetsLent) << " sets lent, " << after.Since(before, DirectCounter::BindingsVerifyChecked) << " verified, " << ShaderResources::PlacedUploadChunks() << " finisher chunks alive" << DescribeDirect(after, before) << '\n';
             Require(after.Since(before, DirectCounter::BindingsVerifyDiffering) == 0 && after.Since(before, DirectCounter::BindingsRefuted) == 0, "commit bindings, " + name + ", " + what + ": the verify found differences or refuted stamps" + DescribeDirect(after, before));
-            Require(PlacedChunksAfterIdle(LingeringChunks) <= LingeringChunks, "commit bindings, " + name + ", " + what + ": " + std::to_string(ShaderResources::PlacedUploadChunks()) + " finisher upload chunks are still alive two seconds after the batches completed");
+            Require(PlacedChunksAfterIdle(lingeringChunks()) <= lingeringChunks(), "commit bindings, " + name + ", " + what + ": " + std::to_string(ShaderResources::PlacedUploadChunks()) + " finisher upload chunks are still alive two seconds after the batches completed");
             return std::pair{before, after};
         };
         static_cast<void>(render(false, false, false, false, "without the switch"));
@@ -1515,7 +1517,7 @@ void CommitBindings(bool ring) {
                 Require(image == today[1], "commit bindings, " + name + ", " + what + ": the pass rendered differently from today's path" + DescribeDirect(after, before));
                 RuntimeSwitches::Assign(RuntimeSwitch::CommitBindings, false);
                 Require(RenderScene(scene, 2) == today[2], "commit bindings, " + name + ", " + what + ": the next pass rendered differently from today's path");
-                Require(PlacedChunksAfterIdle(LingeringChunks) <= LingeringChunks, "commit bindings, " + name + ", " + what + ": " + std::to_string(ShaderResources::PlacedUploadChunks()) + " finisher upload chunks are still alive two seconds after the next batch completed");
+                Require(PlacedChunksAfterIdle(lingeringChunks()) <= lingeringChunks(), "commit bindings, " + name + ", " + what + ": " + std::to_string(ShaderResources::PlacedUploadChunks()) + " finisher upload chunks are still alive two seconds after the next batch completed");
                 std::cout << "commit bindings, " << name << ", " << what << ": " << (refused ? "refused and returned" : "bound as today's prepared buffers") << DescribeDirect(after, before) << '\n';
             };
             expectHook("a pending write over a selected in-place buffer before the commit", &BindingHooks::PendingWrite, true);
@@ -1570,7 +1572,7 @@ void CommitBindings(bool ring) {
             const auto after = DirectTotals::Now();
             std::cout << "commit bindings, " << name << ", " << what << ": " << after.Since(before, DirectCounter::BindingsDynamicBound) << " dynamic sets bound, " << after.Since(before, DirectCounter::BindingsDynamicWritten) << " written, " << after.Since(before, DirectCounter::BindingsVerifyChecked) << " verified" << DescribeDirect(after, before) << '\n';
             Require(after.Since(before, DirectCounter::BindingsVerifyDiffering) == 0 && after.Since(before, DirectCounter::BindingsRefuted) == 0, "commit bindings, " + name + ", " + what + ": the verify found differences or refuted stamps" + DescribeDirect(after, before));
-            Require(PlacedChunksAfterIdle(LingeringChunks) <= LingeringChunks, "commit bindings, " + name + ", " + what + ": " + std::to_string(ShaderResources::PlacedUploadChunks()) + " finisher upload chunks are still alive two seconds after the batches completed");
+            Require(PlacedChunksAfterIdle(lingeringChunks()) <= lingeringChunks(), "commit bindings, " + name + ", " + what + ": " + std::to_string(ShaderResources::PlacedUploadChunks()) + " finisher upload chunks are still alive two seconds after the batches completed");
             return std::pair{before, after};
         };
         const auto [plainBefore, plainAfter] = run(true, false, "without dynamic sets");

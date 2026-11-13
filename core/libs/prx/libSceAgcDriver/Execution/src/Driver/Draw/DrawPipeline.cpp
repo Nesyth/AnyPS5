@@ -122,11 +122,12 @@ std::string orderText(std::uint64_t order) {
 
 bool finisherTakes(unsigned index) {
     if (index == 0) return true;
+    if (index >= 5) return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SiblingFinishers);
     constexpr Graphics::RuntimeSwitch switches[4] = {Graphics::RuntimeSwitch::SecondFinisher, Graphics::RuntimeSwitch::ThirdFinisher, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher};
     return Graphics::RuntimeSwitches::Set(switches[index - 1]);
 }
 
-constexpr const char* FinisherNames[5] = {"draw finisher", "draw finisher 2", "draw finisher 3", "draw finisher 4", "draw finisher 5"};
+constexpr const char* FinisherNames[9] = {"draw finisher", "draw finisher 2", "draw finisher 3", "draw finisher 4", "draw finisher 5", "draw finisher 6", "draw finisher 7", "draw finisher 8", "draw finisher 9"};
 
 constexpr unsigned PublishedReadAttempts = 8;
 
@@ -694,6 +695,13 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     pending.push_back(std::move(held));
     outstanding.fetch_add(1, std::memory_order_release);
     startFinishers();
+    if (const auto asleep = dormant.load(std::memory_order_acquire); asleep != 0) {
+        for (unsigned index = 1; index <= extra.size(); ++index) {
+            if ((asleep & (1u << index)) == 0 || !finisherTakes(index)) continue;
+            dormantWake.notify_all();
+            break;
+        }
+    }
     if (sleepers == 0) return;
     if (spinHandoff() && sleepers == 1) wake.notify_one();
     else wake.notify_all();
@@ -717,7 +725,8 @@ void DrawFinisher::startFinishers() {
         extra[index - 1] = std::thread([this, index] {
             FinisherThread::Set(true);
             RaiseWorkerThreadPriority(FinisherNames[index]);
-            if (index < 3 || std::getenv("APS5_EXTRA_FINISHERS_UNPINNED") == nullptr) PlaceFinisherThread(FinisherNames[index]);
+            if (index >= 5) PlaceFinisherSiblingThread(FinisherNames[index]);
+            else if (index < 3 || std::getenv("APS5_EXTRA_FINISHERS_UNPINNED") == nullptr) PlaceFinisherThread(FinisherNames[index]);
             run(index);
         });
         runningFinishers.fetch_add(1, std::memory_order_acq_rel);
@@ -826,12 +835,17 @@ void DrawFinisher::publishLean(LeanSlot& slot) {
     nextSeq = seq + 1;
     issued.store(nextSeq, std::memory_order_relaxed);
     leanTail.store(nextSeq, std::memory_order_seq_cst);
-    const unsigned wanted = 1u | (finisherTakes(1) ? 2u : 0u) | (finisherTakes(2) ? 4u : 0u) | (finisherTakes(3) ? 8u : 0u) | (finisherTakes(4) ? 16u : 0u);
+    unsigned wanted = 1u;
+    for (unsigned index = 1; index <= extra.size(); ++index) wanted |= finisherTakes(index) ? 1u << index : 0u;
     if ((started.load(std::memory_order_acquire) & wanted) != wanted) {
         const auto lock = lockFor(mutex);
         startFinishers();
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    if ((dormant.load(std::memory_order_acquire) & wanted) != 0) {
+        const auto lock = lockFor(mutex);
+        dormantWake.notify_all();
+    }
     if (parked.load(std::memory_order_relaxed) == 0) return;
     const auto lock = lockFor(mutex);
     if (spinHandoff() && sleepers == 1) wake.notify_one();
@@ -1128,12 +1142,19 @@ void DrawFinisher::run(unsigned index) {
         }
         {
             auto lock = lockFor(mutex);
+            if (!finisherTakes(index) && !closing) {
+                dormant.fetch_or(1u << index, std::memory_order_seq_cst);
+                dormantWake.wait(lock, [&] { return closing || finisherTakes(index); });
+                dormant.fetch_and(~(1u << index), std::memory_order_seq_cst);
+                continue;
+            }
             ++sleepers;
             parked.fetch_add(1, std::memory_order_seq_cst);
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            wake.wait(lock, [&] { return closing || ((untaken() != nullptr || leanReady()) && finisherTakes(index)); });
+            wake.wait(lock, [&] { return closing || !finisherTakes(index) || untaken() != nullptr || leanReady(); });
             parked.fetch_sub(1, std::memory_order_relaxed);
             --sleepers;
+            if (!finisherTakes(index) && !closing) continue;
             if (leanReady()) continue;
             slot = untaken();
             if (slot == nullptr) {
@@ -1236,7 +1257,7 @@ void DrawFinisher::Drain() {
 }
 
 void DrawFinisher::Stop() {
-    std::thread finishers[5];
+    std::thread finishers[9];
     {
         const auto lock = lockFor(mutex);
         closing = true;
@@ -1245,6 +1266,7 @@ void DrawFinisher::Stop() {
         for (std::size_t index = 0; index < extra.size(); ++index) finishers[index + 1] = std::move(extra[index]);
     }
     wake.notify_all();
+    dormantWake.notify_all();
     turnWake.notify_all();
     idle.notify_all();
     for (auto& finisher : finishers) {
