@@ -467,6 +467,7 @@ public:
     PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route) const;
     void PushFragmentBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
     void WriteFragmentSets(DrawBindings& result, std::span<const std::size_t> selected, std::int32_t pushedSet) const;
+    void RewriteFragmentFaults(const DrawBindings& placed) const;
     DescriptorCache* FragmentDescriptorCache() const { return context.descriptorCache; }
     struct RepeatPush {
         RepeatPush() = default;

@@ -3610,7 +3610,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     std::shared_ptr<ShaderResources::DrawBindings> fragmentBindings;
     if (fragment != nullptr && !record.fragmentVerify) {
         auto held = resources.FragmentSelectionHolds(*recorder, record.moved, *record.prepared, route);
-        if (held == PreparedSelection::Taken && resources.ChecksFaults() && fragment->faultGeneration != resources.FaultGeneration()) held = PreparedSelection::Hazard;
+        if (held == PreparedSelection::Taken && resources.ChecksFaults() && fragment->faultGeneration != resources.FaultGeneration() && fragment->bindings != nullptr) resources.RewriteFragmentFaults(*fragment->bindings);
         if (held == PreparedSelection::Taken) {
             fragmentBindings = fragment->bindings;
             preparedSelection = held;
@@ -7281,7 +7281,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     if (recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) recorder->FlushKeyStores();
     if (recorder->HasQueuedStores() && recorder->AnyQueuedStore(touches)) recorder->FlushStores();
     if (resources.FragmentSelectionHolds(*recorder, prepared->moved, *prepared, nullptr) != ShaderResources::PreparedBuffers::Selection::Taken) return giveBack(DrawExpressMiss::Selection);
-    if (resources.ChecksFaults() && fragment->faultGeneration != resources.FaultGeneration()) return giveBack(DrawExpressMiss::Selection);
+    if (resources.ChecksFaults() && fragment->faultGeneration != resources.FaultGeneration()) resources.RewriteFragmentFaults(*fragment->bindings);
     try {
         if (!reprove) resources.ExpressStage(*recorder);
     } catch (const std::exception&) {

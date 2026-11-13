@@ -9008,6 +9008,23 @@ std::array<std::uint32_t, 2u * ShaderRecompiler::RuntimeAbi::StageCount> ShaderR
     return offsets;
 }
 
+void ShaderResources::RewriteFragmentFaults(const DrawBindings& placed) const {
+    if (bda == nullptr || faultDescriptors.empty()) return;
+    struct FaultWritesStorage {};
+    auto& writes = HostThreadLocal<std::vector<VkWriteDescriptorSet>, FaultWritesStorage>();
+    writes.clear();
+    for (const auto& fault : faultDescriptors) {
+        auto write = descriptorWrites[fault.write];
+        write.dstSet = write.dstSet == _set ? placed.allocation.set : placed.fragmentAllocation.set;
+        if (write.dstSet == VK_NULL_HANDLE) continue;
+        write.dstArrayElement = fault.element;
+        write.descriptorCount = 1;
+        write.pBufferInfo = &descriptorBuffers[fault.buffer];
+        writes.push_back(write);
+    }
+    if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
 void ShaderResources::prepareFaultSlot() const {
     if (bda == nullptr) return;
     const auto* recorder = Recorder::Active();
