@@ -66,6 +66,17 @@ struct SharedStage {
     std::shared_ptr<const MemoPatch> patch;
     explicit operator bool() const { return donor != nullptr; }
 };
+struct SideForward {
+    std::uint32_t binding = 0;
+    std::uint32_t position = 0;
+    std::uint32_t word = 0;
+    bool push = false;
+};
+struct SideForwards {
+    bool traced = false;
+    std::uint64_t addressWords = 0;
+    std::vector<SideForward> forwards;
+};
 class PreparedShaderInvocation {
 public:
     static std::optional<PreparedShaderInvocation> TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);
@@ -90,6 +101,7 @@ public:
     // donor would write them, plus the live draw's vertex attributes. False (the side then holds
     // no usable words) where that patch would throw or the donor cannot carry the capture.
     bool FillSharedSide(const ResourceCapture& capture, const RecompileResult& donor, const MemoPatch& patch, HeapStageWords& side) const;
+    SideForwards TraceSideForwards(const ResourceCapture& capture, const RecompileResult& donor, const MemoPatch& patch) const;
 
 private:
     PreparedShaderInvocation(RecompileRequest request, const std::shared_ptr<const SourceHandle>& handle);
