@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <intrin.h>
 #include <malloc.h>
@@ -26,6 +27,7 @@ constexpr std::uint16_t Depth(std::size_t sizeClass) {
 struct Cache {
     void* heads[AllClasses];
     std::uint16_t counts[AllClasses];
+    std::ptrdiff_t untilSample;
 };
 
 constexpr std::uint16_t KeptLists = 8;
@@ -170,6 +172,124 @@ Cache* CurrentCache() noexcept {
     return cache != nullptr ? cache : CreateCache(slot);
 }
 
+constexpr std::size_t CensusInterval = std::size_t{256} << 10;
+constexpr std::size_t CensusBuckets = std::size_t{1} << 16;
+constexpr std::size_t CensusWays = 4;
+constexpr std::size_t CensusSites = std::size_t{1} << 12;
+constexpr int CensusPrinted = 60;
+
+struct CensusEntry {
+    void* site;
+    std::size_t bytes;
+};
+
+struct CensusSite {
+    void* site;
+    std::uint64_t bytes;
+    std::uint64_t samples;
+};
+
+std::atomic<void*> censusKeys[CensusBuckets][CensusWays];
+CensusEntry censusEntries[CensusBuckets][CensusWays];
+CensusSite censusSites[CensusSites];
+SRWLOCK censusLock = SRWLOCK_INIT;
+SRWLOCK censusReportLock = SRWLOCK_INIT;
+std::atomic<std::uint64_t> censusDropped{0};
+std::atomic<std::uint64_t> censusReportAt{0};
+const bool censusOn = std::getenv("APS5_HEAP_CENSUS") != nullptr;
+
+std::size_t CensusBucket(const void* block) noexcept {
+    return static_cast<std::size_t>(((reinterpret_cast<std::uintptr_t>(block) >> 4) * 0x9e3779b97f4a7c15ull) >> 48);
+}
+
+void CensusReport() noexcept {
+    AcquireSRWLockExclusive(&censusReportLock);
+    for (auto& site : censusSites) site = {};
+    std::uint64_t total = 0, samples = 0, beyond = 0;
+    AcquireSRWLockShared(&censusLock);
+    for (std::size_t bucket = 0; bucket < CensusBuckets; ++bucket) {
+        for (std::size_t way = 0; way < CensusWays; ++way) {
+            if (censusKeys[bucket][way].load(std::memory_order_relaxed) == nullptr) continue;
+            const auto entry = censusEntries[bucket][way];
+            total += entry.bytes;
+            ++samples;
+            auto at = static_cast<std::size_t>((reinterpret_cast<std::uintptr_t>(entry.site) * 0x9e3779b97f4a7c15ull) >> 52);
+            std::size_t probes = 0;
+            while (probes < CensusSites && censusSites[at].site != nullptr && censusSites[at].site != entry.site) {
+                at = (at + 1) & (CensusSites - 1);
+                ++probes;
+            }
+            if (probes == CensusSites) {
+                beyond += entry.bytes;
+                continue;
+            }
+            censusSites[at].site = entry.site;
+            censusSites[at].bytes += entry.bytes;
+            ++censusSites[at].samples;
+        }
+    }
+    ReleaseSRWLockShared(&censusLock);
+    char text[512];
+    std::snprintf(text, sizeof(text), "[heap-census] %llu MiB live in %llu samples of the AGC driver's operator new (one sample per %llu KiB allocated, larger blocks at their size; %llu samples dropped, %llu MiB in sites beyond the table)\n", static_cast<unsigned long long>(total >> 20), static_cast<unsigned long long>(samples), static_cast<unsigned long long>(CensusInterval >> 10), static_cast<unsigned long long>(censusDropped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(beyond >> 20));
+    std::fputs(text, stderr);
+    for (int rank = 0; rank < CensusPrinted; ++rank) {
+        std::size_t best = CensusSites;
+        for (std::size_t at = 0; at < CensusSites; ++at) {
+            if (censusSites[at].bytes != 0 && (best == CensusSites || censusSites[at].bytes > censusSites[best].bytes)) best = at;
+        }
+        if (best == CensusSites) break;
+        HMODULE module = nullptr;
+        char path[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(censusSites[best].site), &module) && module != nullptr) GetModuleFileNameA(module, path, sizeof(path));
+        const char* name = path;
+        for (const char* at = path; *at != 0; ++at) {
+            if (*at == '\\' || *at == '/') name = at + 1;
+        }
+        std::snprintf(text, sizeof(text), "[heap-census] %2d. %8.1f MiB in %llu samples: %s+0x%llx\n", rank + 1, static_cast<double>(censusSites[best].bytes) / 1048576.0, static_cast<unsigned long long>(censusSites[best].samples), name, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(censusSites[best].site) - reinterpret_cast<std::uintptr_t>(module)));
+        std::fputs(text, stderr);
+        censusSites[best].bytes = 0;
+    }
+    ReleaseSRWLockExclusive(&censusReportLock);
+}
+
+void CensusAdd(void* block, std::size_t bytes, void* site) noexcept {
+    const auto bucket = CensusBucket(block);
+    bool placed = false;
+    AcquireSRWLockExclusive(&censusLock);
+    for (std::size_t way = 0; way < CensusWays && !placed; ++way) {
+        if (censusKeys[bucket][way].load(std::memory_order_relaxed) != nullptr) continue;
+        censusEntries[bucket][way] = {site, bytes > CensusInterval ? bytes : CensusInterval};
+        censusKeys[bucket][way].store(block, std::memory_order_release);
+        placed = true;
+    }
+    ReleaseSRWLockExclusive(&censusLock);
+    if (!placed) censusDropped.fetch_add(1, std::memory_order_relaxed);
+    const std::uint64_t now = GetTickCount64();
+    auto due = censusReportAt.load(std::memory_order_relaxed);
+    if (due == 0) censusReportAt.compare_exchange_strong(due, now + 30000, std::memory_order_relaxed);
+    else if (now >= due && censusReportAt.compare_exchange_strong(due, now + 30000, std::memory_order_relaxed)) CensusReport();
+}
+
+void CensusRemove(void* block) noexcept {
+    const auto bucket = CensusBucket(block);
+    for (std::size_t way = 0; way < CensusWays; ++way) {
+        if (censusKeys[bucket][way].load(std::memory_order_relaxed) != block) continue;
+        AcquireSRWLockExclusive(&censusLock);
+        if (censusKeys[bucket][way].load(std::memory_order_relaxed) == block) censusKeys[bucket][way].store(nullptr, std::memory_order_release);
+        ReleaseSRWLockExclusive(&censusLock);
+        return;
+    }
+}
+
+void CensusNote(void* block, std::size_t bytes, void* site) noexcept {
+    auto* cache = CurrentCache();
+    if (cache == nullptr) return;
+    cache->untilSample -= static_cast<std::ptrdiff_t>(bytes);
+    if (cache->untilSample > 0) return;
+    cache->untilSample = static_cast<std::ptrdiff_t>(CensusInterval);
+    CensusAdd(block, bytes, site);
+}
+
 void* TryAllocate(std::size_t bytes) noexcept {
     if (bytes == 0) bytes = 1;
     const bool large = bytes > LargestCached && bytes <= LargestLarge && LargeCache();
@@ -196,9 +316,12 @@ void* TryAllocate(std::size_t bytes) noexcept {
     return std::malloc(bytes);
 }
 
-void* Allocate(std::size_t bytes) {
+void* Allocate(std::size_t bytes, void* site) {
     for (;;) {
-        if (void* block = TryAllocate(bytes)) return block;
+        if (void* block = TryAllocate(bytes)) {
+            if (censusOn) CensusNote(block, bytes, site);
+            return block;
+        }
         const auto handler = std::get_new_handler();
         if (handler == nullptr) throw std::bad_alloc();
         handler();
@@ -207,6 +330,7 @@ void* Allocate(std::size_t bytes) {
 
 void Release(void* block, std::size_t bytes = 0) noexcept {
     if (block == nullptr) return;
+    if (censusOn) CensusRemove(block);
     if (auto* cache = CurrentCache()) {
         const bool large = LargeCache();
         const auto usable = bytes != 0 && bytes % Granule == 0 && (bytes <= LargestCached || !large) ? bytes : _msize(block);
@@ -242,18 +366,18 @@ void SetHostPrefetchQuery(bool (*query)()) noexcept {
 
 }
 
-void* operator new(std::size_t bytes) { return Allocate(bytes); }
-void* operator new[](std::size_t bytes) { return Allocate(bytes); }
+void* operator new(std::size_t bytes) { return Allocate(bytes, __builtin_return_address(0)); }
+void* operator new[](std::size_t bytes) { return Allocate(bytes, __builtin_return_address(0)); }
 void* operator new(std::size_t bytes, const std::nothrow_t&) noexcept {
     try {
-        return Allocate(bytes);
+        return Allocate(bytes, __builtin_return_address(0));
     } catch (...) {
         return nullptr;
     }
 }
 void* operator new[](std::size_t bytes, const std::nothrow_t&) noexcept {
     try {
-        return Allocate(bytes);
+        return Allocate(bytes, __builtin_return_address(0));
     } catch (...) {
         return nullptr;
     }

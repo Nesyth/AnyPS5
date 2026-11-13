@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -205,6 +207,7 @@ private:
             _order.push_back({raw, bytes});
             _bySize[bytes].push_back(std::prev(_order.end()));
             _cachedBytes += bytes;
+            noteCensus();
             while (_cachedBytes > budget() && !_order.empty()) {
                 const auto oldest = _order.front();
                 auto& same = _bySize[oldest.bytes];
@@ -220,6 +223,15 @@ private:
             void* raw;
             std::size_t bytes;
         };
+
+        void noteCensus() {
+            static const bool on = std::getenv("APS5_HEAP_CENSUS") != nullptr;
+            if (!on) return;
+            const auto now = std::chrono::steady_clock::now();
+            if (now < _censusAt) return;
+            _censusAt = now + std::chrono::seconds(30);
+            std::fprintf(stderr, "[guest-heap] %zu MiB taken from the arena (peak %zu), %zu MiB in use (peak %zu), %zu MiB of freed large blocks kept in %zu blocks (budget %zu MiB)\n", usage().system.load(std::memory_order_relaxed) >> 20, usage().maxSystem.load(std::memory_order_relaxed) >> 20, usage().inUse.load(std::memory_order_relaxed) >> 20, usage().maxInUse.load(std::memory_order_relaxed) >> 20, _cachedBytes >> 20, _order.size(), budget() >> 20);
+        }
 
         static std::size_t budget() {
             static const std::size_t value = [] {
@@ -240,6 +252,7 @@ private:
         std::list<Entry> _order;
         std::unordered_map<std::size_t, std::vector<std::list<Entry>::iterator>> _bySize;
         std::size_t _cachedBytes = 0;
+        std::chrono::steady_clock::time_point _censusAt{};
     };
 
     std::array<SizeClass, ClassCount> _classes;
