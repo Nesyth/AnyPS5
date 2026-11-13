@@ -340,6 +340,10 @@ enum class Counter : std::uint16_t {
     ResolveCensusChanged,
     ResolveCensusContentNew,
     ResolveCensusContentSeen,
+    ResolveCensusStages,
+    ResolveCensusStageUntraced,
+    ResolveCensusStageRuleSeen,
+    ResolveCensusStageContentSeen,
     Count,
 };
 

@@ -623,6 +623,67 @@ void noteResolveCensus(const LeanDrawJob& job, const DirectStages& resolved) {
     DirectDraws::Add(seen ? Counter::ResolveCensusContentSeen : Counter::ResolveCensusContentNew);
 }
 
+void noteStageCensus(const ShaderRecompiler::PreparedShaderInvocation& invocation, const ShaderRecompiler::ResourceCapture& capture, const DirectReads& reads, std::span<const Graphics::DecodeRead> decodeReads) {
+    constexpr std::uint64_t Prime = 1099511628211ull;
+    const auto mix = [](std::uint64_t& hash, std::uint64_t value) { hash = (hash ^ value) * Prime; };
+    const auto& request = invocation.Request();
+    const auto userData = request.context.userData;
+    const auto& use = capture.userDataUse;
+    std::uint64_t content = invocation.VariantId() * 0x9e3779b97f4a7c15ull + request.layout.pushConstantOffsetBytes;
+    for (const auto& read : decodeReads) {
+        mix(content, read.size);
+        for (std::uint32_t at = 0; at < read.size; ++at) mix(content, std::to_integer<std::uint64_t>(read.data[at]));
+    }
+    bool matched = true;
+    for (const auto& [address, origin] : use.reads) {
+        const auto found = std::lower_bound(reads.words.begin(), reads.words.end(), std::pair<std::uint64_t, std::uint32_t>{address, 0u});
+        if (found == reads.words.end() || found->first != address) {
+            matched = false;
+            break;
+        }
+        const bool based = origin >= 0 && static_cast<std::size_t>(origin) < userData.size();
+        mix(content, static_cast<std::uint64_t>(static_cast<std::int64_t>(origin)));
+        mix(content, based ? address - (static_cast<std::uint64_t>(userData[static_cast<std::size_t>(origin)]) & ~std::uint64_t{3}) : address);
+        mix(content, found->second);
+    }
+    DirectDraws::Add(Counter::ResolveCensusStages);
+    std::vector<std::uint64_t> traced;
+    traced.reserve(use.reads.size());
+    for (const auto& read : use.reads) traced.push_back(read.first);
+    std::sort(traced.begin(), traced.end());
+    traced.erase(std::unique(traced.begin(), traced.end()), traced.end());
+    if (!matched || traced.size() != reads.words.size()) {
+        DirectDraws::Add(Counter::ResolveCensusStageUntraced);
+        return;
+    }
+    auto rule = content;
+    std::uint32_t valueWords = 0;
+    for (std::size_t index = 0; index < userData.size(); ++index) {
+        const bool tracked = index < ShaderRecompiler::SrtUserDataUse::TrackedWords;
+        const bool value = !tracked || ((use.asValue >> index) & 1u) != 0;
+        if (!value) continue;
+        ++valueWords;
+        mix(rule, index);
+        mix(rule, userData[index]);
+    }
+    static std::array<ResolveCensusShard, 16> rules;
+    static std::array<ResolveCensusShard, 16> contents;
+    const auto seenIn = [](std::array<ResolveCensusShard, 16>& shards, std::uint64_t key) {
+        auto& shard = shards[static_cast<std::size_t>((key >> 7u) & 15u)];
+        std::lock_guard lock(shard.mutex);
+        if (shard.seen.size() > 262144u) shard.seen.clear();
+        return !shard.seen.try_emplace(key, 1u).second;
+    };
+    const bool ruleSeen = seenIn(rules, rule);
+    const bool contentSeen = seenIn(contents, content);
+    if (ruleSeen) DirectDraws::Add(Counter::ResolveCensusStageRuleSeen);
+    if (contentSeen) DirectDraws::Add(Counter::ResolveCensusStageContentSeen);
+    if (contentSeen && !ruleSeen) {
+        static std::atomic<std::uint32_t> printed{0};
+        if (printed.fetch_add(1, std::memory_order_relaxed) < 24) std::fprintf(stderr, "[resolve-census] stage content seen, memo rule new: stage %u, %zu user words, %u compared as values, value mask %016llx, base mask %016llx, %zu reads, %zu decode reads\n", static_cast<unsigned>(request.shader.stage), userData.size(), valueWords, static_cast<unsigned long long>(use.asValue), static_cast<unsigned long long>(use.asBase), use.reads.size(), decodeReads.size());
+    }
+}
+
 }
 
 std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const LeanAnchor& anchor, DirectStages& resolved, DirectStepClock* clock) {
@@ -775,6 +836,7 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
         stage.pushOffset = donor.pushConstants.empty() ? 0u : cursor;
         cursor += static_cast<std::uint32_t>(donor.pushConstants.size());
         previous = &donor;
+        if (resolveCensus()) noteStageCensus(*invocation, *stage.capture, reads, resolved.decodeReads[i]);
         lap(Step::Side);
     }
     DrawVertexLayout(resolved.vertexInfos, resolved.vertexLayout, resolved.vertexInputs);
