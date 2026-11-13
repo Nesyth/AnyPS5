@@ -82,6 +82,7 @@ struct InvocationSlot {
     std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
     bool convertedSamples = false;
     bool layerRowSamples = false;
+    std::uint64_t variant = 0;
 };
 
 struct InvocationCache {
@@ -727,7 +728,7 @@ struct StageMemoEntry {
     std::uint32_t indexCount = 0;
     std::uint32_t indexSize = 0;
     std::uint32_t instanceCount = 0;
-    std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+    std::uint64_t variant = 0;
     bool convertedSamples = false;
     bool layerRowSamples = false;
     std::vector<std::uint32_t> userData;
@@ -741,16 +742,97 @@ struct StageMemoEntry {
     std::vector<Graphics::DecodeRead> decodeReads;
 };
 
-struct StageMemo {
+struct StageMemoShard {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const std::vector<StageMemoPattern>>> patterns;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const StageMemoEntry>> current;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const StageMemoEntry>> previous;
+};
+
+class StageMemoStore {
+public:
     static constexpr std::size_t Ways = 4;
-    static constexpr std::size_t Bound = 32768;
-    std::unordered_map<std::uint64_t, std::vector<StageMemoPattern>> patterns;
-    std::unordered_map<std::uint64_t, StageMemoEntry> entries;
+    static constexpr std::size_t Shards = 64;
+    static constexpr std::size_t ShardBound = 512;
+
+    std::shared_ptr<const std::vector<StageMemoPattern>> Patterns(std::uint64_t key) {
+        auto& held = shard(key);
+        std::lock_guard lock(held.mutex);
+        const auto found = held.patterns.find(key);
+        return found != held.patterns.end() ? found->second : nullptr;
+    }
+
+    std::shared_ptr<const StageMemoEntry> Find(std::uint64_t key) {
+        auto& held = shard(key);
+        std::lock_guard lock(held.mutex);
+        if (const auto found = held.current.find(key); found != held.current.end()) return found->second;
+        const auto old = held.previous.find(key);
+        if (old == held.previous.end()) return nullptr;
+        auto entry = std::move(old->second);
+        held.previous.erase(old);
+        place(held, key, entry);
+        return entry;
+    }
+
+    std::optional<std::size_t> Way(std::uint64_t key, const StageMemoPattern& pattern) {
+        auto& held = shard(key);
+        std::lock_guard lock(held.mutex);
+        auto& ways = held.patterns[key];
+        if (ways != nullptr) {
+            const auto way = static_cast<std::size_t>(std::ranges::find(*ways, pattern) - ways->begin());
+            if (way != ways->size()) return way;
+            if (ways->size() >= Ways) return std::nullopt;
+        }
+        auto grown = ways != nullptr ? std::make_shared<std::vector<StageMemoPattern>>(*ways) : std::make_shared<std::vector<StageMemoPattern>>();
+        grown->push_back(pattern);
+        const auto way = grown->size() - 1u;
+        ways = std::move(grown);
+        return way;
+    }
+
+    bool Admit(std::uint64_t key) {
+        auto& cell = seen[static_cast<std::size_t>((key ^ (key >> 29u)) % SeenKeys)];
+        if (cell.load(std::memory_order_relaxed) == key) return true;
+        cell.store(key, std::memory_order_relaxed);
+        return false;
+    }
+
+    void Insert(std::uint64_t key, std::shared_ptr<const StageMemoEntry> entry) {
+        auto& held = shard(key);
+        std::lock_guard lock(held.mutex);
+        held.previous.erase(key);
+        place(held, key, entry);
+    }
+
+private:
+    StageMemoShard& shard(std::uint64_t key) { return shards[static_cast<std::size_t>((key ^ (key >> 23u)) % Shards)]; }
+
+    void place(StageMemoShard& held, std::uint64_t key, const std::shared_ptr<const StageMemoEntry>& entry) {
+        if (held.current.size() >= ShardBound && !held.current.contains(key)) {
+            held.previous = std::move(held.current);
+            held.current.clear();
+            DirectDraws::Add(Counter::StageMemoCleared);
+        }
+        held.current.insert_or_assign(key, entry);
+    }
+
+    static constexpr std::size_t SeenKeys = std::size_t{1} << 17u;
+    std::array<StageMemoShard, Shards> shards;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> seen{new std::atomic<std::uint64_t>[SeenKeys]()};
+};
+
+StageMemoStore& stageMemoStore() {
+    static auto* store = new StageMemoStore;
+    return *store;
+}
+
+struct StageMemo {
     std::vector<std::uint32_t> gathered;
     std::vector<std::uint64_t> addresses;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> sorted;
     AddressRanges decodeRanges;
     std::uint64_t verifyOrdinal = 0;
+    std::uint64_t missKey = 0;
 };
 
 struct StageMemoStorage {};
@@ -808,14 +890,15 @@ bool stageMemoCacheable(const DrawProgram& program) {
 StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, const DrawProgram& program, std::size_t index, std::uint32_t cursor, const InvocationSlot& slot, DirectStages& resolved) {
     const auto& decode = job.shape->decode;
     const auto key = stageMemoKey(decode.get(), index);
-    const auto found = memo.patterns.find(key);
-    if (found == memo.patterns.end()) return StageMemoOutcome::NoPattern;
+    auto& store = stageMemoStore();
+    const auto ways = store.Patterns(key);
+    if (ways == nullptr) return StageMemoOutcome::NoPattern;
     const std::span<const std::uint32_t> userData = program.userData;
     auto& stage = resolved.stages[index];
     const DirectStage* previous = index != 0 ? resolved.stages[index - 1].shared.get() : nullptr;
     auto last = StageMemoOutcome::NoEntry;
-    for (std::size_t way = 0; way < found->second.size(); ++way) {
-        const auto& pattern = found->second[way];
+    for (std::size_t way = 0; way < ways->size(); ++way) {
+        const auto& pattern = (*ways)[way];
         if (pattern.userWords != userData.size()) continue;
         auto& gathered = memo.gathered;
         auto& addresses = memo.addresses;
@@ -838,14 +921,16 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, const DrawP
             last = StageMemoOutcome::Gather;
             continue;
         }
-        const auto entryFound = memo.entries.find(stageMemoContentKey(key, way, pattern, userData, gathered, job.parameters, cursor, previous));
-        if (entryFound == memo.entries.end()) {
+        const auto contentKey = stageMemoContentKey(key, way, pattern, userData, gathered, job.parameters, cursor, previous);
+        const auto held = store.Find(contentKey);
+        if (held == nullptr) {
             last = StageMemoOutcome::NoEntry;
+            memo.missKey = contentKey;
             continue;
         }
-        const auto& entry = entryFound->second;
+        const auto& entry = *held;
         const auto& parameters = job.parameters;
-        bool same = entry.decode.get() == decode.get() && entry.stage == index && entry.way == way && entry.cursor == cursor && entry.tag == resolved.tag && entry.previous.get() == previous && entry.indexAddress == parameters.indexAddress && entry.indexCount == parameters.indexCount && entry.indexSize == parameters.indexSize && entry.instanceCount == parameters.instanceCount && entry.handle.get() == slot.handle.get() && entry.convertedSamples == slot.convertedSamples && entry.layerRowSamples == slot.layerRowSamples && entry.userData.size() == userData.size();
+        bool same = entry.decode.get() == decode.get() && entry.stage == index && entry.way == way && entry.cursor == cursor && entry.tag == resolved.tag && entry.previous.get() == previous && entry.indexAddress == parameters.indexAddress && entry.indexCount == parameters.indexCount && entry.indexSize == parameters.indexSize && entry.instanceCount == parameters.instanceCount && entry.variant == slot.variant && entry.convertedSamples == slot.convertedSamples && entry.layerRowSamples == slot.layerRowSamples && entry.userData.size() == userData.size();
         for (std::size_t word = 0; same && word < userData.size(); ++word) {
             if (stageMemoRelocates(pattern.relocatable, word)) same = userData[word] != 0u;
             else same = entry.userData[word] == userData[word];
@@ -919,7 +1004,7 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, const DrawP
     return last;
 }
 
-std::optional<Counter> rememberStage(StageMemo& memo, const LeanDrawJob& job, const DrawProgram& program, std::size_t index, std::uint32_t cursor, const InvocationSlot& slot, const DirectReads& reads, const DirectStages& resolved) {
+std::optional<Counter> rememberStage(const LeanDrawJob& job, const DrawProgram& program, std::size_t index, std::uint32_t cursor, const InvocationSlot& slot, const DirectReads& reads, const DirectStages& resolved) {
     const auto& stage = resolved.stages[index];
     const auto& use = stage.capture->userDataUse;
     const std::span<const std::uint32_t> userData = program.userData;
@@ -996,16 +1081,10 @@ std::optional<Counter> rememberStage(StageMemo& memo, const LeanDrawJob& job, co
     entry.order.reserve(placed.size());
     for (const auto& item : placed) entry.order.push_back(item.nested ? walkRoots + item.slot : item.slot);
     const auto key = stageMemoKey(job.shape->decode.get(), index);
-    auto& ways = memo.patterns[key];
-    auto way = static_cast<std::size_t>(std::ranges::find(ways, pattern) - ways.begin());
-    if (way == ways.size()) {
-        if (ways.size() >= StageMemo::Ways) return Counter::StageMemoPatternsFull;
-        ways.push_back(pattern);
-    }
-    if (memo.entries.size() >= StageMemo::Bound) {
-        memo.entries.clear();
-        DirectDraws::Add(Counter::StageMemoCleared);
-    }
+    auto& store = stageMemoStore();
+    const auto placedWay = store.Way(key, pattern);
+    if (!placedWay.has_value()) return Counter::StageMemoPatternsFull;
+    const auto way = *placedWay;
     entry.decode = job.shape->decode;
     entry.stage = static_cast<std::uint32_t>(index);
     entry.way = static_cast<std::uint32_t>(way);
@@ -1017,7 +1096,7 @@ std::optional<Counter> rememberStage(StageMemo& memo, const LeanDrawJob& job, co
     entry.indexCount = job.parameters.indexCount;
     entry.indexSize = job.parameters.indexSize;
     entry.instanceCount = job.parameters.instanceCount;
-    entry.handle = slot.handle;
+    entry.variant = slot.variant;
     entry.convertedSamples = slot.convertedSamples;
     entry.layerRowSamples = slot.layerRowSamples;
     entry.userData.assign(userData.begin(), userData.end());
@@ -1026,8 +1105,8 @@ std::optional<Counter> rememberStage(StageMemo& memo, const LeanDrawJob& job, co
     entry.side = stage.side;
     entry.vertexInfo = info;
     entry.decodeReads = decodeReads;
-    const auto contentKey = stageMemoContentKey(key, way, ways[way], userData, entry.rootValues, job.parameters, cursor, entry.previous.get());
-    memo.entries.insert_or_assign(contentKey, std::move(entry));
+    const auto contentKey = stageMemoContentKey(key, way, pattern, userData, entry.rootValues, job.parameters, cursor, entry.previous.get());
+    store.Insert(contentKey, std::make_shared<const StageMemoEntry>(std::move(entry)));
     return Counter::StageMemoStored;
 }
 
@@ -1144,12 +1223,14 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
         stage.capture.reset();
         const auto cursorBefore = cursor;
         std::optional<StageMemoKept> memoKept;
+        bool memoAdmitted = true;
         const bool memoStage = memo != nullptr && stageMemoCacheable(program);
         if (memo != nullptr) {
             const auto& known = cache.For(program);
             if (memoStage && known.handle != nullptr && known.snapshot.get() == program.snapshot.get() && known.codeOffset == program.codeOffset) {
                 const auto outcome = adoptStage(*memo, job, program, i, cursor, known, resolved);
                 DirectDraws::Add(stageMemoCounter(outcome));
+                if (outcome == StageMemoOutcome::NoEntry) memoAdmitted = stageMemoStore().Admit(memo->missKey);
                 if (outcome == StageMemoOutcome::Hit) {
                     const auto every = stageMemoVerifyEvery();
                     if (every == 0 || ++memo->verifyOrdinal % every != 0) {
@@ -1189,7 +1270,7 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
                 DirectDraws::Add(Counter::InvocationsRebuilt);
                 if (slot != nullptr) {
                     const auto& context = invocation->Request().context;
-                    *slot = {program.snapshot, program.codeOffset, invocation->Handle(), context.convertedSamples, context.layerRowSamples};
+                    *slot = {program.snapshot, program.codeOffset, invocation->Handle(), context.convertedSamples, context.layerRowSamples, invocation->VariantId()};
                 }
             }
         } catch (const std::exception&) {
@@ -1263,8 +1344,8 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
                 static std::atomic<std::uint32_t> printed{0};
                 if (printed.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "[stage-memo-verify] %s differs: stage %zu of a draw with %zu stages\n", what, i, count);
             }
-        } else if (memoStage && slot != nullptr && slot->handle != nullptr) {
-            if (const auto stored = rememberStage(*memo, job, program, i, cursorBefore, *slot, reads, resolved)) DirectDraws::Add(*stored);
+        } else if (memoStage && memoAdmitted && slot != nullptr && slot->handle != nullptr) {
+            if (const auto stored = rememberStage(job, program, i, cursorBefore, *slot, reads, resolved)) DirectDraws::Add(*stored);
         }
         if (resolveCensus()) noteStageCensus(*invocation, *stage.capture, reads, resolved.decodeReads[i]);
         lap(Step::Side);
