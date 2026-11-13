@@ -2311,23 +2311,26 @@ bool sameVertexLayout(const VertexInputLayout& a, const VertexInputLayout& b) {
     return std::ranges::equal(a.bindings, b.bindings, sameBinding) && std::ranges::equal(a.attributes, b.attributes, sameAttribute);
 }
 
-DrawRecordInputs takePreparedInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, PreparedInputs& prepared, DrawInputs& inputs, DrawTimer& timer, PerformanceTimer& timing) {
+DrawRecordInputs takePreparedInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, PreparedInputs& prepared, DrawInputs& inputs, DrawTimer& timer, PerformanceTimer& timing, bool atFloor = false, bool validated = false) {
     const std::size_t indexRanges = draw.indexed ? 1u : 0u;
     if (prepared.recipe.get() != &recipe || prepared.device != context.device || prepared.state != &state || prepared.draw != &draw || prepared.shaders != shaders.data() || prepared.stages != shaders.size() || prepared.ranges.size() < indexRanges || context.recorder == nullptr || !context.drawInputsInPlace) return DrawRecordInputs::Shape;
     const bool mapped = (prepared.forget & 1u) == 0 && GuestMemory::ForgetSerial() == prepared.forget;
     const auto indexBytes = static_cast<std::size_t>(prepared.indexBytes);
-    if (draw.indexed) {
+    if (draw.indexed && !atFloor) {
         if (!mapped) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), indexBytes, draw.indexSize);
         RequireNoMultisampleTarget(draw.indexAddress, indexBytes, "an index buffer read");
     }
-    requireUncountedKills(state);
-    ValidateViewport(context, state.viewport);
-    ValidateDepthBounds(context, state);
-    ValidateSampleMask(context, state, shaders);
+    if (!atFloor && !validated) {
+        requireUncountedKills(state);
+        ValidateViewport(context, state.viewport);
+        ValidateDepthBounds(context, state);
+        ValidateSampleMask(context, state, shaders);
+    }
     timer.phase(PhaseValidate);
     timing.Mark("validate");
     bool rechecked = false;
     const auto served = [&](const PreparedInputs::Range& range, bool* behind) {
+        if (atFloor) return DrawRecordInputs::Used;
         KnownImport known{range.import, prepared.imports, prepared.mapping};
         const auto* import = inPlaceDrawInput(context, range.begin, static_cast<std::size_t>(range.end - range.begin), range.alignment, behind, &known);
         rechecked = rechecked || known.looked;
@@ -2344,7 +2347,7 @@ DrawRecordInputs takePreparedInputs(const Context& context, const State& state, 
         const auto& range = prepared.ranges[at];
         const auto bytes = static_cast<std::size_t>(range.end - range.begin);
         if (!mapped) GuestMemory::CheckRange(reinterpret_cast<const void*>(range.begin), bytes, 1);
-        RequireNoMultisampleTarget(range.begin, bytes, "a vertex buffer read");
+        if (!atFloor) RequireNoMultisampleTarget(range.begin, bytes, "a vertex buffer read");
         if (const auto use = served(range, &behind); use != DrawRecordInputs::Used) return use;
     }
     inputs.indexBytes = prepared.indexBytes;
@@ -7136,6 +7139,35 @@ namespace {
 struct ExpressReadsStorage {};
 struct ExpressAttachmentsStorage {};
 
+std::atomic<std::uint64_t> leanExpressTaken{0};
+std::atomic<std::uint64_t> leanExpressTouched{0};
+std::atomic<std::uint64_t> leanExpressChecked{0};
+std::atomic<std::uint64_t> leanExpressDiffering{0};
+
+bool leanExpressVerifyDue() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_LEAN_EXPRESS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    static std::uint64_t ordinal = 0;
+    return every != 0 && ++ordinal % every == 0;
+}
+
+void noteLeanExpressVerify(bool clear) {
+    leanExpressChecked.fetch_add(1, std::memory_order_relaxed);
+    if (clear) return;
+    static std::atomic<std::uint32_t> printed{0};
+    if (leanExpressDiffering.fetch_add(1, std::memory_order_relaxed) == 0 || printed.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[lean-express-verify] the buffer tests refuse a commit whose buffer ranges lie in memory no GPU write was marked for\n");
+}
+
+void noteLeanExpress(bool untouched) {
+    (untouched ? leanExpressTaken : leanExpressTouched).fetch_add(1, std::memory_order_relaxed);
+    static std::uint64_t seen = 0;
+    if ((++seen & 0xfffffu) != 0) return;
+    const auto wide = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    std::fprintf(stderr, "[lean-express] %llu express commits without buffer tests, %llu with them (a range in memory a GPU write was marked for); verify %llu checked, %llu differing\n", wide(leanExpressTaken), wide(leanExpressTouched), wide(leanExpressChecked), wide(leanExpressDiffering));
+}
+
 }
 
 std::uint64_t ExpressVerifyEvery() {
@@ -7163,7 +7195,15 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     const auto templateMiss = resources.ExpressCurrent();
     const bool reprove = templateMiss != ShaderResources::ExpressMiss::None && templateMiss != ShaderResources::ExpressMiss::NotProved && templateMiss != ShaderResources::ExpressMiss::Regions;
     if (templateMiss != ShaderResources::ExpressMiss::None && !reprove) return miss(DrawExpressMiss::Template);
-    for (std::size_t index = 0; index < keep.targets.size(); ++index) {
+    struct FloorPass {
+        std::uint64_t recorder = 0;
+        std::uint64_t generation = 0;
+        const void* framebuffer = nullptr;
+    };
+    thread_local FloorPass floorPass;
+    const bool atFloor = RuntimeSwitches::Set(RuntimeSwitch::XpExpressFloor);
+    const bool sameTargets = atFloor && recorder->RenderPassOpen() && floorPass.recorder == recorder->Id() && floorPass.generation == recorder->RenderPassGeneration() && floorPass.framebuffer == keep.framebuffer.get();
+    for (std::size_t index = 0; !sameTargets && index < keep.targets.size(); ++index) {
         const auto& target = keep.targets[index];
         if (target == nullptr) {
             if (index >= state.colors.size() || index >= keep.multisample.size() || keep.multisample[index] == nullptr || index >= express->multisampleImages.size() || index >= recipe->targetViews.size()) return miss(DrawExpressMiss::Targets);
@@ -7210,7 +7250,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         if (target->UploadVersion() != express->targetVersions[index]) return miss(DrawExpressMiss::Targets);
     }
     if (express->hasDepth && (DepthSurfacesSerial() != express->depthSerial || DepthSurfacesReleased() != express->depthReleased)) return miss(DrawExpressMiss::Depth);
-    if (recipe->hasDepth && state.depth.has_value()) {
+    if (!sameTargets && recipe->hasDepth && state.depth.has_value()) {
         struct DepthChecked {
             std::uint64_t recorder = 0;
             std::uint64_t generation = 0;
@@ -7249,7 +7289,8 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         out.reproved = true;
     }
     DrawInputs inputs;
-    const auto taken = takePreparedInputs(context, state, draw, shaders, *recipe, *preparedInputs, inputs, timer, timing);
+    const bool leanOn = RuntimeSwitches::Set(RuntimeSwitch::LeanExpress);
+    const auto taken = takePreparedInputs(context, state, draw, shaders, *recipe, *preparedInputs, inputs, timer, timing, atFloor, leanOn);
     if (taken != DrawRecordInputs::Used && taken != DrawRecordInputs::Rechecked) {
         record.effects = {};
         return miss(DrawExpressMiss::Inputs);
@@ -7263,7 +7304,14 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         return miss(why);
     };
     record.effects.inputs = taken;
-    {
+    bool untouched = leanOn && (prepared->forget & 1u) == 0 && GuestMemory::ForgetSerial() == prepared->forget && resources.PreparedUntouched(*prepared);
+    if (untouched && leanExpressVerifyDue()) {
+        const bool clear = resources.PreparedMovesClear(*prepared, *recorder, nullptr) && resources.UnmovedRangesClear(*prepared, *recorder);
+        noteLeanExpressVerify(clear);
+        untouched = clear;
+    }
+    if (leanOn) noteLeanExpress(untouched);
+    if (!atFloor && !untouched) {
         auto ticket = record.ticket;
         ticket.ranges = &record.ticketRanges;
         ticket.checked = 0;
@@ -7280,17 +7328,17 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     };
     if (recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) recorder->FlushKeyStores();
     if (recorder->HasQueuedStores() && recorder->AnyQueuedStore(touches)) recorder->FlushStores();
-    if (resources.FragmentSelectionHolds(*recorder, prepared->moved, *prepared, nullptr) != ShaderResources::PreparedBuffers::Selection::Taken) return giveBack(DrawExpressMiss::Selection);
+    if (resources.FragmentSelectionHolds(*recorder, prepared->moved, *prepared, nullptr, untouched) != ShaderResources::PreparedBuffers::Selection::Taken) return giveBack(DrawExpressMiss::Selection);
     if (resources.ChecksFaults() && fragment->faultGeneration != resources.FaultGeneration()) resources.RewriteFragmentFaults(*fragment->bindings);
     try {
         if (!reprove) resources.ExpressStage(*recorder);
     } catch (const std::exception&) {
         return giveBack(DrawExpressMiss::Staging);
     }
-    CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
+    if (!atFloor) CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
     if (recipe->hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     if (const auto present = Recorder::Presents(); record.touchedPresent != present) {
-        if (!RuntimeSwitches::Set(RuntimeSwitch::TemplateTouch) || resources.TouchedPresent() != present) {
+        if ((!atFloor && !RuntimeSwitches::Set(RuntimeSwitch::TemplateTouch)) || resources.TouchedPresent() != present) {
             SharedResourceCache().Touch(recipe->key);
             resources.NoteTouchedPresent(present);
         }
@@ -7316,6 +7364,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     resources.RequireGuestBuffers();
     const auto start = recorder->StartDrawPass(express->passKey, false, express->fenced, passAccess);
     record.access.generation = recorder->RenderPassGeneration();
+    if (atFloor) floorPass = {recorder->Id(), recorder->RenderPassGeneration(), keep.framebuffer.get()};
     const auto commands = start.commands;
     auto drawTiming = Recorder::NoTiming;
     if (!start.continued) {

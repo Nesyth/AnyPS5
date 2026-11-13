@@ -131,6 +131,8 @@ enum class RuntimeSwitch : std::size_t {
     XpSlowFinisher,
     XpSlowCommitter,
     XpSlowWorker,
+    XpExpressFloor,
+    LeanExpress,
     Count,
 };
 

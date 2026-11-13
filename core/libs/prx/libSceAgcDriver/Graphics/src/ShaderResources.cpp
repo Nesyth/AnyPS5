@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuZones.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeviceImageTable.hpp"
@@ -8053,6 +8054,29 @@ bool ShaderResources::PreparedMovesClear(const PreparedBuffers& prepared, Record
     return movedRangesClear(recorder, ranges, ticket, accessible);
 }
 
+bool ShaderResources::PreparedUntouched(const PreparedBuffers& prepared) const {
+    for (const auto& entry : prepared.moved) {
+        const auto& item = allocations[entry.allocation];
+        if (!item.guest) continue;
+        if (!GpuZones::Untouched(entry.address - item.adjustment, GuestBufferMemory::ViewBytes(entry.size, item.adjustment))) return false;
+    }
+    for (const auto& item : prepared.selected) {
+        if (item.moved) continue;
+        const auto& allocation = allocations[item.allocation];
+        if (!GpuZones::Untouched(allocation.address, allocation.size)) return false;
+    }
+    return true;
+}
+
+bool ShaderResources::UnmovedRangesClear(const PreparedBuffers& prepared, Recorder& recorder) const {
+    for (const auto& item : prepared.selected) {
+        if (item.moved) continue;
+        const auto& allocation = allocations[item.allocation];
+        if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return false;
+    }
+    return true;
+}
+
 const char* ShaderResources::MoveRefusalName(MoveRefusal refusal) {
     switch (refusal) {
         case MoveRefusal::None: return "none";
@@ -8475,7 +8499,7 @@ bool ShaderResources::unmovedClear(const Recorder& recorder, const PreparedBuffe
         clearAllocations.assign(allocations.size(), false);
     }
     for (const auto& item : prepared.selected) {
-        if (item.moved || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) continue;
+        if (item.moved || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor) || RuntimeSwitches::Set(RuntimeSwitch::XpExpressFloor)) continue;
         const auto& allocation = allocations[item.allocation];
         if (route != nullptr) ++route->tested;
         if (stamps && clearAllocations[item.allocation]) {
@@ -8641,13 +8665,13 @@ bool ShaderResources::PlaceDirectBuffers(const Context& context, PreparedBuffers
     return true;
 }
 
-ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route) const {
+ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched) const {
     auto selection = PreparedBuffers::Selection::Hazard;
-    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, route));
+    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, route, untouched));
     return selection;
 }
 
-bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route) const {
+bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched) const {
     using Selection = PreparedBuffers::Selection;
     selection = Selection::Hazard;
     const auto& plan = *prepared.plan;
@@ -8676,7 +8700,7 @@ bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const
         if (!unmovedClear(recorder, prepared, route)) return false;
     } else {
         for (const auto& item : prepared.selected) {
-            if (item.moved || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) continue;
+            if (item.moved || untouched || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor) || RuntimeSwitches::Set(RuntimeSwitch::XpExpressFloor)) continue;
             const auto& allocation = allocations[item.allocation];
             if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return false;
         }
@@ -10108,7 +10132,7 @@ void ShaderResources::RepeatRequire(std::span<const MovedBuffer> moved) const {
 
 bool ShaderResources::RepeatUnmovedClear(const Recorder& recorder, const PreparedBuffers& prepared) const {
     for (const auto& item : prepared.selected) {
-        if (item.moved || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) continue;
+        if (item.moved || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor) || RuntimeSwitches::Set(RuntimeSwitch::XpExpressFloor)) continue;
         const auto& allocation = allocations[item.allocation];
         if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return false;
     }

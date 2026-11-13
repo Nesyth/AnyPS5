@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuZones.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -847,6 +848,7 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
         for (const auto& [begin, end, slab] : ranges) {
             if (end <= begin) continue;
             bytes += end - begin;
+            GpuZones::Mark(shadow->UnitBegin(shadow->UnitOf(begin)), shadow->UnitBegin(shadow->UnitOf(end - 1) + 1) - shadow->UnitBegin(shadow->UnitOf(begin)));
             for (auto unit = shadow->UnitOf(begin); unit <= shadow->UnitOf(end - 1); ++unit) {
                 const auto& current = shadow->slabs[static_cast<std::size_t>(unit / SlabUnits())];
                 if (current == nullptr || current != slab) {

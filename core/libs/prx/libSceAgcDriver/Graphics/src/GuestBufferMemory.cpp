@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuZones.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MapImportGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/AdaptiveStaging.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -5446,6 +5447,7 @@ void GuestBufferMemory::AddWritable(std::uint64_t address, std::size_t bytes, bo
         dissolveSpace(false);
     }
     addDescriptorRegion(address, bytes, atomic, swept, false);
+    GpuZones::Mark(address, bytes);
     writes.emplace_back(address, address + bytes);
 }
 

@@ -464,7 +464,7 @@ public:
     bool ExpressReady() const { return expressValid && cleanProved; }
     ExpressMiss ExpressCurrent();
     void ExpressStage(Recorder& recorder);
-    PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route) const;
+    PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched = false) const;
     void PushFragmentBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
     void WriteFragmentSets(DrawBindings& result, std::span<const std::size_t> selected, std::int32_t pushedSet) const;
     void RewriteFragmentFaults(const DrawBindings& placed) const;
@@ -551,6 +551,8 @@ public:
     // changed since). True when every range is clear; the ticket is then left as
     // MovedReadOnlyBuffers would leave it.
     bool PreparedMovesClear(const PreparedBuffers& prepared, Recorder& recorder, MoveTicket* ticket) const;
+    bool PreparedUntouched(const PreparedBuffers& prepared) const;
+    bool UnmovedRangesClear(const PreparedBuffers& prepared, Recorder& recorder) const;
     // The ticket PreparedMovesClear left (null: it refused the ranges) against the one today's
     // MovedReadOnlyBuffers left from the same ticket.
     static PreparedDifference ComparePreparedTickets(const MoveTicket* prepared, const MoveTicket& today);
@@ -1226,7 +1228,7 @@ private:
     mutable std::atomic<std::uint64_t> multisampleGuardsClear{std::numeric_limits<std::uint64_t>::max()};
     void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     void writeFreshDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet) const;
-    bool preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route) const;
+    bool preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched = false) const;
     void pushBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const;
     void writeOwnDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     mutable std::unique_ptr<PushPlan> pushPlan;
