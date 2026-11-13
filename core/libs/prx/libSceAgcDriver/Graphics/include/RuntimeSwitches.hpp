@@ -128,6 +128,9 @@ enum class RuntimeSwitch : std::size_t {
     KeepFaultSlots,
     SiblingFinishers,
     FastSettle,
+    XpSlowFinisher,
+    XpSlowCommitter,
+    XpSlowWorker,
     Count,
 };
 

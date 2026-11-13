@@ -418,6 +418,10 @@ bool Driver::buildLeanShape(const QueueState& queue, const Submission& submissio
 
 DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
     using LeanFront::Counter;
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpSlowWorker)) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(1);
+        while (std::chrono::steady_clock::now() < until) {}
+    }
     static const bool allowed = [] {
         for (const char* name : {"APS5_PROFILE_DRAW", "APS5_LOCKED_DRAW_PREPARE", "APS5_DUMP_DRAW_SHADERS", "APS5_DUMP_DRAW_SLOT1", "APS5_TRACE_DRAW_PROGRAMS", "APS5_TRACE_SHADER_CORRELATION", "APS5_VERIFY_REGISTER_KEYS"}) {
             if (std::getenv(name) != nullptr) return false;

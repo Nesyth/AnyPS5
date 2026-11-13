@@ -916,6 +916,10 @@ void DrawFinisher::runLean(std::uint64_t seq, std::chrono::steady_clock::time_po
         ThreadReport::FinisherBusy(true, jobStart);
         static_cast<void>(ThreadReport::TakeItemMark());
     }
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpSlowFinisher)) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(2);
+        while (std::chrono::steady_clock::now() < until) {}
+    }
     std::exception_ptr error;
     try {
         if (!leanFailed.load(std::memory_order_acquire)) {

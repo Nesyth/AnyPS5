@@ -1810,6 +1810,10 @@ void verifyRepeat(VulkanDevice& device, const Graphics::State& graphics, DrawRec
 
 void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, DrawRecordHit& hit, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape) {
     using DrawRecords::Counter;
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpSlowCommitter)) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(1);
+        while (std::chrono::steady_clock::now() < until) {}
+    }
     if (hit.direct && hit.record->commit->recipe != nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpNoCommits)) {
         ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
         return;
