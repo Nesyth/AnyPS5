@@ -740,9 +740,69 @@ struct StageMemoEntry {
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
     std::shared_ptr<const DirectStage> shared;
     ShaderRecompiler::HeapStageWords side;
+    std::shared_ptr<const std::vector<struct StageForward>> forwards;
     std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
     std::vector<Graphics::DecodeRead> decodeReads;
 };
+
+struct StageForward {
+    std::uint32_t binding = 0;
+    std::uint32_t position = 0;
+    std::uint32_t word = 0;
+    bool push = false;
+};
+
+using StageForwards = std::vector<StageForward>;
+
+std::shared_ptr<const StageForwards> stageForwards(const std::shared_ptr<const DirectStage>& shared, const ShaderRecompiler::PreparedShaderInvocation& invocation, const ShaderRecompiler::ResourceCapture& capture) {
+    struct Known {
+        std::shared_ptr<const DirectStage> stage;
+        std::shared_ptr<const StageForwards> forwards;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<const DirectStage*, Known> known;
+    {
+        std::lock_guard lock(mutex);
+        if (const auto found = known.find(shared.get()); found != known.end()) return found->second.forwards;
+    }
+    auto marked = capture;
+    const auto count = marked.snapshot.userData.size();
+    const auto first = [](std::size_t word) { return 0x5a000000u + static_cast<std::uint32_t>(word) * 0x00010203u; };
+    const auto second = [](std::size_t word) { return 0xc3000000u + static_cast<std::uint32_t>(word) * 0x00030507u; };
+    ShaderRecompiler::HeapStageWords a;
+    ShaderRecompiler::HeapStageWords b;
+    for (std::size_t word = 0; word < count; ++word) marked.snapshot.userData[word] = first(word);
+    bool traced = invocation.FillSharedSide(marked, *shared->donor, *shared->patch, a);
+    for (std::size_t word = 0; word < count; ++word) marked.snapshot.userData[word] = second(word);
+    traced = traced && invocation.FillSharedSide(marked, *shared->donor, *shared->patch, b);
+    traced = traced && a.pushWords.size() == b.pushWords.size() && a.bindings.size() == b.bindings.size();
+    auto forwards = std::make_shared<StageForwards>();
+    const auto wordOf = [&](std::uint32_t x, std::uint32_t y) -> std::optional<std::uint32_t> {
+        for (std::size_t word = 0; word < count; ++word) {
+            if (first(word) == x && second(word) == y) return static_cast<std::uint32_t>(word);
+        }
+        return std::nullopt;
+    };
+    for (std::size_t position = 0; traced && position < a.pushWords.size(); ++position) {
+        if (a.pushWords[position] == b.pushWords[position]) continue;
+        const auto word = a.pushWords[position].first == b.pushWords[position].first ? wordOf(a.pushWords[position].second, b.pushWords[position].second) : std::nullopt;
+        traced = word.has_value();
+        if (traced) forwards->push_back({0u, static_cast<std::uint32_t>(position), *word, true});
+    }
+    for (std::size_t binding = 0; traced && binding < a.bindings.size(); ++binding) {
+        traced = a.bindings[binding].size() == b.bindings[binding].size();
+        for (std::size_t position = 0; traced && position < a.bindings[binding].size(); ++position) {
+            if (a.bindings[binding][position] == b.bindings[binding][position]) continue;
+            const auto word = wordOf(a.bindings[binding][position], b.bindings[binding][position]);
+            traced = word.has_value();
+            if (traced) forwards->push_back({static_cast<std::uint32_t>(binding), static_cast<std::uint32_t>(position), *word, false});
+        }
+    }
+    std::shared_ptr<const StageForwards> result = traced ? forwards : nullptr;
+    std::lock_guard lock(mutex);
+    if (known.size() > 65536u) known.clear();
+    return known.try_emplace(shared.get(), Known{shared, result}).first->second.forwards;
+}
 
 struct StageMemoShard {
     std::mutex mutex;
@@ -1010,8 +1070,8 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, const DrawP
         const auto& parameters = job.parameters;
         bool same = entry.decode.get() == decode.get() && entry.stage == index && entry.way == way && entry.cursor == cursor && entry.tag == resolved.tag && entry.previous.get() == previous && entry.indexAddress == parameters.indexAddress && entry.indexCount == parameters.indexCount && entry.indexSize == parameters.indexSize && entry.instanceCount == parameters.instanceCount && entry.variant == slot.variant && entry.convertedSamples == slot.convertedSamples && entry.layerRowSamples == slot.layerRowSamples && entry.userData.size() == userData.size();
         for (std::size_t word = 0; same && word < userData.size(); ++word) {
-            if (stageMemoRelocates(pattern.relocatable, word)) same = userData[word] != 0u;
-            else same = entry.userData[word] == userData[word];
+            if (!stageMemoRelocates(pattern.relocatable, word)) same = entry.userData[word] == userData[word];
+            else if (((pattern.bases >> word) & 1u) != 0) same = userData[word] != 0u;
         }
         if (!same) {
             last = StageMemoOutcome::Inputs;
@@ -1069,6 +1129,14 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, const DrawP
         for (std::size_t read = 0; read < entry.decodeReads.size(); ++read) decodeRanges.emplace_back(addresses[read], addresses[read] + entry.decodeReads[read].size);
         if (!RangesSettled(stage.ranges, resolved.before.get(), resolved.generation) || (!decodeRanges.empty() && !RangesSettled(decodeRanges, resolved.before.get(), resolved.generation))) return StageMemoOutcome::Unsettled;
         stage.side = entry.side;
+        bool forwarded = true;
+        for (const auto& forward : *entry.forwards) {
+            if (forward.word >= userData.size()) forwarded = false;
+            else if (forward.push && forward.position < stage.side.pushWords.size()) stage.side.pushWords[forward.position].second = userData[forward.word];
+            else if (!forward.push && forward.binding < stage.side.bindings.size() && forward.position < stage.side.bindings[forward.binding].size()) stage.side.bindings[forward.binding][forward.position] = userData[forward.word];
+            else forwarded = false;
+        }
+        if (!forwarded) return StageMemoOutcome::Side;
         GuardRanges(stage.ranges);
         auto& decodeReads = resolved.decodeReads[index];
         decodeReads = entry.decodeReads;
@@ -1082,15 +1150,17 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, const DrawP
     return last;
 }
 
-std::optional<Counter> rememberStage(const LeanDrawJob& job, const DrawProgram& program, std::size_t index, std::uint32_t cursor, const InvocationSlot& slot, const DirectReads& reads, const DirectStages& resolved) {
+std::optional<Counter> rememberStage(const LeanDrawJob& job, const DrawProgram& program, std::size_t index, std::uint32_t cursor, const InvocationSlot& slot, const ShaderRecompiler::PreparedShaderInvocation& invocation, const DirectReads& reads, const DirectStages& resolved) {
     const auto& stage = resolved.stages[index];
     const auto& use = stage.capture->userDataUse;
     const std::span<const std::uint32_t> userData = program.userData;
     if (userData.size() > 0xffffu) return Counter::StageMemoUntraced;
     StageMemoPattern pattern;
     StageMemoEntry entry;
+    entry.forwards = stageForwards(stage.shared, invocation, *stage.capture);
+    if (entry.forwards == nullptr) return Counter::StageMemoUntraced;
     pattern.userWords = static_cast<std::uint32_t>(userData.size());
-    auto relocatable = use.asBase & ~use.asValue;
+    auto relocatable = ~use.asValue;
     std::uint64_t pinned = 0;
     const auto& info = resolved.vertexInfos[index];
     const auto& decodeReads = resolved.decodeReads[index];
@@ -1143,15 +1213,9 @@ std::optional<Counter> rememberStage(const LeanDrawJob& job, const DrawProgram& 
         }
     }
     if (placed.size() != reads.words.size()) return Counter::StageMemoUntraced;
-    const auto carried = [&](std::uint32_t value) {
-        const auto& side = stage.side;
-        if (std::ranges::any_of(side.pushWords, [&](const std::pair<std::uint32_t, std::uint32_t>& word) { return word.second == value; })) return true;
-        if (std::ranges::find(side.userData, value) != side.userData.end()) return true;
-        return std::ranges::any_of(side.bindings, [&](const std::vector<std::uint32_t>& words) { return std::ranges::find(words, value) != words.end(); });
-    };
     for (std::size_t word = 0; word < userData.size() && word < ShaderRecompiler::SrtUserDataUse::TrackedWords; ++word) {
         const auto bit = std::uint64_t{1} << word;
-        if ((relocatable & bit) != 0 && (userData[word] == 0u || carried(userData[word]))) relocatable &= ~bit;
+        if ((use.asBase & bit) != 0 && userData[word] == 0u) relocatable &= ~bit;
     }
     pattern.relocatable = relocatable;
     pattern.values = use.asValue;
@@ -1425,7 +1489,7 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
                 if (printed.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "[stage-memo-verify] %s differs: stage %zu of a draw with %zu stages\n", what, i, count);
             }
         } else if (memoStage && memoAdmitted && slot != nullptr && slot->handle != nullptr) {
-            if (const auto stored = rememberStage(job, program, i, cursorBefore, *slot, reads, resolved)) DirectDraws::Add(*stored);
+            if (const auto stored = rememberStage(job, program, i, cursorBefore, *slot, *invocation, reads, resolved)) DirectDraws::Add(*stored);
         }
         if (resolveCensus()) noteStageCensus(*invocation, *stage.capture, reads, resolved.decodeReads[i]);
         lap(Step::Side);
