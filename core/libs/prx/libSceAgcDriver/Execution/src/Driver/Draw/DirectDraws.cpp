@@ -708,6 +708,8 @@ struct StageMemoRoot {
 
 struct StageMemoPattern {
     std::uint64_t relocatable = 0;
+    std::uint64_t values = 0;
+    std::uint64_t bases = 0;
     std::uint32_t userWords = 0;
     std::uint32_t decodeRoots = 0;
     std::vector<StageMemoRoot> roots;
@@ -887,6 +889,81 @@ bool stageMemoCacheable(const DrawProgram& program) {
     return !program.binary.header.empty() || !program.snapshot->userDataTailRegister;
 }
 
+bool stageMemoDiag() {
+    static const bool on = std::getenv("APS5_STAGE_MEMO_DIAG") != nullptr;
+    return on;
+}
+
+struct StageMemoDiagLast {
+    std::vector<std::uint32_t> userData;
+    std::uint64_t indexAddress = 0;
+    std::uint32_t indexCount = 0;
+    std::uint32_t indexSize = 0;
+    std::uint32_t instanceCount = 0;
+    std::uint32_t cursor = 0;
+    const DirectStage* previous = nullptr;
+};
+
+void stageMemoDiagnose(std::uint64_t key, std::size_t way, const StageMemoPattern& pattern, std::span<const std::uint32_t> userData, std::span<const std::uint32_t> gathered, const Pm4::DrawParameters& parameters, std::uint32_t cursor, const DirectStage* previous) {
+    enum Cause : std::size_t { First, Same, IndexAddress, IndexCount, IndexSize, InstanceCount, Cursor, Previous, ValueWord, BaseValueWord, FixedBaseWord, IdleWord, Causes };
+    static constexpr std::array<const char*, Causes> names{"first sight", "same key", "index address", "index count", "index size", "instance count", "push cursor", "previous stage", "value word", "base word read as a value", "base word kept fixed", "idle word"};
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, StageMemoDiagLast> last;
+    static std::array<std::uint64_t, Causes> causes{};
+    static std::uint64_t total = 0;
+    static std::uint32_t printed = 0;
+    auto identity = (key ^ way) * StageMemoPrime;
+    for (const auto value : gathered) identity = (identity ^ value) * StageMemoPrime;
+    std::lock_guard lock(mutex);
+    if (last.size() > 400000u) last.clear();
+    const auto [found, inserted] = last.try_emplace(identity);
+    auto& kept = found->second;
+    auto cause = First;
+    std::size_t word = 0;
+    if (!inserted) {
+        cause = Same;
+        if (kept.indexAddress != parameters.indexAddress) cause = IndexAddress;
+        else if (kept.indexCount != parameters.indexCount) cause = IndexCount;
+        else if (kept.indexSize != parameters.indexSize) cause = IndexSize;
+        else if (kept.instanceCount != parameters.instanceCount) cause = InstanceCount;
+        else if (kept.cursor != cursor) cause = Cursor;
+        else if (kept.previous != previous) cause = Previous;
+        else {
+            for (; word < userData.size() && word < kept.userData.size(); ++word) {
+                if (stageMemoRelocates(pattern.relocatable, word) || kept.userData[word] == userData[word]) continue;
+                const bool tracked = word < ShaderRecompiler::SrtUserDataUse::TrackedWords;
+                const bool value = !tracked || ((pattern.values >> word) & 1u) != 0;
+                const bool base = tracked && ((pattern.bases >> word) & 1u) != 0;
+                cause = value && base ? BaseValueWord : value ? ValueWord : base ? FixedBaseWord : IdleWord;
+                break;
+            }
+        }
+        if (cause >= ValueWord && printed < 48u) {
+            ++printed;
+            std::fprintf(stderr, "[stage-memo-diag] same roots, key differs in a %s: word %zu of %zu, %08x -> %08x; movable %016llx, values %016llx, bases %016llx, %zu roots (%u decode)\n", names[cause], word, userData.size(), kept.userData[word], userData[word], static_cast<unsigned long long>(pattern.relocatable), static_cast<unsigned long long>(pattern.values), static_cast<unsigned long long>(pattern.bases), pattern.roots.size(), pattern.decodeRoots);
+        }
+    }
+    ++causes[cause];
+    kept.userData.assign(userData.begin(), userData.end());
+    kept.indexAddress = parameters.indexAddress;
+    kept.indexCount = parameters.indexCount;
+    kept.indexSize = parameters.indexSize;
+    kept.instanceCount = parameters.instanceCount;
+    kept.cursor = cursor;
+    kept.previous = previous;
+    if (++total % 200000u == 0u) {
+        std::string text;
+        for (std::size_t index = 0; index < Causes; ++index) {
+            if (causes[index] == 0) continue;
+            text += text.empty() ? " " : ", ";
+            text += names[index];
+            text += ' ';
+            text += std::to_string(causes[index]);
+        }
+        std::fprintf(stderr, "[stage-memo-diag] %llu misses without an entry:%s\n", static_cast<unsigned long long>(total), text.c_str());
+    }
+}
+
 StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, const DrawProgram& program, std::size_t index, std::uint32_t cursor, const InvocationSlot& slot, DirectStages& resolved) {
     const auto& decode = job.shape->decode;
     const auto key = stageMemoKey(decode.get(), index);
@@ -926,6 +1003,7 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, const DrawP
         if (held == nullptr) {
             last = StageMemoOutcome::NoEntry;
             memo.missKey = contentKey;
+            if (stageMemoDiag()) stageMemoDiagnose(key, way, pattern, userData, gathered, job.parameters, cursor, previous);
             continue;
         }
         const auto& entry = *held;
@@ -1076,6 +1154,8 @@ std::optional<Counter> rememberStage(const LeanDrawJob& job, const DrawProgram& 
         if ((relocatable & bit) != 0 && (userData[word] == 0u || carried(userData[word]))) relocatable &= ~bit;
     }
     pattern.relocatable = relocatable;
+    pattern.values = use.asValue;
+    pattern.bases = use.asBase;
     const auto walkRoots = static_cast<std::uint32_t>(pattern.roots.size() - pattern.decodeRoots);
     std::sort(placed.begin(), placed.end(), [](const Placed& a, const Placed& b) { return a.address < b.address; });
     entry.order.reserve(placed.size());
