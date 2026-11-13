@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <new>
 #include <stdexcept>
@@ -12,6 +13,9 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #define AGC_COMMAND_STREAM_OPS(X) \
     X(BeginQuery) \
@@ -158,6 +162,19 @@ PFN_vkVoidFunction realFunction(CommandOp op, std::size_t slot) {
 
 [[noreturn]] void refuse(CommandOp op, const std::string& reason) {
     throw std::runtime_error("AGC graphics: " + std::string(OpNames[indexOf(op)]) + " " + reason);
+}
+
+[[gnu::noinline]] void noteClosedStream(CommandOp op) {
+    static std::atomic<std::uint32_t> printed{0};
+    if (printed.fetch_add(1, std::memory_order_relaxed) >= 4) return;
+    char text[1024];
+    int length = std::snprintf(text, sizeof(text), "[command-stream] %s after its batch was closed; anchor %p; frames", OpNames[indexOf(op)].data(), reinterpret_cast<void*>(&noteClosedStream));
+#ifdef _WIN32
+    void* frames[24];
+    const auto count = RtlCaptureStackBackTrace(1, 24, frames, nullptr);
+    for (unsigned index = 0; index < count && length > 0 && static_cast<std::size_t>(length) < sizeof(text); ++index) length += std::snprintf(text + length, sizeof(text) - static_cast<std::size_t>(length), " %p", frames[index]);
+#endif
+    std::fprintf(stderr, "%s\n", text);
 }
 
 template<typename T>
@@ -314,7 +331,10 @@ void copyArguments(CommandStream& stream, ArgumentsOf<Op>& arguments) {
 template<CommandOp Op, typename... TArguments>
 [[gnu::noinline]] void append(CommandStream& stream, std::size_t slot, TArguments... arguments) {
     static_assert(std::is_trivially_destructible_v<OpRecord<Op>>);
-    if (CommandStreamWriter::Closed(stream)) refuse(Op, "was recorded into a command stream after its batch was closed");
+    if (CommandStreamWriter::Closed(stream)) {
+        noteClosedStream(Op);
+        refuse(Op, "was recorded into a command stream after its batch was closed");
+    }
     auto* const record = new (CommandStreamWriter::Allocate(stream, sizeof(OpRecord<Op>))) OpRecord<Op>{{nullptr, static_cast<std::uint8_t>(Op), static_cast<std::uint8_t>(slot)}, ArgumentsOf<Op>(arguments...)};
     copyArguments<Op>(stream, record->arguments);
     CommandStreamWriter::Link(stream, record);
