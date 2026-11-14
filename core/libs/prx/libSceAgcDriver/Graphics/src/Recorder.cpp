@@ -2052,8 +2052,16 @@ bool Recorder::PassReadsFollow(GuestRangeList first, GuestRangeList second) cons
     return open != nullptr && open->renderPass.open && open->passHazards.ReadsFollow(first, second);
 }
 
+bool Recorder::PassImagesFollow(std::span<const std::pair<VkImage, bool>> images, std::span<const std::pair<VkImage, bool>> attachments) const {
+    return open != nullptr && open->renderPass.open && open->passHazards.ImagesFollow(images, attachments);
+}
+
 void Recorder::NotePassReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     if (open != nullptr) open->passHazards.AddReads(ranges, RuntimeSwitches::Set(RuntimeSwitch::LazyPassReads));
+}
+
+void Recorder::NotePassImages(std::span<const std::pair<VkImage, bool>> images) {
+    if (open != nullptr) open->passHazards.AddImages(images);
 }
 
 bool Recorder::RenderPassOpen() const {

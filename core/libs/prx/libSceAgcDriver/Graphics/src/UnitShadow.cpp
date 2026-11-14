@@ -131,6 +131,7 @@ Shadows& Registry() {
 }
 
 std::atomic<std::uint64_t> liveShadowUnits{0};
+std::atomic<std::uint64_t> shadowLiveSerial{0};
 
 void countLiveUnits(const Shadows& registry) {
     std::uint64_t total = 0;
@@ -632,6 +633,10 @@ bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {
     return anyShadowedLocked(registry, address, bytes);
 }
 
+std::uint64_t ShadowLiveSerial() {
+    return shadowLiveSerial.load(std::memory_order_acquire);
+}
+
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     if (!UnitShadowEnabled() || ranges.empty()) return false;
     if (liveShadowUnits.load(std::memory_order_acquire) == 0 && RuntimeSwitches::Set(RuntimeSwitch::CommitStamps)) return false;
@@ -874,6 +879,7 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                 if (!shadow->Live(unit)) {
                     ++shadow->liveUnits;
                     liveShadowUnits.fetch_add(1, std::memory_order_release);
+                    shadowLiveSerial.fetch_add(1, std::memory_order_release);
                 }
                 shadow->generation[unit] = generation;
                 shadow->published[unit] = 0;

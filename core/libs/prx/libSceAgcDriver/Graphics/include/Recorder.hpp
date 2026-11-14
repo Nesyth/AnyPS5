@@ -505,11 +505,13 @@ public:
     bool PassPureReads() const;
     bool PassFenced() const;
     bool PassReadsFollow(GuestRangeList first, GuestRangeList second) const;
+    bool PassImagesFollow(std::span<const std::pair<VkImage, bool>> images, std::span<const std::pair<VkImage, bool>> attachments) const;
     static std::uint64_t QueuedLabelSerial();
     bool BeginPassLayouts(VkCommandBuffer commands, std::span<const std::pair<VkImage, bool>> attachments);
     bool BeginDepthLayout(VkCommandBuffer commands, VkImage image, VkImageAspectFlags aspects);
     VkImage AttachedDepthImage() const;
     void NotePassReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+    void NotePassImages(std::span<const std::pair<VkImage, bool>> images);
     std::uint64_t RenderPassGeneration() const { return passGeneration; }
     VkDevice Device() const { return context.device; }
     std::uint64_t Id() const { return id; }

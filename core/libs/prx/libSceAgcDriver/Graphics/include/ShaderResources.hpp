@@ -465,6 +465,7 @@ public:
     bool ExpressReady() const { return expressValid && cleanProved; }
     bool ExpressWatchable() const;
     ExpressMiss ExpressCurrent();
+    ExpressMiss ExpressCurrentFollowing();
     void ExpressStage(Recorder& recorder);
     PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched = false) const;
     void PushFragmentBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
@@ -555,6 +556,8 @@ public:
     bool PreparedMovesClear(const PreparedBuffers& prepared, Recorder& recorder, MoveTicket* ticket) const;
     bool PreparedUntouched(const PreparedBuffers& prepared) const;
     bool PreparedZonesClear(const PreparedBuffers& prepared, const Recorder& recorder) const;
+    using ZoneClear = bool (*)(void* tests, std::uint64_t begin, std::size_t bytes, bool moved);
+    bool PreparedZonesClearBy(const PreparedBuffers& prepared, ZoneClear clear, void* tests) const;
     bool UnmovedRangesClear(const PreparedBuffers& prepared, Recorder& recorder) const;
     // The ticket PreparedMovesClear left (null: it refused the ranges) against the one today's
     // MovedReadOnlyBuffers left from the same ticket.
@@ -1321,11 +1324,14 @@ private:
     ExpressBefore expressBefore();
     void expressAfter(bool proved, const ExpressBefore& before);
     bool expressEligible() const;
+    ExpressMiss expressCurrent(bool memo);
     bool revalidateClean(std::span<const CompiledShader> shaders, ProofReport* report, CleanProof* clean);
     std::shared_ptr<GuestMemory::WriteSubscription> expressWatch;
     std::uint64_t expressGeneration = 0;
     CleanStamp expressAt;
     bool expressValid = false;
+    std::atomic<std::uint64_t> expressViewsAt{0};
+    std::atomic<std::uint64_t> expressRegionsAt{0};
     std::vector<std::pair<const StorageTexture*, std::uint64_t>> expressSources;
     std::vector<std::pair<const StorageTexture*, std::uint64_t>> expressSourcesBefore;
     std::uint8_t cleanEligibility = 0;

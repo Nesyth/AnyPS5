@@ -2329,6 +2329,7 @@ HeapBindingClass ClassifyHeapBinding(const ShaderRecompiler::DescriptorBinding& 
 }
 
 void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes) {
+    expressViewsAt.store(0, std::memory_order_relaxed);
     registeredImageViews.clear();
     for (const auto& shader : shaders) if (shader.registeredImageViews != nullptr) registeredImageViews.insert(registeredImageViews.end(), shader.registeredImageViews->begin(), shader.registeredImageViews->end());
     Require(registeredImageViewsCurrent(registeredImageViews), "AGC graphics: registered image range changed after resource capture");
@@ -3080,6 +3081,7 @@ void ShaderResources::noteReusable() {
     spaceReuse = false;
     importsReconcilable = false;
     spaceReuse = false;
+    expressRegionsAt.store(0, std::memory_order_relaxed);
     directRegions.clear();
     const bool spaceReusable = !htileClear.has_value() && drawBuild && usesBda && bdaReadOnly && !SpaceReuseDisabled() && guestMemory.SpaceOnly() && !guestMemory.HasCopiedWrites() && multisampleSources.empty() && !(bda != nullptr && LoopGuardEnabled());
     if (!spaceReusable && (htileClear.has_value() || guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled()))) return;
@@ -5235,6 +5237,14 @@ void ShaderResources::expressAfter(bool proved, const ExpressBefore& before) {
 }
 
 ShaderResources::ExpressMiss ShaderResources::ExpressCurrent() {
+    return expressCurrent(false);
+}
+
+ShaderResources::ExpressMiss ShaderResources::ExpressCurrentFollowing() {
+    return expressCurrent(true);
+}
+
+ShaderResources::ExpressMiss ShaderResources::expressCurrent(bool memo) {
     if (!expressValid || !cleanProved || expressWatch == nullptr) return ExpressMiss::NotProved;
     if (GuestMemory::SubscriptionGeneration(*expressWatch) != expressGeneration) return ExpressMiss::Watch;
     if (GuestMemory::CleanForgetSerial() != expressAt.forget) return ExpressMiss::Forget;
@@ -5242,15 +5252,22 @@ ShaderResources::ExpressMiss ShaderResources::ExpressCurrent() {
     for (const auto& [source, epoch] : expressSources) {
         if (source->StateEpoch() != epoch) return ExpressMiss::Sources;
     }
-    if (!registeredImageViewsCurrent(registeredImageViews)) return ExpressMiss::Views;
+    if (!memo || expressViewsAt.load(std::memory_order_relaxed) != expressAt.allocations) {
+        if (!registeredImageViewsCurrent(registeredImageViews)) return ExpressMiss::Views;
+        if (memo) expressViewsAt.store(expressAt.allocations, std::memory_order_relaxed);
+    }
     if (!Recorder::InCompletion() && Recorder::Active() != nullptr && ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0)) return ExpressMiss::PendingCpu;
     if (!guestMemory.StagingDecisionsCurrent()) return ExpressMiss::Staging;
     if (!directRegions.empty()) {
-        struct ExpressRegionsStorage {};
-        auto& ranges = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ExpressRegionsStorage>();
-        ranges.clear();
-        for (const auto& region : directRegions) ranges.emplace_back(region.begin, region.end);
-        if (AnyShadowedOverlaps(ranges)) return ExpressMiss::Regions;
+        const auto shadows = memo ? ShadowLiveSerial() + 1u : 0u;
+        if (!memo || expressRegionsAt.load(std::memory_order_relaxed) != shadows) {
+            struct ExpressRegionsStorage {};
+            auto& ranges = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ExpressRegionsStorage>();
+            ranges.clear();
+            for (const auto& region : directRegions) ranges.emplace_back(region.begin, region.end);
+            if (AnyShadowedOverlaps(ranges)) return ExpressMiss::Regions;
+            if (memo) expressRegionsAt.store(shadows, std::memory_order_relaxed);
+        }
     }
     return ExpressMiss::None;
 }
@@ -8106,6 +8123,23 @@ bool ShaderResources::PreparedZonesClear(const PreparedBuffers& prepared, const 
         const auto& allocation = allocations[item.allocation];
         if (!PendingZones::Clear(allocation.address, allocation.size) && recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return false;
         if (guestMemory.WritesOverlap(allocation.address, allocation.size)) return false;
+    }
+    return true;
+}
+
+bool ShaderResources::PreparedZonesClearBy(const PreparedBuffers& prepared, ZoneClear clear, void* tests) const {
+    if ((prepared.forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared.forget) return false;
+    for (const auto& entry : prepared.moved) {
+        const auto& item = allocations[entry.allocation];
+        if (!item.guest) continue;
+        const auto begin = entry.address - item.adjustment;
+        const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment));
+        if (guestMemory.WritesOverlap(begin, bytes) || !clear(tests, begin, bytes, true)) return false;
+    }
+    for (const auto& item : prepared.selected) {
+        if (item.moved) continue;
+        const auto& allocation = allocations[item.allocation];
+        if (guestMemory.WritesOverlap(allocation.address, allocation.size) || !clear(tests, allocation.address, static_cast<std::size_t>(allocation.size), false)) return false;
     }
     return true;
 }

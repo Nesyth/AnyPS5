@@ -68,6 +68,8 @@ public:
     void AddReads(GuestRangeList ranges, bool lazyReads);
     bool PureReads() const { return writes.Empty() && writeOnly.Empty() && images.empty() && !anyWrites; }
     bool ReadsFollow(GuestRangeList first, GuestRangeList second) const;
+    bool ImagesFollow(std::span<const std::pair<VkImage, bool>> access, std::span<const std::pair<VkImage, bool>> targets) const;
+    void AddImages(std::span<const std::pair<VkImage, bool>> access);
     void BeginPass() { ++pass; }
     void SealWriteOnly();
     void Clear();

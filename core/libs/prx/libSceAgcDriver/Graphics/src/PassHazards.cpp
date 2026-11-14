@@ -92,6 +92,30 @@ void PassHazards::CarryAttachments() {
     attachments = std::move(carried);
 }
 
+bool PassHazards::ImagesFollow(std::span<const std::pair<VkImage, bool>> access, std::span<const std::pair<VkImage, bool>> targets) const {
+    const auto conflicts = [](bool earlier, bool later) { return earlier || later; };
+    for (const auto& [image, written] : access) {
+        if (image == VK_NULL_HANDLE) continue;
+        if (std::any_of(images.begin(), images.end(), [&](const auto& seen) { return seen.first == image && conflicts(seen.second, written); })) return false;
+        if (std::any_of(attachments.begin(), attachments.end(), [&](const Attachment& seen) { return seen.image == image && conflicts(seen.written, written); })) return false;
+    }
+    for (const auto& [image, written] : targets) {
+        if (image == VK_NULL_HANDLE) continue;
+        if (std::any_of(images.begin(), images.end(), [&](const auto& seen) { return seen.first == image && conflicts(seen.second, written); })) return false;
+        if (std::any_of(attachments.begin(), attachments.end(), [&](const Attachment& seen) { return seen.image == image && seen.pass != pass && conflicts(seen.written, written); })) return false;
+    }
+    return true;
+}
+
+void PassHazards::AddImages(std::span<const std::pair<VkImage, bool>> access) {
+    for (const auto& [image, written] : access) {
+        if (image == VK_NULL_HANDLE) continue;
+        const auto it = std::find_if(images.begin(), images.end(), [&](const auto& seen) { return seen.first == image; });
+        if (it == images.end()) images.emplace_back(image, written);
+        else it->second = it->second || written;
+    }
+}
+
 void PassHazards::Add(const PassAccess& access, bool lazyReads) {
     if (lazyReads) {
         for (const auto& range : access.reads) {

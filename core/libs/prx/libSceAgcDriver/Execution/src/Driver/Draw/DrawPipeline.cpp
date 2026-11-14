@@ -1925,11 +1925,15 @@ void DrawPipeline::run() {
         bool shutdown = false;
         if (!isDraw || commit == nullptr || (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLeanRuns) && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow))) {
             dropHold(!isDraw ? Graphics::ExpressRunEnd::NotDraw : commit == nullptr ? Graphics::ExpressRunEnd::Stop : Graphics::ExpressRunEnd::Switch);
+            if (!isDraw && commit != nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow)) Graphics::NoteExpressRunItem();
         } else if (!runHold) {
+            const bool holdTimed = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow);
+            const auto holdBegan = holdTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
             runHold.emplace(GuestMemory::GpuMutex());
             Graphics::BeginExpressRun();
             runLength = 0;
+            if (holdTimed) Graphics::NoteExpressRunHold(elapsedNs(holdBegan));
         }
         try {
             if (commit != nullptr) (*commit)();

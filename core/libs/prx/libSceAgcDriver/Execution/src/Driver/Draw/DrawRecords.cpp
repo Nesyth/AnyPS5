@@ -1475,8 +1475,14 @@ void Driver::commitRecordDraw(const LeanDrawJob& job, const LeanAnchor& anchor, 
         DrawPipeline::FollowEpoch(epoch);
         GuestMemory::SetCurrentPacket(opcode, queue);
         const bool following = localDevice != nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow);
-        if (following && Graphics::ExpressRunLed() && followRecord(*localDevice, queue, decode->state, *hit, trace)) return;
+        const bool attempted = following && Graphics::ExpressRunLed();
+        static std::uint32_t itemOrdinal = 0;
+        const bool timed = following && (++itemOrdinal & 7u) == 0;
+        const auto began = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (attempted && followRecord(*localDevice, queue, decode->state, *hit, trace)) return;
+        const auto committing = timed && attempted ? std::chrono::steady_clock::now() : began;
         commitRecord(localDevice, queue, decode->state, *hit, trace, shape);
+        if (timed) Graphics::NoteExpressNonFollower(attempted, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(committing - began).count()), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - committing).count()));
         if (following) Graphics::DropExpressFollowVerify();
     };
     DrawPipeline::Queue0().Enqueue(std::move(commit), std::move(writes), 0, {}, std::move(reads), true);
