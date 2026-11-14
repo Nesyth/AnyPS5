@@ -560,9 +560,107 @@ bool CommandStream::Records(const char* name) {
     return name != nullptr && std::binary_search(OpNames.begin(), OpNames.end(), std::string_view(name));
 }
 
+namespace {
+
+std::atomic<std::uint64_t> replayedRecords{0};
+std::atomic<std::uint64_t> droppedRecords{0};
+
+void noteReplay(std::uint64_t replayed, std::uint64_t dropped) {
+    const auto before = replayedRecords.fetch_add(replayed, std::memory_order_relaxed);
+    const auto droppedNow = droppedRecords.fetch_add(dropped, std::memory_order_relaxed) + dropped;
+    if (((before + replayed) >> 22u) == (before >> 22u)) return;
+    std::fprintf(stderr, "[replay-state] %llu records replayed, %llu dropped as unchanged state\n", static_cast<unsigned long long>(before + replayed), static_cast<unsigned long long>(droppedNow));
+}
+
+struct ReplayState {
+    std::array<const Record*, OpCount> last{};
+    std::array<std::array<const Record*, 2>, OpCount> faces{};
+    VkPipeline graphicsPipeline = VK_NULL_HANDLE;
+    bool bound = false;
+
+    void Forget() {
+        last.fill(nullptr);
+        for (auto& pair : faces) pair = {nullptr, nullptr};
+    }
+
+    bool Plain(const Record& record) {
+        auto& slot = last[record.op];
+        if (slot != nullptr && sameRecord(*slot, record, false)) return true;
+        slot = &record;
+        return false;
+    }
+
+    bool Faced(const Record& record, VkStencilFaceFlags face) {
+        auto& pair = faces[record.op];
+        if (face == VK_STENCIL_FACE_FRONT_BIT || face == VK_STENCIL_FACE_BACK_BIT) {
+            auto& slot = pair[face == VK_STENCIL_FACE_FRONT_BIT ? 0u : 1u];
+            if (slot != nullptr && sameRecord(*slot, record, false)) return true;
+            slot = &record;
+            return false;
+        }
+        if (pair[0] != nullptr && pair[0] == pair[1] && sameRecord(*pair[0], record, false)) return true;
+        pair = {&record, &record};
+        return false;
+    }
+
+    bool Unchanged(const Record& record) {
+        switch (static_cast<CommandOp>(record.op)) {
+        case CommandOp::BindPipeline: {
+            const auto& arguments = static_cast<const OpRecord<CommandOp::BindPipeline>&>(record).arguments;
+            if (std::get<0>(arguments) != VK_PIPELINE_BIND_POINT_GRAPHICS) return false;
+            const auto pipeline = std::get<1>(arguments);
+            if (bound && pipeline == graphicsPipeline) return true;
+            graphicsPipeline = pipeline;
+            bound = true;
+            Forget();
+            return false;
+        }
+        case CommandOp::SetCullModeEXT:
+        case CommandOp::SetDepthBias:
+        case CommandOp::SetDepthBounds:
+        case CommandOp::SetDepthBoundsTestEnableEXT:
+        case CommandOp::SetDepthCompareOpEXT:
+        case CommandOp::SetDepthTestEnableEXT:
+        case CommandOp::SetDepthWriteEnableEXT:
+        case CommandOp::SetFrontFaceEXT:
+        case CommandOp::SetScissor:
+        case CommandOp::SetStencilTestEnableEXT:
+        case CommandOp::SetViewport:
+            return Plain(record);
+        case CommandOp::SetStencilCompareMask:
+            return Faced(record, std::get<0>(static_cast<const OpRecord<CommandOp::SetStencilCompareMask>&>(record).arguments));
+        case CommandOp::SetStencilOpEXT:
+            return Faced(record, std::get<0>(static_cast<const OpRecord<CommandOp::SetStencilOpEXT>&>(record).arguments));
+        case CommandOp::SetStencilReference:
+            return Faced(record, std::get<0>(static_cast<const OpRecord<CommandOp::SetStencilReference>&>(record).arguments));
+        case CommandOp::SetStencilWriteMask:
+            return Faced(record, std::get<0>(static_cast<const OpRecord<CommandOp::SetStencilWriteMask>&>(record).arguments));
+        default:
+            return false;
+        }
+    }
+};
+
+}
+
 void CommandStream::Replay(VkCommandBuffer commands) const {
     Require(!IsHandle(commands), "a command stream cannot replay into a stream handle");
-    for (const auto* record = first; record != nullptr; record = record->next) replayRecord(commands, *record);
+    if (!RuntimeSwitches::Set(RuntimeSwitch::ReplayStateDedupe)) {
+        for (const auto* record = first; record != nullptr; record = record->next) replayRecord(commands, *record);
+        return;
+    }
+    ReplayState state;
+    std::uint64_t replayed = 0;
+    std::uint64_t dropped = 0;
+    for (const auto* record = first; record != nullptr; record = record->next) {
+        if (state.Unchanged(*record)) {
+            ++dropped;
+            continue;
+        }
+        replayRecord(commands, *record);
+        ++replayed;
+    }
+    noteReplay(replayed, dropped);
 }
 
 void CommandStream::Reset() {
