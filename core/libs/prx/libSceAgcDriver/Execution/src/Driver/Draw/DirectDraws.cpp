@@ -948,7 +948,15 @@ StageMemoStore& stageMemoStore() {
     return *store;
 }
 
+struct StageMemoFrontSlot {
+    std::uint64_t key = 0;
+    std::shared_ptr<const StageMemoEntry> entry;
+    std::uint32_t uses = 0;
+};
+
 struct StageMemo {
+    static constexpr std::size_t FrontSets = 8192;
+    std::vector<StageMemoFrontSlot> front;
     std::vector<std::uint32_t> gathered;
     std::vector<std::uint64_t> addresses;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> sorted;
@@ -1185,7 +1193,28 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, const DrawP
             continue;
         }
         const auto contentKey = stageMemoContentKey(key, way, pattern, userData, gathered, job.parameters, cursor, previous);
-        const auto held = store.Find(contentKey);
+        std::shared_ptr<const StageMemoEntry> fetched;
+        const StageMemoEntry* held = nullptr;
+        if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoFront)) {
+            if (memo.front.empty()) memo.front.resize(StageMemo::FrontSets * 2u);
+            auto* set = memo.front.data() + static_cast<std::size_t>((contentKey ^ (contentKey >> 19u)) % StageMemo::FrontSets) * 2u;
+            auto* slot = set[0].key == contentKey && set[0].entry != nullptr ? &set[0] : set[1].key == contentKey && set[1].entry != nullptr ? &set[1] : nullptr;
+            if (slot != nullptr) {
+                held = slot->entry.get();
+                if ((++slot->uses & 63u) == 0u && store.Find(contentKey) == nullptr) store.Insert(contentKey, slot->entry);
+            } else if ((fetched = store.Find(contentKey)) != nullptr) {
+                auto& victim = set[0].uses <= set[1].uses ? set[0] : set[1];
+                set[0].uses >>= 1u;
+                set[1].uses >>= 1u;
+                victim.key = contentKey;
+                victim.uses = 1;
+                victim.entry = std::move(fetched);
+                held = victim.entry.get();
+            }
+        } else {
+            fetched = store.Find(contentKey);
+            held = fetched.get();
+        }
         if (held == nullptr) {
             last = StageMemoOutcome::NoEntry;
             memo.missKey = contentKey;

@@ -463,6 +463,7 @@ public:
     std::uint64_t FaultGeneration() const { return faultGeneration.load(std::memory_order_acquire); }
     enum class ExpressMiss : std::uint8_t { None, NotProved, Watch, Forget, Serials, Sources, Views, PendingCpu, Staging, Regions, Count };
     bool ExpressReady() const { return expressValid && cleanProved; }
+    bool ExpressWatchable() const;
     ExpressMiss ExpressCurrent();
     void ExpressStage(Recorder& recorder);
     PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched = false) const;

@@ -6106,7 +6106,7 @@ void captureExpress(const Context& context, const State& state, const DrawRecipe
         noted = DrawExpressCapture::Objects;
         return;
     }
-    if (const auto why = resources->ExpressCurrent(); why != ShaderResources::ExpressMiss::None) {
+    if (const auto why = resources->ExpressCurrent(); why != ShaderResources::ExpressMiss::None && (why == ShaderResources::ExpressMiss::Regions || !RuntimeSwitches::Set(RuntimeSwitch::ExpressKeepState) || !resources->ExpressWatchable())) {
         noted = static_cast<DrawExpressCapture>(static_cast<std::size_t>(DrawExpressCapture::NotProved) + static_cast<std::size_t>(why) - static_cast<std::size_t>(ShaderResources::ExpressMiss::NotProved));
         return;
     }
@@ -6739,7 +6739,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     std::shared_ptr<Framebuffer> expressFramebuffer;
     std::vector<std::shared_ptr<StorageTexture>> expressTargets;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> expressSlices;
-    if (expressWanted && !drawn.resources->ExpressReady()) {
+    if (expressWanted && !drawn.resources->ExpressReady() && !(RuntimeSwitches::Set(RuntimeSwitch::ExpressKeepState) && drawn.resources->ExpressWatchable())) {
         record.effects.fragment.expressCapture = DrawExpressCapture::NotProved;
         record.express.reset();
     } else if (expressWanted) {
@@ -7287,7 +7287,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     if (fragment == nullptr || fragment->bindings == nullptr || fragment->device != context.device || fragment->resources.get() != keep.resources.get() || fragment->pipeline.get() != keep.pipeline.get()) return miss(DrawExpressMiss::Objects);
     auto& resources = *keep.resources;
     const auto templateMiss = resources.ExpressCurrent();
-    const bool reprove = templateMiss != ShaderResources::ExpressMiss::None && templateMiss != ShaderResources::ExpressMiss::NotProved && templateMiss != ShaderResources::ExpressMiss::Regions;
+    const bool reprove = templateMiss != ShaderResources::ExpressMiss::None && templateMiss != ShaderResources::ExpressMiss::Regions && (templateMiss != ShaderResources::ExpressMiss::NotProved || (RuntimeSwitches::Set(RuntimeSwitch::ExpressKeepState) && resources.ExpressWatchable()));
     if (templateMiss != ShaderResources::ExpressMiss::None && !reprove) return miss(DrawExpressMiss::Template);
     const bool appendOn = RuntimeSwitches::Set(RuntimeSwitch::XpAppendCommits);
     if (appendOn && !verifyDue && templateMiss == ShaderResources::ExpressMiss::None && prepared != nullptr && preparedInputs != nullptr && !record.verifyBuffers && !record.verifyInputs && prepared->plan != nullptr && prepared->plan == resources.DirectBufferPlan(shaders) && !StorageTexture::DrawnLinearPending() && (!express->hasDepth || (DepthSurfacesSerial() == express->depthSerial && DepthSurfacesReleased() == express->depthReleased))) {

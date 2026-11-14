@@ -25,9 +25,12 @@ class PublishedRanges {
 public:
     using Range = std::pair<std::uint64_t, std::uint64_t>;
     static constexpr std::uint32_t Capacity = 32;
+    static constexpr std::uint32_t UnknownCapacity = 8;
     enum class Answer : std::uint8_t { Clear, Hit, Unsure };
     void Publish(std::span<const std::pair<Range, std::uint32_t>> entries, std::uint32_t unknownHeld);
-    Answer Overlaps(std::span<const Range> ranges, Range* pendingHit = nullptr, bool* unknownHeld = nullptr) const;
+    void PublishUnknownJobs(std::span<const std::uint64_t> jobs);
+    Answer Overlaps(std::span<const Range> ranges, Range* pendingHit = nullptr, bool* unknownHeld = nullptr, bool ignoreUnknown = false) const;
+    bool UnknownAhead(std::uint64_t front, std::uint64_t asker, std::uint64_t& blocker) const;
     bool Copy(std::array<Range, Capacity>& out, std::uint32_t& size) const;
 
 private:
@@ -37,6 +40,8 @@ private:
     std::atomic<std::uint64_t> lowest{0};
     std::atomic<std::uint64_t> highest{0};
     std::array<std::atomic<std::uint64_t>, Capacity * 2> bounds{};
+    std::atomic<std::uint32_t> unknownJobCount{0};
+    std::array<std::atomic<std::uint64_t>, UnknownCapacity> unknownJobs{};
 };
 
 class PublishedKeys {
@@ -286,6 +291,7 @@ private:
     void runLean(std::uint64_t seq, std::chrono::steady_clock::time_point& lastEnd);
     std::uint64_t advanceLeanFront();
     void awaitTurn(std::uint64_t seq);
+    void awaitFrontPast(std::uint64_t job);
     bool deposit(DrawPipeline& pipeline, DrawPipeline::Item& item);
     void forwardOwn(std::uint64_t seq);
     bool forwardLean(LeanSlot& slot, std::uint64_t seq, std::uint64_t& forwardNs);
@@ -311,6 +317,7 @@ private:
     std::deque<Pending> pending;
     std::vector<std::pair<Range, std::uint32_t>> pendingWrites;
     std::uint32_t pendingUnknown = 0;
+    std::vector<std::uint64_t> unknownSeqs;
     PublishedRanges published;
     PublishedKeys keys;
     std::vector<Job> ran;

@@ -153,6 +153,9 @@ enum class RuntimeSwitch : std::size_t {
     ReapThrottle,
     OcclusionWindows,
     StageMemoAdmitThird,
+    TurnWaitsByJob,
+    StageMemoFront,
+    ExpressKeepState,
     Count,
 };
 

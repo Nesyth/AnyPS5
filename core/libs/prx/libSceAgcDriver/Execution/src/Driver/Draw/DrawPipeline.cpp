@@ -202,7 +202,17 @@ void PublishedRanges::Publish(std::span<const std::pair<Range, std::uint32_t>> e
     seq.store(before + 2, std::memory_order_release);
 }
 
-PublishedRanges::Answer PublishedRanges::Overlaps(std::span<const Range> ranges, Range* pendingHit, bool* unknownHeld) const {
+void PublishedRanges::PublishUnknownJobs(std::span<const std::uint64_t> jobs) {
+    const auto before = seq.load(std::memory_order_relaxed);
+    seq.store(before + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    const auto size = jobs.size() <= UnknownCapacity ? static_cast<std::uint32_t>(jobs.size()) : UnknownCapacity + 1;
+    for (std::uint32_t index = 0; index < size && index < UnknownCapacity; ++index) unknownJobs[index].store(jobs[index], std::memory_order_relaxed);
+    unknownJobCount.store(size, std::memory_order_relaxed);
+    seq.store(before + 2, std::memory_order_release);
+}
+
+bool PublishedRanges::UnknownAhead(std::uint64_t front, std::uint64_t asker, std::uint64_t& blocker) const {
     for (unsigned attempt = 0; attempt < PublishedReadAttempts; ++attempt) {
         const auto before = seq.load(std::memory_order_acquire);
         if ((before & 1u) != 0) {
@@ -210,6 +220,33 @@ PublishedRanges::Answer PublishedRanges::Overlaps(std::span<const Range> ranges,
             continue;
         }
         const auto held = unknown.load(std::memory_order_relaxed);
+        const auto size = unknownJobCount.load(std::memory_order_relaxed);
+        bool found = false;
+        std::uint64_t last = 0;
+        for (std::uint32_t index = 0; index < size && index < UnknownCapacity; ++index) {
+            const auto job = unknownJobs[index].load(std::memory_order_relaxed);
+            if (job < front || job >= asker) continue;
+            found = true;
+            last = std::max(last, job);
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (seq.load(std::memory_order_relaxed) != before) continue;
+        if (size > UnknownCapacity || (held != 0 && size == 0)) break;
+        blocker = last;
+        return found;
+    }
+    blocker = asker - 1;
+    return true;
+}
+
+PublishedRanges::Answer PublishedRanges::Overlaps(std::span<const Range> ranges, Range* pendingHit, bool* unknownHeld, bool ignoreUnknown) const {
+    for (unsigned attempt = 0; attempt < PublishedReadAttempts; ++attempt) {
+        const auto before = seq.load(std::memory_order_acquire);
+        if ((before & 1u) != 0) {
+            SpinPause();
+            continue;
+        }
+        const auto held = ignoreUnknown ? 0u : unknown.load(std::memory_order_relaxed);
         const auto size = count.load(std::memory_order_relaxed);
         const auto low = lowest.load(std::memory_order_relaxed);
         const auto high = highest.load(std::memory_order_relaxed);
@@ -534,8 +571,23 @@ bool DrawFinisher::aheadWait(std::span<const Range> ranges) {
     if (!FinisherAhead::Get() || !AheadBusy()) return false;
     Range pendingHit{};
     bool unknownHeld = false;
-    const auto answer = published.Overlaps(ranges, &pendingHit, &unknownHeld);
+    auto answer = published.Overlaps(ranges, &pendingHit, &unknownHeld);
     if (answer == PublishedRanges::Answer::Clear) return false;
+    if (unknownHeld && ringMode.load(std::memory_order_acquire) && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::TurnWaitsByJob)) {
+        const auto seq = FinisherSeq::Get();
+        std::uint64_t blocker = 0;
+        const bool blocked = published.UnknownAhead(frontSeq.load(std::memory_order_acquire), seq, blocker);
+        if (!blocked || blocker + 1 < seq) {
+            if (blocked) {
+                noteTurnWait(PublishedRanges::Answer::Hit, true, ranges, pendingHit);
+                LeanFront::Add(LeanFront::Counter::AheadWaits);
+                awaitFrontPast(blocker);
+            }
+            unknownHeld = false;
+            answer = published.Overlaps(ranges, &pendingHit, nullptr, true);
+            if (answer == PublishedRanges::Answer::Clear) return false;
+        }
+    }
     noteTurnWait(answer, unknownHeld, ranges, pendingHit);
     LeanFront::Add(LeanFront::Counter::AheadWaits);
     AwaitTurn();
@@ -598,6 +650,26 @@ void DrawFinisher::AwaitTurn() {
     if (seq == 0) return;
     if (frontSeq.load(std::memory_order_acquire) != seq) awaitTurn(seq);
     if (FinisherDeposits::Get()) forwardOwn(seq);
+}
+
+void DrawFinisher::awaitFrontPast(std::uint64_t job) {
+    struct Counted {
+        ThreadReport::Clock::time_point start;
+        ~Counted() {
+            if (start == ThreadReport::Clock::time_point{}) return;
+            ThreadReport::Add(ThreadReport::Count::FinisherTurnWaits, 1);
+            ThreadReport::Add(ThreadReport::Count::FinisherTurnNs, ThreadReport::Nanoseconds(start, ThreadReport::Clock::now()));
+        }
+    } counted{ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{}};
+    const auto passed = [&] { return frontSeq.load(std::memory_order_seq_cst) > job; };
+    if (spinHandoff() && SpinUntil(HandoffSpinWindow(), passed)) return;
+    frontWaiters.fetch_add(1, std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    {
+        auto lock = lockFor(mutex);
+        turnWake.wait(lock, [&] { return closing || passed(); });
+    }
+    frontWaiters.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void DrawFinisher::awaitTurn(std::uint64_t seq) {
@@ -803,6 +875,8 @@ bool DrawFinisher::Adopt(bool ring) {
     if (!pendingWrites.empty() || pendingUnknown != 0) {
         pendingWrites.clear();
         pendingUnknown = 0;
+        unknownSeqs.clear();
+        published.PublishUnknownJobs(unknownSeqs);
         published.Publish(pendingWrites, 0u);
     }
     if (ring) {
@@ -822,13 +896,21 @@ void DrawFinisher::retireLean() {
     const auto front = frontSeq.load(std::memory_order_acquire);
     if (leanRetired >= front) return;
     bool republish = false;
+    bool unlisted = false;
     for (; leanRetired < front; ++leanRetired) {
         auto& slot = leanSlot(leanRetired);
         republish = countPending(slot.pending, false) || republish;
+        if (slot.pending.unknown) {
+            if (const auto listed = std::find(unknownSeqs.begin(), unknownSeqs.end(), leanRetired); listed != unknownSeqs.end()) {
+                unknownSeqs.erase(listed);
+                unlisted = true;
+            }
+        }
         if (const auto retirer = std::exchange(slot.retirer, nullptr); retirer != nullptr) retirer(slot.payload.data(), std::move(slot.answer));
         slot.answer = nullptr;
     }
     if (republish) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
+    if (unlisted) published.PublishUnknownJobs(unknownSeqs);
     keys.Retire(front);
 }
 
@@ -887,6 +969,10 @@ void DrawFinisher::awaitLeanIdle() {
 
 void DrawFinisher::publishLean(LeanSlot& slot) {
     const auto seq = nextSeq;
+    if (!slot.batch && slot.pending.unknown) {
+        unknownSeqs.push_back(seq);
+        published.PublishUnknownJobs(unknownSeqs);
+    }
     if (!slot.batch && countPending(slot.pending, true)) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
     keys.Push(seq, slot.pending.key, slot.pending.shape, slot.pending.inserts);
     slot.seq.store(seq, std::memory_order_relaxed);

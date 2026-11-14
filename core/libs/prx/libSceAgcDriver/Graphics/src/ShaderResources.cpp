@@ -5193,6 +5193,10 @@ bool ShaderResources::expressEligible() const {
     return reusable && cleanEligibility <= 1 && storageTextures.empty() && !heapStage && (bda == nullptr || FaultBufferLean()) && !addressedBuffers && !rebound && !GuestMemory::WriteIndexEnabled() && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits);
 }
 
+bool ShaderResources::ExpressWatchable() const {
+    return expressEligible() && std::none_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->IsDepthCopy(); });
+}
+
 ShaderResources::ExpressBefore ShaderResources::expressBefore() {
     ExpressBefore before;
     expressSourcesBefore.clear();

@@ -416,6 +416,17 @@ bool Driver::buildLeanShape(const QueueState& queue, const Submission& submissio
     return true;
 }
 
+namespace {
+std::uint32_t leanRunLimit() {
+    static const std::uint32_t limit = [] {
+        const char* text = std::getenv("APS5_DRAW_RUN_CAP");
+        const auto value = text != nullptr ? std::strtoul(text, nullptr, 10) : 8ul;
+        return static_cast<std::uint32_t>(std::clamp<unsigned long>(value, 1ul, LeanRunCap));
+    }();
+    return limit;
+}
+}
+
 DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
     using LeanFront::Counter;
     if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpSlowWorker)) {
@@ -562,7 +573,7 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
             leanRun.writes.push_back(range);
             finisher.HoldOpenRunWrite(range);
         }
-        if (leanRun.count == LeanRunCap) publishLeanRun();
+        if (leanRun.count >= leanRunLimit()) publishLeanRun();
         return DrawVerdict::Drawn;
     }
     const bool answered = !direct && (job->recordFlags & (DrawRecordFlags::BuildWanted | DrawRecordFlags::VerifyDue)) != 0;
