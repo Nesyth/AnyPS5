@@ -156,6 +156,7 @@ enum class RuntimeSwitch : std::size_t {
     TurnWaitsByJob,
     StageMemoFront,
     ExpressKeepState,
+    RunFollow,
     Count,
 };
 

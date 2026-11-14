@@ -1808,6 +1808,34 @@ void verifyRepeat(VulkanDevice& device, const Graphics::State& graphics, DrawRec
 
 }
 
+bool Driver::followRecord(VulkanDevice& localDevice, std::uint32_t queue, const Graphics::State& graphics, DrawRecordHit& hit, const VulkanDevice::DrawTraceContext& trace) {
+    auto& commit = *hit.record->commit;
+    if (!hit.direct || trace.token != 0 || commit.recipe == nullptr || commit.writers != 1 || !commit.bufferPlanAsked || !commit.inputsRecipeAsked || !hit.fragment.has_value() || !hit.preparedBuffers.has_value() || !hit.preparedInputs.has_value()) return false;
+    if (DrawRecords::VerifyEvery() != 0 || DirectDraws::BufferVerifyEvery() != 0 || DirectDraws::InputVerifyEvery() != 0 || Graphics::CommitFragmentsVerifyEvery() != 0 || Graphics::ExpressVerifyEvery() != 0) {
+        static std::uint64_t ordinal = 0;
+        if ((++ordinal & 63u) == 0) return false;
+    }
+    if (!GuestMemory::GpuMutex().HeldByThisThread() || !packetLabelsIdle()) return false;
+    commit.cleanProofs = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectCleanProofs);
+    commit.verifyBuffers = false;
+    commit.verifyInputs = false;
+    if (!localDevice.ExpressFollow(graphics, hit.parameters, hit.stages, commit, *hit.preparedBuffers, *hit.preparedInputs, *hit.fragment)) return false;
+    DirectDraws::Add(DirectDraws::Counter::ExpressTaken);
+    DirectDraws::Add(DirectDraws::Counter::FragmentsSpliced);
+    DirectDraws::Add(DirectDraws::Counter::CommitHits);
+    DirectDraws::Add(DirectDraws::Counter::ProofsSkipped);
+    DirectDraws::Add(DirectDraws::Counter::HoldOwn);
+    DirectDraws::Add(DirectDraws::Counter::BuffersUsed);
+    DirectDraws::Add(DirectDraws::Counter::InputsUsed);
+    DrawRecords::AddOnCommitter(DrawRecords::Counter::CommitHits);
+    DrawRecords::AddOnCommitter(DrawRecords::Counter::CommitPassHeld);
+    DrawRecords::AddOnCommitter(DrawRecords::Counter::CommitKeptOnce);
+    ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
+    submitDueAfterCommit(&localDevice);
+    static_cast<void>(queue);
+    return true;
+}
+
 void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, DrawRecordHit& hit, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape) {
     using DrawRecords::Counter;
     if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpSlowCommitter)) {
@@ -1817,6 +1845,10 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     if (hit.direct && hit.record->commit->recipe != nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpNoCommits)) {
         ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
         return;
+    }
+    if (Graphics::ExpressRunLed()) {
+        if (localDevice != nullptr && followRecord(*localDevice, queue, graphics, hit, trace)) return;
+        Graphics::BreakExpressRun();
     }
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);

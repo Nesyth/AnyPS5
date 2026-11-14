@@ -7268,8 +7268,105 @@ std::uint64_t ExpressVerifyEvery() {
     return every;
 }
 
+namespace {
+
+struct ExpressRun {
+    static constexpr std::size_t Targets = 9;
+    std::uint32_t open = 0;
+    bool led = false;
+    bool expectAppend = false;
+    std::uint64_t recorder = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t passKey = 0;
+    const void* framebuffer = nullptr;
+    std::uint64_t forget = 0;
+    std::uint64_t imports = 0;
+    std::uint64_t mapping = 0;
+    std::uint64_t depthSerial = 0;
+    std::uint64_t depthReleased = 0;
+    std::size_t targets = 0;
+    std::array<const void*, Targets> owners{};
+    std::array<std::uint64_t, Targets> versions{};
+    std::array<std::uint64_t, Targets> dcc{};
+    std::array<VkImage, Targets> images{};
+};
+
+struct ExpressRunStorage {};
+
+ExpressRun& expressRun() {
+    return HostThreadLocal<ExpressRun, ExpressRunStorage>();
+}
+
+enum class RunRefusal : std::uint8_t { State, Pass, Serials, Targets, Template, Prepared, Inputs, Ranges, Stores, Verify, Selection, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(RunRefusal::Count)> RunRefusalNames{"express state or objects", "another pass or not reads only", "serials, linear target or copied writers", "targets", "template not current", "prepared buffers", "prepared inputs", "pending write, label or store over a range", "queued store over the template", "verify", "selection or staging"};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RunRefusal::Count)> runRefusals{};
+std::atomic<std::uint64_t> runFollowed{0};
+std::atomic<std::uint64_t> runLed{0};
+std::atomic<std::uint64_t> runFollowChecked{0};
+std::atomic<std::uint64_t> runFollowDiffering{0};
+
+bool runFollowVerifyDue() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_APPEND_COMMITS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    static std::uint64_t ordinal = 0;
+    return every != 0 && ++ordinal % every == 0;
+}
+
+void noteRunFollowVerify(bool same, const char* why) {
+    const auto checked = runFollowChecked.fetch_add(1, std::memory_order_relaxed) + 1u;
+    const auto differing = same ? runFollowDiffering.load(std::memory_order_relaxed) : runFollowDiffering.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (!same && differing <= 16u) std::fprintf(stderr, "[run-follow-verify] a commit the follow conditions accepted is not appended by the express commit: %s\n", why);
+    if (checked % 4096u == 0u) std::fprintf(stderr, "[run-follow-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing));
+}
+
+void noteRunFollowed() {
+    static std::uint64_t seen = 0;
+    runFollowed.fetch_add(1, std::memory_order_relaxed);
+    if ((++seen & 0xfffffu) != 0) return;
+    const auto wide = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    std::string refused;
+    for (std::size_t index = 0; index < runRefusals.size(); ++index) {
+        const auto count = runRefusals[index].exchange(0, std::memory_order_relaxed);
+        if (count != 0) refused += std::string(refused.empty() ? "" : ", ") + RunRefusalNames[index] + " " + std::to_string(count);
+    }
+    std::fprintf(stderr, "[run-follow] %llu express commits followed a leader, %llu led a run; not followed: %s\n", wide(runFollowed), wide(runLed), refused.empty() ? "none" : refused.c_str());
+}
+
+void leadExpressRun(ExpressRun& run, Recorder& recorder, const DrawExpress& express, const DrawExpressKeep& keep) {
+    run.led = false;
+    const auto count = keep.targets.size();
+    if (count > ExpressRun::Targets || express.targetVersions.size() < count || express.dccAddresses.size() < count || !recorder.RenderPassOpen() || recorder.AppendablePass(express.passKey) == VK_NULL_HANDLE) return;
+    run.recorder = recorder.Id();
+    run.generation = recorder.RenderPassGeneration();
+    run.passKey = express.passKey;
+    run.framebuffer = keep.framebuffer.get();
+    run.forget = GuestMemory::ForgetSerial();
+    run.imports = HostImportSetGeneration();
+    run.mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    run.depthSerial = DepthSurfacesSerial();
+    run.depthReleased = DepthSurfacesReleased();
+    run.targets = count;
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto* target = keep.targets[index].get();
+        if (target == nullptr && (index >= keep.multisample.size() || keep.multisample[index] == nullptr || index >= express.multisampleImages.size())) return;
+        run.owners[index] = target != nullptr ? static_cast<const void*>(target) : static_cast<const void*>(keep.multisample[index].get());
+        run.versions[index] = target != nullptr ? target->UploadVersion() : 0u;
+        run.dcc[index] = express.dccAddresses[index];
+        run.images[index] = target != nullptr ? target->Image() : express.multisampleImages[index];
+    }
+    run.led = true;
+    runLed.fetch_add(1, std::memory_order_relaxed);
+}
+
+}
+
 ExpressOutcome ExpressCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs, DrawFragment* fragment, bool verifyDue) {
     ExpressOutcome out;
+    auto& run = expressRun();
+    run.led = false;
+    AppendRefusal followSeen = AppendRefusal::Count;
     const auto miss = [&](DrawExpressMiss why) {
         out.miss = why;
         return out;
@@ -7401,12 +7498,17 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
             }
         }
         if (refusal == AppendRefusal::None && !resources.PreparedZonesClear(*prepared, *recorder)) refusal = AppendRefusal::Buffers;
+        followSeen = refusal;
         if (refusal != AppendRefusal::None) noteAppendRefusal(refusal);
         else if (appendVerifyDue()) appendClaim.armed = true;
         else appended = true;
         for (std::size_t index = 0; appended && index < keep.targets.size(); ++index) {
             if (keep.targets[index] == nullptr) NoteMultisampleTargetDrawn_nid_no_patch(keep.multisample[index]);
         }
+    }
+    if (run.expectAppend) {
+        run.expectAppend = false;
+        if (!verifyDue) noteRunFollowVerify(followSeen == AppendRefusal::None, followSeen == AppendRefusal::Count ? "its append conditions were not reached" : AppendRefusalNames[static_cast<std::size_t>(followSeen)]);
     }
     bool depthStamped = false;
     std::uint32_t multisampleStamped = 0;
@@ -7687,9 +7789,181 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     timing.Mark("draw_and_resource_release");
     if (RuntimeSwitches::Set(RuntimeSwitch::AppendCommits)) noteAppendCommit(appended);
     appendClaim.confirmed = out.refreshed == 0 && taken == DrawRecordInputs::Used && !reprove;
+    if (run.open != 0 && RuntimeSwitches::Set(RuntimeSwitch::RunFollow)) leadExpressRun(run, *recorder, *express, keep);
     out.taken = true;
     out.result.recorded = true;
     return out;
+}
+
+void BeginExpressRun() {
+    ++expressRun().open;
+}
+
+void EndExpressRun() {
+    auto& run = expressRun();
+    if (run.open != 0 && --run.open == 0) {
+        run.led = false;
+        run.expectAppend = false;
+    }
+}
+
+void BreakExpressRun() {
+    expressRun().led = false;
+}
+
+bool ExpressRunLed() {
+    return expressRun().led;
+}
+
+bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers& prepared, PreparedInputs& preparedInputs, DrawFragment& fragment) {
+    auto& run = expressRun();
+    if (!run.led) return false;
+    const auto refuse = [](RunRefusal why) {
+        runRefusals[static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    auto* express = record.express.get();
+    auto* recorder = Recorder::Active();
+    const auto* recipe = record.recipe.get();
+    if (express == nullptr || !express->valid || express->keep == nullptr || recipe == nullptr || express->recipe != recipe || express->state != &state || express->switches != RuntimeSwitches::Generation() || recorder == nullptr || context.recorder != recorder || express->device != context.device || draw.indirect || !RecordDraws() || DumpTargetLimit() != 0 || recordChecksQueued() || repeatExcludedModes() || !fragmentModes() || record.expressRefused || record.verifyBuffers || record.verifyInputs) return refuse(RunRefusal::State);
+    auto& keep = *express->keep;
+    if (fragment.bindings == nullptr || fragment.device != context.device || fragment.resources.get() != keep.resources.get() || fragment.pipeline.get() != keep.pipeline.get()) return refuse(RunRefusal::State);
+    const auto recorderId = recorder->Id();
+    const auto generation = recorder->RenderPassGeneration();
+    if (run.recorder != recorderId || run.generation != generation || run.passKey != express->passKey || run.framebuffer != keep.framebuffer.get() || !express->writes.empty() || !express->writeOnly.empty() || !express->images.empty() || !recorder->PassPureReads()) return refuse(RunRefusal::Pass);
+    const auto commands = recorder->AppendablePass(express->passKey);
+    if (commands == VK_NULL_HANDLE) return refuse(RunRefusal::Pass);
+    const auto forget = GuestMemory::ForgetSerial();
+    const auto imports = HostImportSetGeneration();
+    const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto depthSerial = DepthSurfacesSerial();
+    const auto depthReleased = DepthSurfacesReleased();
+    if (forget != run.forget || imports != run.imports || mapping != run.mapping || depthSerial != run.depthSerial || depthReleased != run.depthReleased || (express->hasDepth && (express->depthSerial != depthSerial || express->depthReleased != depthReleased)) || StorageTexture::DrawnLinearPending() || (context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty()) return refuse(RunRefusal::Serials);
+    if (keep.targets.size() != run.targets || express->targetVersions.size() < run.targets || express->dccAddresses.size() < run.targets) return refuse(RunRefusal::Targets);
+    for (std::size_t index = 0; index < run.targets; ++index) {
+        const auto* target = keep.targets[index].get();
+        if (target != nullptr) {
+            if (static_cast<const void*>(target) != run.owners[index] || express->targetVersions[index] != run.versions[index] || express->dccAddresses[index] != run.dcc[index]) return refuse(RunRefusal::Targets);
+        } else if (index >= keep.multisample.size() || keep.multisample[index] == nullptr || static_cast<const void*>(keep.multisample[index].get()) != run.owners[index] || index >= express->multisampleImages.size() || express->multisampleImages[index] != run.images[index]) {
+            return refuse(RunRefusal::Targets);
+        }
+    }
+    auto& resources = *keep.resources;
+    if (resources.ExpressCurrent() != ShaderResources::ExpressMiss::None) return refuse(RunRefusal::Template);
+    if (!RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || prepared.plan == nullptr || prepared.plan != resources.DirectBufferPlan(shaders) || !context.drawInputsInPlace) return refuse(RunRefusal::Prepared);
+    const std::size_t indexRanges = draw.indexed ? 1u : 0u;
+    if (preparedInputs.recipe.get() != recipe || preparedInputs.device != context.device || preparedInputs.state != &state || preparedInputs.draw != &draw || preparedInputs.shaders != shaders.data() || preparedInputs.stages != shaders.size() || preparedInputs.ranges.size() < indexRanges || (preparedInputs.forget & 1u) != 0 || forget != preparedInputs.forget || imports != preparedInputs.imports || mapping != preparedInputs.mapping) return refuse(RunRefusal::Inputs);
+    for (const auto& range : preparedInputs.ranges) {
+        const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+        if (range.import == nullptr) return refuse(RunRefusal::Inputs);
+        if (!PendingZones::Clear(range.begin, bytes) && (recorder->PendingWriteOverlaps(range.begin, bytes) || PendingStorageOverlaps(range.begin, bytes, nullptr))) return refuse(RunRefusal::Ranges);
+        if (recorder->PendingLabelIn(range.begin, bytes) || recorder->QueuedStoreOverlaps(range.begin, bytes)) return refuse(RunRefusal::Ranges);
+    }
+    if (!resources.PreparedZonesClear(prepared, *recorder)) return refuse(RunRefusal::Ranges);
+    const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes);
+    };
+    if ((recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) || (recorder->HasQueuedStores() && recorder->AnyQueuedStore(touches))) return refuse(RunRefusal::Stores);
+    if (runFollowVerifyDue()) {
+        run.expectAppend = true;
+        return refuse(RunRefusal::Verify);
+    }
+    const DepthCopySourceScope depthCopySource(state.depthCopySource);
+    if (resources.FragmentSelectionHolds(*recorder, prepared.moved, prepared, nullptr, true) != ShaderResources::PreparedBuffers::Selection::Taken) return refuse(RunRefusal::Selection);
+    try {
+        resources.ExpressStage(*recorder);
+    } catch (const std::exception&) {
+        return refuse(RunRefusal::Selection);
+    }
+    if (recorder->AppendablePass(express->passKey) != commands || recorder->RenderPassGeneration() != generation) return refuse(RunRefusal::Selection);
+    recorder->BoundKeptBytes();
+    record.effects = {};
+    for (std::size_t at = 0; at < preparedInputs.ranges.size(); ++at) {
+        const auto& range = preparedInputs.ranges[at];
+        const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+        RequireNoMultisampleTarget(range.begin, bytes, at == 0 && draw.indexed ? "an index buffer read" : "a vertex buffer read");
+        recorder->NotePendingRead(range.begin, bytes, Recorder::ReadKind::DrawInput);
+    }
+    record.effects.inputs = DrawRecordInputs::Used;
+    for (std::size_t index = 0; index < keep.targets.size(); ++index) {
+        if (keep.targets[index] == nullptr) NoteMultisampleTargetDrawn_nid_no_patch(keep.multisample[index]);
+    }
+    if (resources.ChecksFaults() && fragment.faultGeneration != resources.FaultGeneration()) resources.RewriteFragmentFaults(*fragment.bindings);
+    if (!(prepared.aliasesClear && RuntimeSwitches::Set(RuntimeSwitch::AliasesAtPrepare))) CheckBufferAliases(shaders, state.color, draw.indexAddress, preparedInputs.indexBytes);
+    if (recipe->hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
+    if (const auto present = Recorder::Presents(); record.touchedPresent != present) {
+        if (!RuntimeSwitches::Set(RuntimeSwitch::TemplateTouch) || resources.TouchedPresent() != present) {
+            SharedResourceCache().TouchObject(recipe->key, resources);
+            resources.NoteTouchedPresent(present);
+        }
+        record.touchedPresent = present;
+    }
+    countCache(&DrawProfile::cacheHits);
+    keepFragmentBindings(*recorder, fragment.bindings);
+    if (express->keptRecorder != recorderId || express->keptBatch != recorder->OpenSerial()) {
+        recorder->Keep(express->keep);
+        for (const auto& owner : keep.multisample) {
+            if (owner != nullptr) KeepMultisampleTarget_nid_no_patch(owner);
+        }
+        express->keptRecorder = recorderId;
+        express->keptBatch = recorder->OpenSerial();
+    }
+    resources.RequireGuestBuffers();
+    if (express->passSeenRecorder != recorderId || express->passSeenGeneration != generation) recorder->NotePassReads(express->reads);
+    recorder->NotePassReads(preparedInputs.inPlaceReads);
+    record.access.generation = generation;
+    NoteHeapRecord(false, false);
+    recorder->NoteSampledDraw(commands);
+    if (auto* stream = CommandStream::FromHandle(commands); stream != nullptr) {
+        stream->Splice(std::move(fragment.commands));
+        record.effects.fragment.spliced = true;
+    } else {
+        CommandStream::ReplayFragment(fragment.commands, commands);
+        record.effects.fragment.replayed = true;
+    }
+    record.effects.fragment.offered = true;
+    NoteGuestWorkIn(context, commands);
+    express->passSeenRecorder = recorderId;
+    express->passSeenGeneration = generation;
+    record.effects.keptOnce = true;
+    for (std::size_t index = 0; index < keep.targets.size(); ++index) {
+        auto* target = keep.targets[index].get();
+        if (target == nullptr) continue;
+        const auto [slice, count] = express->slices[index];
+        if (target->RenoteInPass(recorderId, generation, slice, count)) {
+            ++record.effects.notesSkipped;
+            continue;
+        }
+        target->MarkSliceDirty(slice, count);
+        if (recorder->RenderPassOpen()) target->RememberPassNote(recorderId, generation, slice, count);
+    }
+    record.effects.proved = true;
+    record.effects.cleanProof = ShaderResources::CleanProof::Skipped;
+    if (resources.ChecksFaults() && resources.TakeFaultCheck(recorderId, recorder->OpenSerial())) recorder->OnComplete([kept = keep.resources] { kept->CheckFaults(); });
+    record.effects.hold = DrawRecordHold::Held;
+    record.effects.passHeld = true;
+    record.effects.buffers = DrawRecordBuffers::Used;
+    record.effects.pushed = fragment.pushing;
+    if (recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {
+        auto& remembered = record.pass;
+        remembered.valid = true;
+        remembered.recorder = recorderId;
+        remembered.generation = generation;
+        remembered.epoch = GuestMemory::CollectEpoch();
+        remembered.proof = GuestMemory::ProofSerial();
+        remembered.pending = StorageTexture::PendingSerial();
+        remembered.depthSerial = depthSerial;
+        remembered.depthReleased = depthReleased;
+        remembered.versions.clear();
+        for (const auto& target : keep.targets) remembered.versions.push_back(target != nullptr ? target->UploadVersion() : 0u);
+        if (std::ranges::any_of(keep.multisample, [](const std::shared_ptr<void>& owner) { return owner != nullptr; })) remembered.valid = false;
+    } else {
+        record.pass.valid = false;
+    }
+    if (RuntimeSwitches::Set(RuntimeSwitch::AppendCommits)) noteAppendCommit(true);
+    noteRunFollowed();
+    return true;
 }
 
 namespace {

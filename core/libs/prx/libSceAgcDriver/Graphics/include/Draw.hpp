@@ -175,6 +175,11 @@ struct ExpressOutcome {
 std::array<std::uint64_t, 8> ExpressTargetMissCauses();
 bool DrawBufferAliasesClear(std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::uint64_t indexBytes);
 ExpressOutcome ExpressCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs, DrawFragment* fragment, bool verifyDue);
+void BeginExpressRun();
+void EndExpressRun();
+void BreakExpressRun();
+bool ExpressRunLed();
+bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers& prepared, PreparedInputs& preparedInputs, DrawFragment& fragment);
 std::uint64_t ExpressVerifyEvery();
 enum class RepeatRefusal : std::uint8_t { NoBlock, NotSimple, VerifyDue, Shape, Objects, Batch, Pass, Epoch, ProofSerial, Pending, Depth, Target, Access, Stores, Linear, Buffers, Selection, DepthGuards, Inputs, Changed, MovedHazard, UnmovedHazard, Count };
 inline constexpr std::array<const char*, static_cast<std::size_t>(RepeatRefusal::Count)> RepeatRefusalNames{"no block", "not simple", "verify due", "shape", "objects", "another batch", "pass", "collect epoch", "proof serial", "pending stores", "depth surfaces", "target changed", "pass access", "queued stores", "drawn linear targets", "no prepared buffers", "selection", "depth guards", "inputs", "changed by the inputs", "moved-range hazard", "unmoved-range hazard"};

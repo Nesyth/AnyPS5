@@ -353,6 +353,7 @@ private:
     DrawRecords::Counter fetchRecordPlan(const LeanDrawJob& job, const DrawRecordPlan& plan, std::span<const std::vector<std::uint32_t>> users, DrawRecordHit& hit, EntryOutcome* gate = nullptr);
     void commitRecordDraw(const LeanDrawJob& job, const LeanAnchor& anchor, std::shared_ptr<DrawRecordHit> hit);
     void commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, DrawRecordHit& hit, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape);
+    bool followRecord(VulkanDevice& localDevice, std::uint32_t queue, const Graphics::State& graphics, DrawRecordHit& hit, const VulkanDevice::DrawTraceContext& trace);
     bool verifyRecordCommit(const DrawRecord& record, const DrawCommitView& answer, const DrawCommitView& today);
     void verifyRecordHit(const LeanDrawJob& job, const DrawRecord& record, const DrawRecordView& answer, const DrawRecordSink& sink);
     bool compareRecordAnswer(const LeanDrawJob& job, const DrawRecord& record, const DrawRecordView& answer, const DrawRecordSink& sink, void (*noteDifference)(DrawRecords::Field, std::string_view), void (*noteAllowed)(DrawRecords::Allowed));
@@ -535,6 +536,7 @@ private:
     static std::uint64_t batchCap();
     void recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue);
     bool recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queue);
+    bool packetLabelsIdle();
     void recordQueuedLabelsBeforeRead(std::uint32_t queue);
     bool recordQueuedLabelsAfterCapture(std::uint32_t queue, std::span<const ShaderRecompiler::MemoryRegion> regions);
     static void runCaptureCheckHook();

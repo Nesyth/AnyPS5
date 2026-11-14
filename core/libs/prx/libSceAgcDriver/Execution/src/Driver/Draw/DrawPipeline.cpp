@@ -1748,6 +1748,11 @@ void DrawPipeline::run() {
     constexpr std::size_t LeanRunCap = 32;
     std::optional<std::unique_lock<GuestMemory::GpuMutexType>> runHold;
     std::size_t runLength = 0;
+    const auto dropHold = [&] {
+        if (!runHold) return;
+        Graphics::EndExpressRun();
+        runHold.reset();
+    };
     ThreadReport::Clock::time_point lastEnd{};
     ThreadReport::StateTimes idleFrom{};
     for (;;) {
@@ -1786,10 +1791,11 @@ void DrawPipeline::run() {
         bool failed = false;
         bool shutdown = false;
         if (!isDraw || commit == nullptr || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLeanRuns)) {
-            runHold.reset();
+            dropHold();
         } else if (!runHold) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
             runHold.emplace(GuestMemory::GpuMutex());
+            Graphics::BeginExpressRun();
             runLength = 0;
         }
         try {
@@ -1823,7 +1829,7 @@ void DrawPipeline::run() {
             idleFrom = ThreadReport::SnapshotStates(end);
             ThreadReport::Tick(end);
         }
-        if (fatal != nullptr) runHold.reset();
+        if (fatal != nullptr) dropHold();
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
@@ -1846,9 +1852,9 @@ void DrawPipeline::run() {
             if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
             keepRun = runHold.has_value() && !stopped && !closing && !items.empty() && items.front().draw && ++runLength < LeanRunCap && idleWaiters == 0;
         }
-        if (runHold && (!keepRun || GuestMemory::GpuMutex().HasWaiters())) runHold.reset();
+        if (runHold && (!keepRun || GuestMemory::GpuMutex().HasWaiters())) dropHold();
     }
-    runHold.reset();
+    dropHold();
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
 
