@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommandStream.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DescriptorHeapObjects.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -338,6 +339,9 @@ template<CommandOp Op, typename... TArguments>
     if (CommandStreamWriter::Closed(stream)) {
         noteClosedStream(Op);
         refuse(Op, "was recorded into a command stream after its batch was closed");
+    }
+    if constexpr (Op == CommandOp::PipelineBarrier) {
+        if (std::get<7>(std::tie(arguments...)) == 0 && RuntimeSwitches::Set(RuntimeSwitch::XpNoBarriers)) return;
     }
     auto* const record = new (CommandStreamWriter::Allocate(stream, sizeof(OpRecord<Op>))) OpRecord<Op>{{nullptr, static_cast<std::uint8_t>(Op), static_cast<std::uint8_t>(slot)}, ArgumentsOf<Op>(arguments...)};
     copyArguments<Op>(stream, record->arguments);
