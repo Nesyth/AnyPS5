@@ -1748,50 +1748,56 @@ void DrawPipeline::run() {
     constexpr std::size_t LeanRunCap = 32;
     std::optional<std::unique_lock<GuestMemory::GpuMutexType>> runHold;
     std::size_t runLength = 0;
-    const auto dropHold = [&] {
+    const auto dropHold = [&](Graphics::ExpressRunEnd reason) {
         if (!runHold) return;
-        Graphics::EndExpressRun();
+        Graphics::EndExpressRun(reason);
         runHold.reset();
     };
     ThreadReport::Clock::time_point lastEnd{};
     ThreadReport::StateTimes idleFrom{};
+    Commit* commit = nullptr;
+    bool isDraw = false;
+    bool rangedItem = false;
+    bool quietItem = false;
+    std::uint32_t itemParts = 1;
+    std::vector<Range> itemRanges;
+    bool taken = false;
+    const auto takeFront = [&] {
+        if (depositVerifyEvery() != 0) verifyOrder(items.front().order);
+        commit = stopped ? nullptr : &items.front().commit;
+        isDraw = items.front().draw;
+        quietItem = items.front().quiet;
+        itemParts = items.front().parts;
+        rangedItem = !isDraw && GuestMemory::RangeProofs();
+        itemRanges.clear();
+        if (rangedItem) {
+            itemRanges = items.front().writes;
+            if (items.front().labelAddress != 0 && !items.front().labelBytes.empty()) itemRanges.emplace_back(items.front().labelAddress, items.front().labelAddress + items.front().labelBytes.size());
+        }
+    };
     for (;;) {
-        Commit* commit = nullptr;
-        bool isDraw = false;
-        bool rangedItem = false;
-        bool quietItem = false;
-        std::uint32_t itemParts = 1;
-        std::vector<Range> itemRanges;
-        static const bool idleCensus = std::getenv("APS5_PIPELINE_STATS") != nullptr;
-        const bool idleNow = idleCensus && outstanding.load(std::memory_order_acquire) == 0;
-        const unsigned idleState = idleNow ? DrawFinisher::Get().IdleState() : 0;
-        const auto idleStart = idleNow ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
-        {
+        if (!taken) {
+            static const bool idleCensus = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+            const bool idleNow = idleCensus && outstanding.load(std::memory_order_acquire) == 0;
+            const unsigned idleState = idleNow ? DrawFinisher::Get().IdleState() : 0;
+            const auto idleStart = idleNow ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
             auto lock = lockFor(mutex);
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
             if (idleNow) noteCommitterIdle(idleState, elapsedNs(idleStart));
             if (items.empty()) break;
-            if (depositVerifyEvery() != 0) verifyOrder(items.front().order);
-            commit = stopped ? nullptr : &items.front().commit;
-            isDraw = items.front().draw;
-            quietItem = items.front().quiet;
-            itemParts = items.front().parts;
-            rangedItem = !isDraw && GuestMemory::RangeProofs();
-            if (rangedItem) {
-                itemRanges = items.front().writes;
-                if (items.front().labelAddress != 0 && !items.front().labelBytes.empty()) itemRanges.emplace_back(items.front().labelAddress, items.front().labelAddress + items.front().labelBytes.size());
-            }
+            takeFront();
         }
+        taken = false;
         const auto start = std::chrono::steady_clock::now();
         const auto idleTo = ThreadReport::Enabled() && lastEnd != ThreadReport::Clock::time_point{} ? ThreadReport::SnapshotStates(start) : ThreadReport::StateTimes{};
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
         if (!isDraw || commit == nullptr || (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLeanRuns) && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow))) {
-            dropHold();
+            dropHold(!isDraw ? Graphics::ExpressRunEnd::NotDraw : commit == nullptr ? Graphics::ExpressRunEnd::Stop : Graphics::ExpressRunEnd::Switch);
         } else if (!runHold) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
             runHold.emplace(GuestMemory::GpuMutex());
@@ -1829,12 +1835,14 @@ void DrawPipeline::run() {
             idleFrom = ThreadReport::SnapshotStates(end);
             ThreadReport::Tick(end);
         }
-        if (fatal != nullptr) dropHold();
+        if (fatal != nullptr) dropHold(Graphics::ExpressRunEnd::Stop);
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
         bool keepRun = false;
+        auto ended = Graphics::ExpressRunEnd::LockWaiter;
+        const bool mergedTake = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow) && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollowPlainLoop);
         {
             const auto lock = lockFor(mutex);
             retiredItems.fetch_add(1, std::memory_order_release);
@@ -1851,10 +1859,15 @@ void DrawPipeline::run() {
             outstanding.fetch_sub(1, std::memory_order_release);
             if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
             keepRun = runHold.has_value() && !stopped && !closing && !items.empty() && items.front().draw && ++runLength < LeanRunCap && idleWaiters == 0;
+            if (!keepRun) ended = stopped || closing ? Graphics::ExpressRunEnd::Stop : items.empty() ? Graphics::ExpressRunEnd::NotQueued : !items.front().draw ? Graphics::ExpressRunEnd::NotDraw : runLength >= LeanRunCap ? Graphics::ExpressRunEnd::Cap : Graphics::ExpressRunEnd::IdleWaiter;
+            if (mergedTake && !items.empty()) {
+                takeFront();
+                taken = true;
+            }
         }
-        if (runHold && (!keepRun || GuestMemory::GpuMutex().HasWaiters())) dropHold();
+        if (runHold && (!keepRun || GuestMemory::GpuMutex().HasWaiters())) dropHold(ended);
     }
-    dropHold();
+    dropHold(Graphics::ExpressRunEnd::Stop);
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
 

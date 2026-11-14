@@ -1474,7 +1474,10 @@ void Driver::commitRecordDraw(const LeanDrawJob& job, const LeanAnchor& anchor, 
     auto commit = [this, hit = std::move(hit), localDevice = anchor.device, decode = job.shape->decode, queue = job.queue, opcode = job.opcode, epoch = job.epoch, trace, shape = job.shapeKey] {
         DrawPipeline::FollowEpoch(epoch);
         GuestMemory::SetCurrentPacket(opcode, queue);
+        const bool following = localDevice != nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow);
+        if (following && Graphics::ExpressRunLed() && followRecord(*localDevice, queue, decode->state, *hit, trace)) return;
         commitRecord(localDevice, queue, decode->state, *hit, trace, shape);
+        if (following) Graphics::DropExpressFollowVerify();
     };
     DrawPipeline::Queue0().Enqueue(std::move(commit), std::move(writes), 0, {}, std::move(reads), true);
 }
@@ -1806,32 +1809,96 @@ void verifyRepeat(VulkanDevice& device, const Graphics::State& graphics, DrawRec
     if (differs || refuted) commit.repeat.reset();
 }
 
+struct FollowTally {
+    std::uint64_t followed = 0;
+};
+struct FollowTallyStorage {};
+
+FollowTally& followTally() {
+    return HostThreadLocal<FollowTally, FollowTallyStorage>();
+}
+
+void flushFollowTally(FollowTally& tally) {
+    const auto count = tally.followed;
+    if (count == 0) return;
+    tally.followed = 0;
+    DirectDraws::Add(DirectDraws::Counter::ExpressTaken, count);
+    DirectDraws::Add(DirectDraws::Counter::FragmentsSpliced, count);
+    DirectDraws::Add(DirectDraws::Counter::CommitHits, count);
+    DirectDraws::Add(DirectDraws::Counter::ProofsSkipped, count);
+    DirectDraws::Add(DirectDraws::Counter::HoldOwn, count);
+    DirectDraws::Add(DirectDraws::Counter::BuffersUsed, count);
+    DirectDraws::Add(DirectDraws::Counter::InputsUsed, count);
+    DrawRecords::AddOnCommitter(DrawRecords::Counter::CommitHits, count);
+    DrawRecords::AddOnCommitter(DrawRecords::Counter::CommitPassHeld, count);
+    DrawRecords::AddOnCommitter(DrawRecords::Counter::CommitKeptOnce, count);
+}
+
+struct CommitOrdinals {
+    std::uint64_t record = 0;
+    std::uint64_t buffers = 0;
+    std::uint64_t inputs = 0;
+    std::uint64_t express = 0;
+    std::uint64_t expressRefused = ~std::uint64_t{0};
+};
+CommitOrdinals commitOrdinals;
+
+bool ordinalDue(std::uint64_t ordinal, std::uint64_t every) {
+    return every != 0 && (ordinal + 1) % every == 0;
+}
+
 }
 
 bool Driver::followRecord(VulkanDevice& localDevice, std::uint32_t queue, const Graphics::State& graphics, DrawRecordHit& hit, const VulkanDevice::DrawTraceContext& trace) {
+    using Refusal = Graphics::ExpressRunRefusal;
+    static std::uint32_t timingOrdinal = 0;
+    const bool timed = (++timingOrdinal & 7u) == 0;
+    const auto began = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto& tally = followTally();
+    const auto refuse = [&tally](Refusal why) {
+        flushFollowTally(tally);
+        Graphics::RefuseExpressFollow(why);
+        return false;
+    };
     auto& commit = *hit.record->commit;
-    if (!hit.direct || trace.token != 0 || commit.recipe == nullptr || commit.writers != 1 || !commit.bufferPlanAsked || !commit.inputsRecipeAsked || !hit.fragment.has_value() || !hit.preparedBuffers.has_value() || !hit.preparedInputs.has_value()) return false;
-    if (DrawRecords::VerifyEvery() != 0 || DirectDraws::BufferVerifyEvery() != 0 || DirectDraws::InputVerifyEvery() != 0 || Graphics::CommitFragmentsVerifyEvery() != 0 || Graphics::ExpressVerifyEvery() != 0) {
-        static std::uint64_t ordinal = 0;
-        if ((++ordinal & 63u) == 0) return false;
+    if (!hit.direct || trace.token != 0 || commit.recipe == nullptr || commit.writers != 1 || !commit.bufferPlanAsked || !commit.inputsRecipeAsked || !hit.fragment.has_value() || !hit.preparedBuffers.has_value() || !hit.preparedInputs.has_value()) return refuse(Refusal::NotDirect);
+    static const bool verifies = DrawRecords::VerifyEvery() != 0 || DirectDraws::BufferVerifyEvery() != 0 || DirectDraws::InputVerifyEvery() != 0 || Graphics::CommitFragmentsVerifyEvery() != 0 || Graphics::ExpressVerifyEvery() != 0;
+    auto& ordinals = commitOrdinals;
+    bool expressDue = false;
+    if (verifies) {
+        if (ordinalDue(ordinals.record, DrawRecords::VerifyEvery()) || ordinalDue(ordinals.buffers, DirectDraws::BufferVerifyEvery()) || ordinalDue(ordinals.inputs, DirectDraws::InputVerifyEvery())) return refuse(Refusal::Verifies);
+        expressDue = commit.express != nullptr && commit.express->valid && ordinalDue(ordinals.express, Graphics::ExpressVerifyEvery());
+        if (expressDue && ordinals.expressRefused != ordinals.express) {
+            ordinals.expressRefused = ordinals.express;
+            return refuse(Refusal::Verifies);
+        }
     }
-    if (!GuestMemory::GpuMutex().HeldByThisThread() || !packetLabelsIdle()) return false;
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpNoCommits)) return refuse(Refusal::Experiment);
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return refuse(Refusal::Unlocked);
+    if (!packetLabelsIdle()) return refuse(Refusal::Labels);
     commit.cleanProofs = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectCleanProofs);
     commit.verifyBuffers = false;
     commit.verifyInputs = false;
-    if (!localDevice.ExpressFollow(graphics, hit.parameters, hit.stages, commit, *hit.preparedBuffers, *hit.preparedInputs, *hit.fragment)) return false;
-    DirectDraws::Add(DirectDraws::Counter::ExpressTaken);
-    DirectDraws::Add(DirectDraws::Counter::FragmentsSpliced);
-    DirectDraws::Add(DirectDraws::Counter::CommitHits);
-    DirectDraws::Add(DirectDraws::Counter::ProofsSkipped);
-    DirectDraws::Add(DirectDraws::Counter::HoldOwn);
-    DirectDraws::Add(DirectDraws::Counter::BuffersUsed);
-    DirectDraws::Add(DirectDraws::Counter::InputsUsed);
-    DrawRecords::AddOnCommitter(DrawRecords::Counter::CommitHits);
-    DrawRecords::AddOnCommitter(DrawRecords::Counter::CommitPassHeld);
-    DrawRecords::AddOnCommitter(DrawRecords::Counter::CommitKeptOnce);
+    const auto attempts = Graphics::ExpressFollowAttempts();
+    if (!localDevice.ExpressFollow(graphics, hit.parameters, hit.stages, commit, *hit.preparedBuffers, *hit.preparedInputs, *hit.fragment)) {
+        if (Graphics::ExpressFollowAttempts() == attempts) return refuse(Refusal::Device);
+        flushFollowTally(tally);
+        return false;
+    }
+    if (++tally.followed >= 64) flushFollowTally(tally);
+    if (verifies) {
+        if (DrawRecords::VerifyEvery() != 0) ++ordinals.record;
+        if (DirectDraws::BufferVerifyEvery() != 0) ++ordinals.buffers;
+        if (DirectDraws::InputVerifyEvery() != 0) ++ordinals.inputs;
+        if (Graphics::ExpressVerifyEvery() != 0 && !expressDue) ++ordinals.express;
+    }
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpSlowCommitter)) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(1);
+        while (std::chrono::steady_clock::now() < until) {}
+    }
     ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
     submitDueAfterCommit(&localDevice);
+    if (timed) Graphics::NoteExpressFollowItem(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count()));
     static_cast<void>(queue);
     return true;
 }
@@ -1846,7 +1913,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
         return;
     }
-    if (Graphics::ExpressRunLed()) {
+    if (Graphics::ExpressRunLed() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow)) {
         if (localDevice != nullptr && followRecord(*localDevice, queue, graphics, hit, trace)) return;
         Graphics::BreakExpressRun();
     }
@@ -1870,7 +1937,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     if (commit.writers == 0) commit.writers = StagesMayWriteBuffers(hit.stages) ? 2 : 1;
     if (commit.writers == 2) noteDrawWriters(hit.stages, queue);
     commit.cleanProofs = hit.direct ? Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectCleanProofs) : hit.planned && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoPlanCleanProofs);
-    static std::uint64_t ordinal = 0;
+    auto& ordinal = commitOrdinals.record;
     const auto every = DrawRecords::VerifyEvery();
     const bool verify = commit.recipe != nullptr && every != 0 && ++ordinal % every == 0;
     if (commit.recipe == nullptr) {
@@ -1878,11 +1945,11 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         if (hit.direct) DirectDraws::Add(DirectDraws::Counter::CommitFirst);
     } else if (!verify) {
         const auto* prepared = hit.preparedBuffers.has_value() ? &*hit.preparedBuffers : nullptr;
-        static std::uint64_t bufferOrdinal = 0;
+        auto& bufferOrdinal = commitOrdinals.buffers;
         const auto bufferEvery = DirectDraws::BufferVerifyEvery();
         commit.verifyBuffers = prepared != nullptr && bufferEvery != 0 && ++bufferOrdinal % bufferEvery == 0;
         auto* inputs = hit.preparedInputs.has_value() ? &*hit.preparedInputs : nullptr;
-        static std::uint64_t inputOrdinal = 0;
+        auto& inputOrdinal = commitOrdinals.inputs;
         const auto inputEvery = DirectDraws::InputVerifyEvery();
         commit.verifyInputs = inputs != nullptr && inputEvery != 0 && ++inputOrdinal % inputEvery == 0;
         // DrawFromRecord can return before DrawWithRecord resets them.
@@ -1946,7 +2013,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         std::vector<std::uint64_t> verifyVersions;
         if (fragment != nullptr && !repeatedOutcome.has_value() && tracePtr == nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ExpressCommits)) {
             using DirectDraws::Counter;
-            static std::uint64_t expressOrdinal = 0;
+            auto& expressOrdinal = commitOrdinals.express;
             const auto expressEvery = Graphics::ExpressVerifyEvery();
             const bool due = expressEvery != 0 && commit.express != nullptr && commit.express->valid && ++expressOrdinal % expressEvery == 0;
             const auto expressBegan = fragmentTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

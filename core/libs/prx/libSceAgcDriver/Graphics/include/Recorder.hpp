@@ -501,6 +501,9 @@ public:
     bool RenderPassOpen() const;
     VkCommandBuffer AppendablePass(std::uint64_t key);
     bool PassPureReads() const;
+    bool PassFenced() const;
+    bool PassReadsFollow(GuestRangeList first, GuestRangeList second) const;
+    static std::uint64_t QueuedLabelSerial();
     bool BeginPassLayouts(VkCommandBuffer commands, std::span<const std::pair<VkImage, bool>> attachments);
     void NotePassReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     std::uint64_t RenderPassGeneration() const { return passGeneration; }

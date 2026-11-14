@@ -175,10 +175,16 @@ struct ExpressOutcome {
 std::array<std::uint64_t, 8> ExpressTargetMissCauses();
 bool DrawBufferAliasesClear(std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::uint64_t indexBytes);
 ExpressOutcome ExpressCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs, DrawFragment* fragment, bool verifyDue);
+enum class ExpressRunEnd : std::uint8_t { NotQueued, NotDraw, Cap, LockWaiter, IdleWaiter, Refusal, Switch, Stop, Count };
+enum class ExpressRunRefusal : std::uint8_t { NotDirect, Verifies, Unlocked, Labels, Experiment, Device, State, Switches, Objects, Recorder, Generation, Key, OwnWrites, OwnImages, NotAppendable, Serials, Linear, Writers, Targets, Multisample, Depth, Template, Prepared, Inputs, PassWrites, Fenced, InputWrites, InputStores, Buffers, Stores, Verify, Selection, Staging, PassMoved, Count };
 void BeginExpressRun();
-void EndExpressRun();
+void EndExpressRun(ExpressRunEnd reason);
 void BreakExpressRun();
 bool ExpressRunLed();
+void RefuseExpressFollow(ExpressRunRefusal why);
+std::uint64_t ExpressFollowAttempts();
+void NoteExpressFollowItem(std::uint64_t nanoseconds);
+void DropExpressFollowVerify();
 bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers& prepared, PreparedInputs& preparedInputs, DrawFragment& fragment);
 std::uint64_t ExpressVerifyEvery();
 enum class RepeatRefusal : std::uint8_t { NoBlock, NotSimple, VerifyDue, Shape, Objects, Batch, Pass, Epoch, ProofSerial, Pending, Depth, Target, Access, Stores, Linear, Buffers, Selection, DepthGuards, Inputs, Changed, MovedHazard, UnmovedHazard, Count };

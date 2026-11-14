@@ -625,6 +625,7 @@ bool KeyStoresEach() {
     return each;
 }
 std::atomic<std::uint64_t> queuedLabelsNoted{0}, queuedLabelsOverRecorded{0}, queuedLabelHits{0}, queuedLabelHookRecords{0}, queuedLabelHookInCompletion{0};
+std::atomic<std::uint64_t> queuedLabelSerial{0};
 // Read-tracking counters (Recorder::ReadCounts), relaxed: they are only reported.
 constexpr std::size_t ReadKinds = static_cast<std::size_t>(Recorder::ReadKind::Count);
 std::atomic<std::uint64_t> readsNoted{0}, readQueries{0}, readStaleIgnored{0};
@@ -1513,6 +1514,10 @@ std::uint64_t Recorder::QueuedStoreGeneration() {
     return queuedStoreGeneration.load(std::memory_order_acquire);
 }
 
+std::uint64_t Recorder::QueuedLabelSerial() {
+    return queuedLabelSerial.load(std::memory_order_acquire);
+}
+
 std::uint64_t Recorder::PublishGeneration() {
     return publishGeneration.load(std::memory_order_acquire);
 }
@@ -1683,6 +1688,7 @@ void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte>
         if (const auto found = recorded.find(address + offset); found != recorded.end() && found->second.batch != nullptr) queuedLabelsOverRecorded.fetch_add(1, std::memory_order_relaxed);
         table.insert_or_assign(address + offset, LabelEntry{value, queue, stamp, nullptr});
     }
+    queuedLabelSerial.fetch_add(1, std::memory_order_release);
     labelTableOwner->recordedLabels.store(recorded.size(), std::memory_order_relaxed);
 }
 
@@ -1978,6 +1984,14 @@ bool Recorder::BeginPassLayouts(VkCommandBuffer commands, std::span<const std::p
 
 bool Recorder::PassPureReads() const {
     return open != nullptr && open->renderPass.open && open->passHazards.PureReads();
+}
+
+bool Recorder::PassFenced() const {
+    return open != nullptr && open->renderPass.open && open->renderPass.fenced;
+}
+
+bool Recorder::PassReadsFollow(GuestRangeList first, GuestRangeList second) const {
+    return open != nullptr && open->renderPass.open && open->passHazards.ReadsFollow(first, second);
 }
 
 void Recorder::NotePassReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {

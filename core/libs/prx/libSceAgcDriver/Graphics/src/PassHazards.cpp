@@ -75,6 +75,12 @@ PassHazard PassHazards::Check(const PassAccess& access, bool samePass) {
     return PassHazard::None;
 }
 
+bool PassHazards::ReadsFollow(GuestRangeList first, GuestRangeList second) const {
+    const auto nonEmpty = [](GuestRangeList ranges) { return std::any_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.first < range.second; }); };
+    if (anyWrites && (nonEmpty(first) || nonEmpty(second))) return false;
+    return !overlapsAny(writes, first) && !overlapsAny(writeOnly, first) && !overlapsAny(writes, second) && !overlapsAny(writeOnly, second);
+}
+
 void PassHazards::Add(const PassAccess& access, bool lazyReads) {
     if (lazyReads) {
         for (const auto& range : access.reads) {
