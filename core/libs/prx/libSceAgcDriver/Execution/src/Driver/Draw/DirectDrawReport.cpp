@@ -400,6 +400,10 @@ void Report(bool force) {
     if (sum(Counter::FragmentsBlockNotReusable, Counter::FragmentsBlockModes) != 0) {
         AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] fragment blocks not published: %llu commits%s\n", static_cast<unsigned long long>(sum(Counter::FragmentsBlockNotReusable, Counter::FragmentsBlockModes)), reasons(counts, Counter::FragmentsBlockNotReusable, Counter::FragmentsBlockModes).c_str());
     }
+    if (const auto causes = Graphics::ExpressTargetMissCauses(); std::any_of(causes.begin(), causes.end(), [](std::uint64_t count) { return count != 0; })) {
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] express target misses in the run: multisample shape %llu, multisample view %llu, target not cached %llu, dcc or keys %llu, image not cached %llu, another resident %llu, upload version %llu\n",
+            static_cast<unsigned long long>(causes[0]), static_cast<unsigned long long>(causes[1]), static_cast<unsigned long long>(causes[2]), static_cast<unsigned long long>(causes[3]), static_cast<unsigned long long>(causes[4]), static_cast<unsigned long long>(causes[5]), static_cast<unsigned long long>(causes[6]));
+    }
     if (sum(Counter::ExpressTaken, Counter::ExpressCaptureUnreached) != 0) {
         const auto perCommit = [&](Counter nanoseconds, Counter timed) { return at(timed) == 0 ? 0.0 : static_cast<double>(at(nanoseconds)) / static_cast<double>(at(timed)); };
         AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] express: %llu taken, %llu not taken%s; verify %llu checked, %llu differing; ns per express commit %.0f (%llu); %llu reproved, %llu targets refreshed; states %llu captured, %llu not%s\n",

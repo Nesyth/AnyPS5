@@ -7237,6 +7237,18 @@ void noteLeanExpress(bool untouched) {
 
 }
 
+namespace {
+
+std::array<std::atomic<std::uint64_t>, 7> expressTargetCauses{};
+
+}
+
+std::array<std::uint64_t, 7> ExpressTargetMissCauses() {
+    std::array<std::uint64_t, 7> causes{};
+    for (std::size_t index = 0; index < causes.size(); ++index) causes[index] = expressTargetCauses[index].load(std::memory_order_relaxed);
+    return causes;
+}
+
 std::uint64_t ExpressVerifyEvery() {
     static const std::uint64_t every = [] {
         const char* text = std::getenv("APS5_VERIFY_EXPRESS_COMMITS");
@@ -7250,6 +7262,10 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     const auto miss = [&](DrawExpressMiss why) {
         out.miss = why;
         return out;
+    };
+    const auto targetMiss = [&](std::size_t cause) {
+        expressTargetCauses[cause].fetch_add(1, std::memory_order_relaxed);
+        return miss(DrawExpressMiss::Targets);
     };
     auto* express = record.express.get();
     if (express == nullptr || !express->valid || express->keep == nullptr) return miss(DrawExpressMiss::NoState);
@@ -7385,7 +7401,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     for (std::size_t index = 0; !sameTargets && index < keep.targets.size(); ++index) {
         const auto& target = keep.targets[index];
         if (target == nullptr) {
-            if (index >= state.colors.size() || index >= keep.multisample.size() || keep.multisample[index] == nullptr || index >= express->multisampleImages.size() || index >= recipe->targetViews.size()) return miss(DrawExpressMiss::Targets);
+            if (index >= state.colors.size() || index >= keep.multisample.size() || keep.multisample[index] == nullptr || index >= express->multisampleImages.size() || index >= recipe->targetViews.size()) return targetMiss(0);
             auto& multisampleMemo = HostThreadLocal<ExpressMultisampleMemo, ExpressMultisampleStorage>();
             auto& checked = multisampleMemo.checked;
             auto& nextChecked = multisampleMemo.next;
@@ -7397,7 +7413,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
                 VkImage image = VK_NULL_HANDLE;
                 if (state.colors[index].fmaskAddress != 0) GuardOneFragmentFmask(context, state.colors[index]);
                 const auto view = MultisampleTargetView(context, state.colors[index], current, &image);
-                if (view != recipe->targetViews[index] || current.get() != owner || image != express->multisampleImages[index]) return miss(DrawExpressMiss::Targets);
+                if (view != recipe->targetViews[index] || current.get() != owner || image != express->multisampleImages[index]) return targetMiss(1);
                 auto& slot = found != checked.end() ? *found : checked[nextChecked++ % checked.size()];
                 slot = {owner, recorder->Id(), generation};
                 ++out.refreshed;
@@ -7406,12 +7422,12 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
             }
             continue;
         }
-        if (index >= state.colors.size() || !target->Cached()) return miss(DrawExpressMiss::Targets);
+        if (index >= state.colors.size() || !target->Cached()) return targetMiss(2);
         const auto& color = state.colors[index];
         const auto dcc = SurfaceForTarget(color).dccAddress;
-        if (dcc != express->dccAddresses[index] || !StorageImageServesKeys(*target, dcc)) return miss(DrawExpressMiss::Targets);
+        if (dcc != express->dccAddresses[index] || !StorageImageServesKeys(*target, dcc)) return targetMiss(3);
         if (!recorder->RenderPassOpen() || !target->NotedInPass(recorder->Id(), recorder->RenderPassGeneration())) {
-            if (!StorageImageCached(context, target.get())) return miss(DrawExpressMiss::Targets);
+            if (!StorageImageCached(context, target.get())) return targetMiss(4);
             if (color.fmaskAddress != 0) GuardOneFragmentFmask(context, color);
             DrawOutcome refreshed;
             const auto resident = refreshResidentTarget(context, state, color, refreshed, false, [&] {
@@ -7419,10 +7435,10 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
                 else target->Refresh();
                 return target;
             });
-            if (resident.get() != target.get()) return miss(DrawExpressMiss::Targets);
+            if (resident.get() != target.get()) return targetMiss(5);
             ++out.refreshed;
         }
-        if (target->UploadVersion() != express->targetVersions[index]) return miss(DrawExpressMiss::Targets);
+        if (target->UploadVersion() != express->targetVersions[index]) return targetMiss(6);
     }
     if (express->hasDepth && (DepthSurfacesSerial() != express->depthSerial || DepthSurfacesReleased() != express->depthReleased)) return miss(DrawExpressMiss::Depth);
     if (!sameTargets && recipe->hasDepth && state.depth.has_value()) {
