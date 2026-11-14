@@ -160,6 +160,7 @@ enum class RuntimeSwitch : std::size_t {
     StageMemoPatchVertex,
     StageMemoPatchBuffers,
     StageMemoPatchData,
+    XpAttachmentLayouts,
     Count,
 };
 

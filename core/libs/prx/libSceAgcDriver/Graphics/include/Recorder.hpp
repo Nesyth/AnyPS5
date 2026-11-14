@@ -501,6 +501,7 @@ public:
     bool RenderPassOpen() const;
     VkCommandBuffer AppendablePass(std::uint64_t key);
     bool PassPureReads() const;
+    bool BeginPassLayouts(VkCommandBuffer commands, std::span<const std::pair<VkImage, bool>> attachments);
     void NotePassReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     std::uint64_t RenderPassGeneration() const { return passGeneration; }
     VkDevice Device() const { return context.device; }
@@ -779,6 +780,7 @@ private:
             std::vector<Image> images;
         } tracker;
         struct RenderPass {
+            std::vector<VkImage> layoutImages;
             bool open = false;
             bool fenced = false;
             std::uint64_t key = 0;

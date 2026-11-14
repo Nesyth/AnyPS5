@@ -7321,9 +7321,9 @@ void noteRunFollowVerify(bool same, const char* why) {
     if (checked % 4096u == 0u) std::fprintf(stderr, "[run-follow-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing));
 }
 
-void noteRunFollowed() {
+void noteRunFollow(bool followed) {
     static std::uint64_t seen = 0;
-    runFollowed.fetch_add(1, std::memory_order_relaxed);
+    if (followed) runFollowed.fetch_add(1, std::memory_order_relaxed);
     if ((++seen & 0xfffffu) != 0) return;
     const auto wide = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     std::string refused;
@@ -7734,7 +7734,8 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT);
             Recorder::CountBarriers(Recorder::CommandClass::Draw, 1);
         }
-        keep.pipeline->BeginPass(commands, *keep.framebuffer, state.renderExtent, state);
+        const bool optimalColors = RuntimeSwitches::Set(RuntimeSwitch::XpAttachmentLayouts) && keep.pipeline->DynamicRendering() && recorder->BeginPassLayouts(commands, passAttachments);
+        keep.pipeline->BeginPass(commands, *keep.framebuffer, state.renderExtent, state, optimalColors);
     }
     NoteHeapRecord(false, false);
     if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);
@@ -7820,6 +7821,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     if (!run.led) return false;
     const auto refuse = [](RunRefusal why) {
         runRefusals[static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+        noteRunFollow(false);
         return false;
     };
     auto* express = record.express.get();
@@ -7830,7 +7832,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     if (fragment.bindings == nullptr || fragment.device != context.device || fragment.resources.get() != keep.resources.get() || fragment.pipeline.get() != keep.pipeline.get()) return refuse(RunRefusal::State);
     const auto recorderId = recorder->Id();
     const auto generation = recorder->RenderPassGeneration();
-    if (run.recorder != recorderId || run.generation != generation || run.passKey != express->passKey || run.framebuffer != keep.framebuffer.get() || !express->writes.empty() || !express->writeOnly.empty() || !express->images.empty() || !recorder->PassPureReads()) return refuse(RunRefusal::Pass);
+    if (run.recorder != recorderId || run.generation != generation || run.passKey != express->passKey || !express->writes.empty() || !express->writeOnly.empty() || !express->images.empty() || !recorder->PassPureReads()) return refuse(RunRefusal::Pass);
     const auto commands = recorder->AppendablePass(express->passKey);
     if (commands == VK_NULL_HANDLE) return refuse(RunRefusal::Pass);
     const auto forget = GuestMemory::ForgetSerial();
@@ -7962,7 +7964,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
         record.pass.valid = false;
     }
     if (RuntimeSwitches::Set(RuntimeSwitch::AppendCommits)) noteAppendCommit(true);
-    noteRunFollowed();
+    noteRunFollow(true);
     return true;
 }
 

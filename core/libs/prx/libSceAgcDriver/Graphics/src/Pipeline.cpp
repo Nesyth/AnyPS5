@@ -943,7 +943,7 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
     Continue(commands, state);
 }
 
-void Pipeline::BeginPass(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const {
+void Pipeline::BeginPass(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, bool optimalColors) const {
     if (dynamicRendering) {
         const auto views = framebuffer.Views();
         Require(views.size() == attachments, "render targets do not match the pipeline's attachments");
@@ -951,7 +951,7 @@ void Pipeline::BeginPass(VkCommandBuffer commands, const Framebuffer& framebuffe
         for (std::size_t slot = 0; slot < colorSlots.size(); ++slot) {
             if (colorSlots[slot] == ~0u) continue;
             colors[slot].imageView = views[colorSlots[slot]];
-            colors[slot].imageLayout = attachmentLayout;
+            colors[slot].imageLayout = optimalColors ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : attachmentLayout;
             colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             colors[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         }

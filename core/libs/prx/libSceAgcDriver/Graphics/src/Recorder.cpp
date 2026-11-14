@@ -1945,6 +1945,37 @@ VkCommandBuffer Recorder::AppendablePass(std::uint64_t key) {
     return open->commands;
 }
 
+namespace {
+void recordAttachmentLayouts(const Context& context, VkCommandBuffer commands, std::span<const VkImage> images, bool intoPass) {
+    std::vector<VkImageMemoryBarrier> barriers(images.size(), VkImageMemoryBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER});
+    for (std::size_t index = 0; index < images.size(); ++index) {
+        auto& barrier = barriers[index];
+        barrier.srcAccessMask = intoPass ? VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstAccessMask = intoPass ? VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.oldLayout = intoPass ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.newLayout = intoPass ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = images[index];
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    }
+    context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, intoPass ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, intoPass ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, static_cast<std::uint32_t>(barriers.size()), barriers.data());
+}
+}
+
+bool Recorder::BeginPassLayouts(VkCommandBuffer commands, std::span<const std::pair<VkImage, bool>> attachments) {
+    if (open == nullptr || open->commands != commands) return false;
+    auto& images = open->renderPass.layoutImages;
+    images.clear();
+    for (const auto& [image, written] : attachments) {
+        static_cast<void>(written);
+        if (image != VK_NULL_HANDLE && std::find(images.begin(), images.end(), image) == images.end()) images.push_back(image);
+    }
+    if (images.empty()) return false;
+    recordAttachmentLayouts(context, commands, images, true);
+    return true;
+}
+
 bool Recorder::PassPureReads() const {
     return open != nullptr && open->renderPass.open && open->passHazards.PureReads();
 }
@@ -1969,6 +2000,7 @@ void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
     auto& pass = open->renderPass;
     if (open->segmentActive) endSegment(*open);
     EndRenderPass(context, open->commands);
+    if (!pass.layoutImages.empty()) recordAttachmentLayouts(context, open->commands, pass.layoutImages, false);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
     // host sees them at the batch's fence).
     const VkAccessFlags leading = barrier && !pass.afterPass && RuntimeSwitches::Set(RuntimeSwitch::PassBarriersMerged) ? DrawLeadingAccess : 0;
