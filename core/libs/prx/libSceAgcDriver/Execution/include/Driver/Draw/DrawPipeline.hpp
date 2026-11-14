@@ -244,7 +244,7 @@ public:
     unsigned IdleState() const;
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
-    void Drain();
+    void Drain(bool helping = false);
     void Settle();
     void Stop();
     void ReleaseRan();
@@ -309,8 +309,11 @@ private:
     void checkDrainDeposits();
     void retireLean();
     void rethrowLeanFailure();
-    void awaitLeanRoom();
+    void awaitLeanRoom(bool helping = false);
     void awaitLeanIdle();
+    bool takeHelped(std::uint64_t& seq);
+    template<typename TWaiting>
+    void helpLean(TWaiting&& waiting, bool room);
     void publishLean(LeanSlot& slot);
     void signalSlots(std::uint32_t bits);
     void wakeParked(std::uint32_t slotted, unsigned wanted);

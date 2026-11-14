@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanFront.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -170,6 +171,96 @@ void RoomWait() {
     Require(order.size() == 16, "the ring lost jobs queued behind a room wait");
 }
 
+std::mutex helpedMutex;
+std::vector<std::thread::id> helpedThreads;
+std::atomic<bool> helpedOnFinisherThread{true};
+
+void RunHelped(const std::byte*) {
+    if (!DrawFinisher::OnFinisherThread()) helpedOnFinisherThread.store(false);
+    const std::lock_guard lock(helpedMutex);
+    helpedThreads.push_back(std::this_thread::get_id());
+}
+
+void PublishHelped() {
+    auto& finisher = DrawFinisher::Get();
+    Require(finisher.ReserveLean() != nullptr, "the finisher ring refused a job while open");
+    finisher.PublishLean(&RunHelped, {}, 0, 0);
+}
+
+void WorkerHelps() {
+    auto& finisher = DrawFinisher::Get();
+    const bool deep = RuntimeSwitches::Set(RuntimeSwitch::DeepQueues);
+    const bool helps = RuntimeSwitches::Set(RuntimeSwitch::WorkerHelps);
+    RuntimeSwitches::Assign(RuntimeSwitch::DeepQueues, false);
+    SetThreads(1);
+    finisher.Drain();
+    const auto self = std::this_thread::get_id();
+    const auto ranHere = [&] {
+        const std::lock_guard lock(helpedMutex);
+        return static_cast<std::size_t>(std::count(helpedThreads.begin(), helpedThreads.end(), self));
+    };
+    const auto blockFront = [&](std::binary_semaphore& release, std::atomic<bool>& started) {
+        finisher.Enqueue([&] {
+            started.store(true);
+            release.acquire();
+        }, DrawFinisher::Pending{0, 0, true, false, {}, 0, {}});
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!started.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        Require(started.load(), "the only finisher thread never took the blocking job");
+    };
+    for (const bool on : {false, true}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::WorkerHelps, on);
+        {
+            const std::lock_guard lock(helpedMutex);
+            helpedThreads.clear();
+        }
+        helpedOnFinisherThread.store(true);
+        std::binary_semaphore release{0};
+        std::atomic<bool> started{false};
+        blockFront(release, started);
+        for (int index = 0; index < 6; ++index) PublishHelped();
+        std::thread releaser([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            release.release();
+        });
+        finisher.Drain(true);
+        releaser.join();
+        Require(!DrawFinisher::OnFinisherThread(), "the producer thread stayed a finisher thread after it drained");
+        Require(helpedOnFinisherThread.load(), "a ring job ran without the finisher thread flag");
+        {
+            const std::lock_guard lock(helpedMutex);
+            Require(helpedThreads.size() == 6, "a helped drain lost ring jobs");
+        }
+        Require(ranHere() == (on ? 6u : 0u), on ? "the draining producer did not run the untaken ring jobs" : "the producer ran ring jobs with the switch off");
+        {
+            const std::lock_guard lock(helpedMutex);
+            helpedThreads.clear();
+        }
+        std::binary_semaphore releaseRoom{0};
+        std::atomic<bool> startedRoom{false};
+        blockFront(releaseRoom, startedRoom);
+        for (int index = 1; index < 16; ++index) PublishHelped();
+        std::thread roomReleaser([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            releaseRoom.release();
+        });
+        PublishHelped();
+        roomReleaser.join();
+        finisher.Drain();
+        {
+            const std::lock_guard lock(helpedMutex);
+            Require(helpedThreads.size() == 16, "a helped room wait lost ring jobs");
+        }
+        Require(on ? ranHere() >= 15u : ranHere() == 0u, on ? "the producer waiting for ring room did not run the untaken ring jobs" : "the producer ran ring jobs in a room wait with the switch off");
+        order.clear();
+        PublishValue(9);
+        finisher.Drain();
+        Require(order.size() == 1 && order[0] == 9, "the producer could not queue a job after it helped");
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::WorkerHelps, helps);
+    RuntimeSwitches::Assign(RuntimeSwitch::DeepQueues, deep);
+}
+
 std::atomic<bool> frontFinished{false};
 std::atomic<bool> aheadStarted{false};
 std::atomic<bool> aheadSawFront{false};
@@ -313,6 +404,7 @@ int main() {
             SetThreads(threads);
             AnswersReachTheRetirer();
         }
+        WorkerHelps();
         RuntimeSwitches::Assign(RuntimeSwitch::SecondFinisher, second);
         RuntimeSwitches::Assign(RuntimeSwitch::ThirdFinisher, third);
         RuntimeSwitches::Assign(RuntimeSwitch::FourthFinisher, fourth);

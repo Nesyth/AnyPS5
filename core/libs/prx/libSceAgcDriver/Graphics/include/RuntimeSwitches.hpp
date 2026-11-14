@@ -196,6 +196,7 @@ enum class RuntimeSwitch : std::size_t {
     ShapePrologue,
     DirectHandoff,
     InputsMemo,
+    WorkerHelps,
     Count,
 };
 

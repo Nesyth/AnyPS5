@@ -100,9 +100,10 @@ void noteDepositDifference(const std::string& text) {
     if (depositPrinted.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[finisher-deposit-verify] %s\n", text.c_str());
 }
 
+thread_local std::uint64_t keyBase = 0;
+thread_local std::uint64_t keyOrdinal = 0;
+
 std::uint64_t orderKey() {
-    thread_local std::uint64_t keyBase = 0;
-    thread_local std::uint64_t keyOrdinal = 0;
     std::uint64_t base = 0;
     if (const auto seq = FinisherSeq::Get(); seq != 0) base = seq * 2 + 1;
     else if (FinisherProducer::Get() && !FinisherThread::Get()) base = DrawFinisher::Get().Issued() * 2;
@@ -119,6 +120,52 @@ std::string orderText(std::uint64_t order) {
     const auto base = order >> 16;
     return std::string(base % 2 != 0 ? "job " : "worker item before job ") + std::to_string(base / 2) + " (item " + std::to_string(order & 0xffff) + ")";
 }
+
+std::atomic<std::uint64_t> helpedRoomJobs{0};
+std::atomic<std::uint64_t> helpedDrainJobs{0};
+std::atomic<std::uint64_t> helpedNs{0};
+std::atomic<std::int64_t> helpedWindow{-1};
+
+void noteHelped(bool room, std::uint64_t jobs, std::chrono::steady_clock::time_point start) {
+    const auto end = std::chrono::steady_clock::now();
+    (room ? helpedRoomJobs : helpedDrainJobs).fetch_add(jobs, std::memory_order_relaxed);
+    helpedNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()), std::memory_order_relaxed);
+    const std::int64_t window = std::chrono::duration_cast<std::chrono::seconds>(end.time_since_epoch()).count() / 10;
+    if (helpedWindow.exchange(window, std::memory_order_relaxed) == window) return;
+    std::fprintf(stderr, "[worker-helps] %llu finisher jobs run by the queue worker while it waited for ring room, %llu while it drained the ring, %.1f ms in them\n", static_cast<unsigned long long>(helpedRoomJobs.load(std::memory_order_relaxed)), static_cast<unsigned long long>(helpedDrainJobs.load(std::memory_order_relaxed)), static_cast<double>(helpedNs.load(std::memory_order_relaxed)) / 1e6);
+}
+
+struct HelpScope {
+    bool thread = FinisherThread::Get();
+    bool producer = FinisherProducer::Get();
+    bool ahead = FinisherAhead::Get();
+    bool deposits = FinisherDeposits::Get();
+    bool active = DrawPipeline::Active();
+    GuestMemory::PacketTag packet = GuestMemory::CurrentPacket();
+    std::uint64_t base = keyBase;
+    std::uint64_t ordinal = keyOrdinal;
+
+    HelpScope() {
+        FinisherThread::Set(true);
+        FinisherProducer::Set(false);
+        FinisherAhead::Set(false);
+        FinisherDeposits::Set(false);
+    }
+
+    HelpScope(const HelpScope&) = delete;
+    HelpScope& operator=(const HelpScope&) = delete;
+
+    ~HelpScope() {
+        FinisherThread::Set(thread);
+        FinisherProducer::Set(producer);
+        FinisherAhead::Set(ahead);
+        FinisherDeposits::Set(deposits);
+        DrawPipeline::Active() = active;
+        GuestMemory::SetCurrentPacket(packet.opcode, packet.queue);
+        keyBase = base;
+        keyOrdinal = ordinal;
+    }
+};
 
 bool finisherTakes(unsigned index) {
     if (index == 0) return true;
@@ -958,7 +1005,39 @@ void DrawFinisher::rethrowLeanFailure() {
     if (error != nullptr) std::rethrow_exception(error);
 }
 
-void DrawFinisher::awaitLeanRoom() {
+bool DrawFinisher::takeHelped(std::uint64_t& seq) {
+    for (;;) {
+        auto take = leanTake.load(std::memory_order_acquire);
+        if (take >= leanTail.load(std::memory_order_acquire)) return false;
+        if (leanSlot(take).runner == nullptr) return false;
+        if (leanTake.compare_exchange_weak(take, take + 1, std::memory_order_acq_rel)) {
+            seq = take;
+            return true;
+        }
+    }
+}
+
+template<typename TWaiting>
+void DrawFinisher::helpLean(TWaiting&& waiting, bool room) {
+    if (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::WorkerHelps) || !ringMode.load(std::memory_order_acquire) || FinisherThread::Get() || !FinisherProducer::Get()) return;
+    if (closed.load(std::memory_order_acquire) || leanFailed.load(std::memory_order_acquire) || GuestMemory::GpuMutex().HeldByThisThread()) return;
+    std::uint64_t seq = 0;
+    if (!waiting() || !takeHelped(seq)) return;
+    const auto start = std::chrono::steady_clock::now();
+    std::uint64_t jobs = 0;
+    {
+        const HelpScope scope;
+        do {
+            if (parkedSlots.load(std::memory_order_relaxed) != 0) wakeParked(parkedSlots.load(std::memory_order_seq_cst), takingFinishers(extra.size()));
+            std::chrono::steady_clock::time_point lastEnd{};
+            runLean(seq, lastEnd);
+            ++jobs;
+        } while (waiting() && takeHelped(seq));
+    }
+    noteHelped(room, jobs, start);
+}
+
+void DrawFinisher::awaitLeanRoom(bool helping) {
     static_assert(PublishedKeys::Capacity <= LeanSlots && 16 <= LeanSlots, "the finisher ring must hold the deepest finisher queue");
     const std::uint64_t depth = finisherDepth();
     const auto full = [&] { return nextSeq - frontSeq.load(std::memory_order_seq_cst) >= depth && !closed.load(std::memory_order_acquire); };
@@ -971,7 +1050,8 @@ void DrawFinisher::awaitLeanRoom() {
     std::optional<ThreadReport::WorkerStateScope> room;
     if (roomStart != ThreadReport::Clock::time_point{} && ThreadReport::OnQueue0Worker()) room.emplace(ThreadReport::WorkerState::RoomFinisher);
     LeanFront::AddOnWorker(LeanFront::Counter::RingRoomWaits);
-    if (!spinHandoff() || !SpinUntil(HandoffSpinWindow(), [&] { return !full(); })) {
+    if (helping) helpLean(full, true);
+    if (full() && (!spinHandoff() || !SpinUntil(HandoffSpinWindow(), [&] { return !full(); }))) {
         frontWaiters.fetch_add(1, std::memory_order_seq_cst);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         {
@@ -1111,7 +1191,7 @@ std::byte* DrawFinisher::ReserveLean() {
     FlushOpenRun();
     rethrowLeanFailure();
     if (closed.load(std::memory_order_acquire)) return nullptr;
-    awaitLeanRoom();
+    awaitLeanRoom(true);
     if (closed.load(std::memory_order_acquire)) return nullptr;
     return leanSlot(nextSeq).payload.data();
 }
@@ -1548,12 +1628,13 @@ void DrawFinisher::Settle() {
     --idleWaiters;
 }
 
-void DrawFinisher::Drain() {
+void DrawFinisher::Drain(bool helping) {
     if (OnFinisherThread()) return;
     FlushOpenRun();
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
     const auto drainStart = ThreadReport::Enabled() && Busy() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
     const ThreadReport::WorkerStateScope draining(ThreadReport::WorkerState::DrainFinisher, drainStart != ThreadReport::Clock::time_point{} && ThreadReport::OnQueue0Worker());
+    if (helping) helpLean([&] { return outstanding.load(std::memory_order_acquire) != 0; }, false);
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     if (ringMode.load(std::memory_order_acquire)) {
         awaitLeanIdle();

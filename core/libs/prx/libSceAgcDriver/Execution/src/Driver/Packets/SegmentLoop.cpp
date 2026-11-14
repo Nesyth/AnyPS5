@@ -942,7 +942,7 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
             }
             const bool beside = DrawFinisher::Overlap() && (opcode != 0x15 || dispatchBeside) && (queuesLabel || heldLabelWait || queuesSampleDump || keeps);
             if (!beside) {
-                DrawFinisher::Get().Drain();
+                DrawFinisher::Get().Drain(true);
                 listVerdictKnown = false;
             }
             if (DrawFinisher::Overlap()) {
