@@ -28,6 +28,14 @@ public:
     };
     std::vector<AddressForward> AddressForwards(const IrResourcePlan& plan) const;
 
+    struct ReadForward {
+        std::uint32_t node = 0;
+        std::uint32_t index = 0;
+        std::uint8_t dword = 0;
+        bool flat = false;
+    };
+    std::vector<ReadForward> ReadForwards(const IrResourcePlan& plan) const;
+
 private:
     friend class SrtTapeCompiler;
     static std::shared_ptr<const SrtTape> Compile(const IrResourcePlan& plan);

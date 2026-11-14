@@ -439,7 +439,10 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
                 frame.nullRoot = true;
                 return false;
             }
-            if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->reads.emplace_back(address, origin);
+            if (frame.runtime.userDataUse != nullptr) {
+                frame.runtime.userDataUse->reads.emplace_back(address, origin);
+                if (frame.runtime.readNodes != nullptr) frame.runtime.readNodes->push_back(static_cast<std::uint32_t>(&node - nodes.data()));
+            }
             if (node.loaded && frame.runtime.accessible != nullptr && !frame.runtime.accessible(frame.runtime.userContext, address, sizeof(std::uint32_t))) return false;
             if (auto* trace = frame.runtime.readTrace; trace != nullptr) {
                 if (node.source == trace->leaf) trace->leaves.emplace_back(trace->leafSlot, address);
@@ -587,6 +590,40 @@ std::vector<SrtTape::AddressForward> SrtTape::AddressForwards(const IrResourcePl
     return forwards;
 }
 
+std::vector<SrtTape::ReadForward> SrtTape::ReadForwards(const IrResourcePlan& plan) const {
+    std::vector<ReadForward> forwards;
+    if (plan.uniformFill.fill.kind != UniformFillKind::None) return forwards;
+    std::vector<std::uint8_t> impure(nodes.size(), 0u);
+    const auto read = [&](std::uint32_t index) { return index != NoNode && index < nodes.size() && (nodes[index].op == Op::Read || nodes[index].op == Op::ReadConstBuffer) && !nodes[index].clean; };
+    for (const auto& node : nodes) {
+        for (std::uint8_t argument = 0; argument < node.argumentCount; ++argument) {
+            if (node.arguments[argument] < impure.size()) impure[node.arguments[argument]] = 1u;
+        }
+    }
+    for (const auto root : conditionRoots) {
+        if (root < impure.size()) impure[root] = 1u;
+    }
+    for (std::size_t position = 0; position < plan.materializationSources.size(); ++position) {
+        const auto source = plan.materializationSources[position];
+        if (source >= sourceDwords.size()) return {};
+        for (std::size_t dword = 0; dword < sourceDwords[source].size(); ++dword) {
+            const auto index = sourceDwords[source][dword];
+            if (!read(index)) continue;
+            if (position < plan.info.buffers.size() && dword < 3u) forwards.push_back({index, static_cast<std::uint32_t>(position), static_cast<std::uint8_t>(dword), false});
+            else impure[index] = 1u;
+        }
+    }
+    for (std::size_t slot = 0; slot < flatRoots.size() && slot < plan.srtReads.size(); ++slot) {
+        const auto index = flatRoots[slot];
+        if (!read(index)) continue;
+        const auto offset = plan.srtReads[slot].flatOffset;
+        if (offset < plan.cleanFlatSlots.size() && plan.cleanFlatSlots[offset] != 0u) impure[index] = 1u;
+        else forwards.push_back({index, offset, 0, true});
+    }
+    std::erase_if(forwards, [&](const ReadForward& forward) { return impure[forward.node] != 0u; });
+    return forwards;
+}
+
 bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources) const {
     if (!plan.srtPlanComplete) return false;
     if (std::any_of(plan.cleanFlatSlots.begin(), plan.cleanFlatSlots.end(), [](std::uint8_t clean) { return clean != 0u; }) && runtime.readSpecializationMemory == nullptr) return false;
@@ -597,6 +634,7 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     const auto baseBefore = use != nullptr ? use->asBase : 0;
     const auto valueBefore = use != nullptr ? use->asValue : 0;
     const auto useReadsBefore = use != nullptr ? use->reads.size() : 0;
+    const auto readNodesBefore = runtime.readNodes != nullptr ? runtime.readNodes->size() : 0;
     const auto refuse = [&] {
         if (trace != nullptr) {
             trace->leaves.resize(leavesBefore);
@@ -608,6 +646,7 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
             use->asValue = valueBefore;
             use->reads.resize(useReadsBefore);
         }
+        if (runtime.readNodes != nullptr) runtime.readNodes->resize(readNodesBefore);
         return false;
     };
     constexpr std::size_t InlineNodes = 512;

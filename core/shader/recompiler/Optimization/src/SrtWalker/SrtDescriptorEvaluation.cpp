@@ -254,6 +254,7 @@ bool interpretRuntimeSources(const IrResourcePlan& program, std::span<const std:
     const auto baseBefore = use != nullptr ? use->asBase : 0;
     const auto valueBefore = use != nullptr ? use->asValue : 0;
     const auto useReadsBefore = use != nullptr ? use->reads.size() : 0;
+    const auto readNodesBefore = runtime.readNodes != nullptr ? runtime.readNodes->size() : 0;
     const auto runWithRetry = [&](auto evaluateFn) {
         for (std::uint32_t attempt = 0; attempt < 3u; ++attempt) {
             if (attempt != 0u) {
@@ -267,6 +268,7 @@ bool interpretRuntimeSources(const IrResourcePlan& program, std::span<const std:
                     use->asValue = valueBefore;
                     use->reads.resize(useReadsBefore);
                 }
+                if (runtime.readNodes != nullptr) runtime.readNodes->resize(readNodesBefore);
             }
             const SrtForceSyncScope forceSync(runtime, attempt == 2u);
             const auto invalidationsBefore = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
@@ -314,6 +316,7 @@ void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::v
     SrtRuntime interpreted = runtime;
     interpreted.readTrace = runtime.readTrace != nullptr ? &expectedTrace : nullptr;
     interpreted.userDataUse = runtime.userDataUse != nullptr ? &expectedUse : nullptr;
+    interpreted.readNodes = nullptr;
     std::vector<DescriptorValue> expectedResults;
     std::vector<std::uint32_t> expectedFlat;
     std::vector<std::uint8_t> expectedActive;
@@ -359,6 +362,7 @@ void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::v
     if (differences.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[srt-tape] verify: shader %016llx: the tape's walk differs from the Evaluator's in its %s\n", static_cast<unsigned long long>(program.shaderHash), difference.c_str());
     if (!ok) return;
     if (runtime.userDataUse != nullptr) *runtime.userDataUse = std::move(expectedUse);
+    if (runtime.readNodes != nullptr) runtime.readNodes->assign(runtime.userDataUse != nullptr ? runtime.userDataUse->reads.size() : 0u, SrtNoReadNode);
     results = std::move(expectedResults);
     flat = std::move(expectedFlat);
     activeSources = std::move(expectedActive);

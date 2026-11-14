@@ -72,10 +72,19 @@ struct SideForward {
     std::uint32_t word = 0;
     bool push = false;
 };
+enum class SideReadKind : std::uint8_t { BufferAddress = 2, BufferSize = 3, FlatWord = 4 };
+struct SideReadForward {
+    std::uint32_t node = 0;
+    std::uint32_t binding = 0;
+    std::uint32_t position = 0;
+    std::uint32_t keyMask = 0;
+    SideReadKind kind = SideReadKind::BufferAddress;
+};
 struct SideForwards {
     bool traced = false;
     std::uint64_t addressWords = 0;
     std::vector<SideForward> forwards;
+    std::vector<SideReadForward> reads;
 };
 class PreparedShaderInvocation {
 public:

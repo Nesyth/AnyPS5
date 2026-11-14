@@ -2725,6 +2725,28 @@ SideForwards PreparedShaderInvocation::TraceSideForwards(const ResourceCapture& 
     for (const auto& forward : moved) {
         if ((out.addressWords & bit(forward.word)) != 0u) out.forwards.push_back(forward);
     }
+    if (GcnGuestShaders()) return out;
+    std::vector<std::uint32_t> uncoveredNodes;
+    for (const auto& forward : tape->ReadForwards(plan)) {
+        bool covered = false;
+        if (forward.flat) {
+            if (patch.flattenedSrt != MemoPatch::NoBinding && patch.flattenedSrt < count) {
+                out.reads.push_back({forward.node, patch.flattenedSrt, forward.index, 0u, SideReadKind::FlatWord});
+                covered = true;
+            }
+        } else {
+            for (const auto& [binding, resources] : patch.buffers) {
+                for (std::size_t element = 0; element < resources.size(); ++element) {
+                    if (resources[element] != forward.index || binding >= count) continue;
+                    out.reads.push_back({forward.node, binding, static_cast<std::uint32_t>(element * 4u + forward.dword), forward.dword == 1u ? 0xffff0000u : 0x00000003u, forward.dword == 2u ? SideReadKind::BufferSize : SideReadKind::BufferAddress});
+                    covered = true;
+                }
+            }
+        }
+        if (!covered) uncoveredNodes.push_back(forward.node);
+    }
+    std::erase_if(out.reads, [&](const SideReadForward& read) { return std::find(uncoveredNodes.begin(), uncoveredNodes.end(), read.node) != uncoveredNodes.end(); });
+    std::sort(out.reads.begin(), out.reads.end(), [](const SideReadForward& a, const SideReadForward& b) { return a.node < b.node; });
     return out;
 }
 

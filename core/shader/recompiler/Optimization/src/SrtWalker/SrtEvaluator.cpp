@@ -261,7 +261,10 @@ bool BasicEvaluator<TNode>::EvaluateRawRead(const TNode& inst, std::uint64_t& re
         result = 0;
         return true;
     }
-    if (_runtime.userDataUse != nullptr) _runtime.userDataUse->reads.emplace_back(address, origin);
+    if (_runtime.userDataUse != nullptr) {
+        _runtime.userDataUse->reads.emplace_back(address, origin);
+        if (_runtime.readNodes != nullptr) _runtime.readNodes->push_back(SrtNoReadNode);
+    }
     if (_inaccessible != nullptr && _runtime.accessible != nullptr && !_runtime.accessible(_runtime.userContext, address, sizeof(std::uint32_t)) && LoadedFromMemory(*handle.Value())) {
         *_inaccessible = {inst.Value(), address};
         return false;

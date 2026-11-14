@@ -99,6 +99,8 @@ struct SrtReadTrace {
     std::vector<std::uint64_t> otherReads;
 };
 
+inline constexpr std::uint32_t SrtNoReadNode = 0xffffffffu;
+
 struct SrtRuntime {
     std::span<const std::uint32_t> userData;
     std::uint64_t shaderBase = 0;
@@ -117,6 +119,7 @@ struct SrtRuntime {
     SrtImageViewNormalizer normalizeImageView = nullptr;
     SrtImageViewGeneration imageViewGeneration = nullptr;
     SrtSnapshotCurrent snapshotCurrent = nullptr;
+    std::vector<std::uint32_t>* readNodes = nullptr;
 };
 
 struct SrtForceSyncScope {
