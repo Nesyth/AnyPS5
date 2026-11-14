@@ -8743,6 +8743,7 @@ bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const
             ++route->refuted;
             requireGuestBuffers(moved);
         }
+    } else if (route == nullptr && RuntimeSwitches::Set(RuntimeSwitch::CommitStamps) && requireMovedGuestBuffers(moved)) {
     } else {
         requireGuestBuffers(moved);
     }
@@ -9104,7 +9105,13 @@ void ShaderResources::RewriteFragmentFaults(const DrawBindings& placed) const {
 void ShaderResources::prepareFaultSlot() const {
     if (bda == nullptr) return;
     const auto* recorder = Recorder::Active();
+    const bool stamped = recorder != nullptr && recorder->Device() == context.device && RuntimeSwitches::Set(RuntimeSwitch::CommitStamps);
+    if (stamped && faultStampRecorder == recorder->Id() && faultStampBatch == recorder->OpenSerial()) return;
     bda->NoteUse(recorder != nullptr && recorder->Device() == context.device ? recorder->OpenSerial() : std::numeric_limits<std::uint64_t>::max());
+    if (stamped) {
+        faultStampRecorder = recorder->Id();
+        faultStampBatch = recorder->OpenSerial();
+    }
     if (!bda->TakeFaultSlot(context)) return;
     faultGeneration.fetch_add(1, std::memory_order_acq_rel);
     struct Settle {

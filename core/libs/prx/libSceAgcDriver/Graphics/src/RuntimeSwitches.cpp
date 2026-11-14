@@ -154,6 +154,11 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_STAGE_MEMO_NO_INDEX",
     "APS5_PASS_BARRIERS_MERGED",
     "APS5_EXPRESS_PASS_STAMPS",
+    "APS5_COMMIT_STAMPS",
+    "APS5_PASS_READS_ONCE",
+    "APS5_REAP_THROTTLE",
+    "APS5_OCCLUSION_WINDOWS",
+    "APS5_STAGE_MEMO_ADMIT_THIRD",
 };
 static_assert(SwitchNames.back() != nullptr, "every runtime switch needs a name");
 
@@ -308,6 +313,11 @@ struct SwitchValues {
             std::getenv("APS5_STAGE_MEMO_NO_INDEX") != nullptr,
             std::getenv("APS5_PASS_BARRIERS_MERGED") != nullptr,
             std::getenv("APS5_EXPRESS_PASS_STAMPS") != nullptr,
+            std::getenv("APS5_COMMIT_STAMPS") != nullptr,
+            std::getenv("APS5_PASS_READS_ONCE") != nullptr,
+            std::getenv("APS5_REAP_THROTTLE") != nullptr,
+            std::getenv("APS5_OCCLUSION_WINDOWS") != nullptr,
+            std::getenv("APS5_STAGE_MEMO_ADMIT_THIRD") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

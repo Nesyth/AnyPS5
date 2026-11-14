@@ -102,6 +102,17 @@ void PassHazards::Add(const PassAccess& access, bool lazyReads) {
     anyWrites = anyWrites || access.anyWrites;
 }
 
+void PassHazards::AddReads(GuestRangeList ranges, bool lazyReads) {
+    if (lazyReads) {
+        for (const auto& range : ranges) {
+            if (range.first < range.second) pendingReads.push_back(range);
+        }
+        if (pendingReads.size() >= std::max(PendingReadsBound, reads.Size())) reads.Merge(pendingReads);
+        return;
+    }
+    for (const auto& [begin, end] : ranges) reads.Insert(begin, end);
+}
+
 void PassHazards::SealWriteOnly() {
     for (const auto& [begin, end] : writeOnly.Ranges()) writes.Insert(begin, end);
     writeOnly.Clear();

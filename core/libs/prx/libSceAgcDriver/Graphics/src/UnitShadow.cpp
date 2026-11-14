@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -129,6 +130,14 @@ Shadows& Registry() {
     return shadows;
 }
 
+std::atomic<std::uint64_t> liveShadowUnits{0};
+
+void countLiveUnits(const Shadows& registry) {
+    std::uint64_t total = 0;
+    for (const auto& [base, shadow] : registry.byBase) total += shadow->liveUnits;
+    liveShadowUnits.store(total, std::memory_order_release);
+}
+
 VkDeviceSize SlabBytes(const ShadowSlab& slab) {
     return static_cast<VkDeviceSize>(slab.units) * UnitBytes;
 }
@@ -188,6 +197,7 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
     shadow->slabs.assign(static_cast<std::size_t>(slabs), nullptr);
     shadow->slabFailedUntil.assign(static_cast<std::size_t>(slabs), 0);
     registry.byBase.emplace(import.base, shadow);
+    countLiveUnits(registry);
     return shadow;
 }
 
@@ -435,6 +445,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
             ++units;
         }
         shadow->liveUnits -= ended;
+        countLiveUnits(registry);
     }
     if (units == 0) return 0;
     Stats().published[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -501,6 +512,7 @@ bool evictOne(Shadows& registry) {
         victim->published[unit] = 0;
     }
     victim->Recount();
+    countLiveUnits(registry);
     registry.liveBytes -= SlabBytes(*slab);
     --registry.liveSlabs;
     slab.reset();
@@ -614,6 +626,7 @@ bool anyShadowedLocked(const Shadows& registry, std::uint64_t address, std::size
 
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {
     if (!UnitShadowEnabled() || bytes == 0) return false;
+    if (liveShadowUnits.load(std::memory_order_acquire) == 0 && RuntimeSwitches::Set(RuntimeSwitch::CommitStamps)) return false;
     auto& registry = Registry();
     std::lock_guard lock(registry.mutex);
     return anyShadowedLocked(registry, address, bytes);
@@ -621,6 +634,7 @@ bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {
 
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     if (!UnitShadowEnabled() || ranges.empty()) return false;
+    if (liveShadowUnits.load(std::memory_order_acquire) == 0 && RuntimeSwitches::Set(RuntimeSwitch::CommitStamps)) return false;
     auto& registry = Registry();
     std::lock_guard lock(registry.mutex);
     for (const auto& [begin, end] : ranges) {
@@ -857,7 +871,10 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                     ++lost;
                     continue;
                 }
-                if (!shadow->Live(unit)) ++shadow->liveUnits;
+                if (!shadow->Live(unit)) {
+                    ++shadow->liveUnits;
+                    liveShadowUnits.fetch_add(1, std::memory_order_release);
+                }
                 shadow->generation[unit] = generation;
                 shadow->published[unit] = 0;
                 current->lastUse = present;
@@ -902,6 +919,7 @@ void RetireShadow(VkDevice device, const HostImport& import, const std::function
             }
         }
         shadow->Recount();
+        countLiveUnits(registry);
     }
     if (dropped != 0) Stats().droppedOnRetire.fetch_add(dropped, std::memory_order_relaxed);
     std::size_t published = 0;
@@ -925,6 +943,7 @@ void RetireShadow(VkDevice device, const HostImport& import, const std::function
     ++registry.retired;
     if (TraceEnabled()) std::fprintf(stderr, "[shadow] retire import 0x%llx+0x%llx: %zu units published, %llu dropped (memory no longer registered)\n", static_cast<unsigned long long>(import.base), static_cast<unsigned long long>(import.bytes), published, static_cast<unsigned long long>(dropped));
     registry.byBase.erase(found);
+    countLiveUnits(registry);
 }
 
 void PublishAllShadows(const Context& context, PublishReason reason) {
@@ -955,6 +974,7 @@ void DestroyShadows(VkDevice device) {
         }
         it = registry.byBase.erase(it);
     }
+    countLiveUnits(registry);
 }
 
 std::string ShadowReport() {

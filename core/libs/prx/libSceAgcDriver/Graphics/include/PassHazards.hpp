@@ -64,6 +64,8 @@ public:
     static constexpr std::size_t PendingReadsBound = 1024;
     PassHazard Check(const PassAccess& access, bool samePass);
     void Add(const PassAccess& access, bool lazyReads = false);
+    void AddReads(GuestRangeList ranges, bool lazyReads);
+    bool PureReads() const { return writes.Empty() && writeOnly.Empty() && images.empty() && !anyWrites; }
     void BeginPass() { ++pass; }
     void SealWriteOnly();
     void Clear();

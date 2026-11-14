@@ -7187,6 +7187,8 @@ void noteAppendRefusal(AppendRefusal refusal) {
     appendRefusals[static_cast<std::size_t>(refusal)].fetch_add(1, std::memory_order_relaxed);
 }
 
+std::atomic<std::uint64_t> passReadsChecked{0};
+std::atomic<std::uint64_t> passReadsDiffering{0};
 std::atomic<std::uint64_t> appendVerifyChecked{0};
 std::atomic<std::uint64_t> appendVerifyDiffering{0};
 
@@ -7569,18 +7571,36 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         express->keptRecorder = recorder->Id();
         express->keptBatch = recorder->OpenSerial();
     }
-    auto& passReads = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ExpressReadsStorage>();
-    passReads.assign(express->reads.begin(), express->reads.end());
+    resources.RequireGuestBuffers();
     const auto& inPlaceReads = appended ? preparedInputs->inPlaceReads : inputs.inPlaceReads;
-    passReads.insert(passReads.end(), inPlaceReads.begin(), inPlaceReads.end());
+    bool passSeen = appended && RuntimeSwitches::Set(RuntimeSwitch::PassReadsOnce) && express->passSeenRecorder == recorder->Id() && express->passSeenGeneration == recorder->RenderPassGeneration() && express->writes.empty() && express->writeOnly.empty() && express->images.empty() && recorder->PassPureReads() && recorder->AppendablePass(express->passKey) != VK_NULL_HANDLE;
+    const bool passSeenVerify = passSeen && appendVerifyDue();
+    if (passSeenVerify) passSeen = false;
+    auto& passReads = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ExpressReadsStorage>();
+    passReads.clear();
+    if (!passSeen) {
+        passReads.assign(express->reads.begin(), express->reads.end());
+        passReads.insert(passReads.end(), inPlaceReads.begin(), inPlaceReads.end());
+    }
     auto& passAttachments = HostThreadLocal<std::vector<std::pair<VkImage, bool>>, ExpressAttachmentsStorage>();
     passAttachments.clear();
     for (std::size_t index = 0; index < keep.targets.size(); ++index) passAttachments.emplace_back(keep.targets[index] != nullptr ? keep.targets[index]->Image() : express->multisampleImages[index], true);
     const PassAccess passAccess{passReads, express->writes, express->images, passAttachments, false, false, express->writeOnly};
-    resources.RequireGuestBuffers();
     const auto generationBeforeStart = recorder->RenderPassGeneration();
     const bool passOpenBeforeStart = recorder->RenderPassOpen() && !recorder->RunOpen();
-    const auto start = recorder->StartDrawPass(express->passKey, false, express->fenced, passAccess);
+    Recorder::DrawPassStart start;
+    if (passSeen) {
+        recorder->NotePassReads(inPlaceReads);
+        start = {recorder->AppendablePass(express->passKey), true, false, PassBreak::Continued};
+    } else {
+        start = recorder->StartDrawPass(express->passKey, false, express->fenced, passAccess);
+        if (passSeenVerify) {
+            const auto checked = passReadsChecked.fetch_add(1, std::memory_order_relaxed) + 1u;
+            const auto differing = start.continued ? passReadsDiffering.load(std::memory_order_relaxed) : passReadsDiffering.fetch_add(1, std::memory_order_relaxed) + 1u;
+            if (!start.continued && differing <= 16u) std::fprintf(stderr, "[pass-reads-verify] a commit that would have skipped the pass access did not continue the pass: %s\n", PassBreakNames[static_cast<std::size_t>(start.reason)]);
+            if (checked % 4096u == 0u) std::fprintf(stderr, "[pass-reads-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing));
+        }
+    }
     if ((depthStamped || multisampleStamped != 0) && passOpenBeforeStart && recorder->RenderPassGeneration() == generationBeforeStart + 1 && RuntimeSwitches::Set(RuntimeSwitch::ExpressPassStamps)) {
         const auto opened = recorder->RenderPassGeneration();
         if (depthStamped) {
@@ -7625,7 +7645,9 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     }
     record.effects.fragment.offered = true;
     NoteGuestWorkIn(context, commands);
-    recorder->LeaveRenderPassOpen(express->passKey, drawTiming, express->fenced, passAccess);
+    if (!passSeen) recorder->LeaveRenderPassOpen(express->passKey, drawTiming, express->fenced, passAccess);
+    express->passSeenRecorder = recorder->Id();
+    express->passSeenGeneration = recorder->RenderPassGeneration();
     record.effects.keptOnce = true;
     const auto recorderId = recorder->Id();
     for (std::size_t index = 0; index < keep.targets.size(); ++index) {

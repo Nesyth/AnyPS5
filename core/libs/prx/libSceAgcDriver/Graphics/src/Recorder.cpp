@@ -1945,6 +1945,14 @@ VkCommandBuffer Recorder::AppendablePass(std::uint64_t key) {
     return open->commands;
 }
 
+bool Recorder::PassPureReads() const {
+    return open != nullptr && open->renderPass.open && open->passHazards.PureReads();
+}
+
+void Recorder::NotePassReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    if (open != nullptr) open->passHazards.AddReads(ranges, RuntimeSwitches::Set(RuntimeSwitch::LazyPassReads));
+}
+
 bool Recorder::RenderPassOpen() const {
     return open != nullptr && open->renderPass.open;
 }
@@ -2656,6 +2664,7 @@ void Recorder::NoteSampledDraw(VkCommandBuffer commands) {
     if (open == nullptr) return;
     if (segmentMode()) {
         if (RuntimeSwitches::Set(RuntimeSwitch::XpNoOcclusion)) return;
+        if (!dumpWindow && RuntimeSwitches::Set(RuntimeSwitch::OcclusionWindows)) return;
         if (countingSamples && commands == open->commands && !open->segmentActive) beginSegment(*open);
         return;
     }
@@ -3052,6 +3061,16 @@ bool Recorder::DumpSamples(VkDeviceAddress target, std::uint64_t address) {
     lastDumpAddress = address;
     sampledDrawsSinceDump = 0;
     countingSamples = true;
+    if (address != 0) {
+        constexpr std::uint64_t EndOffset = 8;
+        if (const auto begun = std::find(openDumps.begin(), openDumps.end(), address - EndOffset); begun != openDumps.end()) {
+            openDumps.erase(begun);
+        } else if (std::find(openDumps.begin(), openDumps.end(), address) == openDumps.end()) {
+            if (openDumps.size() >= 64u) openDumps.erase(openDumps.begin());
+            openDumps.push_back(address);
+        }
+    }
+    dumpWindow = address == 0 || !openDumps.empty();
     flushDeferredDispatch();
     const bool xpVisible = RuntimeSwitches::Set(RuntimeSwitch::XpKeepDraws) || RuntimeSwitches::Set(RuntimeSwitch::XpNoOcclusion);
     if (segmentMode()) {
@@ -4988,8 +5007,17 @@ bool Recorder::Reap() {
     const bool profile = DrawProfiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::uint64_t retired = 0;
+    const bool throttled = RuntimeSwitches::Set(RuntimeSwitch::ReapThrottle);
     while (!inFlight.empty()) {
-        if (fenceStatus(inFlight.front()->fence) != VK_SUCCESS) break;
+        const auto* front = inFlight.front().get();
+        const auto asked = throttled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (throttled && front == reapUnfinished && asked - reapUnfinishedAt < std::chrono::microseconds(200)) break;
+        if (fenceStatus(front->fence) != VK_SUCCESS) {
+            reapUnfinished = front;
+            reapUnfinishedAt = asked;
+            break;
+        }
+        reapUnfinished = nullptr;
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
         finish(std::move(batch), false, 4);

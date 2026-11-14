@@ -148,6 +148,11 @@ enum class RuntimeSwitch : std::size_t {
     StageMemoNoIndex,
     PassBarriersMerged,
     ExpressPassStamps,
+    CommitStamps,
+    PassReadsOnce,
+    ReapThrottle,
+    OcclusionWindows,
+    StageMemoAdmitThird,
     Count,
 };
 

@@ -500,6 +500,8 @@ public:
     static Recorder* Active();
     bool RenderPassOpen() const;
     VkCommandBuffer AppendablePass(std::uint64_t key);
+    bool PassPureReads() const;
+    void NotePassReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     std::uint64_t RenderPassGeneration() const { return passGeneration; }
     VkDevice Device() const { return context.device; }
     std::uint64_t Id() const { return id; }
@@ -840,6 +842,8 @@ private:
     std::vector<SampleSegment> pendingSamples;
     bool countingSamples = false;
     std::uint64_t sampledDrawsSinceDump = 0;
+    std::vector<std::uint64_t> openDumps;
+    bool dumpWindow = true;
     std::uint64_t lastDumpAddress = 0;
     std::uint64_t dumpOrdinal = 0;
     int meshArgumentState = 0;
@@ -986,6 +990,8 @@ private:
     std::vector<std::shared_ptr<void>> holdKept;
     std::uint64_t holdKeptSerial = 0;
     std::deque<std::unique_ptr<Batch>> inFlight;
+    const Batch* reapUnfinished = nullptr;
+    std::chrono::steady_clock::time_point reapUnfinishedAt{};
     // Batches popped from inFlight whose completions have not run yet: their writes stay in the
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;

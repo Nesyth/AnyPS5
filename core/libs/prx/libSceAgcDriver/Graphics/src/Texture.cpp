@@ -4456,7 +4456,7 @@ bool StorageTexture::RenoteInPass(std::uint64_t recorder, std::uint64_t pass, st
         if (occasional) occasionalMarks.fetch_add(1, std::memory_order_relaxed);
         writtenFlip = flip;
     }
-    const auto pendingSince = GuestMemory::TrackerGeneration();
+    const auto pendingSince = RuntimeSwitches::Set(RuntimeSwitch::CommitStamps) ? GuestMemory::TrackerGenerationSettled() : GuestMemory::TrackerGeneration();
     if (RuntimeSwitches::Set(RuntimeSwitch::LeanRemark) && keptAtUnwatch.empty()) {
         std::fill_n(layerPendingSince.begin() + note.first, note.layers, pendingSince);
     } else {

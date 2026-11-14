@@ -27,7 +27,7 @@ public:
     static constexpr std::uint32_t Capacity = 32;
     enum class Answer : std::uint8_t { Clear, Hit, Unsure };
     void Publish(std::span<const std::pair<Range, std::uint32_t>> entries, std::uint32_t unknownHeld);
-    Answer Overlaps(std::span<const Range> ranges) const;
+    Answer Overlaps(std::span<const Range> ranges, Range* pendingHit = nullptr, bool* unknownHeld = nullptr) const;
     bool Copy(std::array<Range, Capacity>& out, std::uint32_t& size) const;
 
 private:

@@ -211,6 +211,8 @@ struct DrawExpress {
     std::vector<std::pair<VkImage, bool>> images;
     std::uint64_t keptRecorder = 0;
     std::uint64_t keptBatch = 0;
+    std::uint64_t passSeenRecorder = 0;
+    std::uint64_t passSeenGeneration = 0;
 };
 
 enum class DrawExpressMiss : std::uint8_t { None, NoState, Shape, Objects, Template, Targets, Depth, Stores, Linear, Buffers, Inputs, Moved, Selection, Staging, Verify, Count };

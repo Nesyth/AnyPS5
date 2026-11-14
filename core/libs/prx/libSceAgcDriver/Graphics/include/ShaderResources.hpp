@@ -1231,6 +1231,8 @@ private:
     std::vector<FaultDescriptor> faultDescriptors;
     void prepareFaultSlot() const;
     mutable bool bindingsChecked = false;
+    mutable std::uint64_t faultStampRecorder = 0;
+    mutable std::uint64_t faultStampBatch = 0;
     mutable std::atomic<std::uint64_t> depthGuardsClear{std::numeric_limits<std::uint64_t>::max()};
     mutable std::atomic<std::uint64_t> multisampleGuardsClear{std::numeric_limits<std::uint64_t>::max()};
     void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;

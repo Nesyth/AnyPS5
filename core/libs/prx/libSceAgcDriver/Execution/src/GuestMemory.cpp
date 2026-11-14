@@ -3339,6 +3339,15 @@ std::uint64_t TrackerGenerationNow() {
     return Tracker().generation.load(std::memory_order_acquire);
 }
 
+std::uint64_t TrackerGenerationSettled() {
+    static std::atomic<std::uint64_t> settled{~std::uint64_t{0}};
+    const auto now = Tracker().generation.load(std::memory_order_acquire);
+    if (settled.load(std::memory_order_acquire) == now) return now;
+    const auto locked = TrackerGeneration();
+    settled.store(locked, std::memory_order_release);
+    return locked;
+}
+
 void AdvanceTrackerGenerationForTest(std::uint64_t generation) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);

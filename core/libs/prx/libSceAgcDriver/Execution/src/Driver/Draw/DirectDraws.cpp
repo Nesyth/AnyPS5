@@ -903,10 +903,18 @@ public:
 
     std::uint64_t PatternVersion() const { return patternVersion.load(std::memory_order_acquire); }
 
-    bool Admit(std::uint64_t key) {
+    bool Admit(std::uint64_t key, bool third) {
         auto& cell = seen[static_cast<std::size_t>((key ^ (key >> 29u)) % SeenKeys)];
-        if (cell.load(std::memory_order_relaxed) == key) return true;
-        cell.store(key, std::memory_order_relaxed);
+        const auto once = key & ~std::uint64_t{1};
+        const auto twice = key | std::uint64_t{1};
+        const auto held = cell.load(std::memory_order_relaxed);
+        if (held == twice) return true;
+        if (held == once) {
+            if (!third) return true;
+            cell.store(twice, std::memory_order_relaxed);
+            return false;
+        }
+        cell.store(once, std::memory_order_relaxed);
         return false;
     }
 
@@ -1061,21 +1069,39 @@ void stageMemoDiagnose(std::uint64_t key, std::size_t way, const StageMemoPatter
             std::fprintf(stderr, "[stage-memo-diag] same roots, key differs in a %s: word %zu of %zu, %08x -> %08x; movable %016llx, values %016llx, bases %016llx, %zu roots (%u decode)\n", names[cause], word, userData.size(), kept.userData[word], userData[word], static_cast<unsigned long long>(pattern.relocatable), static_cast<unsigned long long>(pattern.values), static_cast<unsigned long long>(pattern.bases), pattern.roots.size(), pattern.decodeRoots);
         }
     }
-    static std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> lastRoots;
+    struct RootHistory {
+        std::array<std::vector<std::uint32_t>, 16> kept;
+        std::size_t next = 0;
+    };
+    static std::unordered_map<std::uint64_t, RootHistory> lastRoots;
     static std::array<std::uint64_t, 7> rootBuckets{};
     static std::uint32_t rootsPrinted = 0;
     if (cause == First) {
         if (lastRoots.size() > 100000u) lastRoots.clear();
-        auto& before = lastRoots[key ^ (way * StageMemoPrime)];
-        if (before.empty()) {
+        auto& history = lastRoots[key ^ (way * StageMemoPrime)];
+        const std::vector<std::uint32_t>* closest = nullptr;
+        std::size_t differing = 0;
+        bool any = false;
+        for (const auto& candidate : history.kept) {
+            if (candidate.empty()) continue;
+            any = true;
+            if (candidate.size() != gathered.size()) continue;
+            std::size_t count = 0;
+            for (std::size_t at = 0; at < gathered.size(); ++at) count += candidate[at] != gathered[at] ? 1u : 0u;
+            if (closest == nullptr || count < differing) {
+                closest = &candidate;
+                differing = count;
+            }
+        }
+        static const std::vector<std::uint32_t> none;
+        const auto& before = closest != nullptr ? *closest : none;
+        if (!any) {
             ++rootBuckets[0];
-        } else if (before.size() != gathered.size()) {
+        } else if (closest == nullptr) {
             ++rootBuckets[6];
         } else {
-            std::size_t differing = 0;
-            for (std::size_t at = 0; at < gathered.size(); ++at) differing += before[at] != gathered[at] ? 1u : 0u;
             ++rootBuckets[differing <= 2 ? 1 : differing <= 4 ? 2 : differing <= 8 ? 3 : differing <= 16 ? 4 : 5];
-            if (differing != 0 && rootsPrinted < 40u) {
+            if (differing != 0 && rootsPrinted < 120u && (rootsPrinted < 40u || total > 1500000u)) {
                 ++rootsPrinted;
                 std::string text;
                 std::size_t at = 0;
@@ -1089,10 +1115,10 @@ void stageMemoDiagnose(std::uint64_t key, std::size_t way, const StageMemoPatter
                         text += line;
                     }
                 }
-                std::fprintf(stderr, "[stage-memo-diag] first sight of root values, %zu of %zu words differ from the pattern's last sighting:%s\n", differing, gathered.size(), text.c_str());
+                std::fprintf(stderr, "[stage-memo-diag] first sight of root values, %zu of %zu words differ from the closest of the pattern's last 16 sightings:%s\n", differing, gathered.size(), text.c_str());
             }
         }
-        before.assign(gathered.begin(), gathered.end());
+        history.kept[history.next++ % history.kept.size()].assign(gathered.begin(), gathered.end());
     }
     ++causes[cause];
     kept.userData.assign(userData.begin(), userData.end());
@@ -1111,7 +1137,7 @@ void stageMemoDiagnose(std::uint64_t key, std::size_t way, const StageMemoPatter
             text += ' ';
             text += std::to_string(causes[index]);
         }
-        std::fprintf(stderr, "[stage-memo-diag] %llu misses without an entry:%s; first sights by root words that differ from the pattern's last sighting: no sighting before %llu, 1 to 2 words %llu, 3 to 4 %llu, 5 to 8 %llu, 9 to 16 %llu, more %llu, another word count %llu\n", static_cast<unsigned long long>(total), text.c_str(), static_cast<unsigned long long>(rootBuckets[0]), static_cast<unsigned long long>(rootBuckets[1]), static_cast<unsigned long long>(rootBuckets[2]), static_cast<unsigned long long>(rootBuckets[3]), static_cast<unsigned long long>(rootBuckets[4]), static_cast<unsigned long long>(rootBuckets[5]), static_cast<unsigned long long>(rootBuckets[6]));
+        std::fprintf(stderr, "[stage-memo-diag] %llu misses without an entry:%s; first sights by root words that differ from the closest of the pattern's last 16 sightings: no sighting before %llu, 1 to 2 words %llu, 3 to 4 %llu, 5 to 8 %llu, 9 to 16 %llu, more %llu, another word count %llu\n", static_cast<unsigned long long>(total), text.c_str(), static_cast<unsigned long long>(rootBuckets[0]), static_cast<unsigned long long>(rootBuckets[1]), static_cast<unsigned long long>(rootBuckets[2]), static_cast<unsigned long long>(rootBuckets[3]), static_cast<unsigned long long>(rootBuckets[4]), static_cast<unsigned long long>(rootBuckets[5]), static_cast<unsigned long long>(rootBuckets[6]));
     }
 }
 
@@ -1489,7 +1515,7 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
         for (std::size_t i = 0; i < count; ++i) decodeVertex(i);
     }
     resolved.before = Graphics::Recorder::PendingWriteSnapshot();
-    resolved.generation = GuestMemory::TrackerGeneration();
+    resolved.generation = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::CommitStamps) ? GuestMemory::TrackerGenerationSettled() : GuestMemory::TrackerGeneration();
     resolved.stages.resize(count);
     resolved.regions.clear();
     lap(Step::Request);
@@ -1517,7 +1543,7 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
             if (memoStage && known.handle != nullptr && known.snapshot.get() == program.snapshot.get() && known.codeOffset == program.codeOffset) {
                 const auto outcome = adoptStage(*memo, job, program, i, cursor, known, resolved);
                 DirectDraws::Add(stageMemoCounter(outcome));
-                if (outcome == StageMemoOutcome::NoEntry) memoAdmitted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoAdmitFirst) || stageMemoStore().Admit(memo->missKey);
+                if (outcome == StageMemoOutcome::NoEntry) memoAdmitted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoAdmitFirst) || stageMemoStore().Admit(memo->missKey, Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoAdmitThird));
                 if (outcome == StageMemoOutcome::Hit) {
                     const auto every = stageMemoVerifyEvery();
                     if (every == 0 || ++memo->verifyOrdinal % every != 0) {

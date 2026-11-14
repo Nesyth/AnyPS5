@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/QueueSubmitter.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #ifndef _WIN32
@@ -176,6 +177,10 @@ ResidentDevices& Devices() {
     return devices;
 }
 
+std::atomic<std::uint64_t> flushWork{1};
+std::atomic<std::uint64_t> flushIdle{0};
+std::atomic<VkDevice> flushIdleDevice{VK_NULL_HANDLE};
+
 std::shared_ptr<ResidentMemory> residentMemory(const Context& context, std::uint32_t type) {
     auto& devices = Devices();
     std::lock_guard lock(devices.mutex);
@@ -183,6 +188,7 @@ std::shared_ptr<ResidentMemory> residentMemory(const Context& context, std::uint
     if (auto held = slot.lock()) return held;
     auto made = std::make_shared<ResidentMemory>(context, type);
     slot = made;
+    flushWork.fetch_add(1, std::memory_order_release);
     return made;
 }
 
@@ -501,6 +507,7 @@ void ResidentBuffer::MarkChanged(std::uint64_t begin, std::uint64_t end) {
     auto& devices = Devices();
     std::lock_guard lock(devices.pendingMutex);
     devices.pending.push_back(weak_from_this());
+    flushWork.fetch_add(1, std::memory_order_release);
 }
 
 void ResidentBuffer::Read(std::uint64_t guest, std::span<std::byte> out) const {
@@ -613,11 +620,14 @@ void ResidentBuffer::flush() {
         auto& devices = Devices();
         std::lock_guard lock(devices.pendingMutex);
         devices.pending.push_back(weak_from_this());
+        flushWork.fetch_add(1, std::memory_order_release);
         throw;
     }
 }
 
 void ResidentBuffer::FlushChanged(const Context& context) {
+    const auto work = flushWork.load(std::memory_order_acquire);
+    if (RuntimeSwitches::Set(RuntimeSwitch::CommitStamps) && flushIdle.load(std::memory_order_acquire) == work && flushIdleDevice.load(std::memory_order_acquire) == context.device) return;
     auto& devices = Devices();
     std::vector<std::shared_ptr<ResidentMemory>> unzeroed;
     {
@@ -639,6 +649,7 @@ void ResidentBuffer::FlushChanged(const Context& context) {
         if (held->context.device != context.device) {
             std::lock_guard lock(devices.pendingMutex);
             devices.pending.push_back(waiting[index]);
+            flushWork.fetch_add(1, std::memory_order_release);
             continue;
         }
         try {
@@ -646,9 +657,12 @@ void ResidentBuffer::FlushChanged(const Context& context) {
         } catch (...) {
             std::lock_guard lock(devices.pendingMutex);
             devices.pending.insert(devices.pending.end(), waiting.begin() + static_cast<std::ptrdiff_t>(index) + 1, waiting.end());
+            flushWork.fetch_add(1, std::memory_order_release);
             throw;
         }
     }
+    flushIdleDevice.store(context.device, std::memory_order_release);
+    flushIdle.store(work, std::memory_order_release);
 }
 
 void ResidentBuffer::submit(const std::vector<VkSparseMemoryBind>& binds) {

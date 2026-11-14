@@ -202,7 +202,7 @@ void PublishedRanges::Publish(std::span<const std::pair<Range, std::uint32_t>> e
     seq.store(before + 2, std::memory_order_release);
 }
 
-PublishedRanges::Answer PublishedRanges::Overlaps(std::span<const Range> ranges) const {
+PublishedRanges::Answer PublishedRanges::Overlaps(std::span<const Range> ranges, Range* pendingHit, bool* unknownHeld) const {
     for (unsigned attempt = 0; attempt < PublishedReadAttempts; ++attempt) {
         const auto before = seq.load(std::memory_order_acquire);
         if ((before & 1u) != 0) {
@@ -215,15 +215,19 @@ PublishedRanges::Answer PublishedRanges::Overlaps(std::span<const Range> ranges)
         const auto high = highest.load(std::memory_order_relaxed);
         const bool outside = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle) && std::none_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.first < high && low < range.second; });
         bool hit = false;
+        Range found{};
         for (std::uint32_t index = 0; held == 0 && !outside && index < size && index < Capacity && !hit; ++index) {
             const auto first = bounds[index * 2].load(std::memory_order_relaxed);
             const auto last = bounds[index * 2 + 1].load(std::memory_order_relaxed);
             hit = std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.first < last && first < range.second; });
+            if (hit) found = {first, last};
         }
         std::atomic_thread_fence(std::memory_order_acquire);
         if (seq.load(std::memory_order_relaxed) != before) continue;
+        if (unknownHeld != nullptr) *unknownHeld = held != 0;
         if (held != 0) return Answer::Hit;
         if (size > Capacity) return Answer::Unsure;
+        if (hit && pendingHit != nullptr) *pendingHit = found;
         return hit ? Answer::Hit : Answer::Clear;
     }
     return Answer::Unsure;
@@ -499,9 +503,40 @@ DrawFinisher::AheadScope::~AheadScope() {
     FinisherAhead::Set(previous);
 }
 
+namespace {
+void noteTurnWait(PublishedRanges::Answer answer, bool unknownHeld, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, const std::pair<std::uint64_t, std::uint64_t>& pendingHit) {
+    static std::atomic<std::uint64_t> total{0};
+    static std::atomic<std::uint64_t> unknown{0};
+    static std::atomic<std::uint64_t> crowded{0};
+    static std::atomic<std::uint64_t> overlapping{0};
+    static std::atomic<std::uint32_t> printed{0};
+    static const bool examples = std::getenv("APS5_TURN_WAIT_DIAG") != nullptr;
+    const auto wide = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    if (unknownHeld) {
+        unknown.fetch_add(1, std::memory_order_relaxed);
+    } else if (answer == PublishedRanges::Answer::Unsure) {
+        crowded.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        overlapping.fetch_add(1, std::memory_order_relaxed);
+        if (examples && printed.fetch_add(1, std::memory_order_relaxed) < 32u) {
+            const auto asked = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.first < pendingHit.second && pendingHit.first < range.second; });
+            const auto read = asked != ranges.end() ? *asked : std::pair<std::uint64_t, std::uint64_t>{};
+            std::fprintf(stderr, "[turn-waits] a read of %llx..%llx (%zu ranges asked) overlaps the pending write %llx..%llx\n", wide(read.first), wide(read.second), ranges.size(), wide(pendingHit.first), wide(pendingHit.second));
+        }
+    }
+    if ((total.fetch_add(1, std::memory_order_relaxed) + 1u) % 8192u == 0u) {
+        std::fprintf(stderr, "[turn-waits] %llu waits: a job with unknown writes outstanding %llu, a pending write over the read %llu, more than %u pending write ranges %llu\n", wide(total.load(std::memory_order_relaxed)), wide(unknown.load(std::memory_order_relaxed)), wide(overlapping.load(std::memory_order_relaxed)), PublishedRanges::Capacity, wide(crowded.load(std::memory_order_relaxed)));
+    }
+}
+}
+
 bool DrawFinisher::aheadWait(std::span<const Range> ranges) {
     if (!FinisherAhead::Get() || !AheadBusy()) return false;
-    if (published.Overlaps(ranges) == PublishedRanges::Answer::Clear) return false;
+    Range pendingHit{};
+    bool unknownHeld = false;
+    const auto answer = published.Overlaps(ranges, &pendingHit, &unknownHeld);
+    if (answer == PublishedRanges::Answer::Clear) return false;
+    noteTurnWait(answer, unknownHeld, ranges, pendingHit);
     LeanFront::Add(LeanFront::Counter::AheadWaits);
     AwaitTurn();
     return false;
