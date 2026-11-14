@@ -202,6 +202,7 @@ std::uint64_t TrackerGenerationNow();
 std::uint64_t TrackerGenerationSettled();
 void AdvanceTrackerGenerationForTest(std::uint64_t generation);
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes);
+bool StampsAtMost(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes);
 // Whether no CPU write touched the range since `generation`: an uncached resetting collect of the
 // range's pages first (a game store not collected yet becomes a block stamp), then the compare over

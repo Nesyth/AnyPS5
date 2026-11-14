@@ -214,6 +214,9 @@ enum class RuntimeSwitch : std::size_t {
     MergedSettle,
     IdleHitRelease,
     FragmentParkedSets,
+    UnlockedStamps,
+    WriteSnapshotFronts,
+    PendingFronts,
     Count,
 };
 

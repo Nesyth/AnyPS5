@@ -22,7 +22,7 @@ inline bool RangesStamped(const AddressRanges& ranges, std::uint64_t generation)
     const bool precise = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PreciseSettle);
     for (const auto& [begin, end] : ranges) {
         const auto bytes = static_cast<std::size_t>(end - begin);
-        if (GuestMemory::NewestStamp(begin, bytes) <= generation) continue;
+        if (GuestMemory::StampsAtMost(begin, bytes, generation)) continue;
         if (!precise || !GuestMemory::UnchangedSince(begin, bytes, generation)) return false;
         PreciseSettles.fetch_add(1, std::memory_order_relaxed);
     }
@@ -42,7 +42,7 @@ inline bool RangesSettled(const AddressRanges& ranges, const Graphics::Recorder:
     const bool precise = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PreciseSettle);
     for (const auto& [begin, end] : ranges) {
         const auto bytes = static_cast<std::size_t>(end - begin);
-        if (GuestMemory::NewestStamp(begin, bytes) <= generation) continue;
+        if (GuestMemory::StampsAtMost(begin, bytes, generation)) continue;
         if (!precise || !GuestMemory::UnchangedSince(begin, bytes, generation)) return false;
         PreciseSettles.fetch_add(1, std::memory_order_relaxed);
     }
