@@ -22,6 +22,7 @@ struct DecodeRead {
     std::uint32_t size = 0;
     std::span<const std::byte> Bytes() const { return {data.data(), size}; }
 };
+std::array<std::uint32_t, 4> VertexResourceFields(std::span<const std::uint32_t, 4> sharp, std::uint32_t attribWord);
 ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const std::byte> header, std::uint64_t headerAddress, std::span<const std::uint32_t> userData, std::vector<DecodeRead>* reads = nullptr, bool staticAbi = false, std::uint32_t hiddenUserWords = 0);
 
 }

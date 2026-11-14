@@ -1790,7 +1790,7 @@ void DrawPipeline::run() {
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
-        if (!isDraw || commit == nullptr || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLeanRuns)) {
+        if (!isDraw || commit == nullptr || (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLeanRuns) && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow))) {
             dropHold();
         } else if (!runHold) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);

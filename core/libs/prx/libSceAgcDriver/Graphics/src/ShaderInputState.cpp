@@ -229,6 +229,27 @@ bool PixelEarlyZ(std::uint32_t shaderControl) {
     return depthBeforeShader || ((zOrder & 1u) != 0u && !pixelKillEnable && !depthExportEnable && !sampleMaskExportEnable && !stencilRefExportEnable);
 }
 
+std::array<std::uint32_t, 4> VertexResourceFields(std::span<const std::uint32_t, 4> sharp, std::uint32_t attribWord) {
+    std::array<std::uint32_t, 4> fields{sharp[0], sharp[1], sharp[2], sharp[3]};
+    const auto format = (attribWord >> 5u) & 0x1ffu;
+    const auto offset = (attribWord >> 14u) & 0xfffu;
+    if (format != 0u) {
+        const auto bufferFormat = format >> 2u;
+        const auto channels = (format & 0x3u) + 1u;
+        const auto dstSelY = channels > 1u ? 5u : 0u;
+        const auto dstSelZ = channels > 2u ? 6u : 0u;
+        const auto dstSelW = channels > 3u ? 7u : 1u;
+        const auto dstSel = 4u | (dstSelY << 3u) | (dstSelZ << 6u) | (dstSelW << 9u);
+        fields[3] = (fields[3] & ~((0x7fu << 12u) | 0xfffu)) | (bufferFormat << 12u) | dstSel;
+    }
+    if (offset != 0u) {
+        const auto base = ((static_cast<std::uint64_t>(fields[0]) | (static_cast<std::uint64_t>(fields[1]) << 32u)) & 0xffffffffffffull) + offset;
+        fields[0] = static_cast<std::uint32_t>(base & 0xffffffffu);
+        fields[1] = (fields[1] & 0xffff0000u) | static_cast<std::uint32_t>((base >> 32u) & 0xffffu);
+    }
+    return fields;
+}
+
 ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const std::byte> header, std::uint64_t headerAddress, std::span<const std::uint32_t> userData, std::vector<DecodeRead>* reads, bool staticAbi, std::uint32_t hiddenUserWords) {
     if (header.empty()) return {};
     if (header.size() < sizeof(Shader)) throw std::runtime_error("AGC graphics: shader header is smaller than the fixed AGC header");
@@ -333,8 +354,6 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
         record(attribWordAddress, attribWordBytes);
         const std::uint32_t attribWord = attribWords[i];
         const auto index = attribWord & 0x1fu;
-        const auto format = (attribWord >> 5u) & 0x1ffu;
-        const auto offset = (attribWord >> 14u) & 0xfffu;
         const auto fetchIndex = (attribWord >> 26u) & 0x1u;
         if (index >= ShaderRecompiler::ShaderVertexStageInfo::MaxResources) throw std::runtime_error("AGC graphics: vertex buffer index exceeds the supported domain");
         std::array<std::byte, 16> sharpBytes{};
@@ -346,25 +365,11 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
         if (info.resourcesNum >= ShaderRecompiler::ShaderVertexStageInfo::MaxResources) throw std::runtime_error("AGC graphics: vertex resource count exceeds the supported domain");
         auto& resource = info.resources[info.resourcesNum];
         auto& destination = info.resourcesDst[info.resourcesNum];
-        resource.fields = sharp;
+        resource.fields = VertexResourceFields(sharp, attribWord);
         destination.registerStart = static_cast<std::int32_t>(semantic.hardware_mapping);
         destination.registersNum = static_cast<std::int32_t>(semantic.size_in_elements);
         destination.attrId = static_cast<std::int32_t>(semantic.semantic);
         destination.fetchIndex = fetchIndex;
-        if (format != 0u) {
-            const auto bufferFormat = format >> 2u;
-            const auto channels = (format & 0x3u) + 1u;
-            const auto dstSelY = channels > 1u ? 5u : 0u;
-            const auto dstSelZ = channels > 2u ? 6u : 0u;
-            const auto dstSelW = channels > 3u ? 7u : 1u;
-            const auto dstSel = 4u | (dstSelY << 3u) | (dstSelZ << 6u) | (dstSelW << 9u);
-            resource.fields[3] = (resource.fields[3] & ~((0x7fu << 12u) | 0xfffu)) | (bufferFormat << 12u) | dstSel;
-        }
-        if (offset != 0u) {
-            const auto base = ((static_cast<std::uint64_t>(resource.fields[0]) | (static_cast<std::uint64_t>(resource.fields[1]) << 32u)) & 0xffffffffffffull) + offset;
-            resource.fields[0] = static_cast<std::uint32_t>(base & 0xffffffffu);
-            resource.fields[1] = (resource.fields[1] & 0xffff0000u) | static_cast<std::uint32_t>((base >> 32u) & 0xffffu);
-        }
         ++info.resourcesNum;
     }
     return info;

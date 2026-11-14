@@ -106,9 +106,11 @@ struct DirectReads {
     std::vector<std::pair<std::uint64_t, std::uint32_t>> words;
     std::uint64_t page = ~std::uint64_t{0};
     bool failed = false;
+    std::vector<std::uint32_t> nodes;
 
     void Reset() {
         words.clear();
+        nodes.clear();
         page = ~std::uint64_t{0};
         failed = false;
     }
@@ -154,6 +156,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> walkDirect(const Shader
     runtime.accessible = &directAccessible;
     ShaderMemory::SetImageViewHooks(runtime);
     runtime.snapshotCurrent = &directViewsCurrent;
+    runtime.readNodes = &reads.nodes;
     return invocation.Capture(runtime);
 }
 
@@ -621,7 +624,7 @@ std::uint64_t DirectStores::Follow(std::uint64_t serial) {
     auto live = Graphics::RuntimeSwitches::Snapshot();
     // Switches that change only what the committer does with a hit, or only dispatch packets,
     // leave the stages and classes as they are, so an in-run A/B of one keeps the stores.
-    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic, Graphics::RuntimeSwitch::CommitFragments, Graphics::RuntimeSwitch::ExpressCommits, Graphics::RuntimeSwitch::XpStreamSegments, Graphics::RuntimeSwitch::XpNoEagerStore, Graphics::RuntimeSwitch::LabelOrderedStores, Graphics::RuntimeSwitch::DeeperRing, Graphics::RuntimeSwitch::BesideSampleDumps, Graphics::RuntimeSwitch::DispatchBeside, Graphics::RuntimeSwitch::FaultFragments, Graphics::RuntimeSwitch::StageMemo, Graphics::RuntimeSwitch::KeepFaultSlots, Graphics::RuntimeSwitch::SiblingFinishers, Graphics::RuntimeSwitch::FastSettle, Graphics::RuntimeSwitch::XpSlowFinisher, Graphics::RuntimeSwitch::XpSlowCommitter, Graphics::RuntimeSwitch::XpSlowWorker, Graphics::RuntimeSwitch::XpExpressFloor, Graphics::RuntimeSwitch::LeanExpress, Graphics::RuntimeSwitch::XpAppendCommits, Graphics::RuntimeSwitch::PreciseSettle, Graphics::RuntimeSwitch::AppendCommits, Graphics::RuntimeSwitch::RunFollow, Graphics::RuntimeSwitch::TurnWaitsByJob, Graphics::RuntimeSwitch::ExpressKeepState, Graphics::RuntimeSwitch::StageMemoFront, Graphics::RuntimeSwitch::StageMemoAdmitThird, Graphics::RuntimeSwitch::CommitStamps, Graphics::RuntimeSwitch::PassReadsOnce, Graphics::RuntimeSwitch::ReapThrottle, Graphics::RuntimeSwitch::OcclusionWindows, Graphics::RuntimeSwitch::ExpressPassStamps, Graphics::RuntimeSwitch::PassBarriersMerged, Graphics::RuntimeSwitch::LabelReadbackMemo, Graphics::RuntimeSwitch::ExpressTargetUploads, Graphics::RuntimeSwitch::DrawRuns, Graphics::RuntimeSwitch::LargeBatches}) live.Assign(id, false);
+    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic, Graphics::RuntimeSwitch::CommitFragments, Graphics::RuntimeSwitch::ExpressCommits, Graphics::RuntimeSwitch::XpStreamSegments, Graphics::RuntimeSwitch::XpNoEagerStore, Graphics::RuntimeSwitch::LabelOrderedStores, Graphics::RuntimeSwitch::DeeperRing, Graphics::RuntimeSwitch::BesideSampleDumps, Graphics::RuntimeSwitch::DispatchBeside, Graphics::RuntimeSwitch::FaultFragments, Graphics::RuntimeSwitch::StageMemo, Graphics::RuntimeSwitch::KeepFaultSlots, Graphics::RuntimeSwitch::SiblingFinishers, Graphics::RuntimeSwitch::FastSettle, Graphics::RuntimeSwitch::XpSlowFinisher, Graphics::RuntimeSwitch::XpSlowCommitter, Graphics::RuntimeSwitch::XpSlowWorker, Graphics::RuntimeSwitch::XpExpressFloor, Graphics::RuntimeSwitch::LeanExpress, Graphics::RuntimeSwitch::XpAppendCommits, Graphics::RuntimeSwitch::PreciseSettle, Graphics::RuntimeSwitch::AppendCommits, Graphics::RuntimeSwitch::StageMemoPatchVertex, Graphics::RuntimeSwitch::StageMemoPatchBuffers, Graphics::RuntimeSwitch::StageMemoPatchData, Graphics::RuntimeSwitch::RunFollow, Graphics::RuntimeSwitch::TurnWaitsByJob, Graphics::RuntimeSwitch::ExpressKeepState, Graphics::RuntimeSwitch::StageMemoFront, Graphics::RuntimeSwitch::StageMemoAdmitThird, Graphics::RuntimeSwitch::CommitStamps, Graphics::RuntimeSwitch::PassReadsOnce, Graphics::RuntimeSwitch::ReapThrottle, Graphics::RuntimeSwitch::OcclusionWindows, Graphics::RuntimeSwitch::ExpressPassStamps, Graphics::RuntimeSwitch::PassBarriersMerged, Graphics::RuntimeSwitch::LabelReadbackMemo, Graphics::RuntimeSwitch::ExpressTargetUploads, Graphics::RuntimeSwitch::DrawRuns, Graphics::RuntimeSwitch::LargeBatches}) live.Assign(id, false);
     if (!tagged || deviceSerial != serial || !(live == switches)) {
         tagged = true;
         deviceSerial = serial;
@@ -792,6 +795,29 @@ struct StageMemoRoot {
     bool operator==(const StageMemoRoot& other) const = default;
 };
 
+struct StageMemoWord {
+    std::uint32_t key = 0xffffffffu;
+    std::uint8_t kind = 0;
+
+    bool operator==(const StageMemoWord& other) const = default;
+};
+
+struct StageMemoPatch {
+    std::uint32_t word = 0;
+    std::uint32_t binding = 0;
+    std::uint32_t position = 0;
+    std::uint32_t mask = 0;
+};
+
+constexpr std::uint8_t StageMemoVertexKind = 1;
+
+std::uint32_t stageMemoPatchKinds() {
+    using Graphics::RuntimeSwitch;
+    using Graphics::RuntimeSwitches::Set;
+    return (Set(RuntimeSwitch::StageMemoPatchVertex) ? 1u << StageMemoVertexKind : 0u) | (Set(RuntimeSwitch::StageMemoPatchBuffers) ? 1u << static_cast<std::uint32_t>(ShaderRecompiler::SideReadKind::BufferAddress) : 0u) |
+           (Set(RuntimeSwitch::StageMemoPatchData) ? (1u << static_cast<std::uint32_t>(ShaderRecompiler::SideReadKind::BufferSize)) | (1u << static_cast<std::uint32_t>(ShaderRecompiler::SideReadKind::FlatWord)) : 0u);
+}
+
 struct StageMemoPattern {
     std::uint64_t relocatable = 0;
     std::uint64_t values = 0;
@@ -799,6 +825,8 @@ struct StageMemoPattern {
     std::uint64_t addresses = 0;
     std::uint32_t userWords = 0;
     std::uint32_t decodeRoots = 0;
+    std::uint32_t patchKinds = 0;
+    std::vector<StageMemoWord> words;
     std::vector<StageMemoRoot> roots;
 
     bool operator==(const StageMemoPattern& other) const = default;
@@ -830,6 +858,7 @@ struct StageMemoEntry {
     std::shared_ptr<const ShaderRecompiler::SideForwards> forwards;
     std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
     std::vector<Graphics::DecodeRead> decodeReads;
+    std::vector<StageMemoPatch> patches;
 };
 
 using StageForwards = ShaderRecompiler::SideForwards;
@@ -837,19 +866,22 @@ using StageForwards = ShaderRecompiler::SideForwards;
 std::shared_ptr<const StageForwards> stageForwards(const std::shared_ptr<const DirectStage>& shared, const ShaderRecompiler::PreparedShaderInvocation& invocation, const ShaderRecompiler::ResourceCapture& capture) {
     struct Known {
         std::shared_ptr<const DirectStage> stage;
+        decltype(ShaderRecompiler::ResourceCapture::plan) plan;
         std::shared_ptr<const StageForwards> forwards;
     };
     static std::mutex mutex;
     static std::unordered_map<const DirectStage*, Known> known;
     {
         std::lock_guard lock(mutex);
-        if (const auto found = known.find(shared.get()); found != known.end()) return found->second.forwards;
+        if (const auto found = known.find(shared.get()); found != known.end() && found->second.plan.get() == capture.plan.get()) return found->second.forwards;
     }
     auto traced = invocation.TraceSideForwards(capture, *shared->donor, *shared->patch);
     std::shared_ptr<const StageForwards> result = traced.traced ? std::make_shared<const StageForwards>(std::move(traced)) : nullptr;
     std::lock_guard lock(mutex);
     if (known.size() > 65536u) known.clear();
-    return known.try_emplace(shared.get(), Known{shared, result}).first->second.forwards;
+    auto& slot = known[shared.get()];
+    slot = Known{shared, capture.plan, result};
+    return slot.forwards;
 }
 
 struct StageMemoShard {
@@ -963,6 +995,8 @@ struct StageMemo {
     AddressRanges decodeRanges;
     AddressRanges settled;
     std::uint64_t verifyOrdinal = 0;
+    std::uint64_t patchedOrdinal = 0;
+    bool patched = false;
     std::uint64_t missKey = 0;
     std::uint64_t patternVersion = 0;
     std::unordered_map<std::uint64_t, std::shared_ptr<const std::vector<StageMemoPattern>>> patterns;
@@ -1011,8 +1045,32 @@ std::uint64_t stageMemoContentKey(std::uint64_t key, std::size_t way, const Stag
     for (std::size_t word = 0; word < userData.size(); ++word) {
         if (!stageMemoRelocates(pattern.relocatable, word)) hash = (hash ^ userData[word]) * StageMemoPrime;
     }
-    for (const auto value : rootValues) hash = (hash ^ value) * StageMemoPrime;
+    for (std::size_t at = 0; at < rootValues.size(); ++at) {
+        if (pattern.words.empty()) {
+            hash = (hash ^ rootValues[at]) * StageMemoPrime;
+            continue;
+        }
+        const auto& word = pattern.words[at];
+        const bool guarded = word.kind == static_cast<std::uint8_t>(ShaderRecompiler::SideReadKind::BufferAddress) || word.kind == static_cast<std::uint8_t>(ShaderRecompiler::SideReadKind::BufferSize);
+        const std::uint64_t live = guarded && (rootValues[at] & ~word.key) != 0u ? std::uint64_t{1} << 32u : 0u;
+        hash = (hash ^ (rootValues[at] & word.key) ^ live) * StageMemoPrime;
+    }
     return hash;
+}
+
+int stageMemoSameRoots(const StageMemoPattern& pattern, std::span<const std::uint32_t> stored, std::span<const std::uint32_t> live) {
+    if (stored.size() != live.size()) return 0;
+    if (pattern.words.empty()) return std::equal(stored.begin(), stored.end(), live.begin()) ? 1 : 0;
+    if (pattern.words.size() != live.size()) return 0;
+    bool patched = false;
+    for (std::size_t at = 0; at < live.size(); ++at) {
+        const auto& word = pattern.words[at];
+        if (((stored[at] ^ live[at]) & word.key) != 0u) return 0;
+        const bool guarded = word.kind == static_cast<std::uint8_t>(ShaderRecompiler::SideReadKind::BufferAddress) || word.kind == static_cast<std::uint8_t>(ShaderRecompiler::SideReadKind::BufferSize);
+        if (guarded && (live[at] & ~word.key) == 0u) return 0;
+        patched = patched || stored[at] != live[at];
+    }
+    return patched ? 2 : 1;
 }
 
 bool stageMemoCacheable(const DrawProgram& program) {
@@ -1164,13 +1222,15 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, const DrawP
         cached = memo.patterns.emplace(key, std::move(fetched)).first;
     }
     const auto* const ways = cached->second.get();
+    const auto enabledKinds = stageMemoPatchKinds();
+    memo.patched = false;
     const std::span<const std::uint32_t> userData = program.userData;
     auto& stage = resolved.stages[index];
     const DirectStage* previous = index != 0 ? resolved.stages[index - 1].shared.get() : nullptr;
     auto last = StageMemoOutcome::NoEntry;
     for (std::size_t way = 0; way < ways->size(); ++way) {
         const auto& pattern = (*ways)[way];
-        if (pattern.userWords != userData.size()) continue;
+        if (pattern.userWords != userData.size() || (pattern.patchKinds & ~enabledKinds) != 0u) continue;
         auto& gathered = memo.gathered;
         auto& addresses = memo.addresses;
         gathered.clear();
@@ -1233,7 +1293,8 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, const DrawP
             last = StageMemoOutcome::Inputs;
             continue;
         }
-        if (entry.rootValues != gathered) {
+        const auto sameRoots = stageMemoSameRoots(pattern, entry.rootValues, gathered);
+        if (sameRoots == 0) {
             last = StageMemoOutcome::Values;
             continue;
         }
@@ -1260,7 +1321,7 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, const DrawP
         for (const auto slotIndex : entry.order) {
             const bool isRoot = slotIndex < walkRoots;
             const auto address = isRoot ? addresses[pattern.decodeRoots + slotIndex] : entry.nested[slotIndex - walkRoots].first;
-            const auto value = isRoot ? entry.rootValues[entry.decodeWords + slotIndex] : entry.nested[slotIndex - walkRoots].second;
+            const auto value = isRoot ? gathered[entry.decodeWords + slotIndex] : entry.nested[slotIndex - walkRoots].second;
             if (!sorted.empty() && address <= sorted.back().first) increasing = false;
             sorted.emplace_back(address, value);
         }
@@ -1309,11 +1370,27 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, const DrawP
             }
         }
         if (!forwarded) return StageMemoOutcome::Side;
+        for (const auto& patch : entry.patches) {
+            auto& word = stage.side.bindings[patch.binding][patch.position];
+            word = (word & ~patch.mask) | (gathered[patch.word] & patch.mask);
+        }
+        memo.patched = sameRoots == 2;
         GuardRanges(stage.ranges);
         auto& decodeReads = resolved.decodeReads[index];
         decodeReads = entry.decodeReads;
         for (std::size_t read = 0; read < decodeReads.size(); ++read) decodeReads[read].address = addresses[read];
         resolved.vertexInfos[index] = entry.vertexInfo;
+        if ((pattern.patchKinds & (1u << StageMemoVertexKind)) != 0u && resolved.vertexInfos[index].has_value()) {
+            auto& info = *resolved.vertexInfos[index];
+            std::size_t at = 0;
+            for (std::size_t read = 0; read < decodeReads.size(); ++read) {
+                auto& decoded = decodeReads[read];
+                std::memcpy(decoded.data.data(), gathered.data() + at, decoded.size);
+                if ((read & 1u) != 0) info.resources[read / 2u].fields = Graphics::VertexResourceFields(std::span<const std::uint32_t, 4>(gathered.data() + at, 4), gathered[at - 1u]);
+                at += decoded.size / sizeof(std::uint32_t);
+            }
+            for (auto& attribute : stage.side.vertexAttributes) attribute.resource = info.resources[attribute.location];
+        }
         stage.capture = entry.capture;
         stage.shared = entry.shared;
         stage.pushOffset = entry.pushOffset;
@@ -1329,6 +1406,8 @@ std::optional<Counter> rememberStage(const LeanDrawJob& job, const DrawProgram& 
     if (userData.size() > 0xffffu) return Counter::StageMemoUntraced;
     StageMemoPattern pattern;
     StageMemoEntry entry;
+    const auto enabledKinds = stageMemoPatchKinds();
+    std::vector<StageMemoWord> words;
     entry.forwards = stageForwards(stage.shared, invocation, *stage.capture);
     if (entry.forwards == nullptr) return Counter::StageMemoUntraced;
     pattern.userWords = static_cast<std::uint32_t>(userData.size());
@@ -1354,6 +1433,12 @@ std::optional<Counter> rememberStage(const LeanDrawJob& job, const DrawProgram& 
                 std::uint32_t value = 0;
                 std::memcpy(&value, decoded.data.data() + at, sizeof(value));
                 entry.rootValues.push_back(value);
+                StageMemoWord word;
+                if (sharp && at < 12u && (enabledKinds & (1u << StageMemoVertexKind)) != 0u) {
+                    word = {at == 4u ? 0xffff0000u : 0u, StageMemoVertexKind};
+                    pattern.patchKinds |= 1u << StageMemoVertexKind;
+                }
+                words.push_back(word);
             }
         }
         for (const auto word : {attribWord, bufferWord}) {
@@ -1380,12 +1465,71 @@ std::optional<Counter> rememberStage(const LeanDrawJob& job, const DrawProgram& 
             placed.push_back({address, static_cast<std::uint32_t>(pattern.roots.size() - pattern.decodeRoots), false});
             pattern.roots.push_back({address - (static_cast<std::uint64_t>(userData[static_cast<std::size_t>(origin)]) & ~std::uint64_t{3}), static_cast<std::uint16_t>(origin), 1, 1});
             entry.rootValues.push_back(found->second);
+            words.push_back({});
         } else {
             placed.push_back({address, static_cast<std::uint32_t>(entry.nested.size()), true});
             entry.nested.emplace_back(address, found->second);
         }
     }
     if (placed.size() != reads.words.size()) return Counter::StageMemoUntraced;
+    const auto& readForwards = entry.forwards->reads;
+    if ((enabledKinds & ~(1u << StageMemoVertexKind)) != 0u && !readForwards.empty() && reads.nodes.size() == use.reads.size()) {
+        struct Granted {
+            std::uint64_t address;
+            std::uint32_t key;
+            std::uint8_t kind;
+            bool pinned;
+        };
+        struct ByNode {
+            bool operator()(const ShaderRecompiler::SideReadForward& forward, std::uint32_t node) const { return forward.node < node; }
+            bool operator()(std::uint32_t node, const ShaderRecompiler::SideReadForward& forward) const { return node < forward.node; }
+        };
+        std::vector<Granted> granted;
+        for (std::size_t at = 0; at < use.reads.size(); ++at) {
+            const auto address = use.reads[at].first;
+            auto slot = std::find_if(granted.begin(), granted.end(), [&](const Granted& known) { return known.address == address; });
+            if (slot == granted.end()) slot = granted.insert(granted.end(), Granted{address, 0u, 0u, false});
+            const auto node = reads.nodes[at];
+            const auto [first, last] = std::equal_range(readForwards.begin(), readForwards.end(), node, ByNode{});
+            if (node == ShaderRecompiler::SrtNoReadNode || first == last) {
+                slot->pinned = true;
+                continue;
+            }
+            for (auto forward = first; forward != last; ++forward) {
+                const auto kind = static_cast<std::uint8_t>(forward->kind);
+                if (slot->kind != 0u && slot->kind != kind) slot->pinned = true;
+                slot->kind = kind;
+                slot->key |= forward->keyMask;
+            }
+        }
+        for (const auto& item : placed) {
+            if (item.nested) continue;
+            const auto slot = std::find_if(granted.begin(), granted.end(), [&](const Granted& known) { return known.address == item.address; });
+            if (slot == granted.end() || slot->pinned || slot->kind == 0u || (enabledKinds & (1u << slot->kind)) == 0u || slot->key == 0xffffffffu) continue;
+            const auto wordIndex = entry.decodeWords + item.slot;
+            const auto value = entry.rootValues[wordIndex];
+            const auto patchMask = ~slot->key;
+            const bool guarded = slot->kind == static_cast<std::uint8_t>(ShaderRecompiler::SideReadKind::BufferAddress) || slot->kind == static_cast<std::uint8_t>(ShaderRecompiler::SideReadKind::BufferSize);
+            if (guarded && (value & patchMask) == 0u) continue;
+            bool fits = true;
+            const auto patchesBefore = entry.patches.size();
+            for (std::size_t at = 0; fits && at < use.reads.size(); ++at) {
+                if (use.reads[at].first != item.address) continue;
+                const auto [first, last] = std::equal_range(readForwards.begin(), readForwards.end(), reads.nodes[at], ByNode{});
+                for (auto forward = first; fits && forward != last; ++forward) {
+                    fits = forward->binding < stage.side.bindings.size() && forward->position < stage.side.bindings[forward->binding].size() && ((stage.side.bindings[forward->binding][forward->position] ^ value) & patchMask) == 0u;
+                    if (fits) entry.patches.push_back({wordIndex, forward->binding, forward->position, patchMask});
+                }
+            }
+            if (!fits) {
+                entry.patches.resize(patchesBefore);
+                continue;
+            }
+            words[wordIndex] = {slot->key, slot->kind};
+            pattern.patchKinds |= 1u << slot->kind;
+        }
+    }
+    if (pattern.patchKinds != 0u) pattern.words = std::move(words);
     for (std::size_t word = 0; word < userData.size() && word < ShaderRecompiler::SrtUserDataUse::TrackedWords; ++word) {
         const auto bit = std::uint64_t{1} << word;
         if (((use.asBase | addresses) & bit) != 0 && userData[word] == 0u) relocatable &= ~bit;
@@ -1432,6 +1576,7 @@ struct StageMemoKept {
     DirectResolvedStage stage;
     std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
     std::vector<Graphics::DecodeRead> decodeReads;
+    bool patched = false;
 };
 
 const char* stageMemoDifference(const StageMemoKept& kept, const DirectResolvedStage& stage, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, const std::vector<Graphics::DecodeRead>& decodeReads) {
@@ -1575,14 +1720,15 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
                 if (outcome == StageMemoOutcome::NoEntry) memoAdmitted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoAdmitFirst) || stageMemoStore().Admit(memo->missKey, Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoAdmitThird));
                 if (outcome == StageMemoOutcome::Hit) {
                     const auto every = stageMemoVerifyEvery();
-                    if (every == 0 || ++memo->verifyOrdinal % every != 0) {
+                    if (memo->patched) DirectDraws::Add(Counter::StageMemoPatched);
+                    if (every == 0 || (memo->patched ? ++memo->patchedOrdinal : ++memo->verifyOrdinal) % every != 0) {
                         const auto& adopted = *stage.shared->donor;
                         cursor += static_cast<std::uint32_t>(adopted.pushConstants.size());
                         previous = &adopted;
                         lap(Step::Side);
                         continue;
                     }
-                    memoKept.emplace(StageMemoKept{stage, resolved.vertexInfos[i], resolved.decodeReads[i]});
+                    memoKept.emplace(StageMemoKept{stage, resolved.vertexInfos[i], resolved.decodeReads[i], memo->patched});
                     stage.shared.reset();
                     stage.capture.reset();
                 }
@@ -1681,6 +1827,7 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
         previous = &donor;
         if (memoKept.has_value()) {
             DirectDraws::Add(Counter::StageMemoVerifyChecked);
+            if (memoKept->patched) DirectDraws::Add(Counter::StageMemoVerifyPatched);
             if (const char* what = stageMemoDifference(*memoKept, stage, resolved.vertexInfos[i], resolved.decodeReads[i]); what != nullptr) {
                 DirectDraws::Add(Counter::StageMemoVerifyDiffering);
                 static std::atomic<std::uint32_t> printed{0};

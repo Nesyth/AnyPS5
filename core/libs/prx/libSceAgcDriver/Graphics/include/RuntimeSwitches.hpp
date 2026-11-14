@@ -157,6 +157,9 @@ enum class RuntimeSwitch : std::size_t {
     StageMemoFront,
     ExpressKeepState,
     RunFollow,
+    StageMemoPatchVertex,
+    StageMemoPatchBuffers,
+    StageMemoPatchData,
     Count,
 };
 

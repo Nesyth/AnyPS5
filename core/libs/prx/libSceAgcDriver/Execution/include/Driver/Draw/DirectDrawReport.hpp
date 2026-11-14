@@ -360,6 +360,8 @@ enum class Counter : std::uint16_t {
     StageMemoCleared,
     StageMemoVerifyChecked,
     StageMemoVerifyDiffering,
+    StageMemoPatched,
+    StageMemoVerifyPatched,
     Count,
 };
 
