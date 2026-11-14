@@ -390,6 +390,8 @@ struct SpirvTarget {
     bool float32HostNans = false;
     bool float16WidenNans = false;
     bool float16NarrowNans = false;
+    bool float32HostFmaNans = false;
+    bool float32NativeMinMax = false;
 };
 
 struct BindingLayout {
@@ -1078,6 +1080,10 @@ void SetDebugProbeActive(bool active);
 [[nodiscard]] bool RayTracingStrict();
 [[nodiscard]] bool RayTracingMiss();
 [[nodiscard]] bool ExactF32Arithmetic();
+[[nodiscard]] bool HostF32FmaNansRequested();
+[[nodiscard]] bool NativeF32MinMaxRequested();
+[[nodiscard]] bool ReadOnlyGuestBuffers();
+[[nodiscard]] bool ShaderFaultReports();
 
 struct RectListShaders {
     RecompileResult control;

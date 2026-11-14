@@ -1,5 +1,6 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "BdaAbi.hpp"
+#include "Recompiler.hpp"
 #include "PipelineSpecialization.hpp"
 #include "StencilReplay.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
@@ -549,6 +550,9 @@ void DefineDescriptors(SpirvEmitterState& state) {
             if (state.requirements.coherentBuffers) {
                 state.module.AddAnnotation(spv::OpDecorate, state.storageBufferCoherentVariable != 0u ? state.storageBufferCoherentVariable : state.storageBufferVariable, spv::DecorationCoherent);
                 if (state.storageBufferU64Variable != 0u) state.module.AddAnnotation(spv::OpDecorate, state.storageBufferU64Variable, spv::DecorationCoherent);
+            }
+            if (ReadOnlyGuestBuffers() && (!state.requirements.coherentBuffers || state.storageBufferCoherentVariable != 0u) && !WritesGuestBuffers(state.program)) {
+                state.module.AddAnnotation(spv::OpDecorate, state.storageBufferVariable, spv::DecorationNonWritable);
             }
             break;
         }

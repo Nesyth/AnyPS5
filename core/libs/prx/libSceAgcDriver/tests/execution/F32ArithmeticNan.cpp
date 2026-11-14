@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Float32NanProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
@@ -24,6 +25,7 @@ constexpr std::uint32_t Results = 16;
 alignas(256) std::array<std::uint32_t, Threads * Inputs> Input{};
 alignas(256) std::array<std::uint32_t, Threads * Results> Output{};
 bool FusedExactArithmetic = false;
+bool HostFmaNans = false;
 
 alignas(256) constexpr std::array<std::uint32_t, 57> Code{
     0x34020084u, 0x34060086u, 0xe0381000u, 0x80000401u, 0xbf8c3f70u, 0x7e140280u, 0x7e160280u, 0x7e180280u,
@@ -204,6 +206,7 @@ void Run(AgcDriver::VulkanDevice& device, const std::optional<ShaderRecompiler::
     request.useCache = false;
     request.context.floatMode = floatMode;
     request.target.fusedExactArithmetic = FusedExactArithmetic;
+    request.target.float32HostFmaNans = HostFmaNans;
     const auto result = ShaderRecompiler::Recompile(request);
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
@@ -257,6 +260,20 @@ int main() {
                     }
                 }
             }
+        }
+        const auto probe = AgcDriver::ProbeFloat32HostNans(*device, device->Target(), false, true);
+        const bool hostFmaProven = device->Target().float32HostNans && probe.mismatches == 0u && probe.fusedCompared != 0u && probe.fusedMismatches == 0u;
+        std::printf("f32 arithmetic nan: multiply-add probe %u of %u results differ; host multiply-add NaNs %s\n", probe.fusedMismatches, probe.fusedCompared, hostFmaProven ? "checked" : "not checked");
+        if (hostFmaProven) {
+            HostFmaNans = true;
+            FusedExactArithmetic = device->Target().fusedExactArithmetic;
+            Run(*device, std::nullopt);
+            Check(ExpectedNoIeee, "host multiply-add NaNs, no float mode");
+            Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false});
+            Check(ExpectedNoIeee, "host multiply-add NaNs, IEEE=0");
+            Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, true, false});
+            Check(ExpectedIeee, "host multiply-add NaNs, IEEE=1");
+            HostFmaNans = false;
         }
         std::puts("f32 arithmetic nan tests passed");
         return 0;

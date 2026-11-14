@@ -3,6 +3,7 @@
 #include "Recompiler.hpp"
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -425,6 +426,58 @@ IrValue& TranslationContext::invalidProductF32(IrValue* lhs, IrValue* rhs) {
     IrValue& rhsMagnitude = ir.BitwiseAnd(ir.BitCastU32(*rhs), ir.Constant(0x7fffffffu));
     const auto infZero = [&](IrValue& inf, IrValue& zero) -> IrValue& { return ir.LogicalAnd(ir.IEqual(inf, ir.Constant(0x7f800000u)), ir.IEqual(zero, ir.Constant(0u))); };
     return ir.LogicalOr(infZero(lhsMagnitude, rhsMagnitude), infZero(rhsMagnitude, lhsMagnitude));
+}
+
+IrValue* TranslationContext::fusedNanResultF32(IrValue* lhs, IrValue* rhs, IrValue* addend, IrValue* result) {
+    const std::array<IrValue*, 3> sources{lhs, rhs, addend};
+    std::array<std::optional<std::uint32_t>, 3> constants{};
+    for (std::size_t index = 0; index < sources.size(); ++index) {
+        if (const IrValue* constant = constantF32Bits(*sources[index])) constants[index] = constant->ImmediateU32() & 0x7fffffffu;
+    }
+    const auto infinite = [](const std::optional<std::uint32_t>& magnitude) { return magnitude.has_value() && *magnitude == 0x7f800000u; };
+    const auto belowNormal = [](const std::optional<std::uint32_t>& magnitude) { return magnitude.has_value() && *magnitude < 0x00800000u; };
+    const bool nanConstant = std::ranges::any_of(constants, [](const std::optional<std::uint32_t>& magnitude) { return magnitude.has_value() && *magnitude > 0x7f800000u; });
+    const bool constantProduct = constants[0].has_value() && constants[1].has_value();
+    const bool productHazard = constantProduct && ((infinite(constants[0]) && belowNormal(constants[1])) || (infinite(constants[1]) && belowNormal(constants[0])));
+    const bool allConstant = constantProduct && constants[2].has_value();
+    if (!float32HostFmaNans || ieeeMode || !ExactF32Arithmetic() || nanConstant || productHazard || allConstant) return nanResultF32({lhs, rhs, addend}, result, &invalidProductF32(lhs, rhs));
+    std::array<IrValue*, 3> magnitudes{};
+    const auto magnitude = [&](std::size_t index) -> IrValue& {
+        if (magnitudes[index] == nullptr) magnitudes[index] = &ir.BitwiseAnd(ir.BitCastU32(*sources[index]), ir.Constant(0x7fffffffu));
+        return *magnitudes[index];
+    };
+    const bool squared = lhs->Resolve() == rhs->Resolve();
+    IrValue* bits = nullptr;
+    if (!constantProduct) {
+        const std::size_t first = constants[0].has_value() ? 1u : 0u;
+        IrValue& firstNan = ir.UGreaterThan(magnitude(first), ir.Constant(0x7f800000u));
+        IrValue& firstBits = ir.BitCastU32(*sources[first]);
+        IrValue& resultBits = ir.BitCastU32(*result);
+        bits = &ir.Select(firstNan, firstBits, resultBits);
+    }
+    IrValue* corner = nullptr;
+    if (!constants[2].has_value() && !constantProduct && !squared) {
+        if (!constants[0].has_value() && !constants[1].has_value()) {
+            IrValue& smaller = ir.Emit(IrOpcode::UMin32, IrType::U32, {&magnitude(0u), &magnitude(1u)});
+            IrValue& larger = ir.Emit(IrOpcode::UMax32, IrType::U32, {&magnitude(0u), &magnitude(1u)});
+            IrValue& largerInfinite = ir.IEqual(larger, ir.Constant(0x7f800000u));
+            IrValue& smallerTiny = ir.ULessThan(ir.ISub(smaller, ir.Constant(1u)), ir.Constant(0x007fffffu));
+            corner = &ir.LogicalAnd(largerInfinite, smallerTiny);
+        } else {
+            const std::size_t known = constants[0].has_value() ? 0u : 1u;
+            const std::uint32_t knownMagnitude = *constants[known];
+            if (knownMagnitude == 0x7f800000u) corner = &ir.ULessThan(ir.ISub(magnitude(1u - known), ir.Constant(1u)), ir.Constant(0x007fffffu));
+            else if (knownMagnitude != 0u && knownMagnitude < 0x00800000u) corner = &ir.IEqual(magnitude(1u - known), ir.Constant(0x7f800000u));
+        }
+    }
+    if (corner != nullptr) {
+        IrValue& addendNan = ir.UGreaterThan(magnitude(2u), ir.Constant(0x7f800000u));
+        IrValue& selected = ir.LogicalAnd(addendNan, *corner);
+        IrValue& addendBits = ir.BitCastU32(*addend);
+        IrValue& previous = bits != nullptr ? *bits : ir.BitCastU32(*result);
+        bits = &ir.Select(selected, addendBits, previous);
+    }
+    return bits != nullptr ? &ir.BitCastF32(*bits) : result;
 }
 
 IrValue& TranslationContext::invalidOperationF32(std::initializer_list<IrValue*> sources, IrValue& invalidProduct) {

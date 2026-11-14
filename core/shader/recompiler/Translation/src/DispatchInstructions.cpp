@@ -115,6 +115,38 @@ bool ExactF32Arithmetic() {
     return exact;
 }
 
+bool HostF32FmaNansRequested() {
+    static const bool requested = [] {
+        const char* text = std::getenv("APS5_HOST_F32_FMA_NANS");
+        return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
+    }();
+    return requested;
+}
+
+bool NativeF32MinMaxRequested() {
+    static const bool requested = [] {
+        const char* text = std::getenv("APS5_NATIVE_F32_MINMAX");
+        return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
+    }();
+    return requested;
+}
+
+bool ReadOnlyGuestBuffers() {
+    static const bool requested = [] {
+        const char* text = std::getenv("APS5_READONLY_GUEST_BUFFERS");
+        return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
+    }();
+    return requested;
+}
+
+bool ShaderFaultReports() {
+    static const bool reports = [] {
+        const char* text = std::getenv("APS5_XP_NO_SHADER_FAULTS");
+        return text == nullptr || *text == '\0' || std::strcmp(text, "0") == 0;
+    }();
+    return reports;
+}
+
 DebugProbe DebugProbeConfig() {
     static const DebugProbe parsed = [] {
         DebugProbe result;

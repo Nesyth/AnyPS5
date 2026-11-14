@@ -1360,23 +1360,126 @@ std::uint32_t EmitFPIsNan32(SpirvEmitterState& state, std::uint32_t arg0) {
     return EmitNative<spv::OpFUnordNotEqual, IrType::U1>(state, arg0, arg0);
 }
 
-std::uint32_t EmitFPMin32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
+namespace {
+
+std::optional<std::uint32_t> ImmediateF32Bits(const IrValue* value) {
+    if (value == nullptr) return std::nullopt;
+    value = value->Resolve();
+    if (value->HasImmediate()) return value->Type() == IrType::F32 ? std::optional<std::uint32_t>(value->ImmediateU32()) : std::nullopt;
+    if (value->Opcode() != IrOpcode::BitCastF32U32) return std::nullopt;
+    const IrValue* bits = value->Argument(0)->Resolve();
+    if (!bits->HasImmediate() || bits->Type() != IrType::U32) return std::nullopt;
+    return bits->ImmediateU32();
+}
+
+bool OrderedF32Constant(const IrValue* value) {
+    const auto bits = ImmediateF32Bits(value);
+    return bits.has_value() && (*bits & 0x7fffffffu) <= 0x7f800000u;
+}
+
+bool ClampBound(const std::optional<std::uint32_t>& bits) {
+    if (!bits.has_value()) return false;
+    const std::uint32_t magnitude = *bits & 0x7fffffffu;
+    return magnitude <= 0x7f800000u && (magnitude == 0u || magnitude >= 0x00800000u);
+}
+
+std::uint32_t GuestOrderKey(std::uint32_t bits) {
+    return (bits & 0x80000000u) != 0u ? ~bits : bits | 0x80000000u;
+}
+
+std::uint32_t NativeMinMax(SpirvEmitterState& state, std::uint32_t lhs, std::uint32_t rhs, bool maxValue) {
+    return EmitExt(state, TypeF32(state), maxValue ? GLSLstd450NMax : GLSLstd450NMin, {lhs, rhs});
+}
+
+std::uint32_t NativeIsNan(SpirvEmitterState& state, std::uint32_t value) {
+    return Binary(state, spv::OpFUnordNotEqual, TypeBool(state), value, value);
+}
+
+bool AnyOrderedF32Constant(const IrValue& inst) {
+    for (std::size_t index = 0; index < inst.ArgumentCount(); ++index) {
+        if (OrderedF32Constant(inst.Argument(index))) return true;
+    }
+    return false;
+}
+
+bool NativeMinMaxApplies(const SpirvEmitterState& state, const IrValue& inst) {
+    return state.float32NativeMinMax && !(ImmediateF32Bits(inst.Argument(0)).has_value() && ImmediateF32Bits(inst.Argument(1)).has_value());
+}
+
+std::uint32_t EmitNativeMinMax(SpirvEmitterState& state, const IrValue& inst, std::uint32_t lhs, std::uint32_t rhs, bool maxValue) {
+    const auto value = NativeMinMax(state, lhs, rhs, maxValue);
+    if (AnyOrderedF32Constant(inst)) return value;
+    const auto rhsNan = NativeIsNan(state, rhs);
+    return Select(state, TypeF32(state), rhsNan, lhs, value);
+}
+
+std::uint32_t EmitNativeMinMax3(SpirvEmitterState& state, const IrValue& inst, std::uint32_t a, std::uint32_t b, std::uint32_t c, bool maxValue) {
+    const auto value = NativeMinMax(state, NativeMinMax(state, a, b, maxValue), c, maxValue);
+    if (AnyOrderedF32Constant(inst)) return value;
+    const auto allNan = NativeIsNan(state, value);
+    return Select(state, TypeF32(state), allNan, a, value);
+}
+
+std::optional<std::uint32_t> EmitNativeMed3(SpirvEmitterState& state, const IrValue& inst, std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+    const std::array<std::uint32_t, 3> ids{a, b, c};
+    std::array<std::optional<std::uint32_t>, 3> constants{};
+    for (std::size_t index = 0; index < constants.size(); ++index) constants[index] = ImmediateF32Bits(inst.Argument(index));
+    const auto bounds = std::ranges::count_if(constants, ClampBound);
+    const auto variable = std::ranges::find_if(constants, [](const std::optional<std::uint32_t>& bits) { return !bits.has_value(); });
+    if (bounds == 2 && variable != constants.end()) {
+        const auto index = static_cast<std::size_t>(variable - constants.begin());
+        const std::uint32_t first = *constants[index == 0u ? 1u : 0u];
+        const std::uint32_t second = *constants[index == 2u ? 1u : 2u];
+        const bool ordered = GuestOrderKey(first) <= GuestOrderKey(second);
+        const auto low = ConstantF32(state, ordered ? first : second);
+        const auto high = ConstantF32(state, ordered ? second : first);
+        return NativeMinMax(state, NativeMinMax(state, ids[index], low, true), high, false);
+    }
+    if (constants[0].has_value() && constants[1].has_value()) return std::nullopt;
+    const auto f32 = TypeF32(state);
+    const auto boolean = TypeBool(state);
+    const auto low = NativeMinMax(state, a, b, false);
+    const auto high = NativeMinMax(state, a, b, true);
+    const auto upper = NativeMinMax(state, high, c, false);
+    const auto median = NativeMinMax(state, low, upper, true);
+    auto minimum = NativeMinMax(state, low, c, false);
+    if (!AnyOrderedF32Constant(inst)) {
+        const auto allNan = NativeIsNan(state, minimum);
+        minimum = Select(state, f32, allNan, a, minimum);
+    }
+    const auto nanA = NativeIsNan(state, a);
+    const auto nanB = NativeIsNan(state, b);
+    const auto nanC = NativeIsNan(state, c);
+    const auto anyNan = Binary(state, spv::OpLogicalOr, boolean, Binary(state, spv::OpLogicalOr, boolean, nanA, nanB), nanC);
+    return Select(state, f32, anyNan, minimum, median);
+}
+
+}
+
+std::uint32_t EmitFPMin32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1) {
+    if (NativeMinMaxApplies(state, inst)) return EmitNativeMinMax(state, inst, arg0, arg1, false);
     return EmitMinMaxF32Value(state, arg0, arg1, false);
 }
 
-std::uint32_t EmitFPMax32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
+std::uint32_t EmitFPMax32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1) {
+    if (NativeMinMaxApplies(state, inst)) return EmitNativeMinMax(state, inst, arg0, arg1, true);
     return EmitMinMaxF32Value(state, arg0, arg1, true);
 }
 
-std::uint32_t EmitFPMinTri32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+std::uint32_t EmitFPMinTri32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+    if (NativeMinMaxApplies(state, inst)) return EmitNativeMinMax3(state, inst, arg0, arg1, arg2, false);
     return EmitFMinMax3(state, arg0, arg1, arg2, false);
 }
 
-std::uint32_t EmitFPMaxTri32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+std::uint32_t EmitFPMaxTri32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+    if (NativeMinMaxApplies(state, inst)) return EmitNativeMinMax3(state, inst, arg0, arg1, arg2, true);
     return EmitFMinMax3(state, arg0, arg1, arg2, true);
 }
 
-std::uint32_t EmitFPMedTri32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+std::uint32_t EmitFPMedTri32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+    if (state.float32NativeMinMax) {
+        if (const auto native = EmitNativeMed3(state, inst, arg0, arg1, arg2)) return *native;
+    }
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
     const auto bits = [&](std::uint32_t value) { return Unary(state, spv::OpBitcast, u32, value); };

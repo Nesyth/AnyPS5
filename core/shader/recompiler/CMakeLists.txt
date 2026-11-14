@@ -305,6 +305,8 @@ function(add_shader_recompiler target runtimeTarget)
             RuntimeAbi::RequireVersion
             GcnGuestShaders
             SetGcnGuestShaders
+            HostF32FmaNansRequested
+            NativeF32MinMaxRequested
             GcnImageTilingIndex
             GcnImagePitch
             GcnImagePow2Pad

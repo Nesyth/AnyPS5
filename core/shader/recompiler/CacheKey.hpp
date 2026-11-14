@@ -398,6 +398,8 @@ private:
         append(key, value.float32HostNans);
         append(key, value.float16WidenNans);
         append(key, value.float16NarrowNans);
+        if (value.float32HostFmaNans) append(key, 0x46333246414e414eull);
+        if (value.float32NativeMinMax) append(key, 0x46333246584d4e4dull);
     }
 };
 

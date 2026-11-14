@@ -1980,7 +1980,12 @@ DiskStore& store() {
 }
 
 std::uint64_t SourceVersion() {
-    return ExactF32Arithmetic() ? Generated::SourceVersion : Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull;
+    std::uint64_t version = ExactF32Arithmetic() ? Generated::SourceVersion : Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull;
+    if (HostF32FmaNansRequested()) version ^= 0xbf58476d1ce4e5b9ull;
+    if (NativeF32MinMaxRequested()) version ^= 0x94d049bb133111ebull;
+    if (ReadOnlyGuestBuffers()) version ^= 0xff51afd7ed558ccdull;
+    if (!ShaderFaultReports()) version ^= 0xc4ceb9fe1a85ec53ull;
+    return version;
 }
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key) {

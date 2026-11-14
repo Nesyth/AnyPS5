@@ -1,7 +1,10 @@
+#include "prx/libSceAgcDriver/Execution/include/Float32NanProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
+#include <spirv/unified1/GLSL.std.450.h>
+#include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -27,6 +30,10 @@ alignas(256) constexpr std::array<std::uint32_t, 23> Code{
     0x34020084, 0x34060086, 0xe0381000, 0x80000401, 0xbf8c3f70, 0x1e140b04, 0x20160b04, 0xd551000c,
     0x041a0b04, 0xd554000d, 0x041a0b04, 0xd557000e, 0x041a0b04, 0xd50f000f, 0x02020b04, 0xd5100010,
     0x02020b04, 0x20220880, 0xe0781000, 0x80010a03, 0xe0781010, 0x80010e03, 0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 8> ConstantCode{
+    0x34060086, 0xd50f000a, 0x020100f2, 0xd557000b, 0x03cd00f2, 0xe0741000, 0x80010a03, 0xbf810000,
 };
 
 constexpr std::uint32_t Rows[128][4] = {
@@ -422,6 +429,7 @@ constexpr std::uint32_t ExpectedIeee[128][7] = {
 constexpr std::uint32_t Chunks = 4;
 std::uint32_t Chunk = 0;
 bool Ieee = false;
+bool Native = false;
 constexpr const char* Names[7] = {
     "v_min_f32 v10, v4, v5",
     "v_max_f32 v11, v4, v5",
@@ -448,7 +456,44 @@ std::string Hex(std::uint32_t value) {
 }
 
 void Expect(std::uint32_t tid, std::uint32_t actual, std::uint32_t expected, const char* name) {
-    Require(actual == expected, std::string(Ieee ? "f32 min max nan, IEEE mode: row " : "f32 min max nan: row ") + std::to_string(tid) + " " + name + " is " + Hex(actual) + ", expected " + Hex(expected));
+    Require(actual == expected, std::string("f32 min max nan") + (Native ? ", native" : "") + (Ieee ? ", IEEE mode: row " : ": row ") + std::to_string(tid) + " " + name + " is " + Hex(actual) + ", expected " + Hex(expected));
+}
+
+struct SpirvCounts {
+    std::uint32_t instructions = 0;
+    std::uint32_t nativeMinMax = 0;
+};
+
+SpirvCounts Count(std::span<const std::uint32_t> words) {
+    SpirvCounts counts;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        Require(count != 0 && cursor + count <= words.size(), "f32 min max nan: malformed SPIR-V");
+        ++counts.instructions;
+        if ((words[cursor] & 0xffffu) == spv::OpExtInst && count > 4u && (words[cursor + 4u] == GLSLstd450NMin || words[cursor + 4u] == GLSLstd450NMax)) ++counts.nativeMinMax;
+        cursor += count;
+    }
+    return counts;
+}
+
+std::vector<std::uint32_t> Spirv(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code) {
+    std::vector<std::uint32_t> userData(8, 0u);
+    const auto input = BufferDescriptor(Input.data(), static_cast<std::uint32_t>(Input.size() * 4u));
+    const auto output = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(Output.size() * 4u));
+    std::copy(input.begin(), input.end(), userData.begin());
+    std::copy(output.begin(), output.end(), userData.begin() + 4);
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
+        device.Target(),
+        {0, 0, 0, 128}
+    };
+    request.useCache = false;
+    request.target.float32NativeMinMax = Native;
+    if (Ieee) request.context.floatMode = ShaderRecompiler::ShaderFloatMode{0xf0u, true, true, false};
+    return ShaderRecompiler::Recompile(request).spirv.Copy();
 }
 
 void Run(AgcDriver::VulkanDevice& device) {
@@ -469,6 +514,7 @@ void Run(AgcDriver::VulkanDevice& device) {
         {0, 0, 0, 128}
     };
     request.useCache = false;
+    request.target.float32NativeMinMax = Native;
     if (Ieee) request.context.floatMode = ShaderRecompiler::ShaderFloatMode{0xf0u, true, true, false};
     const auto result = ShaderRecompiler::Recompile(request);
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
@@ -497,9 +543,28 @@ int main() {
         if (!device) return VulkanTestSkipped;
         for (const bool ieee : {false, true}) {
             Ieee = ieee;
-            for (Chunk = 0; Chunk < Chunks; ++Chunk) {
-                Run(*device);
-                Check();
+            Native = false;
+            const auto selected = Count(Spirv(*device, Code));
+            Native = true;
+            const auto native = Count(Spirv(*device, Code));
+            Require(selected.nativeMinMax == 0u && native.nativeMinMax != 0u && native.instructions < selected.instructions, std::string("f32 min max nan: native min and max") + (ieee ? " with IEEE_MODE set" : "") + " give " + std::to_string(native.instructions) + " instructions (" + std::to_string(native.nativeMinMax) + " NMin or NMax), the selected forms " + std::to_string(selected.instructions) + " (" + std::to_string(selected.nativeMinMax) + ")");
+        }
+        Ieee = false;
+        Native = true;
+        const auto constants = Count(Spirv(*device, ConstantCode));
+        Require(constants.nativeMinMax == 0u, "f32 min max nan: native min and med3 of constants give " + std::to_string(constants.nativeMinMax) + " NMin or NMax, expected the selected forms");
+        const auto probe = AgcDriver::ProbeFloat32NativeMinMax(*device, device->Target());
+        const bool nativeProven = probe.compared != 0u && probe.mismatches == 0u;
+        std::printf("f32 min max nan: native probe %u of %u results differ, %u float modes not compiled; native forms %s\n", probe.mismatches, probe.compared, probe.skippedModes, nativeProven ? "checked" : "not checked");
+        for (const bool native : {false, true}) {
+            if (native && !nativeProven) continue;
+            Native = native;
+            for (const bool ieee : {false, true}) {
+                Ieee = ieee;
+                for (Chunk = 0; Chunk < Chunks; ++Chunk) {
+                    Run(*device);
+                    Check();
+                }
             }
         }
         std::puts("f32 min max nan tests passed");

@@ -668,6 +668,8 @@ struct VulkanDevice::State {
     bool float16HostNanCandidate = false;
     bool float16HostNans = false;
     bool float32HostNans = false;
+    bool float32HostFmaNans = false;
+    bool float32NativeMinMax = false;
     bool probingFloatControls = false;
     bool demoteToHelperInvocation = false;
     bool earlyFragmentSampleMaskTestBeforeSampleCounting = false;
@@ -2925,9 +2927,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         const auto probeStart = std::chrono::steady_clock::now();
         state->probingFloatControls = true;
         const bool probeDetail = std::getenv("APS5_F32_NAN_PROBE_DETAIL") != nullptr;
-        const auto probe = ProbeFloat32HostNans(*this, Target(), probeDetail);
+        const bool fused = ShaderRecompiler::HostF32FmaNansRequested();
+        const auto probe = ProbeFloat32HostNans(*this, Target(), probeDetail, fused);
         state->probingFloatControls = false;
         state->float32HostNans = probe.mismatches == 0u;
+        state->float32HostFmaNans = fused && state->float32HostNans && probe.fusedCompared != 0u && probe.fusedMismatches == 0u;
+        if (fused) std::fprintf(stderr, "[float-controls] f32 multiply-add NaN results with IEEE_MODE clear: %s (%u of %u probe results differ from the selected NaN)\n", state->float32HostFmaNans ? "host" : "selected", probe.fusedMismatches, probe.fusedCompared);
         if (probeDetail) {
             std::string byResult;
             for (std::size_t index = 0; index < probe.byResult.size(); ++index) byResult += " " + std::to_string(index) + ":" + std::to_string(probe.byResult[index]);
@@ -2935,6 +2940,18 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             for (const auto& row : probe.rows) std::fprintf(stderr, "[float-controls] f32 NaN probe row: mode %u result %u operands %08x %08x %08x selected %08x host %08x\n", row.mode, row.result, row.operands[0], row.operands[1], row.operands[2], row.selected, row.host);
         }
         std::fprintf(stderr, "[float-controls] f32 NaN results with IEEE_MODE clear: %s (%u of %u probe results differ from the selected NaN, %.0f ms)\n", state->float32HostNans ? "host" : "selected", probe.mismatches, probe.compared, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - probeStart).count());
+    }
+    if (ShaderRecompiler::NativeF32MinMaxRequested()) {
+        const auto probeStart = std::chrono::steady_clock::now();
+        state->probingFloatControls = true;
+        const bool probeDetail = std::getenv("APS5_F32_NAN_PROBE_DETAIL") != nullptr;
+        const auto probe = ProbeFloat32NativeMinMax(*this, Target(), probeDetail);
+        state->probingFloatControls = false;
+        state->float32NativeMinMax = probe.compared != 0u && probe.mismatches == 0u;
+        if (probeDetail) {
+            for (const auto& row : probe.rows) std::fprintf(stderr, "[float-controls] f32 min/max probe row: mode %u result %u operands %08x %08x %08x selected %08x native %08x\n", row.mode, row.result, row.operands[0], row.operands[1], row.operands[2], row.selected, row.host);
+        }
+        std::fprintf(stderr, "[float-controls] f32 min, max and med3: %s (%u of %u probe results differ from the selected forms, %u float modes not compiled, %.0f ms)\n", state->float32NativeMinMax ? "native" : "selected", probe.mismatches, probe.compared, probe.skippedModes, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - probeStart).count());
     }
     if (std::getenv("APS5_NO_NATIVE_F16_NANS") == nullptr) {
         const auto probeStart = std::chrono::steady_clock::now();
@@ -4888,6 +4905,8 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     target.float32FlushToZero = state->float32FlushToZero && !state->float32FlushComputeOnly;
     target.float16HostNans = state->float16HostNans;
     target.float32HostNans = state->float32HostNans;
+    target.float32HostFmaNans = state->float32HostFmaNans;
+    target.float32NativeMinMax = state->float32NativeMinMax;
     target.fusedExactArithmetic = state->fusedExactArithmetic;
     target.hostInterpolationFirst = state->hostInterpolationFirst;
     target.float32DenormPreserve = state->float32DenormPreserve;

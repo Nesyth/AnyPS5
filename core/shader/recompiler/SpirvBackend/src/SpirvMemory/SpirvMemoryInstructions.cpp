@@ -5,6 +5,7 @@
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvBufferAccess.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
+#include "Recompiler.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -1644,7 +1645,7 @@ std::uint32_t EmitReadConst(SpirvValueEmitContext& ctx, const IrValue& inst) {
             if (records + 3u * guarded.size() >= (1u << BdaAbi::SrtGuardStageShift)) {
                 ctx.Fail(inst, "has more guarded SRT records than the fault buffer's guard word can name");
             }
-            EmitIfCondition(state, poisoned, [&] {
+            if (ShaderFaultReports()) EmitIfCondition(state, poisoned, [&] {
                 const auto record = Binary(state, spv::OpIAdd, u32, ConstantU32(state, records), Binary(state, spv::OpIMul, u32, Binary(state, spv::OpISub, u32, flag, ConstantU32(state, 1u)), ConstantU32(state, 3u)));
                 const auto stage = ConstantU32(state, static_cast<std::uint32_t>(resources.stage) << BdaAbi::SrtGuardStageShift);
                 const auto word = BdaWord(state, state.faultBufferVariable, ConstantU32(state, BdaAbi::SrtGuardWord));
