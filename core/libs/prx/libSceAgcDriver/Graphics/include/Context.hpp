@@ -9,9 +9,12 @@
 #include "prx/libc/include/PrimedSharedMutex.hpp"
 #include <array>
 #include "prx/libSceAgcDriver/Graphics/include/DescriptorHeapObjects.hpp"
+#include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -76,8 +79,45 @@ inline void Check(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
 }
 
+inline void ForceEarlyFragmentTests(std::vector<std::uint32_t>& words) {
+    constexpr std::uint32_t EntryPoint = 15;
+    constexpr std::uint32_t ExecutionMode = 16;
+    constexpr std::uint32_t Function = 54;
+    constexpr std::uint32_t Fragment = 4;
+    constexpr std::uint32_t EarlyFragmentTests = 9;
+    constexpr std::uint32_t DepthReplacing = 12;
+    std::vector<std::uint32_t> fragments;
+    std::vector<std::uint32_t> settled;
+    std::size_t insertAt = 0;
+    for (std::size_t at = 5; at < words.size();) {
+        const auto count = words[at] >> 16u;
+        const auto op = words[at] & 0xffffu;
+        if (count == 0 || at + count > words.size()) return;
+        if (op == Function) break;
+        if (op == EntryPoint && count >= 3) {
+            if (words[at + 1] == Fragment) fragments.push_back(words[at + 2]);
+            insertAt = at + count;
+        } else if (op == ExecutionMode && count >= 3) {
+            if (words[at + 2] == EarlyFragmentTests || words[at + 2] == DepthReplacing) settled.push_back(words[at + 1]);
+            insertAt = at + count;
+        }
+        at += count;
+    }
+    if (insertAt == 0) return;
+    std::vector<std::uint32_t> added;
+    for (const auto entry : fragments) {
+        if (std::find(settled.begin(), settled.end(), entry) != settled.end()) continue;
+        added.push_back((3u << 16u) | ExecutionMode);
+        added.push_back(entry);
+        added.push_back(EarlyFragmentTests);
+    }
+    words.insert(words.begin() + static_cast<std::ptrdiff_t>(insertAt), added.begin(), added.end());
+}
+
 inline VkShaderModule CreateShaderModule(PFN_vkCreateShaderModule create, VkDevice device, bool graphicsPipelineLibrary, const std::uint32_t* code, std::size_t bytes, const char* operation) {
     std::vector<std::uint32_t> keyed(code, code + bytes / sizeof(std::uint32_t));
+    static const bool earlyTests = std::getenv("APS5_XP_EARLY_FRAGMENT_TESTS") != nullptr;
+    if (earlyTests) ForceEarlyFragmentTests(keyed);
     if (!graphicsPipelineLibrary && keyed.size() > 2) keyed[2] ^= 0x8000u;
     VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     info.codeSize = keyed.size() * sizeof(std::uint32_t);

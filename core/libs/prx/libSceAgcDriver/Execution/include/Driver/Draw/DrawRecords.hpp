@@ -220,6 +220,9 @@ struct DrawRecordHit {
     std::optional<Graphics::ShaderResources::PreparedBuffers> preparedBuffers;
     std::optional<Graphics::PreparedInputs> preparedInputs;
     std::optional<DrawFragment> fragment;
+    Graphics::ShaderResources::PreparedBuffers spareBuffers;
+    Graphics::PreparedInputs spareInputs;
+    bool pooled = false;
 };
 
 namespace DrawRecordFlags {

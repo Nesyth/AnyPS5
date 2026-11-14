@@ -139,6 +139,7 @@ enum class RuntimeSwitch : std::size_t {
     XpNoBarriers,
     DrawRuns,
     LeanPrepare,
+    PooledHits,
     Count,
 };
 

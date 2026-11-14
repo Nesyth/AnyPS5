@@ -207,6 +207,89 @@ bool ExactClassKeys() {
     return exact;
 }
 
+struct HitPool {
+    static constexpr std::size_t Slots = 256;
+    std::vector<std::shared_ptr<DrawRecordHit>> slots;
+    std::size_t next = 0;
+    std::uint64_t device = 0;
+};
+
+struct HitPoolStorage {};
+
+void keepCleared(Graphics::ShaderResources::PreparedBuffers& held) {
+    auto moved = std::move(held.moved);
+    auto selected = std::move(held.selected);
+    auto blob = std::move(held.blob);
+    moved.clear();
+    selected.clear();
+    blob.clear();
+    held = {};
+    held.moved = std::move(moved);
+    held.selected = std::move(selected);
+    held.blob = std::move(blob);
+}
+
+void keepCleared(Graphics::PreparedInputs& held) {
+    auto vertexInput = std::move(held.vertexInput);
+    auto vertexHandles = std::move(held.vertexHandles);
+    auto vertexOffsets = std::move(held.vertexOffsets);
+    auto inPlaceReads = std::move(held.inPlaceReads);
+    auto ranges = std::move(held.ranges);
+    vertexInput.bindings.clear();
+    vertexInput.attributes.clear();
+    vertexHandles.clear();
+    vertexOffsets.clear();
+    inPlaceReads.clear();
+    ranges.clear();
+    held = {};
+    held.vertexInput = std::move(vertexInput);
+    held.vertexHandles = std::move(vertexHandles);
+    held.vertexOffsets = std::move(vertexOffsets);
+    held.inPlaceReads = std::move(inPlaceReads);
+    held.ranges = std::move(ranges);
+}
+
+void recycleHit(DrawRecordHit& hit) {
+    auto sides = std::move(hit.sides);
+    auto stages = std::move(hit.stages);
+    auto captures = std::move(hit.captures);
+    auto buffers = hit.preparedBuffers.has_value() ? std::move(*hit.preparedBuffers) : std::move(hit.spareBuffers);
+    auto inputs = hit.preparedInputs.has_value() ? std::move(*hit.preparedInputs) : std::move(hit.spareInputs);
+    stages.clear();
+    captures.clear();
+    keepCleared(buffers);
+    keepCleared(inputs);
+    hit = {};
+    hit.sides = std::move(sides);
+    hit.stages = std::move(stages);
+    hit.captures = std::move(captures);
+    hit.spareBuffers = std::move(buffers);
+    hit.spareInputs = std::move(inputs);
+    hit.pooled = true;
+}
+
+std::shared_ptr<DrawRecordHit> pooledHit(std::uint64_t device) {
+    auto& pool = HostThreadLocal<HitPool, HitPoolStorage>();
+    if (pool.device != device) {
+        pool.slots.clear();
+        pool.next = 0;
+        pool.device = device;
+    }
+    if (pool.slots.size() < HitPool::Slots) {
+        auto& made = pool.slots.emplace_back(std::make_shared<DrawRecordHit>());
+        made->pooled = true;
+        return made;
+    }
+    for (std::size_t tries = 0; tries < 4; ++tries) {
+        auto& slot = pool.slots[pool.next];
+        pool.next = (pool.next + 1) % HitPool::Slots;
+        if (slot.use_count() != 1) continue;
+        recycleHit(*slot);
+        return slot;
+    }
+    return std::make_shared<DrawRecordHit>();
+}
+
 Counter BufferRefusal(Graphics::ShaderResources::PreparedBuffers::Refusal refusal) {
     using Refusal = Graphics::ShaderResources::PreparedBuffers::Refusal;
     switch (refusal) {
@@ -229,7 +312,7 @@ void prepareBuffers(const LeanDrawJob& job, const LeanAnchor& anchor, const Dire
         DirectDraws::Add(Counter::BuffersNoPlan);
         return;
     }
-    auto& prepared = hit.preparedBuffers.emplace();
+    auto& prepared = hit.pooled ? hit.preparedBuffers.emplace(std::move(hit.spareBuffers)) : hit.preparedBuffers.emplace();
     prepared.generation = resolved.generation;
     const auto pending = Graphics::Recorder::PendingWriteSnapshot();
     std::optional<DrawPipeline::Watch> queued;
@@ -286,7 +369,7 @@ void prepareInputs(const LeanDrawJob& job, const LeanAnchor& anchor, const Direc
         DirectDraws::Add(Counter::InputsNoRecipe);
         return;
     }
-    auto& prepared = hit.preparedInputs.emplace();
+    auto& prepared = hit.pooled ? hit.preparedInputs.emplace(std::move(hit.spareInputs)) : hit.preparedInputs.emplace();
     const auto pending = Graphics::Recorder::PendingWriteSnapshot();
     std::optional<DrawPipeline::Watch> queued;
     if (DrawPipeline::Active()) queued = DrawPipeline::Queue0().WatchWrites();
@@ -1549,7 +1632,8 @@ std::optional<Counter> Driver::assembleDirectHit(const LeanDrawJob& job, DirectS
     hit.stages.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
         auto& stage = resolved.stages[i];
-        hit.sides[i] = std::move(stage.side);
+        if (hit.pooled) hit.sides[i] = stage.side;
+        else hit.sides[i] = std::move(stage.side);
         hit.captures[i] = stage.capture;
         hit.stages.push_back({stage.stage, stage.shared->donor.get(), stage.pushOffset, &hit.captures[i]->snapshot.registeredImages, &hit.sides[i]});
     }
@@ -1672,7 +1756,7 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
             lap(Step::Class);
         }
         if (!reason) {
-            hit = std::make_shared<DrawRecordHit>();
+            hit = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PooledHits) ? pooledHit(job.deviceSerial) : std::make_shared<DrawRecordHit>();
             reason = assembleDirectHit(job, resolved, *hit);
             lap(Step::Checks);
         }
