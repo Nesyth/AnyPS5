@@ -5,12 +5,18 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -132,6 +138,120 @@ void checkAnswer(const ListShape& list, std::span<const std::uint32_t> today, st
     else detail += ": first difference at word " + std::to_string(at) + ": lean " + hex(lean[at]) + ", today " + hex(today[at]);
     detail += GuestMemory::OwnWriteSerial() != ownWrites ? "; driver stores landed meanwhile" : "; no driver store landed meanwhile";
     LeanFront::NoteDifference(cached != nullptr ? LeanFront::Field::ListCache : LeanFront::Field::RegisterLists, detail);
+}
+
+constexpr std::uint64_t ListSpanGap = 4096;
+constexpr std::size_t NoSpan = ~std::size_t{0};
+
+bool listSpanIdle(const std::pair<std::uint64_t, std::uint64_t>& span) {
+    return Graphics::Recorder::FlushHookIdle({&span, 1}) && Graphics::ReadGuardIdle(span.first, static_cast<std::size_t>(span.second - span.first));
+}
+
+void planListHooks(LeanTails& tails, std::span<const std::uint32_t> commands) {
+    auto& spans = tails.spans;
+    auto& idle = tails.spanIdle;
+    spans.clear();
+    idle.clear();
+    for (std::size_t cursor = 0; cursor < commands.size(); cursor += Pm4::PacketWords(commands[cursor])) {
+        const auto header = commands[cursor];
+        if ((header >> 30u) != 3u || !Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) continue;
+        if (Pm4::PacketWords(header) > commands.size() - cursor) break;
+        const auto shape = leanShape(commands.subspan(cursor, Pm4::PacketWords(header)));
+        if (!shape || shape->count == 0 || shape->Bytes() > std::numeric_limits<std::uint64_t>::max() - shape->address) continue;
+        spans.emplace_back(shape->address, shape->address + shape->Bytes());
+    }
+    if (spans.empty()) return;
+    if (!std::is_sorted(spans.begin(), spans.end())) std::sort(spans.begin(), spans.end());
+    std::size_t last = 0;
+    for (std::size_t index = 1; index < spans.size(); ++index) {
+        if (spans[index].first <= spans[last].second || spans[index].first - spans[last].second <= ListSpanGap) spans[last].second = std::max(spans[last].second, spans[index].second);
+        else spans[++last] = spans[index];
+    }
+    spans.resize(last + 1);
+    bool all = Graphics::Recorder::FlushHookIdle(spans);
+    for (std::size_t index = 0; all && index < spans.size(); ++index) all = Graphics::ReadGuardIdle(spans[index].first, static_cast<std::size_t>(spans[index].second - spans[index].first));
+    idle.assign(spans.size(), static_cast<std::uint8_t>(all ? 1 : 0));
+    if (all) return;
+    for (std::size_t index = 0; index < spans.size(); ++index) idle[index] = static_cast<std::uint8_t>(listSpanIdle(spans[index]) ? 1 : 0);
+}
+
+std::size_t idleListSpan(const LeanTails& tails, const ListShape& list) {
+    const auto& spans = tails.spans;
+    if (spans.empty() || list.count == 0) return NoSpan;
+    const auto found = std::upper_bound(spans.begin(), spans.end(), list.address, [](std::uint64_t address, const std::pair<std::uint64_t, std::uint64_t>& span) { return address < span.first; });
+    if (found == spans.begin()) return NoSpan;
+    const auto index = static_cast<std::size_t>(found - spans.begin()) - 1;
+    const auto& span = spans[index];
+    if (tails.spanIdle[index] == 0 || list.address >= span.second || list.Bytes() > span.second - list.address) return NoSpan;
+    return index;
+}
+
+std::uint64_t listHooksVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_LIST_HOOKS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+std::atomic<std::uint64_t> listHookTails{0};
+std::atomic<std::uint64_t> listHookLists{0};
+std::atomic<std::uint64_t> listHookDiffering{0};
+std::atomic<std::uint64_t> listHookMoved{0};
+std::atomic<std::uint64_t> listHookBytes{0};
+std::atomic<std::int64_t> listHookWindow{-1};
+
+void noteListHookCounts() {
+    const std::int64_t window = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (listHookWindow.exchange(window, std::memory_order_relaxed) == window) return;
+    std::fprintf(stderr, "[list-hooks-verify] %llu tails checked, %llu lists checked, %llu differing (own range not idle at its turn), %llu of them with the span no longer idle either, %llu whose bytes today's guard and hook changed\n", static_cast<unsigned long long>(listHookTails.load(std::memory_order_relaxed)), static_cast<unsigned long long>(listHookLists.load(std::memory_order_relaxed)), static_cast<unsigned long long>(listHookDiffering.load(std::memory_order_relaxed)), static_cast<unsigned long long>(listHookMoved.load(std::memory_order_relaxed)), static_cast<unsigned long long>(listHookBytes.load(std::memory_order_relaxed)));
+}
+
+const char* listHookReason(const ListShape& list) {
+    const std::pair<std::uint64_t, std::uint64_t> own{list.address, list.address + list.Bytes()};
+    if (Graphics::Recorder::SnapshotWriteOverlaps(list.address, list.Bytes())) return "a pending GPU write";
+    if (Graphics::StorageTexture::AnyPendingOverlaps({&own, 1})) return "a pending or flushing storage image";
+    if (Graphics::AnyShadowedOverlaps(list.address, list.Bytes())) return "a live unit shadow";
+    if (!Graphics::ReadGuardIdle(list.address, list.Bytes())) return "the depth or multisample read guard";
+    return "a queued label or the flush hook's state";
+}
+
+bool listHooksVerifyDue(LeanTails& tails) {
+    const auto every = listHooksVerifyEvery();
+    if (every == 0 || std::none_of(tails.spanIdle.begin(), tails.spanIdle.end(), [](std::uint8_t idle) { return idle != 0; })) return false;
+    if (++tails.hookVerifyOrdinal % every != 0) return false;
+    listHookTails.fetch_add(1, std::memory_order_relaxed);
+    noteListHookCounts();
+    return true;
+}
+
+void checkListHook(const LeanTails& tails, const ListShape& list, std::size_t span, std::uint64_t serial, std::size_t cursor) {
+    listHookLists.fetch_add(1, std::memory_order_relaxed);
+    const std::pair<std::uint64_t, std::uint64_t> own{list.address, list.address + list.Bytes()};
+    if (!Graphics::Recorder::FlushHookIdle({&own, 1}) || !Graphics::ReadGuardIdle(list.address, list.Bytes())) {
+        const auto& range = tails.spans[span];
+        const bool spanIdle = listSpanIdle(range);
+        if (!spanIdle) listHookMoved.fetch_add(1, std::memory_order_relaxed);
+        if (listHookDiffering.fetch_add(1, std::memory_order_relaxed) < 16) {
+            std::fprintf(stderr, "[list-hooks-verify] serial %llu list at DWORD %zu, 0x%llx+0x%zx: its guard and hook were skipped, its own range is not idle at its turn (%s); its span 0x%llx..0x%llx %s\n", static_cast<unsigned long long>(serial), cursor, static_cast<unsigned long long>(list.address), list.Bytes(), listHookReason(list), static_cast<unsigned long long>(range.first), static_cast<unsigned long long>(range.second), spanIdle ? "still answers idle" : "no longer answers idle either");
+        }
+    }
+    const auto* source = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(list.address));
+    const bool readable = GuestMemory::Accessible(source, list.Bytes());
+    std::vector<std::uint8_t> before;
+    if (readable) {
+        before.resize(list.Bytes());
+        GuestMemory::CopyGuestBytes(before.data(), source, before.size());
+    }
+    hookList(list);
+    if (!readable) return;
+    std::vector<std::uint8_t> after(before.size());
+    GuestMemory::CopyGuestBytes(after.data(), source, after.size());
+    const auto differs = std::mismatch(before.begin(), before.end(), after.begin());
+    if (differs.first == before.end()) return;
+    if (listHookBytes.fetch_add(1, std::memory_order_relaxed) < 16) {
+        std::fprintf(stderr, "[list-hooks-verify] serial %llu list at DWORD %zu, 0x%llx+0x%zx: today's guard and hook changed its bytes, the first at offset 0x%zx\n", static_cast<unsigned long long>(serial), cursor, static_cast<unsigned long long>(list.address), list.Bytes(), static_cast<std::size_t>(differs.first - before.begin()));
+    }
 }
 
 }
@@ -301,6 +421,19 @@ void Driver::resolveLeanLists(Submission& submission, bool cacheable) {
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Registers);
     const auto& commands = submission.commands;
     std::uint64_t resolved = 0;
+    const bool hooksOnce = LeanFront::SwitchSet(frontLatch, Graphics::RuntimeSwitch::ListHooksOnce);
+    leanTails.spans.clear();
+    if (hooksOnce) planListHooks(leanTails, commands);
+    const bool verifyHooks = hooksOnce && listHooksVerifyDue(leanTails);
+    const auto ownRead = [&] { leanTails.spans.clear(); };
+    const auto hook = [&](const ListShape& list, std::size_t at) {
+        if (const auto span = idleListSpan(leanTails, list); span != NoSpan) {
+            if (verifyHooks) checkListHook(leanTails, list, span, submission.serial, at);
+            return;
+        }
+        ownRead();
+        hookList(list);
+    };
     for (std::size_t cursor = 0; cursor < commands.size(); cursor += Pm4::PacketWords(commands[cursor])) {
         const auto header = commands[cursor];
         if ((header >> 30u) != 3u || !Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) continue;
@@ -310,6 +443,7 @@ void Driver::resolveLeanLists(Submission& submission, bool cacheable) {
             const auto first = lists.words.size();
             const auto shape = leanShape(packet);
             if (!shape) {
+                ownRead();
                 const auto pairs = Pm4::ReadIndirectRegisters(packet);
                 lists.words.insert(lists.words.end(), pairs.begin(), pairs.end());
                 lists.refs.push_back({static_cast<std::uint32_t>(cursor), static_cast<std::uint32_t>(first), static_cast<std::uint32_t>(pairs.size() / 2), Pm4::IndirectRegistersValid(pairs) ? RegisterLists::Valid : 0u});
@@ -319,6 +453,7 @@ void Driver::resolveLeanLists(Submission& submission, bool cacheable) {
             const bool bypass = candidate && cache.Volatile(shape->address);
             auto* entry = candidate && !bypass ? cache.Find(shape->address, shape->mode, shape->count) : nullptr;
             if (LeanFront::Due(frontLatch, LeanFront::Item::RegisterList)) {
+                ownRead();
                 const auto ownWrites = GuestMemory::OwnWriteSerial();
                 const auto tracked = candidate && !bypass ? GuestMemory::CollectWrites(shape->address, shape->Bytes()) : 0;
                 const auto pairs = Pm4::ReadIndirectRegisters(packet);
@@ -355,7 +490,7 @@ void Driver::resolveLeanLists(Submission& submission, bool cacheable) {
             if (shape->count == 0) {
                 flags = RegisterLists::Valid;
             } else if (entry != nullptr) {
-                hookList(*shape);
+                hook(*shape, cursor);
                 if (entry->epoch != epoch) {
                     if (GuestMemory::CollectWrites(shape->address, shape->Bytes()) == 0) entry->live = false;
                     else entry->epoch = epoch;
@@ -373,10 +508,11 @@ void Driver::resolveLeanLists(Submission& submission, bool cacheable) {
             } else {
                 std::uint64_t tracked = 0;
                 if (countedReads()) {
+                    ownRead();
                     if (candidate && !bypass) tracked = GuestMemory::CollectWrites(shape->address, shape->Bytes());
                     readCounted(*shape, out);
                 } else {
-                    hookList(*shape);
+                    hook(*shape, cursor);
                     if (candidate && !bypass) tracked = GuestMemory::CollectWrites(shape->address, shape->Bytes());
                     copyList(*shape, out);
                 }

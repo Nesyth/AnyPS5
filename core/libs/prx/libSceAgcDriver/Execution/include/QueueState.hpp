@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <iterator>
 #include <stdexcept>
@@ -121,6 +122,18 @@ public:
             out[index] = held ? values[offset] : 0u;
             bits |= static_cast<std::uint64_t>(held) << index;
         }
+        return bits;
+    }
+    std::uint64_t CopyBlock(std::uint32_t first, std::uint32_t count, std::uint32_t* out) const {
+        if (count == 0 || count > 64 || static_cast<std::size_t>(first) + count > values.size()) return CopyRange(first, count, out);
+        const auto word = static_cast<std::size_t>(first) / 64;
+        const auto shift = first % 64;
+        std::uint64_t bits = present[word] >> shift;
+        if (shift != 0 && word + 1 < present.size()) bits |= present[word + 1] << (64 - shift);
+        const std::uint64_t mask = count == 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << count) - 1;
+        bits &= mask;
+        std::memcpy(out, values.data() + first, static_cast<std::size_t>(count) * sizeof(std::uint32_t));
+        for (auto absent = ~bits & mask; absent != 0; absent &= absent - 1) out[std::countr_zero(absent)] = 0u;
         return bits;
     }
     std::size_t size() const { return entries; }

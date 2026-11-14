@@ -164,6 +164,11 @@ enum class RuntimeSwitch : std::size_t {
     ReplayStateDedupe,
     RunFollowNoCarry,
     RunFollowPlainLoop,
+    FinisherParkSlots,
+    ListHooksOnce,
+    DispatchEnvOnce,
+    PlainRegisterPackets,
+    UserWordBlocks,
     Count,
 };
 

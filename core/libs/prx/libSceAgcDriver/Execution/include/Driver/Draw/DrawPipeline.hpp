@@ -280,6 +280,11 @@ private:
         std::vector<Deposit> deposits;
         alignas(16) std::array<std::byte, LeanPayloadBytes> payload{};
     };
+    struct ParkSlot {
+        std::mutex mutex;
+        std::condition_variable wake;
+        bool signaled = false;
+    };
     DrawFinisher() = default;
     void run(unsigned index);
     Slot* untaken();
@@ -305,6 +310,10 @@ private:
     void awaitLeanRoom();
     void awaitLeanIdle();
     void publishLean(LeanSlot& slot);
+    void signalSlots(std::uint32_t bits);
+    void wakeParked(std::uint32_t slotted, unsigned wanted);
+    bool parkInSlot(unsigned index);
+    void verifiedIdleWait(std::unique_lock<std::mutex>& lock, const std::function<bool()>& ready);
     bool aheadWait(std::span<const Range> ranges);
     inline static std::atomic<std::size_t> outstanding{0};
     inline static std::atomic<bool> runOpen{false};
@@ -342,6 +351,10 @@ private:
     std::atomic<unsigned> parked{0};
     std::atomic<unsigned> dormant{0};
     std::atomic<unsigned> frontWaiters{0};
+    std::atomic<std::uint32_t> parkedSlots{0};
+    std::atomic<std::uint32_t> idleSpinners{0};
+    std::atomic<std::uint32_t> wakesInFlight{0};
+    std::array<ParkSlot, 9> parkSlots;
     std::atomic<std::uint64_t> leanTake{1};
     std::atomic<std::uint64_t> leanTail{1};
     std::uint64_t leanRetired = 1;

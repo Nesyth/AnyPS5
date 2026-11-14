@@ -33,6 +33,19 @@ bool DispatchItemsEnabled() {
     return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelineDispatch);
 }
 
+bool dumpsDispatchProgram(std::uint64_t address) {
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchEnvOnce)) {
+        static const std::optional<std::uint64_t> watched = []() -> std::optional<std::uint64_t> {
+            const char* text = std::getenv("APS5_DUMP_DISPATCH_PROGRAM");
+            if (text == nullptr) return std::nullopt;
+            return std::strtoull(text, nullptr, 0);
+        }();
+        return watched.has_value() && *watched == address;
+    }
+    const char* watched = std::getenv("APS5_DUMP_DISPATCH_PROGRAM");
+    return watched != nullptr && std::strtoull(watched, nullptr, 0) == address;
+}
+
 enum class ItemFallback : std::size_t { Miss, Reads, NoRecipe, Writes, Verify, Count };
 constexpr std::array<const char*, static_cast<std::size_t>(ItemFallback::Count)> ItemFallbackNames{"miss", "reads", "no recipe", "writes", "verify"};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ItemFallback::Count)> itemFallbacks{};
@@ -181,7 +194,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             return;
         }
         if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
-        if (const char* watched = std::getenv("APS5_DUMP_DISPATCH_PROGRAM"); watched != nullptr && std::strtoull(watched, nullptr, 0) == address) {
+        if (dumpsDispatchProgram(address)) {
             static std::atomic<unsigned> programDumps{0};
             if (programDumps.fetch_add(1, std::memory_order_relaxed) < 3) {
                 const auto code = std::span(snapshot.code).subspan(codeOffset);

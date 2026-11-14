@@ -197,6 +197,29 @@ std::vector<std::uint64_t> labelWritesAt(const Submission& submission, std::span
     return writes;
 }
 
+bool newCounterWindow(std::atomic<std::int64_t>& window) {
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    return window.exchange(now, std::memory_order_relaxed) != now;
+}
+
+bool plainVerifyDue() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_PLAIN_REGISTER_PACKETS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    static std::atomic<std::uint64_t> ordinal{0};
+    return every != 0 && ordinal.fetch_add(1, std::memory_order_relaxed) % every == 0;
+}
+
+void notePlainVerify(bool drains, bool flushDue, const Submission& submission, std::size_t cursor) {
+    static std::atomic<std::uint64_t> checked{0}, deferred{0}, differing{0};
+    static std::atomic<std::int64_t> window{-1};
+    checked.fetch_add(1, std::memory_order_relaxed);
+    if (flushDue) deferred.fetch_add(1, std::memory_order_relaxed);
+    if (drains && differing.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[plain-register-verify] %s: the register packet took the short path, today's rules drain the finisher or the committer before it\n", where(submission, cursor).c_str());
+    if (newCounterWindow(window)) std::fprintf(stderr, "[plain-register-verify] %llu packets checked, %llu with a flush due deferred to the next full packet, %llu differing\n", static_cast<unsigned long long>(checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(deferred.load(std::memory_order_relaxed)), static_cast<unsigned long long>(differing.load(std::memory_order_relaxed)));
+}
+
 }
 
 std::size_t PacketTable::IndexAt(std::size_t cursor) const {
@@ -603,6 +626,15 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
             }
         }
     } leanRunEnd{*this};
+    const bool plainRegisters = LeanFront::SwitchSet(frontLatch, RuntimeSwitch::PlainRegisterPackets);
+    std::uint64_t plainDone = 0;
+    struct PlainProgress {
+        Driver& driver;
+        std::uint64_t& done;
+        ~PlainProgress() {
+            if (done != 0) driver.packetsDone.fetch_add(done, std::memory_order_seq_cst);
+        }
+    } plainProgress{*this, plainDone};
     for (std::size_t index = 0; index < packets.size();) {
         const auto& entry = packets[index];
         if (run.packetEpoch) bumpEpoch(&EpochBumps::packets);
@@ -628,6 +660,27 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
             continue;
         }
         const bool verifyPacket = LeanFront::Due(frontLatch, LeanFront::Item::Packet);
+        if constexpr (!Timers) {
+            if (plainRegisters && !verifyPacket && !profilePackets && entry.Has(LeanPacket::Plain) && entry.Has(LeanPacket::KeepsFinisher) && entry.pipeline == LeanPacket::Pipeline::Keeps && !entry.Has(LeanPacket::IndirectRegisters) && (opcode == 0x69 || opcode == 0x76 || opcode == 0x79) && !run.gate.everyPacket && deferredLabels().labels.empty()) {
+                if (plainVerifyDue()) {
+                    FlushInputs plainInputs;
+                    const bool drains = (DrawFinisher::Busy() && !PacketRules::keepsDrawFinisher(header, opcode)) || (DrawPipeline::Queue0().Busy() && !PacketRules::keepsDrawPipeline(packet, header, opcode));
+                    notePlainVerify(drains, flushDue(run.gate, plainInputs), submission, cursor);
+                }
+                if (opcode != tagged) {
+                    GuestMemory::SetCurrentPacket(opcode, submission.queue);
+                    tagged = opcode;
+                }
+                if (report) CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
+                recent.Record(cursor);
+                ++plainDone;
+                Pm4::Execute(packet, queue);
+                ++run.gate.skipped;
+                index = next;
+                continue;
+            }
+        }
+        if (plainDone != 0) packetsDone.fetch_add(std::exchange(plainDone, 0), std::memory_order_seq_cst);
         const auto pipelineVerdict = [&] {
             switch (entry.pipeline) {
                 case LeanPacket::Pipeline::Keeps: return true;

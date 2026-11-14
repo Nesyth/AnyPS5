@@ -3878,6 +3878,10 @@ auto CurrentFlushHook() -> void (*)(std::uint64_t, std::size_t) {
     return flushHook.load(std::memory_order_acquire);
 }
 
+auto CurrentReadGuard() -> void (*)(std::uint64_t, std::size_t) {
+    return readGuard.load(std::memory_order_acquire);
+}
+
 void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes)) {
     readGuard.store(guard, std::memory_order_release);
     GuestArena::GuestArenaSetHostReadHook_nid_no_patch(&PrepareHostRead);

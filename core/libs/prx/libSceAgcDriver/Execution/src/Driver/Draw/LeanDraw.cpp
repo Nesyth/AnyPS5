@@ -12,7 +12,10 @@
 #include "Recompiler.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -41,6 +44,47 @@ std::uint32_t userWordCount(std::uint32_t resources) {
 bool allUserWords() {
     static const bool all = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
     return all;
+}
+
+std::uint32_t userWordRegister(std::size_t index) {
+    if (index < 128) return DrawUserWords::Bases[index / 32] + static_cast<std::uint32_t>(index % 32);
+    return index < 130 ? 0x082u + static_cast<std::uint32_t>(index - 128) : 0x102u + static_cast<std::uint32_t>(index - 130);
+}
+
+bool userWordPresent(const DrawUserWords& words, std::size_t index) {
+    return ((words.present[index / 64] >> (index % 64)) & 1u) != 0;
+}
+
+void captureUserWords(DrawUserWords& words, const Registers& shader, bool blocks) {
+    if (!blocks) {
+        words.Capture(shader);
+        return;
+    }
+    words.CaptureBlocks(shader);
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_USER_WORD_BLOCKS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    static std::atomic<std::uint64_t> ordinal{0}, checked{0}, differing{0};
+    static std::atomic<std::int64_t> window{-1};
+    if (every == 0 || ordinal.fetch_add(1, std::memory_order_relaxed) % every != 0) return;
+    checked.fetch_add(1, std::memory_order_relaxed);
+    DrawUserWords today;
+    today.Capture(shader);
+    std::size_t at = 0;
+    while (at < DrawUserWords::Count && today.values[at] == words.values[at] && userWordPresent(today, at) == userWordPresent(words, at)) ++at;
+    std::size_t resource = 0;
+    while (resource < today.resources.size() && today.resources[resource] == words.resources[resource]) ++resource;
+    if (at != DrawUserWords::Count || resource != today.resources.size() || today.present != words.present) {
+        if (differing.fetch_add(1, std::memory_order_relaxed) < 16) {
+            if (at != DrawUserWords::Count) std::fprintf(stderr, "[user-word-blocks-verify] register 0x%x differs: blocks 0x%08x (%s), today 0x%08x (%s)\n", userWordRegister(at), words.values[at], userWordPresent(words, at) ? "set" : "unset", today.values[at], userWordPresent(today, at) ? "set" : "unset");
+            else if (resource != today.resources.size()) std::fprintf(stderr, "[user-word-blocks-verify] resource register 0x%x differs: blocks 0x%08x, today 0x%08x\n", DrawUserWords::ResourceRegisters[resource], words.resources[resource], today.resources[resource]);
+            else std::fprintf(stderr, "[user-word-blocks-verify] the present bits differ past the captured words\n");
+        }
+        words = today;
+    }
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (window.exchange(now, std::memory_order_relaxed) != now) std::fprintf(stderr, "[user-word-blocks-verify] %llu draws checked, %llu differing\n", static_cast<unsigned long long>(checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(differing.load(std::memory_order_relaxed)));
 }
 
 bool runtimeRegister(std::uint32_t offset) {
@@ -487,7 +531,7 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
         job.packetOffset = static_cast<std::uint64_t>(packet.data() - submission.commands.data());
         job.opcode = (packet[0] >> 8u) & 0xffu;
         job.parameters = parameters;
-        job.words.Capture(queue.shader);
+        captureUserWords(job.words, queue.shader, LeanFront::SwitchSet(frontLatch, Graphics::RuntimeSwitch::UserWordBlocks));
         job.drawKey = LeanExactKey(shape, job.words);
         job.shapeKey = shape.finalShape;
         job.deviceSerial = record.deviceSerial;
@@ -538,7 +582,7 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
     job->packetOffset = static_cast<std::uint64_t>(packet.data() - submission.commands.data());
     job->opcode = (packet[0] >> 8u) & 0xffu;
     job->parameters = parameters;
-    job->words.Capture(queue.shader);
+    captureUserWords(job->words, queue.shader, LeanFront::SwitchSet(frontLatch, Graphics::RuntimeSwitch::UserWordBlocks));
     job->drawKey = LeanExactKey(shape, job->words);
     job->shapeKey = shape.finalShape;
     job->deviceSerial = record.deviceSerial;

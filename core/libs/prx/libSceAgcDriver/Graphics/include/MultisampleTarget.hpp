@@ -124,6 +124,7 @@ void ClearMultisampleTargets(VkDevice device);
 std::uint64_t MultisampleTargetRangeGeneration();
 std::uint64_t MultisampleGuardsGeneration();
 bool MayOverlapMultisampleGuards(std::uint64_t address, std::size_t bytes);
+bool ReadGuardIdle(std::uint64_t address, std::size_t bytes);
 std::optional<std::vector<ShaderRecompiler::BdaAbi::Range>> ExcludeMultisampleTargetRanges(
     VkDevice device, std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::uint64_t& generation);
 void InstallResidentImageReadGuard_nid_no_patch();

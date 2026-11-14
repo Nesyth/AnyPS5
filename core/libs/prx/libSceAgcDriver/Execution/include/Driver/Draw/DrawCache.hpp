@@ -90,6 +90,21 @@ struct DrawUserWords {
             resources[index] = found == shader.end() ? 0u : found->second;
         }
     }
+    void CaptureBlocks(const Registers& shader) {
+        present = {};
+        const auto range = [&](std::uint32_t first, std::uint32_t count, std::size_t index) {
+            const auto bits = shader.CopyBlock(first, count, values.data() + index);
+            present[index / 64] |= bits << (index % 64);
+            if (index % 64 + count > 64) present[index / 64 + 1] |= bits >> (64 - index % 64);
+        };
+        for (std::size_t base = 0; base < Bases.size(); ++base) range(Bases[base], 32, 32 * base);
+        range(0x082u, 2, 128);
+        range(0x102u, 2, 130);
+        for (std::size_t index = 0; index < ResourceRegisters.size(); ++index) {
+            const auto found = shader.find(ResourceRegisters[index]);
+            resources[index] = found == shader.end() ? 0u : found->second;
+        }
+    }
 };
 
 void ReadUserWords(const QueueState& queue, DrawProgram& program, bool staticAbi);

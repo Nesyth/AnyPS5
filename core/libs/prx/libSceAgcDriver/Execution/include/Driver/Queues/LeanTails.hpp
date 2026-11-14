@@ -129,6 +129,9 @@ public:
     std::vector<PendingListHit> served;
     std::vector<std::uint8_t> servedBatched;
     std::uint64_t verifyOrdinal = 0;
+    GuestRanges spans;
+    std::vector<std::uint8_t> spanIdle;
+    std::uint64_t hookVerifyOrdinal = 0;
 
 private:
     std::vector<KeptTail> kept;

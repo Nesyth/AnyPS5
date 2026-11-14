@@ -131,6 +131,37 @@ constexpr const char* FinisherNames[9] = {"draw finisher", "draw finisher 2", "d
 
 constexpr unsigned PublishedReadAttempts = 8;
 
+unsigned takingFinishers(std::size_t extras) {
+    unsigned wanted = 1u;
+    for (unsigned index = 1; index <= extras; ++index) wanted |= finisherTakes(index) ? 1u << index : 0u;
+    return wanted;
+}
+
+std::uint64_t parkVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_FINISHER_PARK");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+std::atomic<std::uint64_t> parkVerifyOrdinal{0};
+std::atomic<std::uint64_t> parkVerifyWaits{0};
+std::atomic<std::uint64_t> parkVerifySlices{0};
+std::atomic<std::uint64_t> parkVerifyDiffering{0};
+std::atomic<std::int64_t> parkVerifyWindow{-1};
+
+bool parkVerifyDue() {
+    const auto every = parkVerifyEvery();
+    return every != 0 && parkVerifyOrdinal.fetch_add(1, std::memory_order_relaxed) % every == 0;
+}
+
+void noteParkVerifyCounts() {
+    const std::int64_t window = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (parkVerifyWindow.exchange(window, std::memory_order_relaxed) == window) return;
+    std::fprintf(stderr, "[finisher-park-verify] %llu worker waits checked, %llu slices of 50 ms, %llu differing\n", static_cast<unsigned long long>(parkVerifyWaits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(parkVerifySlices.load(std::memory_order_relaxed)), static_cast<unsigned long long>(parkVerifyDiffering.load(std::memory_order_relaxed)));
+}
+
 #ifdef _WIN32
 const bool hostLargeCacheHooked = [] {
     SetHostLargeCacheQuery(+[] { return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::HostLargeCache); });
@@ -700,7 +731,7 @@ void DrawFinisher::awaitTurn(std::uint64_t seq) {
 
 unsigned DrawFinisher::IdleState() const {
     if (outstanding.load(std::memory_order_acquire) == 0) return 0;
-    if (leanTake.load(std::memory_order_acquire) < leanTail.load(std::memory_order_acquire)) return parked.load(std::memory_order_acquire) != 0 ? 1 : 2;
+    if (leanTake.load(std::memory_order_acquire) < leanTail.load(std::memory_order_acquire)) return parked.load(std::memory_order_acquire) != 0 || parkedSlots.load(std::memory_order_acquire) != 0 ? 1 : 2;
     return 3;
 }
 
@@ -888,6 +919,8 @@ bool DrawFinisher::Adopt(bool ring) {
     frontSeq.store(nextSeq, std::memory_order_release);
     leanFailed.store(false, std::memory_order_release);
     ringMode.store(ring, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (const auto slotted = parkedSlots.load(std::memory_order_seq_cst); slotted != 0) signalSlots(slotted);
     LeanFront::Add(LeanFront::Counter::StoreSwitches);
     return true;
 }
@@ -943,7 +976,8 @@ void DrawFinisher::awaitLeanRoom() {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         {
             auto lock = lockFor(mutex);
-            idle.wait(lock, [&] { return !full(); });
+            if (parkVerifyDue()) verifiedIdleWait(lock, [&] { return !full(); });
+            else idle.wait(lock, [&] { return !full(); });
         }
         frontWaiters.fetch_sub(1, std::memory_order_relaxed);
     }
@@ -962,9 +996,82 @@ void DrawFinisher::awaitLeanIdle() {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     {
         auto lock = lockFor(mutex);
-        idle.wait(lock, [&] { return outstanding.load(std::memory_order_seq_cst) == 0; });
+        if (parkVerifyDue()) verifiedIdleWait(lock, [&] { return outstanding.load(std::memory_order_seq_cst) == 0; });
+        else idle.wait(lock, [&] { return outstanding.load(std::memory_order_seq_cst) == 0; });
     }
     frontWaiters.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void DrawFinisher::verifiedIdleWait(std::unique_lock<std::mutex>& lock, const std::function<bool()>& ready) {
+    parkVerifyWaits.fetch_add(1, std::memory_order_relaxed);
+    bool stuckBefore = false;
+    std::uint64_t stuckTake = 0;
+    while (!idle.wait_for(lock, std::chrono::milliseconds(50), ready)) {
+        parkVerifySlices.fetch_add(1, std::memory_order_relaxed);
+        const auto take = leanTake.load(std::memory_order_seq_cst);
+        const auto tail = leanTail.load(std::memory_order_seq_cst);
+        const auto slotted = parkedSlots.load(std::memory_order_seq_cst);
+        const auto taking = takingFinishers(extra.size()) & started.load(std::memory_order_acquire);
+        const bool stuck = tail > take && idleSpinners.load(std::memory_order_seq_cst) == 0 && wakesInFlight.load(std::memory_order_seq_cst) == 0 && taking != 0 && (slotted & taking) == taking;
+        if (!stuck || !stuckBefore || take != stuckTake) {
+            stuckBefore = stuck;
+            stuckTake = take;
+            continue;
+        }
+        stuckBefore = false;
+        if (parkVerifyDiffering.fetch_add(1, std::memory_order_relaxed) < 16) {
+            std::fprintf(stderr, "[finisher-park-verify] jobs ready for two slices while every taking finisher sleeps in its park slot, none spins and no wake is in flight: front %llu, take %llu, tail %llu, parked 0x%x, taking 0x%x; waking every slot\n", static_cast<unsigned long long>(frontSeq.load(std::memory_order_acquire)), static_cast<unsigned long long>(take), static_cast<unsigned long long>(tail), slotted, taking);
+        }
+        signalSlots(slotted);
+    }
+    noteParkVerifyCounts();
+}
+
+void DrawFinisher::signalSlots(std::uint32_t bits) {
+    for (unsigned index = 0; bits != 0 && index < parkSlots.size(); ++index) {
+        const std::uint32_t bit = 1u << index;
+        if ((bits & bit) == 0) continue;
+        bits &= ~bit;
+        wakesInFlight.fetch_add(1, std::memory_order_seq_cst);
+        if ((parkedSlots.fetch_and(~bit, std::memory_order_seq_cst) & bit) == 0) {
+            wakesInFlight.fetch_sub(1, std::memory_order_seq_cst);
+            continue;
+        }
+        auto& park = parkSlots[index];
+        {
+            const std::lock_guard lock(park.mutex);
+            park.signaled = true;
+        }
+        park.wake.notify_one();
+    }
+}
+
+void DrawFinisher::wakeParked(std::uint32_t slotted, unsigned wanted) {
+    if (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FinisherParkSlots)) {
+        signalSlots(slotted);
+        return;
+    }
+    if ((slotted & ~wanted) != 0) signalSlots(slotted & ~wanted);
+    const std::uint32_t taking = slotted & wanted;
+    if (taking == 0) return;
+    const auto take = leanTake.load(std::memory_order_seq_cst);
+    const auto tail = leanTail.load(std::memory_order_seq_cst);
+    if (tail <= take) return;
+    const std::uint64_t awake = std::uint64_t{idleSpinners.load(std::memory_order_seq_cst)} + wakesInFlight.load(std::memory_order_seq_cst);
+    if (tail - take > awake) signalSlots(taking & (~taking + 1u));
+}
+
+bool DrawFinisher::parkInSlot(unsigned index) {
+    auto& park = parkSlots[index];
+    const std::uint32_t bit = 1u << index;
+    std::unique_lock lock(park.mutex);
+    parkedSlots.fetch_or(bit, std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const bool stays = !closed.load(std::memory_order_seq_cst) && !leanReady() && untakenJobs.load(std::memory_order_seq_cst) == 0 && finisherTakes(index) && ringMode.load(std::memory_order_seq_cst) && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FinisherParkSlots);
+    if (!stays && (parkedSlots.fetch_and(~bit, std::memory_order_seq_cst) & bit) != 0) return false;
+    park.wake.wait(lock, [&] { return park.signaled; });
+    park.signaled = false;
+    return true;
 }
 
 void DrawFinisher::publishLean(LeanSlot& slot) {
@@ -992,6 +1099,7 @@ void DrawFinisher::publishLean(LeanSlot& slot) {
         const auto lock = lockFor(mutex);
         dormantWake.notify_all();
     }
+    if (const auto slotted = parkedSlots.load(std::memory_order_seq_cst); slotted != 0) wakeParked(slotted, wanted);
     if (parked.load(std::memory_order_relaxed) == 0) return;
     const auto lock = lockFor(mutex);
     if (spinHandoff() && sleepers == 1) wake.notify_one();
@@ -1315,19 +1423,36 @@ void DrawFinisher::run(unsigned index) {
     PerformanceTrace::BindThread(FinisherNames[index]);
     if (index == 0) StartFinisherSampler();
     ThreadReport::Clock::time_point lastEnd{};
+    bool woken = false;
     for (;;) {
         std::uint64_t leanSeq = 0;
-        if (takeLean(index, leanSeq)) {
+        const bool took = takeLean(index, leanSeq);
+        const bool wasWoken = std::exchange(woken, false);
+        if (wasWoken) wakesInFlight.fetch_sub(1, std::memory_order_seq_cst);
+        if (took) {
+            if (parkedSlots.load(std::memory_order_relaxed) != 0) wakeParked(parkedSlots.load(std::memory_order_seq_cst), takingFinishers(extra.size()));
             runLean(leanSeq, lastEnd);
             continue;
         }
         Slot* slot = nullptr;
         bool failed = false;
+        const bool slots = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FinisherParkSlots) && ringMode.load(std::memory_order_acquire) && finisherTakes(index) && !closed.load(std::memory_order_acquire);
+        if (slots) idleSpinners.fetch_add(1, std::memory_order_seq_cst);
         if (finisherTakes(index) && spinHandoff()) SpinUntil(HandoffSpinWindow(), [&] { return untakenJobs.load(std::memory_order_acquire) != 0 || leanReady(); });
         else if (finisherTakes(index)) SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
+        if (slots) idleSpinners.fetch_sub(1, std::memory_order_seq_cst);
         if (takeLean(index, leanSeq)) {
+            if (parkedSlots.load(std::memory_order_relaxed) != 0) wakeParked(parkedSlots.load(std::memory_order_seq_cst), takingFinishers(extra.size()));
             runLean(leanSeq, lastEnd);
             continue;
+        }
+        if (slots && finisherTakes(index)) {
+            woken = parkInSlot(index);
+            continue;
+        }
+        if (slots || wasWoken) {
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (const auto slotted = parkedSlots.load(std::memory_order_seq_cst); slotted != 0 && leanReady()) wakeParked(slotted, takingFinishers(extra.size()));
         }
         {
             auto lock = lockFor(mutex);
@@ -1466,6 +1591,8 @@ void DrawFinisher::Stop() {
         finishers[0] = std::move(thread);
         for (std::size_t index = 0; index < extra.size(); ++index) finishers[index + 1] = std::move(extra[index]);
     }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (const auto slotted = parkedSlots.load(std::memory_order_seq_cst); slotted != 0) signalSlots(slotted);
     wake.notify_all();
     dormantWake.notify_all();
     turnWake.notify_all();

@@ -1149,6 +1149,10 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
 
 }
 
+bool Recorder::FlushHookIdle(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    return GuestMemory::CurrentFlushHook() == &FlushForAccess && HookSnapshotEnabled() && !HookFlushCpuBlocks() && completionDepth() == 0 && ReadsSettled(ranges, nullptr);
+}
+
 static bool CheckpointMarkersEnabled() {
     static const bool enabled = std::getenv("APS5_GPU_CHECKPOINTS") != nullptr;
     return enabled;
