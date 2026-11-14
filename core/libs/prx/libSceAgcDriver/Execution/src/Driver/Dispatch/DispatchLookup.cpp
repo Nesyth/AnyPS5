@@ -1,11 +1,300 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
+#include <atomic>
 #include <cstdlib>
+#include <cstring>
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering) {
+namespace {
+
+enum RelocationOutcome : std::size_t { RelocatedHit, RelocatedDescriptors, RelocatedPush, RelocatedDiffering, RelocatedRefused, RelocatedNoShape, RelocatedNoAlias, RelocatedIdle, RelocatedExactPatched, RelocationOutcomes };
+enum MissWord : std::size_t { MissBase, MissAddress, MissUnused, MissForwarded, MissValue, MissOther, MissWords };
+
+struct RelocationCensus {
+    std::array<std::atomic<std::uint64_t>, RelocationOutcomes> outcomes{};
+    std::array<std::atomic<std::uint64_t>, MissWords> words{};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+RelocationCensus& Relocations() {
+    static RelocationCensus census;
+    return census;
+}
+
+void reportRelocations() {
+    auto& census = Relocations();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = census.lastReport.load();
+    if (last == 0) {
+        census.lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !census.lastReport.compare_exchange_strong(last, nowMs)) return;
+    std::array<unsigned long long, RelocationOutcomes> outcome{};
+    for (std::size_t index = 0; index < outcome.size(); ++index) outcome[index] = static_cast<unsigned long long>(census.outcomes[index].exchange(0, std::memory_order_relaxed));
+    std::array<unsigned long long, MissWords> word{};
+    for (std::size_t index = 0; index < word.size(); ++index) word[index] = static_cast<unsigned long long>(census.words[index].exchange(0, std::memory_order_relaxed));
+    const auto misses = outcome[RelocatedHit] + outcome[RelocatedDiffering] + outcome[RelocatedRefused] + outcome[RelocatedNoShape] + outcome[RelocatedNoAlias] + outcome[RelocatedIdle];
+    std::fprintf(stderr, "[dispatch-relocate] (10 s) %llu exact misses: %llu relocated hits (%llu with patched descriptors, %llu with patched push words), %llu relocated but differing, %llu with moves the donors refuse, %llu with no shape, %llu with no alias, %llu with the trial idle; misses by the user words that differ from the program's last insert: base %llu, buffer address %llu, unused %llu, forwarded %llu, walked value %llu, other %llu; %llu exact hits served through a patched copy\n", misses, outcome[RelocatedHit], outcome[RelocatedDescriptors], outcome[RelocatedPush], outcome[RelocatedDiffering], outcome[RelocatedRefused], outcome[RelocatedNoShape], outcome[RelocatedNoAlias], outcome[RelocatedIdle], word[MissBase], word[MissAddress], word[MissUnused], word[MissForwarded], word[MissValue], word[MissOther], outcome[RelocatedExactPatched]);
+}
+
+bool ElementWritten(const ShaderRecompiler::RecompileResult& compiled, std::uint32_t binding, std::uint32_t word) {
+    if (binding >= compiled.bindings.size()) return true;
+    const auto& target = compiled.bindings[binding];
+    const auto element = word / 4u;
+    return element >= target.bufferWritten.size() || target.bufferWritten[element];
+}
+
+}
+
+bool Driver::dispatchCensusEnabled() {
+    static const bool census = std::getenv("APS5_DISPATCH_CENSUS") != nullptr;
+    return census;
+}
+
+void Driver::noteDispatchRelocation(std::size_t outcome, std::uint64_t identity, std::span<const std::uint32_t> userData) {
+    if (!dispatchCensusEnabled()) return;
+    auto& census = Relocations();
+    census.outcomes[outcome].fetch_add(1, std::memory_order_relaxed);
+    if (outcome != RelocatedHit && outcome != RelocatedDescriptors && outcome != RelocatedPush && outcome != RelocatedExactPatched) {
+        std::array<bool, MissWords> seen{};
+        {
+            std::lock_guard cacheLock(dispatchCacheMutex);
+            const auto found = dispatchRelocations.find(identity);
+            if (found == dispatchRelocations.end() || found->second.lastUserData.size() != userData.size()) {
+                seen[MissOther] = true;
+            } else {
+                const auto& shape = found->second;
+                for (std::size_t index = 0; index < userData.size(); ++index) {
+                    if (shape.lastUserData[index] == userData[index]) continue;
+                    const auto bit = index < 64 ? std::uint64_t{1} << index : std::uint64_t{0};
+                    const auto kind = (shape.lastAddresses & bit) != 0 ? MissAddress : (shape.lastRelocatable & bit) != 0 ? MissBase : (shape.lastUnused & bit) != 0 ? MissUnused : (shape.lastForwarded & bit) != 0 ? MissForwarded : (shape.lastValues & bit) != 0 ? MissValue : MissOther;
+                    seen[kind] = true;
+                }
+            }
+        }
+        for (std::size_t kind = 0; kind < MissWords; ++kind) {
+            if (seen[kind]) census.words[kind].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    reportRelocations();
+}
+
+std::shared_ptr<DispatchVariant> Driver::relocatedCopy(const std::shared_ptr<DispatchVariant>& variant, std::span<const std::uint32_t> userData, bool requireMoves) {
+    const auto& donor = *variant;
+    if (donor.compiled == nullptr || donor.userData.size() != userData.size()) return nullptr;
+    std::uint64_t moves = 0;
+    for (std::size_t index = 0; index < userData.size(); ++index) {
+        const auto from = donor.userData[index];
+        const auto to = userData[index];
+        if (from == to) continue;
+        if (index >= 64) return nullptr;
+        const auto bit = std::uint64_t{1} << index;
+        if (((donor.relocatableWords | donor.addressWords) & bit) != 0) {
+            if (from == 0 || to == 0 || ((from ^ to) & 3u) != 0) return nullptr;
+        } else if ((donor.unusedWords & bit) == 0) {
+            return nullptr;
+        }
+        moves |= bit;
+    }
+    if (moves == 0 && requireMoves) return nullptr;
+    auto copy = std::make_shared<DispatchVariant>();
+    copy->runs = donor.runs;
+    copy->runBases = donor.runBases;
+    copy->words = donor.words;
+    copy->forgetSerial = donor.forgetSerial;
+    copy->compiled = donor.compiled;
+    copy->registeredViews = donor.registeredViews;
+    copy->shader = donor.shader;
+    copy->dataPositions = donor.dataPositions;
+    copy->dataSlots = donor.dataSlots;
+    copy->flatBinding = donor.flatBinding;
+    copy->pushOffset = donor.pushOffset;
+    copy->relocatableWords = donor.relocatableWords;
+    copy->userWordsWalked = donor.userWordsWalked;
+    copy->addressWords = donor.addressWords;
+    copy->unusedWords = donor.unusedWords;
+    copy->addressForwards = donor.addressForwards;
+    copy->addressPositions = donor.addressPositions;
+    copy->userData.assign(userData.begin(), userData.end());
+    copy->donor = donor.donor != nullptr ? donor.donor : variant;
+    copy->relocated = true;
+    const auto& compiled = *donor.compiled;
+    for (std::uint32_t index = 0; index < 64 && index < userData.size(); ++index) {
+        if ((moves >> index & 1u) == 0) continue;
+        const auto from = donor.userData[index];
+        const auto to = userData[index];
+        if ((donor.relocatableWords >> index & 1u) != 0) {
+            const auto delta = static_cast<std::uint64_t>(to & ~3u) - static_cast<std::uint64_t>(from & ~3u);
+            for (std::size_t run = 0; run < copy->runs.size() && run < copy->runBases.size(); ++run) {
+                if (copy->runBases[run] != static_cast<std::int8_t>(index)) continue;
+                copy->runs[run].first += delta;
+                copy->runs[run].second += delta;
+            }
+        }
+        for (std::uint32_t slot = 0; slot < compiled.shaderDataUserWords.size(); ++slot) {
+            if (compiled.shaderDataUserWords[slot] == index) copy->shaderDataPatches.emplace_back(slot, to);
+        }
+        for (const auto& [word, binding, position] : donor.addressForwards) {
+            if (word != index) continue;
+            copy->descriptorPatches.push_back({binding, position, to});
+            copy->descriptorsPatched = true;
+            copy->writtenPatched = copy->writtenPatched || ElementWritten(compiled, binding, position);
+        }
+    }
+    return copy;
+}
+
+std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::patchRelocated(DispatchVariant& copy, const DispatchVariant& donor, std::vector<std::uint32_t>& liveWords, std::span<const std::pair<std::uint32_t, std::uint32_t>> live) {
+    auto result = std::make_shared<ShaderRecompiler::RecompileResult>(*donor.compiled);
+    for (const auto& [slot, value] : copy.shaderDataPatches) patchForwardedWord(*result, slot, value);
+    for (const auto& [binding, word, value] : copy.descriptorPatches) {
+        if (binding < result->bindings.size() && word < result->bindings[binding].guestDescriptor.size()) result->bindings[binding].guestDescriptor[word] = value;
+    }
+    if (!live.empty() && copy.flatBinding < result->bindings.size()) {
+        auto& descriptor = result->bindings[copy.flatBinding].guestDescriptor;
+        for (std::size_t k = 0; k < copy.dataPositions.size() && k < copy.dataSlots.size(); ++k) {
+            if (copy.dataSlots[k] < descriptor.size() && copy.dataPositions[k] < liveWords.size()) descriptor[copy.dataSlots[k]] = liveWords[copy.dataPositions[k]];
+        }
+    }
+    for (const auto& [position, value] : live) {
+        for (const auto& entry : copy.addressPositions) {
+            if (entry.position != position || entry.binding >= result->bindings.size() || entry.word >= result->bindings[entry.binding].guestDescriptor.size()) continue;
+            auto& word = result->bindings[entry.binding].guestDescriptor[entry.word];
+            const auto patched = (word & ~entry.mask) | (value & entry.mask);
+            if (patched == word) continue;
+            word = patched;
+            copy.descriptorsPatched = true;
+            copy.writtenPatched = copy.writtenPatched || ElementWritten(*donor.compiled, entry.binding, entry.word);
+        }
+    }
+    return result;
+}
+
+void Driver::inheritRelocatedRecipe(DispatchVariant& copy, const DispatchVariant& donor) {
+    const auto recipe = donor.recipe.load(std::memory_order_acquire);
+    if (recipe == nullptr || copy.compiled == nullptr || donor.compiled == nullptr) return;
+    const bool plain = !copy.descriptorsPatched && copy.compiled->pushConstants == donor.compiled->pushConstants;
+    const bool moves = recipe->moves && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchMovedRecipes) && (!copy.writtenPatched || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchMovedWrites));
+    if (plain || moves) copy.recipe.store(recipe, std::memory_order_release);
+}
+
+bool Driver::relocateDispatch(std::uint64_t address, const Submission& submission, std::uint64_t identity, const DispatchAliasOf& aliasOf, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> memory, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords) {
+    constexpr std::uint32_t TrialWindow = 128;
+    constexpr std::uint32_t TrialRest = 2048;
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<DispatchEntry>>> donors;
+    auto outcome = RelocatedNoAlias;
+    {
+        std::lock_guard cacheLock(dispatchCacheMutex);
+        const auto shaped = dispatchRelocations.find(identity);
+        if (shaped == dispatchRelocations.end()) {
+            outcome = RelocatedNoShape;
+        } else if (shaped->second.idle != 0) {
+            --shaped->second.idle;
+            outcome = RelocatedIdle;
+        } else if (const auto found = dispatchAliases.find(aliasOf(shaped->second)); found != dispatchAliases.end()) {
+            for (auto& key : found->second) {
+                if (key == 0) continue;
+                const auto entry = dispatchCache.find(key);
+                if (entry == dispatchCache.end()) {
+                    key = 0;
+                    continue;
+                }
+                donors.emplace_back(key, entry->second);
+            }
+            std::stable_partition(found->second.begin(), found->second.end(), [](std::uint64_t key) { return key != 0; });
+            if (donors.empty()) dispatchAliases.erase(found);
+        }
+    }
+    if (donors.empty()) {
+        if (outcome == RelocatedNoAlias) {
+            std::lock_guard cacheLock(dispatchCacheMutex);
+            if (const auto shaped = dispatchRelocations.find(identity); shaped != dispatchRelocations.end() && ++shaped->second.lookups >= TrialWindow) {
+                if (shaped->second.hits * 8u < shaped->second.lookups) shaped->second.idle = TrialRest;
+                shaped->second.lookups = 0;
+                shaped->second.hits = 0;
+            }
+        }
+        noteDispatchRelocation(outcome, identity, userData);
+        return false;
+    }
+    outcome = RelocatedRefused;
+    std::optional<SampledReadScope> sampling;
+    std::uint64_t imagesFlushed = 0, runsSynced = 0;
+    std::vector<ShaderRecompiler::MemoryRegion> regions;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
+    std::shared_ptr<DispatchVariant> hit;
+    std::shared_ptr<DispatchVariant> hitDonor;
+    std::uint64_t hitKey = 0;
+    std::shared_ptr<DispatchEntry> hitEntry;
+    for (const auto& [key, entry] : donors) {
+        for (const auto& variant : entry->variants) {
+            if (variant == nullptr || variant->shader != registeredShader) continue;
+            if (variant->registeredViews != nullptr && !CaptureRegisteredViewsCurrent(*variant->registeredViews)) continue;
+            auto copy = relocatedCopy(variant, userData);
+            if (copy == nullptr) continue;
+            regions.clear();
+            appendEntryRegions(*copy, regions);
+            const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DispatchCache);
+            const auto result = validateVariant(address, submission.queue, *copy, regions, imagesFlushed, runsSynced, sampling, &liveData, true);
+            if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) {
+                outcome = RelocatedDiffering;
+                continue;
+            }
+            hit = std::move(copy);
+            hitDonor = variant;
+            hitKey = key;
+            hitEntry = entry;
+            break;
+        }
+        if (hit != nullptr) break;
+    }
+    if (hit != nullptr) {
+        liveWords = hit->words;
+        for (const auto& [position, value] : liveData) liveWords[position] = value;
+        regions.clear();
+        appendEntryRegions(*hit, regions, &liveWords);
+        compiledResult = patchRelocated(*hit, *hitDonor, liveWords, liveData);
+        hit->compiled = compiledResult;
+        inheritRelocatedRecipe(*hit, *hitDonor);
+        captured.reserve(memory.size() + regions.size());
+        captured.assign(memory.begin(), memory.end());
+        captured.insert(captured.end(), regions.begin(), regions.end());
+        const bool pushPatched = compiledResult->pushConstants != hitDonor->compiled->pushConstants;
+        const bool descriptorsPatched = hit->descriptorsPatched;
+        keepVariant = std::move(hit);
+        outcome = RelocatedHit;
+        {
+            std::lock_guard cacheLock(dispatchCacheMutex);
+            ++dispatchCacheHits;
+            if (const auto again = dispatchCache.find(hitKey); again != dispatchCache.end() && again->second == hitEntry && dispatchCacheHits - hitEntry->touched > dispatchCacheEntries() / 8) {
+                dispatchOrder.splice(dispatchOrder.begin(), dispatchOrder, hitEntry->order);
+                hitEntry->touched = dispatchCacheHits;
+            }
+        }
+        if (descriptorsPatched) noteDispatchRelocation(RelocatedDescriptors, identity, userData);
+        if (pushPatched) noteDispatchRelocation(RelocatedPush, identity, userData);
+    }
+    {
+        std::lock_guard cacheLock(dispatchCacheMutex);
+        if (const auto shaped = dispatchRelocations.find(identity); shaped != dispatchRelocations.end()) {
+            if (outcome == RelocatedHit) ++shaped->second.hits;
+            if (++shaped->second.lookups >= TrialWindow) {
+                if (shaped->second.hits * 8u < shaped->second.lookups) shaped->second.idle = TrialRest;
+                shaped->second.lookups = 0;
+                shaped->second.hits = 0;
+            }
+        }
+    }
+    noteDispatchRelocation(outcome, identity, userData);
+    return outcome == RelocatedHit;
+}
+
+void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering, bool relocate) {
     if (!noDispatchCache) {
 
         static const bool validateUnlocked = std::getenv("APS5_NO_UNLOCKED_VALIDATE") == nullptr;
@@ -42,10 +331,10 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                     regions.clear();
                     appendEntryRegions(*variants[i], regions);
                     ++compared;
-                    auto result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData);
+                    auto result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, relocate);
 
                     if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) {
-                        result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData);
+                        result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, relocate);
                         ++(result == EntryOutcome::Equal || result == EntryOutcome::EqualData ? retriesEqual : retriesMoved);
                     }
                     if (i == 0) outcome = result;
@@ -122,6 +411,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 case EntryOutcome::ForgetMoved: ++counters.forgetMoved; break;
                 case EntryOutcome::DeviceImageFallback: ++counters.deviceImageFallbacks; break;
             }
+            std::shared_ptr<DispatchVariant> patchedCopy;
             if (current) {
                 ++counters.variantHitsByRank[rank];
                 compiledResult = variant->compiled;
@@ -129,9 +419,18 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
 
                     liveWords = variant->words;
                     for (const auto& [position, value] : liveData) liveWords[position] = value;
+                    const bool addressMoved = relocate && !variant->addressPositions.empty() && std::any_of(liveData.begin(), liveData.end(), [&](const std::pair<std::uint32_t, std::uint32_t>& entry) { return std::any_of(variant->addressPositions.begin(), variant->addressPositions.end(), [&](const DispatchAddressPosition& held) { return held.position == entry.first; }); });
+                    if (addressMoved) patchedCopy = relocatedCopy(variant, variant->userData, false);
                     regions.clear();
-                    appendEntryRegions(*variant, regions, &liveWords);
-                    compiledResult = patchDataWords(*variant, liveWords);
+                    appendEntryRegions(patchedCopy != nullptr ? *patchedCopy : *variant, regions, &liveWords);
+                    if (patchedCopy != nullptr) {
+                        compiledResult = patchRelocated(*patchedCopy, *variant, liveWords, liveData);
+                        patchedCopy->compiled = compiledResult;
+                        inheritRelocatedRecipe(*patchedCopy, *variant);
+                        noteDispatchRelocation(RelocatedExactPatched, 0, {});
+                    } else {
+                        compiledResult = patchDataWords(*variant, liveWords);
+                    }
                     ++counters.dataHits;
                     counters.dataWordsRefreshed += liveData.size();
                     ++counters.dataHitsByRank[rank];
@@ -145,7 +444,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                     captured.insert(captured.end(), regions.begin(), regions.end());
                     if (variant->forgetSerial != GuestMemory::ForgetSerial()) ++counters.forgetSinceInsert;
                 }
-                keepVariant = variant;
+                keepVariant = patchedCopy != nullptr ? patchedCopy : variant;
                 cached = true;
                 ++dispatchCacheHits;
                 if (untouched) {

@@ -157,7 +157,7 @@ bool Driver::vouchedValidation() {
     return enabled;
 }
 
-EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live) {
+EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, bool addresses) {
     if (live != nullptr) live->clear();
     if (variant.compiled->deviceImageTables) {
         const auto localDevice = device.Load();
@@ -170,8 +170,8 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
             pipeline.Drain(DrawPipeline::DrainReason::Capture);
         }
     }
-    const bool masked = live != nullptr && !variant.dataPositions.empty();
-    const DataMask mask{variant.dataPositions, live};
+    const bool masked = live != nullptr && (!variant.dataPositions.empty() || (addresses && !variant.addressPositions.empty()));
+    const DataMask mask{variant.dataPositions, live, addresses ? std::span<const DispatchAddressPosition>(variant.addressPositions) : std::span<const DispatchAddressPosition>{}};
     struct VouchedStorage {};
     auto& vouched = HostThreadLocal<std::vector<VouchedRegions>, VouchedStorage>();
     vouched.clear();

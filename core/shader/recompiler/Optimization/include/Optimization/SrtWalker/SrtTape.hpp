@@ -36,6 +36,24 @@ public:
     };
     std::vector<ReadForward> ReadForwards(const IrResourcePlan& plan) const;
 
+    struct ReadBase {
+        std::uint32_t parent = 0;
+        std::uint32_t child = 0;
+    };
+    static constexpr std::uint8_t UseForward = 1;
+    static constexpr std::uint8_t UseBase = 2;
+    static constexpr std::uint8_t UseReadArgument = 4;
+    static constexpr std::uint8_t UseArgument = 8;
+    static constexpr std::uint8_t UseCondition = 16;
+    static constexpr std::uint8_t UseClean = 32;
+    static constexpr std::uint8_t UseDwordKept = 64;
+    struct ReadUses {
+        std::vector<ReadForward> forwards;
+        std::vector<ReadBase> bases;
+        std::vector<std::uint8_t> flags;
+    };
+    ReadUses ChainedReadUses(const IrResourcePlan& plan) const;
+
 private:
     friend class SrtTapeCompiler;
     static std::shared_ptr<const SrtTape> Compile(const IrResourcePlan& plan);

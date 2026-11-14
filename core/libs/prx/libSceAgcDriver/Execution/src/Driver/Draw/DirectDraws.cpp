@@ -19,12 +19,14 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/SrtWalker.hpp"
+#include "Optimization/SrtWalker/SrtAddressArithmetic.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include <cstdio>
 #include <atomic>
 #include <algorithm>
 #include <new>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -138,9 +140,21 @@ struct InvocationSlot {
 
 struct InvocationCache {
     std::array<InvocationSlot, InvocationSlots> slots;
+    std::array<std::uint8_t, InvocationSlots / 2> recent{};
     std::vector<std::uint64_t> key;
 
-    InvocationSlot& For(const DrawProgram& program) { return slots[mixedSlot(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(program.snapshot.get())), program.codeOffset, InvocationSlots)]; }
+    InvocationSlot& For(const DrawProgram& program) {
+        const auto snapshot = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(program.snapshot.get()));
+        if (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoInvocationWays)) return slots[mixedSlot(snapshot, program.codeOffset, InvocationSlots)];
+        const auto set = mixedSlot(snapshot, program.codeOffset, InvocationSlots / 2u);
+        auto* const ways = slots.data() + set * 2u;
+        for (std::uint8_t way = 0; way < 2u; ++way) {
+            if (ways[way].snapshot.get() != program.snapshot.get() || ways[way].codeOffset != program.codeOffset) continue;
+            recent[set] = way;
+            return ways[way];
+        }
+        return ways[recent[set] ^ 1u];
+    }
 };
 
 struct InvocationCacheStorage {};
@@ -768,7 +782,7 @@ std::uint64_t DirectStores::Follow(std::uint64_t serial) {
     auto live = Graphics::RuntimeSwitches::Snapshot();
     // Switches that change only what the committer does with a hit, or only dispatch packets,
     // leave the stages and classes as they are, so an in-run A/B of one keeps the stores.
-    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic, Graphics::RuntimeSwitch::CommitFragments, Graphics::RuntimeSwitch::ExpressCommits, Graphics::RuntimeSwitch::XpStreamSegments, Graphics::RuntimeSwitch::XpNoEagerStore, Graphics::RuntimeSwitch::LabelOrderedStores, Graphics::RuntimeSwitch::DeeperRing, Graphics::RuntimeSwitch::BesideSampleDumps, Graphics::RuntimeSwitch::DispatchBeside, Graphics::RuntimeSwitch::FaultFragments, Graphics::RuntimeSwitch::StageMemo, Graphics::RuntimeSwitch::KeepFaultSlots, Graphics::RuntimeSwitch::SiblingFinishers, Graphics::RuntimeSwitch::FastSettle, Graphics::RuntimeSwitch::XpSlowFinisher, Graphics::RuntimeSwitch::XpSlowCommitter, Graphics::RuntimeSwitch::XpSlowWorker, Graphics::RuntimeSwitch::XpExpressFloor, Graphics::RuntimeSwitch::LeanExpress, Graphics::RuntimeSwitch::XpAppendCommits, Graphics::RuntimeSwitch::PreciseSettle, Graphics::RuntimeSwitch::AppendCommits, Graphics::RuntimeSwitch::StageMemoPatchVertex, Graphics::RuntimeSwitch::StageMemoPatchBuffers, Graphics::RuntimeSwitch::StageMemoPatchData, Graphics::RuntimeSwitch::RunFollow, Graphics::RuntimeSwitch::TurnWaitsByJob, Graphics::RuntimeSwitch::ExpressKeepState, Graphics::RuntimeSwitch::StageMemoFront, Graphics::RuntimeSwitch::StageMemoAdmitThird, Graphics::RuntimeSwitch::CommitStamps, Graphics::RuntimeSwitch::PassReadsOnce, Graphics::RuntimeSwitch::ReapThrottle, Graphics::RuntimeSwitch::OcclusionWindows, Graphics::RuntimeSwitch::ExpressPassStamps, Graphics::RuntimeSwitch::PassBarriersMerged, Graphics::RuntimeSwitch::LabelReadbackMemo, Graphics::RuntimeSwitch::ExpressTargetUploads, Graphics::RuntimeSwitch::DrawRuns, Graphics::RuntimeSwitch::LargeBatches, Graphics::RuntimeSwitch::ReplayStateDedupe, Graphics::RuntimeSwitch::RunFollowNoCarry, Graphics::RuntimeSwitch::RunFollowPlainLoop, Graphics::RuntimeSwitch::FinisherParkSlots, Graphics::RuntimeSwitch::ListHooksOnce, Graphics::RuntimeSwitch::DispatchEnvOnce, Graphics::RuntimeSwitch::PlainRegisterPackets, Graphics::RuntimeSwitch::UserWordBlocks, Graphics::RuntimeSwitch::XpDeviceUploads, Graphics::RuntimeSwitch::XpDepthLayouts, Graphics::RuntimeSwitch::XpTargetRestarts, Graphics::RuntimeSwitch::TargetRestarts, Graphics::RuntimeSwitch::MovedInPlace, Graphics::RuntimeSwitch::IndirectInPass, Graphics::RuntimeSwitch::FragmentOwnSets, Graphics::RuntimeSwitch::DirectBuffersInPlace, Graphics::RuntimeSwitch::DirectGpuIndirect, Graphics::RuntimeSwitch::ExpressGpuIndirect, Graphics::RuntimeSwitch::RegisterRuns, Graphics::RuntimeSwitch::ListRegisterPackets, Graphics::RuntimeSwitch::PacketClassTable, Graphics::RuntimeSwitch::RangeMemo, Graphics::RuntimeSwitch::PendingIndexKept, Graphics::RuntimeSwitch::FillImageIndex, Graphics::RuntimeSwitch::WatchedReaps, Graphics::RuntimeSwitch::DeferredBatchStamps, Graphics::RuntimeSwitch::StageViews, Graphics::RuntimeSwitch::StageMemoLeanStores, Graphics::RuntimeSwitch::SettleSerial, Graphics::RuntimeSwitch::FragmentPlans, Graphics::RuntimeSwitch::BufferBlobAppend, Graphics::RuntimeSwitch::ShapePrologue, Graphics::RuntimeSwitch::DirectHandoff, Graphics::RuntimeSwitch::InputsMemo, Graphics::RuntimeSwitch::WorkerHelps}) live.Assign(id, false);
+    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic, Graphics::RuntimeSwitch::CommitFragments, Graphics::RuntimeSwitch::ExpressCommits, Graphics::RuntimeSwitch::XpStreamSegments, Graphics::RuntimeSwitch::XpNoEagerStore, Graphics::RuntimeSwitch::LabelOrderedStores, Graphics::RuntimeSwitch::DeeperRing, Graphics::RuntimeSwitch::BesideSampleDumps, Graphics::RuntimeSwitch::DispatchBeside, Graphics::RuntimeSwitch::FaultFragments, Graphics::RuntimeSwitch::StageMemo, Graphics::RuntimeSwitch::KeepFaultSlots, Graphics::RuntimeSwitch::SiblingFinishers, Graphics::RuntimeSwitch::FastSettle, Graphics::RuntimeSwitch::XpSlowFinisher, Graphics::RuntimeSwitch::XpSlowCommitter, Graphics::RuntimeSwitch::XpSlowWorker, Graphics::RuntimeSwitch::XpExpressFloor, Graphics::RuntimeSwitch::LeanExpress, Graphics::RuntimeSwitch::XpAppendCommits, Graphics::RuntimeSwitch::PreciseSettle, Graphics::RuntimeSwitch::AppendCommits, Graphics::RuntimeSwitch::StageMemoPatchVertex, Graphics::RuntimeSwitch::StageMemoPatchBuffers, Graphics::RuntimeSwitch::StageMemoPatchData, Graphics::RuntimeSwitch::RunFollow, Graphics::RuntimeSwitch::TurnWaitsByJob, Graphics::RuntimeSwitch::ExpressKeepState, Graphics::RuntimeSwitch::StageMemoFront, Graphics::RuntimeSwitch::StageMemoAdmitThird, Graphics::RuntimeSwitch::CommitStamps, Graphics::RuntimeSwitch::PassReadsOnce, Graphics::RuntimeSwitch::ReapThrottle, Graphics::RuntimeSwitch::OcclusionWindows, Graphics::RuntimeSwitch::ExpressPassStamps, Graphics::RuntimeSwitch::PassBarriersMerged, Graphics::RuntimeSwitch::LabelReadbackMemo, Graphics::RuntimeSwitch::ExpressTargetUploads, Graphics::RuntimeSwitch::DrawRuns, Graphics::RuntimeSwitch::LargeBatches, Graphics::RuntimeSwitch::ReplayStateDedupe, Graphics::RuntimeSwitch::RunFollowNoCarry, Graphics::RuntimeSwitch::RunFollowPlainLoop, Graphics::RuntimeSwitch::FinisherParkSlots, Graphics::RuntimeSwitch::ListHooksOnce, Graphics::RuntimeSwitch::DispatchEnvOnce, Graphics::RuntimeSwitch::PlainRegisterPackets, Graphics::RuntimeSwitch::UserWordBlocks, Graphics::RuntimeSwitch::XpDeviceUploads, Graphics::RuntimeSwitch::XpDepthLayouts, Graphics::RuntimeSwitch::XpTargetRestarts, Graphics::RuntimeSwitch::TargetRestarts, Graphics::RuntimeSwitch::MovedInPlace, Graphics::RuntimeSwitch::IndirectInPass, Graphics::RuntimeSwitch::FragmentOwnSets, Graphics::RuntimeSwitch::DirectBuffersInPlace, Graphics::RuntimeSwitch::DirectGpuIndirect, Graphics::RuntimeSwitch::ExpressGpuIndirect, Graphics::RuntimeSwitch::RegisterRuns, Graphics::RuntimeSwitch::ListRegisterPackets, Graphics::RuntimeSwitch::PacketClassTable, Graphics::RuntimeSwitch::RangeMemo, Graphics::RuntimeSwitch::PendingIndexKept, Graphics::RuntimeSwitch::FillImageIndex, Graphics::RuntimeSwitch::WatchedReaps, Graphics::RuntimeSwitch::DeferredBatchStamps, Graphics::RuntimeSwitch::StageViews, Graphics::RuntimeSwitch::StageMemoLeanStores, Graphics::RuntimeSwitch::SettleSerial, Graphics::RuntimeSwitch::FragmentPlans, Graphics::RuntimeSwitch::BufferBlobAppend, Graphics::RuntimeSwitch::ShapePrologue, Graphics::RuntimeSwitch::DirectHandoff, Graphics::RuntimeSwitch::InputsMemo, Graphics::RuntimeSwitch::WorkerHelps, Graphics::RuntimeSwitch::DispatchMovedWrites, Graphics::RuntimeSwitch::DispatchRelocate, Graphics::RuntimeSwitch::DispatchMovedRecipes, Graphics::RuntimeSwitch::StageMemoPatchMerged, Graphics::RuntimeSwitch::StageMemoChained, Graphics::RuntimeSwitch::StageMemoAdmitWays, Graphics::RuntimeSwitch::StageMemoInvocationWays}) live.Assign(id, false);
     if (!tagged || deviceSerial != serial || !(live == switches)) {
         tagged = true;
         deviceSerial = serial;
@@ -935,6 +949,7 @@ struct StageMemoRoot {
     std::uint16_t origin = 0;
     std::uint8_t aligned = 0;
     std::uint8_t words = 1;
+    std::uint8_t chained = 0;
 
     bool operator==(const StageMemoRoot& other) const = default;
 };
@@ -942,6 +957,7 @@ struct StageMemoRoot {
 struct StageMemoWord {
     std::uint32_t key = 0xffffffffu;
     std::uint8_t kind = 0;
+    std::uint8_t merged = 0;
 
     bool operator==(const StageMemoWord& other) const = default;
 };
@@ -954,12 +970,43 @@ struct StageMemoPatch {
 };
 
 constexpr std::uint8_t StageMemoVertexKind = 1;
+constexpr std::uint8_t StageMemoBaseKind = 5;
+constexpr std::uint8_t StageMemoMergedKind = 6;
+constexpr std::uint32_t StageMemoSideKinds = (1u << static_cast<std::uint32_t>(ShaderRecompiler::SideReadKind::BufferAddress)) | (1u << static_cast<std::uint32_t>(ShaderRecompiler::SideReadKind::BufferSize)) | (1u << static_cast<std::uint32_t>(ShaderRecompiler::SideReadKind::FlatWord));
+constexpr std::uint32_t StageMemoWalkKinds = StageMemoSideKinds | (1u << StageMemoBaseKind);
+constexpr std::uint32_t StageMemoGuardedKinds = (1u << static_cast<std::uint32_t>(ShaderRecompiler::SideReadKind::BufferAddress)) | (1u << static_cast<std::uint32_t>(ShaderRecompiler::SideReadKind::BufferSize)) | (1u << StageMemoBaseKind);
+constexpr std::uint32_t StageMemoArmBit = 1u << 31u;
+
+bool stageMemoGuarded(std::uint8_t kind) {
+    return kind < 32u && ((StageMemoGuardedKinds >> kind) & 1u) != 0u;
+}
+
+std::uint8_t stageMemoWordKind(std::uint32_t kinds) {
+    const auto real = kinds & StageMemoSideKinds;
+    if (std::popcount(real) > 1) return static_cast<std::uint8_t>(ShaderRecompiler::SideReadKind::BufferAddress);
+    if (real == 0u) return StageMemoBaseKind;
+    const auto kind = static_cast<std::uint8_t>(std::countr_zero(real));
+    return (kinds & (1u << StageMemoBaseKind)) != 0u && !stageMemoGuarded(kind) ? StageMemoBaseKind : kind;
+}
 
 std::uint32_t stageMemoPatchKinds() {
     using Graphics::RuntimeSwitch;
     using Graphics::RuntimeSwitches::Set;
     return (Set(RuntimeSwitch::StageMemoPatchVertex) ? 1u << StageMemoVertexKind : 0u) | (Set(RuntimeSwitch::StageMemoPatchBuffers) ? 1u << static_cast<std::uint32_t>(ShaderRecompiler::SideReadKind::BufferAddress) : 0u) |
-           (Set(RuntimeSwitch::StageMemoPatchData) ? (1u << static_cast<std::uint32_t>(ShaderRecompiler::SideReadKind::BufferSize)) | (1u << static_cast<std::uint32_t>(ShaderRecompiler::SideReadKind::FlatWord)) : 0u);
+           (Set(RuntimeSwitch::StageMemoPatchData) ? (1u << static_cast<std::uint32_t>(ShaderRecompiler::SideReadKind::BufferSize)) | (1u << static_cast<std::uint32_t>(ShaderRecompiler::SideReadKind::FlatWord)) : 0u) |
+           (Set(RuntimeSwitch::StageMemoChained) ? 1u << StageMemoBaseKind : 0u) | (Set(RuntimeSwitch::StageMemoPatchMerged) ? 1u << StageMemoMergedKind : 0u);
+}
+
+std::uint32_t stageMemoArm(std::uint32_t enabledKinds) {
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoAdmitWays) ? enabledKinds | StageMemoArmBit : enabledKinds & ((1u << StageMemoBaseKind) | (1u << StageMemoMergedKind));
+}
+
+std::size_t stageMemoWayLimit() {
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoPatchMerged) || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoChained) ? 8u : 4u;
+}
+
+std::uint32_t stageMemoForeignKinds(std::uint32_t enabledKinds) {
+    return ((1u << StageMemoBaseKind) | (1u << StageMemoMergedKind)) & ~enabledKinds;
 }
 
 struct StageMemoPattern {
@@ -970,6 +1017,7 @@ struct StageMemoPattern {
     std::uint32_t userWords = 0;
     std::uint32_t decodeRoots = 0;
     std::uint32_t patchKinds = 0;
+    std::uint32_t arm = 0;
     std::vector<StageMemoWord> words;
     std::vector<StageMemoRoot> roots;
 
@@ -1020,6 +1068,10 @@ struct StageMemoEntry {
 void viewStageEntry(StageMemoEntry& entry, const StageMemoPattern& pattern, std::span<const std::uint32_t> userData, ShaderRecompiler::ShaderStage stage, std::size_t count) {
     entry.addresses.clear();
     for (const auto& root : pattern.roots) {
+        if (root.chained != 0) {
+            entry.addresses.push_back((static_cast<std::uint64_t>(entry.rootValues[root.origin]) & ~std::uint64_t{3}) + root.offset);
+            continue;
+        }
         const auto word = userData[root.origin];
         entry.addresses.push_back((root.aligned != 0 ? static_cast<std::uint64_t>(word) & ~std::uint64_t{3} : static_cast<std::uint64_t>(word)) + root.offset);
     }
@@ -1122,18 +1174,18 @@ public:
             held.previous.erase(old);
             retired = place(held, key, entry);
         }
-        if (retired != nullptr) retired->clear();
+        if (retired != nullptr) forget(*retired);
         return entry;
     }
 
-    std::optional<std::size_t> Way(std::uint64_t key, const StageMemoPattern& pattern) {
+    std::optional<std::size_t> Way(std::uint64_t key, const StageMemoPattern& pattern, std::size_t limit, std::uint32_t foreign) {
         auto& held = shard(key);
         std::lock_guard lock(held.mutex);
         auto& ways = held.patterns[key];
         if (ways != nullptr) {
             const auto way = static_cast<std::size_t>(std::ranges::find(*ways, pattern) - ways->begin());
             if (way != ways->size()) return way;
-            if (ways->size() >= Ways) return std::nullopt;
+            if (static_cast<std::size_t>(std::ranges::count_if(*ways, [&](const StageMemoPattern& known) { return known.arm == pattern.arm && (known.patchKinds & foreign) == 0u; })) >= limit) return std::nullopt;
         }
         auto grown = ways != nullptr ? std::make_shared<std::vector<StageMemoPattern>>(*ways) : std::make_shared<std::vector<StageMemoPattern>>();
         grown->push_back(pattern);
@@ -1160,6 +1212,17 @@ public:
         return false;
     }
 
+    enum class MissCause : std::uint8_t { First, Second, Admitted, Missing, Rotated };
+
+    MissCause Cause(std::uint64_t key, bool third, bool first) const {
+        const auto index = cell(key);
+        if (storedKeys[index].load(std::memory_order_relaxed) == key) return rotatedKeys[index].load(std::memory_order_relaxed) == key ? MissCause::Rotated : MissCause::Missing;
+        if (first) return MissCause::Admitted;
+        const auto held = seen[index].load(std::memory_order_relaxed);
+        if (held == (key | std::uint64_t{1}) || (held == (key & ~std::uint64_t{1}) && !third)) return MissCause::Admitted;
+        return held == (key & ~std::uint64_t{1}) ? MissCause::Second : MissCause::First;
+    }
+
     void Insert(std::uint64_t key, std::shared_ptr<const StageMemoEntry> entry) {
         auto& held = shard(key);
         StageMemoMap* retired = nullptr;
@@ -1176,11 +1239,23 @@ public:
                 retired = place(held, key, entry);
             }
         }
-        if (retired != nullptr) retired->clear();
+        storedKeys[cell(key)].store(key, std::memory_order_relaxed);
+        if (retired != nullptr) forget(*retired);
     }
 
 private:
     StageMemoShard& shard(std::uint64_t key) { return shards[static_cast<std::size_t>((key ^ (key >> 23u)) % Shards)]; }
+
+    static std::size_t cell(std::uint64_t key) { return static_cast<std::size_t>((key ^ (key >> 29u)) % SeenKeys); }
+
+    void note(const StageMemoMap& dropped) {
+        for (const auto& [key, entry] : dropped) rotatedKeys[cell(key)].store(key, std::memory_order_relaxed);
+    }
+
+    void forget(StageMemoMap& dropped) {
+        note(dropped);
+        dropped.clear();
+    }
 
     StageMemoMap* place(StageMemoShard& held, std::uint64_t key, const std::shared_ptr<const StageMemoEntry>& entry) {
         StageMemoMap* retired = nullptr;
@@ -1190,6 +1265,8 @@ private:
                 retired = &HostThreadLocal<StageMemoMap, RetiredStorage>();
                 retired->clear();
                 retired->swap(held.previous);
+            } else {
+                note(held.previous);
             }
             held.previous = std::move(held.current);
             held.current.clear();
@@ -1203,6 +1280,8 @@ private:
     std::array<StageMemoShard, Shards> shards;
     std::atomic<std::uint64_t> patternVersion{1};
     std::unique_ptr<std::atomic<std::uint64_t>[]> seen{new std::atomic<std::uint64_t>[SeenKeys]()};
+    std::unique_ptr<std::atomic<std::uint64_t>[]> storedKeys{new std::atomic<std::uint64_t>[SeenKeys]()};
+    std::unique_ptr<std::atomic<std::uint64_t>[]> rotatedKeys{new std::atomic<std::uint64_t>[SeenKeys]()};
 };
 
 StageMemoStore& stageMemoStore() {
@@ -1230,6 +1309,23 @@ struct StageMemo {
     std::uint64_t missKey = 0;
     std::uint64_t patternVersion = 0;
     std::unordered_map<std::uint64_t, std::shared_ptr<const std::vector<StageMemoPattern>>> patterns;
+    static constexpr std::size_t MissWays = 8;
+    static constexpr std::size_t RefusalSlots = 4096;
+    std::uint64_t mergedOrdinal = 0;
+    std::uint64_t relocatedOrdinal = 0;
+    std::uint64_t stageKey = 0;
+    std::array<std::uint64_t, MissWays> missKeys{};
+    std::uint32_t missCount = 0;
+    std::uint32_t tried = 0;
+    std::uint32_t armWays = 0;
+    bool merged = false;
+    bool relocated = false;
+    bool inputsTag = false;
+    bool noEntryPlain = false;
+    bool noEntryPatterned = false;
+    bool forced = false;
+    std::vector<std::uint8_t> refusals;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> conflicts;
 };
 
 struct StageMemoStorage {};
@@ -1281,7 +1377,7 @@ std::uint64_t stageMemoContentKey(std::uint64_t key, std::size_t way, const Stag
             continue;
         }
         const auto& word = pattern.words[at];
-        const bool guarded = word.kind == static_cast<std::uint8_t>(ShaderRecompiler::SideReadKind::BufferAddress) || word.kind == static_cast<std::uint8_t>(ShaderRecompiler::SideReadKind::BufferSize);
+        const bool guarded = stageMemoGuarded(word.kind);
         const std::uint64_t live = guarded && (rootValues[at] & ~word.key) != 0u ? std::uint64_t{1} << 32u : 0u;
         hash = (hash ^ (rootValues[at] & word.key) ^ live) * StageMemoPrime;
     }
@@ -1296,7 +1392,7 @@ int stageMemoSameRoots(const StageMemoPattern& pattern, std::span<const std::uin
     for (std::size_t at = 0; at < live.size(); ++at) {
         const auto& word = pattern.words[at];
         if (((stored[at] ^ live[at]) & word.key) != 0u) return 0;
-        const bool guarded = word.kind == static_cast<std::uint8_t>(ShaderRecompiler::SideReadKind::BufferAddress) || word.kind == static_cast<std::uint8_t>(ShaderRecompiler::SideReadKind::BufferSize);
+        const bool guarded = stageMemoGuarded(word.kind);
         if (guarded && (live[at] & ~word.key) == 0u) return 0;
         patched = patched || stored[at] != live[at];
     }
@@ -1321,12 +1417,15 @@ struct StageMemoRootHistory {
     std::size_t next = 0;
 };
 
-enum class StageMemoGrant : std::uint8_t { Granted, DecodeKey, NoNodes, NoForwards, NodeForwards, Mixed, KindOff, AllKey, GuardedZero, NoPosition, NotVerbatim, Count };
+enum class StageMemoGrant : std::uint8_t { Granted, DecodeKey, NoNodes, NoForwards, NodeForwards, Mixed, KindOff, AllKey, GuardedZero, NoPosition, NotVerbatim, BaseAbsolute, Count };
+
+enum class StageMemoKeyReason : std::uint8_t { None, NoTape, UniformFill, GcnGuest, Interpreter, Uncovered, Condition, Arithmetic, NestedOperand, DwordKept, Clean, BaseChained, BaseAbsolute, NoUse, Count };
 
 struct StageMemoDiagState {
     std::mutex mutex;
     std::unordered_map<std::uint64_t, StageMemoRootHistory> lastRoots;
     std::array<std::uint64_t, static_cast<std::size_t>(StageMemoGrant::Count)> grants{};
+    std::array<std::uint64_t, static_cast<std::size_t>(StageMemoKeyReason::Count)> reasons{};
     std::uint64_t stores = 0;
     std::uint64_t compared = 0;
     std::uint64_t full = 0;
@@ -1339,8 +1438,45 @@ StageMemoDiagState& stageMemoDiagState() {
     return *state;
 }
 
-void stageMemoGrantCensus(std::uint64_t key, std::size_t way, std::span<const std::uint32_t> rootValues, std::span<const StageMemoGrant> grants, bool full) {
-    static constexpr std::array<const char*, static_cast<std::size_t>(StageMemoGrant::Count)> names{"granted", "decode word kept as key", "no read nodes", "no read forwards in the stage", "a read without forwards", "mixed kinds", "kind not enabled", "all bits key", "guarded zero", "side position missing", "side word not verbatim"};
+StageMemoKeyReason stageMemoKeyReason(const ShaderRecompiler::SideForwards& forwards, const DirectReads& reads, std::span<const std::pair<std::uint64_t, std::int32_t>> walked, std::uint64_t address, bool chainedChild) {
+    using Use = ShaderRecompiler::SideNodeUse;
+    if (forwards.tape == ShaderRecompiler::SideTape::None) return StageMemoKeyReason::NoTape;
+    if (forwards.tape == ShaderRecompiler::SideTape::UniformFill) return StageMemoKeyReason::UniformFill;
+    if (forwards.tape == ShaderRecompiler::SideTape::GcnGuest) return StageMemoKeyReason::GcnGuest;
+    std::uint32_t uses = 0;
+    for (std::size_t at = 0; at < walked.size(); ++at) {
+        if (walked[at].first != address) continue;
+        if (reads.nodes.size() != walked.size() || reads.nodes[at] == ShaderRecompiler::SrtNoReadNode) return StageMemoKeyReason::Interpreter;
+        const auto node = reads.nodes[at];
+        if (node < forwards.nodeUses.size()) uses |= forwards.nodeUses[node];
+    }
+    const auto has = [&](Use use) { return (uses & static_cast<std::uint32_t>(use)) != 0u; };
+    if (has(Use::Uncovered)) return StageMemoKeyReason::Uncovered;
+    if (has(Use::Condition)) return StageMemoKeyReason::Condition;
+    if (has(Use::Argument)) return StageMemoKeyReason::Arithmetic;
+    if (has(Use::ReadArgument)) return StageMemoKeyReason::NestedOperand;
+    if (has(Use::DwordKept)) return StageMemoKeyReason::DwordKept;
+    if (has(Use::Clean)) return StageMemoKeyReason::Clean;
+    if (has(Use::Base)) return chainedChild ? StageMemoKeyReason::BaseChained : StageMemoKeyReason::BaseAbsolute;
+    return has(Use::Forward) ? StageMemoKeyReason::None : StageMemoKeyReason::NoUse;
+}
+
+void stageMemoKeyReasons(const StageMemoPattern& pattern, const StageMemoEntry& entry, std::span<const std::uint32_t> userData, const DirectReads& reads, std::span<const std::pair<std::uint64_t, std::int32_t>> walked, std::span<const StageMemoGrant> grants, std::vector<StageMemoKeyReason>& reasons) {
+    reasons.assign(grants.size(), StageMemoKeyReason::None);
+    for (std::size_t root = pattern.decodeRoots; root < pattern.roots.size(); ++root) {
+        const auto wordIndex = entry.decodeWords + (root - pattern.decodeRoots);
+        if (wordIndex >= grants.size() || grants[wordIndex] == StageMemoGrant::Granted || grants[wordIndex] == StageMemoGrant::DecodeKey) continue;
+        const auto& placed = pattern.roots[root];
+        const auto base = placed.chained != 0 ? static_cast<std::uint64_t>(entry.rootValues[placed.origin]) : static_cast<std::uint64_t>(userData[placed.origin]);
+        const auto address = (base & ~std::uint64_t{3}) + placed.offset;
+        const bool chainedChild = std::ranges::any_of(pattern.roots, [&](const StageMemoRoot& other) { return other.chained != 0 && other.origin == wordIndex; });
+        reasons[wordIndex] = stageMemoKeyReason(*entry.forwards, reads, walked, address, chainedChild);
+    }
+}
+
+void stageMemoGrantCensus(std::uint64_t key, std::size_t way, std::span<const std::uint32_t> rootValues, std::span<const StageMemoGrant> grants, std::span<const StageMemoKeyReason> keyReasons, bool full) {
+    static constexpr std::array<const char*, static_cast<std::size_t>(StageMemoGrant::Count)> names{"granted", "decode word kept as key", "no read nodes", "no read forwards in the stage", "a read without forwards", "mixed kinds", "kind not enabled", "all bits key", "guarded zero", "side position missing", "side word not verbatim", "base of a read kept absolute"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(StageMemoKeyReason::Count)> reasonNames{"", "stage without a tape", "uniform fill", "GCN guest stage", "interpreter read", "uncovered side position", "condition root", "arithmetic, select or compare input", "high half, offset or records of a nested read", "descriptor dword without forward", "clean slot", "base of a nested read, child chained", "base of a nested read, child kept absolute", "no use found"};
     auto& state = stageMemoDiagState();
     std::lock_guard lock(state.mutex);
     ++state.stores;
@@ -1361,7 +1497,9 @@ void stageMemoGrantCensus(std::uint64_t key, std::size_t way, std::span<const st
         if (closest != nullptr) {
             ++state.compared;
             for (std::size_t at = 0; at < rootValues.size() && at < grants.size(); ++at) {
-                if ((*closest)[at] != rootValues[at]) ++state.grants[static_cast<std::size_t>(grants[at])];
+                if ((*closest)[at] == rootValues[at]) continue;
+                ++state.grants[static_cast<std::size_t>(grants[at])];
+                if (at < keyReasons.size() && keyReasons[at] != StageMemoKeyReason::None) ++state.reasons[static_cast<std::size_t>(keyReasons[at])];
             }
         }
     }
@@ -1374,7 +1512,15 @@ void stageMemoGrantCensus(std::uint64_t key, std::size_t way, std::span<const st
         text += ' ';
         text += std::to_string(state.grants[index]);
     }
-    std::fprintf(stderr, "[stage-memo-diag] %llu stores (%llu refused for full patterns), %llu with an earlier sighting of other root values; their differing root words by grant decision:%s; no-entry lookups under a way with patch words %llu, without %llu\n", static_cast<unsigned long long>(state.stores), static_cast<unsigned long long>(state.full), static_cast<unsigned long long>(state.compared), text.c_str(), static_cast<unsigned long long>(state.patterned), static_cast<unsigned long long>(state.plain));
+    std::string finer;
+    for (std::size_t index = 1; index < reasonNames.size(); ++index) {
+        if (state.reasons[index] == 0) continue;
+        finer += finer.empty() ? "; the key words among them by the recompiler's node uses: " : ", ";
+        finer += reasonNames[index];
+        finer += ' ';
+        finer += std::to_string(state.reasons[index]);
+    }
+    std::fprintf(stderr, "[stage-memo-diag] %llu stores (%llu refused for full patterns), %llu with an earlier sighting of other root values; their differing root words by grant decision:%s; no-entry lookups under a way with patch words %llu, without %llu%s\n", static_cast<unsigned long long>(state.stores), static_cast<unsigned long long>(state.full), static_cast<unsigned long long>(state.compared), text.c_str(), static_cast<unsigned long long>(state.patterned), static_cast<unsigned long long>(state.plain), finer.c_str());
 }
 
 struct StageMemoDiagLast {
@@ -1465,7 +1611,7 @@ void stageMemoDiagnose(std::uint64_t key, std::size_t way, const StageMemoPatter
                         if (before[at] == gathered[at] || listed >= 6u) continue;
                         ++listed;
                         char line[128];
-                        std::snprintf(line, sizeof(line), " root %zu%s user %u +0x%llx word %u: %08x -> %08x;", root, root < pattern.decodeRoots ? " (decode)" : "", static_cast<unsigned>(pattern.roots[root].origin), static_cast<unsigned long long>(pattern.roots[root].offset), static_cast<unsigned>(word), before[at], gathered[at]);
+                        std::snprintf(line, sizeof(line), " root %zu%s %s %u +0x%llx word %u: %08x -> %08x;", root, root < pattern.decodeRoots ? " (decode)" : "", pattern.roots[root].chained != 0 ? "chained on word" : "user", static_cast<unsigned>(pattern.roots[root].origin), static_cast<unsigned long long>(pattern.roots[root].offset), static_cast<unsigned>(word), before[at], gathered[at]);
                         text += line;
                     }
                 }
@@ -1482,6 +1628,66 @@ void stageMemoDiagnose(std::uint64_t key, std::size_t way, const StageMemoPatter
     kept.instanceCount = parameters.instanceCount;
     kept.cursor = cursor;
     kept.previous = previous;
+    enum MaskedCause : std::size_t { MaskedNew, MaskedSame, MaskedIndex, MaskedCursor, MaskedPrevious, MaskedWord, MaskedCauses };
+    static constexpr std::array<const char*, MaskedCauses> maskedNames{"new", "seen with the same inputs", "index parameters", "push cursor", "previous stage", "user value word"};
+    static std::unordered_map<std::uint64_t, StageMemoDiagLast> masked;
+    static std::array<std::uint64_t, MaskedCauses> maskedCauses{};
+    static std::array<std::uint64_t, ShaderRecompiler::SrtUserDataUse::TrackedWords> maskedWords{};
+    if (!pattern.words.empty() && pattern.words.size() == gathered.size()) {
+        auto maskedIdentity = (key ^ way ^ 0x9e3779b97f4a7c15ull) * StageMemoPrime;
+        for (std::size_t at = 0; at < gathered.size(); ++at) {
+            const auto& held = pattern.words[at];
+            const std::uint64_t live = stageMemoGuarded(held.kind) && (gathered[at] & ~held.key) != 0u ? std::uint64_t{1} << 32u : 0u;
+            maskedIdentity = (maskedIdentity ^ (gathered[at] & held.key) ^ live) * StageMemoPrime;
+        }
+        if (masked.size() > 400000u) masked.clear();
+        const auto [seenAt, fresh] = masked.try_emplace(maskedIdentity);
+        auto& before = seenAt->second;
+        auto maskedCause = MaskedNew;
+        if (!fresh) {
+            maskedCause = MaskedSame;
+            if (before.indexAddress != parameters.indexAddress || before.indexCount != parameters.indexCount || before.indexSize != parameters.indexSize || before.instanceCount != parameters.instanceCount) maskedCause = MaskedIndex;
+            else if (before.cursor != cursor) maskedCause = MaskedCursor;
+            else if (before.previous != previous) maskedCause = MaskedPrevious;
+            else {
+                for (std::size_t at = 0; at < userData.size() && at < before.userData.size(); ++at) {
+                    if (stageMemoRelocates(pattern.relocatable, at) || before.userData[at] == userData[at]) continue;
+                    maskedCause = MaskedWord;
+                    if (at < maskedWords.size()) ++maskedWords[at];
+                    break;
+                }
+            }
+        }
+        ++maskedCauses[maskedCause];
+        before.userData.assign(userData.begin(), userData.end());
+        before.indexAddress = parameters.indexAddress;
+        before.indexCount = parameters.indexCount;
+        before.indexSize = parameters.indexSize;
+        before.instanceCount = parameters.instanceCount;
+        before.cursor = cursor;
+        before.previous = previous;
+    }
+    if (total % 200000u == 199999u) {
+        std::string text;
+        for (std::size_t index = 0; index < MaskedCauses; ++index) {
+            if (maskedCauses[index] == 0) continue;
+            text += text.empty() ? " " : ", ";
+            text += maskedNames[index];
+            text += ' ';
+            text += std::to_string(maskedCauses[index]);
+        }
+        std::string words;
+        for (std::size_t index = 0; index < maskedWords.size(); ++index) {
+            if (maskedWords[index] == 0) continue;
+            words += words.empty() ? " (" : ", ";
+            words += "word ";
+            words += std::to_string(index);
+            words += ' ';
+            words += std::to_string(maskedWords[index]);
+        }
+        if (!words.empty()) words += ')';
+        std::fprintf(stderr, "[stage-memo-diag] no-entry misses under ways with patch words, by their masked root content:%s%s\n", text.c_str(), words.c_str());
+    }
     if (++total % 200000u == 0u) {
         std::string text;
         for (std::size_t index = 0; index < Causes; ++index) {
@@ -1628,6 +1834,15 @@ StageMemoOutcome adoptViews(StageMemo& memo, const StageMemoEntry& entry, const 
 StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, std::span<const std::uint32_t> userData, std::size_t index, std::uint32_t cursor, const InvocationSlot& slot, DirectStages& resolved) {
     const auto& decode = job.shape->decode;
     const auto key = stageMemoKey(decode.get(), index);
+    memo.stageKey = key;
+    memo.missCount = 0;
+    memo.tried = 0;
+    memo.armWays = 0;
+    memo.merged = false;
+    memo.relocated = false;
+    memo.inputsTag = false;
+    memo.noEntryPlain = false;
+    memo.noEntryPatterned = false;
     auto& store = stageMemoStore();
     if (const auto version = store.PatternVersion(); memo.patternVersion != version) {
         memo.patterns.clear();
@@ -1641,13 +1856,17 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, std::span<c
     }
     const auto* const ways = cached->second.get();
     const auto enabledKinds = stageMemoPatchKinds();
+    const auto arm = stageMemoArm(enabledKinds);
+    const auto foreign = stageMemoForeignKinds(enabledKinds);
     memo.patched = false;
     auto& stage = resolved.stages[index];
     const DirectStage* previous = index != 0 ? resolved.stages[index - 1].Shared().get() : nullptr;
     auto last = StageMemoOutcome::NoEntry;
     for (std::size_t way = 0; way < ways->size(); ++way) {
         const auto& pattern = (*ways)[way];
-        if (pattern.userWords != userData.size() || (pattern.patchKinds & ~enabledKinds) != 0u) continue;
+        if (pattern.arm == arm && (pattern.patchKinds & foreign) == 0u) ++memo.armWays;
+        if (pattern.userWords != userData.size() || (pattern.patchKinds & ~enabledKinds) != 0u || pattern.arm != arm) continue;
+        ++memo.tried;
         auto& gathered = memo.gathered;
         auto& addresses = memo.addresses;
         gathered.clear();
@@ -1655,8 +1874,22 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, std::span<c
         std::uint64_t page = ~std::uint64_t{0};
         bool readable = true;
         for (const auto& root : pattern.roots) {
-            const auto word = userData[root.origin];
-            const auto address = (root.aligned != 0 ? static_cast<std::uint64_t>(word) & ~std::uint64_t{3} : static_cast<std::uint64_t>(word)) + root.offset;
+            std::uint64_t address = 0;
+            if (root.chained != 0) {
+                if (root.origin >= gathered.size()) {
+                    readable = false;
+                    break;
+                }
+                const auto at = static_cast<std::int64_t>(static_cast<std::uint64_t>(gathered[root.origin]) & ~std::uint64_t{3}) + static_cast<std::int64_t>(root.offset);
+                if (at < 0 || static_cast<std::uint64_t>(at) > ShaderRecompiler::Detail::AddressMask) {
+                    readable = false;
+                    break;
+                }
+                address = static_cast<std::uint64_t>(at);
+            } else {
+                const auto word = userData[root.origin];
+                address = (root.aligned != 0 ? static_cast<std::uint64_t>(word) & ~std::uint64_t{3} : static_cast<std::uint64_t>(word)) + root.offset;
+            }
             addresses.push_back(address);
             for (std::uint32_t at = 0; readable && at < root.words; ++at) {
                 std::uint32_t value = 0;
@@ -1698,6 +1931,8 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, std::span<c
         if (held == nullptr) {
             last = StageMemoOutcome::NoEntry;
             memo.missKey = contentKey;
+            if (memo.missCount < StageMemo::MissWays) memo.missKeys[memo.missCount++] = contentKey;
+            (pattern.patchKinds != 0u ? memo.noEntryPatterned : memo.noEntryPlain) = true;
             if (stageMemoDiag()) stageMemoDiagnose(key, way, pattern, userData, gathered, job.parameters, cursor, previous);
             continue;
         }
@@ -1711,6 +1946,7 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, std::span<c
         }
         if (!same) {
             last = StageMemoOutcome::Inputs;
+            memo.inputsTag = entry.tag != resolved.tag;
             continue;
         }
         const auto sameRoots = stageMemoSameRoots(pattern, entry.rootValues, gathered);
@@ -1733,6 +1969,12 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, std::span<c
         if (!CaptureRegisteredViewsCurrent(entry.capture->snapshot.registeredImages)) {
             last = StageMemoOutcome::Views;
             continue;
+        }
+        memo.merged = false;
+        memo.relocated = false;
+        if (sameRoots == 2 && (pattern.patchKinds & ((1u << StageMemoMergedKind) | (1u << StageMemoBaseKind))) != 0u) {
+            for (std::size_t at = 0; at < gathered.size() && at < pattern.words.size(); ++at) memo.merged = memo.merged || (pattern.words[at].merged != 0 && gathered[at] != entry.rootValues[at]);
+            for (const auto& root : pattern.roots) memo.relocated = memo.relocated || (root.chained != 0 && ((gathered[root.origin] ^ entry.rootValues[root.origin]) & ~3u) != 0u);
         }
         if (entry.viewable && resolved.viewing) {
             const auto viewed = adoptViews(memo, entry, *owning, pattern, userData, sameRoots, resolved, index);
@@ -1822,7 +2064,252 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, std::span<c
         stage.pushOffset = entry.pushOffset;
         return StageMemoOutcome::Hit;
     }
-    return last;
+    return memo.armWays == 0 && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoAdmitWays) ? StageMemoOutcome::NoPattern : last;
+}
+
+struct StageMemoPlaced {
+    std::uint64_t address;
+    std::uint32_t slot;
+    bool nested;
+};
+
+struct StageMemoByNode {
+    bool operator()(const ShaderRecompiler::SideReadForward& forward, std::uint32_t node) const { return forward.node < node; }
+    bool operator()(std::uint32_t node, const ShaderRecompiler::SideReadForward& forward) const { return node < forward.node; }
+};
+
+struct StageMemoByParent {
+    bool operator()(const ShaderRecompiler::SideReadBase& base, std::uint32_t node) const { return base.parent < node; }
+    bool operator()(std::uint32_t node, const ShaderRecompiler::SideReadBase& base) const { return node < base.parent; }
+};
+
+std::optional<Counter> stageMemoFinish(std::span<const std::uint32_t> userData, const ShaderRecompiler::SrtUserDataUse& use, std::uint64_t addresses, std::uint64_t relocatable, StageMemoPattern& pattern, StageMemoEntry& entry, std::vector<StageMemoWord>& words, std::vector<StageMemoPlaced>& placed) {
+    if (pattern.patchKinds != 0u) pattern.words = std::move(words);
+    for (std::size_t word = 0; word < userData.size() && word < ShaderRecompiler::SrtUserDataUse::TrackedWords; ++word) {
+        const auto bit = std::uint64_t{1} << word;
+        if (((use.asBase | addresses) & bit) != 0 && userData[word] == 0u) relocatable &= ~bit;
+    }
+    pattern.relocatable = relocatable;
+    pattern.values = use.asValue;
+    pattern.bases = use.asBase;
+    pattern.addresses = addresses & relocatable;
+    const auto walkRoots = static_cast<std::uint32_t>(pattern.roots.size() - pattern.decodeRoots);
+    std::sort(placed.begin(), placed.end(), [](const StageMemoPlaced& a, const StageMemoPlaced& b) { return a.address < b.address; });
+    entry.order.reserve(placed.size());
+    for (const auto& item : placed) entry.order.push_back(item.nested ? walkRoots + item.slot : item.slot);
+    return std::nullopt;
+}
+
+std::optional<Counter> stageMemoShapeChained(std::span<const std::uint32_t> userData, const DirectResolvedStage& stage, const DirectReads& reads, std::uint32_t enabledKinds, StageMemoPattern& pattern, StageMemoEntry& entry, std::vector<StageMemoWord>& words, std::vector<StageMemoPlaced>& placed, std::vector<StageMemoGrant>* grants) {
+    const auto& use = stage.capture->userDataUse;
+    const auto& forwards = *entry.forwards;
+    constexpr std::uint32_t None = 0xffffffffu;
+    constexpr std::uint32_t Conflict = 0xfffffffeu;
+    enum class Formula : std::uint8_t { User, Chained, Absolute };
+    struct Group {
+        std::uint64_t address = 0;
+        std::uint64_t offset = 0;
+        std::uint32_t value = 0;
+        std::uint32_t first = 0;
+        std::uint32_t begin = 0;
+        std::uint32_t end = 0;
+        std::uint32_t root = None;
+        std::uint32_t parent = None;
+        std::int32_t origin = -1;
+        Formula formula = Formula::Absolute;
+    };
+    struct Scratch {
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> byAddress;
+        std::vector<Group> groups;
+        std::vector<std::uint32_t> readGroup;
+        std::vector<std::uint32_t> order;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> nodeGroups;
+    };
+    struct ScratchStorage {};
+    auto& scratch = HostThreadLocal<Scratch, ScratchStorage>();
+    auto& byAddress = scratch.byAddress;
+    auto& groups = scratch.groups;
+    auto& readGroup = scratch.readGroup;
+    auto& order = scratch.order;
+    auto& nodeGroups = scratch.nodeGroups;
+    byAddress.clear();
+    for (std::size_t at = 0; at < use.reads.size(); ++at) byAddress.emplace_back(use.reads[at].first, static_cast<std::uint32_t>(at));
+    std::sort(byAddress.begin(), byAddress.end());
+    groups.clear();
+    readGroup.assign(use.reads.size(), None);
+    for (std::size_t at = 0; at < byAddress.size(); ++at) {
+        if (at == 0 || byAddress[at].first != byAddress[at - 1].first) {
+            const auto found = std::lower_bound(reads.words.begin(), reads.words.end(), std::pair<std::uint64_t, std::uint32_t>{byAddress[at].first, 0u});
+            if (found == reads.words.end() || found->first != byAddress[at].first) return Counter::StageMemoUntraced;
+            Group group;
+            group.address = byAddress[at].first;
+            group.value = found->second;
+            group.first = byAddress[at].second;
+            group.begin = static_cast<std::uint32_t>(at);
+            groups.push_back(group);
+        }
+        groups.back().end = static_cast<std::uint32_t>(at + 1u);
+        readGroup[byAddress[at].second] = static_cast<std::uint32_t>(groups.size() - 1u);
+    }
+    if (groups.size() != reads.words.size()) return Counter::StageMemoUntraced;
+    nodeGroups.clear();
+    for (std::size_t at = 0; at < use.reads.size(); ++at) {
+        if (reads.nodes[at] != ShaderRecompiler::SrtNoReadNode) nodeGroups.emplace_back(reads.nodes[at], readGroup[at]);
+    }
+    std::sort(nodeGroups.begin(), nodeGroups.end());
+    nodeGroups.erase(std::unique(nodeGroups.begin(), nodeGroups.end()), nodeGroups.end());
+    const auto groupOfNode = [&](std::uint32_t node) {
+        const auto found = std::lower_bound(nodeGroups.begin(), nodeGroups.end(), std::pair<std::uint32_t, std::uint32_t>{node, 0u});
+        if (found == nodeGroups.end() || found->first != node) return None;
+        if (std::next(found) != nodeGroups.end() && std::next(found)->first == node) return Conflict;
+        return found->second;
+    };
+    const auto parentOf = [&](std::uint32_t node) {
+        const auto found = std::lower_bound(forwards.bases.begin(), forwards.bases.end(), node, [](const ShaderRecompiler::SideReadBase& base, std::uint32_t child) { return base.child < child; });
+        return found != forwards.bases.end() && found->child == node ? found->parent : None;
+    };
+    order.resize(groups.size());
+    for (std::size_t at = 0; at < order.size(); ++at) order[at] = static_cast<std::uint32_t>(at);
+    std::sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) { return groups[a].first < groups[b].first; });
+    bool chained = false;
+    for (const auto index : order) {
+        auto& group = groups[index];
+        for (auto at = group.begin; at < group.end; ++at) {
+            const auto read = byAddress[at].second;
+            const auto origin = use.reads[read].second;
+            auto formula = Formula::Absolute;
+            std::uint64_t offset = 0;
+            std::uint32_t parent = None;
+            if (origin >= 0) {
+                if (static_cast<std::size_t>(origin) >= userData.size()) return Counter::StageMemoUntraced;
+                formula = Formula::User;
+                offset = group.address - (static_cast<std::uint64_t>(userData[static_cast<std::size_t>(origin)]) & ~std::uint64_t{3});
+            } else if (const auto node = reads.nodes[read]; node != ShaderRecompiler::SrtNoReadNode && groupOfNode(node) == index) {
+                const auto parentNode = parentOf(node);
+                const auto parentGroup = parentNode != None ? groupOfNode(parentNode) : None;
+                if (parentGroup < groups.size() && groups[parentGroup].root != None && groups[parentGroup].root <= 0xffffu) {
+                    formula = Formula::Chained;
+                    parent = parentGroup;
+                    offset = group.address - (static_cast<std::uint64_t>(groups[parentGroup].value) & ~std::uint64_t{3});
+                }
+            }
+            if (at == group.begin) {
+                group.formula = formula;
+                group.offset = offset;
+                group.parent = parent;
+                group.origin = origin;
+            } else if (formula != group.formula || offset != group.offset || parent != group.parent || (formula == Formula::User && origin != group.origin)) {
+                return Counter::StageMemoChainConflict;
+            }
+        }
+        if (group.formula == Formula::Absolute) {
+            placed.push_back({group.address, static_cast<std::uint32_t>(entry.nested.size()), true});
+            entry.nested.emplace_back(group.address, group.value);
+            continue;
+        }
+        placed.push_back({group.address, static_cast<std::uint32_t>(pattern.roots.size() - pattern.decodeRoots), false});
+        if (group.formula == Formula::User) {
+            pattern.roots.push_back({group.offset, static_cast<std::uint16_t>(group.origin), 1, 1, 0});
+        } else {
+            pattern.roots.push_back({group.offset, static_cast<std::uint16_t>(groups[group.parent].root), 1, 1, 1});
+            chained = true;
+        }
+        group.root = static_cast<std::uint32_t>(entry.rootValues.size());
+        entry.rootValues.push_back(group.value);
+        words.push_back({});
+    }
+    if (chained) pattern.patchKinds |= 1u << StageMemoBaseKind;
+    pattern.arm |= 1u << StageMemoBaseKind;
+    const auto& readForwards = forwards.chainedReads;
+    const bool walkable = (enabledKinds & StageMemoWalkKinds) != 0u && (!readForwards.empty() || !forwards.children.empty());
+    if (grants != nullptr) {
+        grants->assign(entry.rootValues.size(), StageMemoGrant::Granted);
+        for (std::size_t at = 0; at < entry.decodeWords; ++at) {
+            if (words[at].key == 0xffffffffu) (*grants)[at] = StageMemoGrant::DecodeKey;
+        }
+        const auto walkReason = (enabledKinds & StageMemoWalkKinds) == 0u ? StageMemoGrant::KindOff : walkable ? StageMemoGrant::Granted : StageMemoGrant::NoForwards;
+        for (std::size_t at = entry.decodeWords; at < grants->size(); ++at) (*grants)[at] = walkReason;
+    }
+    if (!walkable) return std::nullopt;
+    const bool merging = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoPatchMerged);
+    for (const auto index : order) {
+        const auto& group = groups[index];
+        if (group.root == None) continue;
+        std::uint32_t key = 0;
+        std::uint32_t kinds = 0;
+        std::uint8_t kind = 0;
+        bool pinned = false;
+        auto cause = StageMemoGrant::Granted;
+        const auto pin = [&](StageMemoGrant why) {
+            if (!pinned) cause = why;
+            pinned = true;
+        };
+        for (auto at = group.begin; at < group.end; ++at) {
+            const auto node = reads.nodes[byAddress[at].second];
+            if (node == ShaderRecompiler::SrtNoReadNode) {
+                pin(StageMemoGrant::NodeForwards);
+                continue;
+            }
+            bool chainedChild = false;
+            const auto [firstChild, lastChild] = std::equal_range(forwards.children.begin(), forwards.children.end(), node, StageMemoByParent{});
+            for (auto child = firstChild; child != lastChild; ++child) {
+                const auto childGroup = groupOfNode(child->child);
+                if (childGroup == None) continue;
+                if (childGroup < groups.size() && groups[childGroup].formula == Formula::Chained && groups[childGroup].parent == index) chainedChild = true;
+                else pin(StageMemoGrant::BaseAbsolute);
+            }
+            const auto [first, last] = std::equal_range(readForwards.begin(), readForwards.end(), node, StageMemoByNode{});
+            if (first == last && !chainedChild) {
+                pin(StageMemoGrant::NodeForwards);
+                continue;
+            }
+            for (auto forward = first; forward != last; ++forward) {
+                const auto forwardKind = static_cast<std::uint8_t>(forward->kind);
+                if (!merging && kind != 0u && kind != forwardKind) pin(StageMemoGrant::Mixed);
+                kind = forwardKind;
+                kinds |= 1u << forwardKind;
+                key |= forward->keyMask;
+            }
+            if (chainedChild) kinds |= 1u << StageMemoBaseKind;
+        }
+        const auto wordIndex = group.root;
+        const auto note = [&](StageMemoGrant why) {
+            if (grants != nullptr && wordIndex < grants->size()) (*grants)[wordIndex] = why;
+        };
+        if (pinned || kinds == 0u || (kinds & ~enabledKinds) != 0u || key == 0xffffffffu) {
+            note(pinned ? cause : kinds == 0u ? StageMemoGrant::NodeForwards : (kinds & ~enabledKinds) != 0u ? StageMemoGrant::KindOff : StageMemoGrant::AllKey);
+            continue;
+        }
+        const auto value = entry.rootValues[wordIndex];
+        const auto patchMask = ~key;
+        if ((kinds & StageMemoGuardedKinds) != 0u && (value & patchMask) == 0u) {
+            note(StageMemoGrant::GuardedZero);
+            continue;
+        }
+        bool fits = true;
+        auto why = StageMemoGrant::Granted;
+        const auto patchesBefore = entry.patches.size();
+        for (auto at = group.begin; fits && at < group.end; ++at) {
+            const auto [first, last] = std::equal_range(readForwards.begin(), readForwards.end(), reads.nodes[byAddress[at].second], StageMemoByNode{});
+            for (auto forward = first; fits && forward != last; ++forward) {
+                const bool held = forward->binding < stage.side.bindings.size() && forward->position < stage.side.bindings[forward->binding].size();
+                fits = held && ((stage.side.bindings[forward->binding][forward->position] ^ value) & patchMask) == 0u;
+                if (!held) why = StageMemoGrant::NoPosition;
+                else if (!fits) why = StageMemoGrant::NotVerbatim;
+                if (fits) entry.patches.push_back({wordIndex, forward->binding, forward->position, patchMask});
+            }
+        }
+        if (!fits) {
+            entry.patches.resize(patchesBefore);
+            note(why);
+            continue;
+        }
+        note(StageMemoGrant::Granted);
+        const bool mergedWord = std::popcount(kinds & StageMemoSideKinds) > 1;
+        words[wordIndex] = {key, stageMemoWordKind(kinds), static_cast<std::uint8_t>(mergedWord ? 1u : 0u)};
+        pattern.patchKinds |= kinds | (mergedWord ? 1u << StageMemoMergedKind : 0u);
+    }
+    return std::nullopt;
 }
 
 std::optional<Counter> stageMemoShape(bool lean, const DrawProgram& program, std::span<const std::uint32_t> userData, const DirectResolvedStage& stage, const DirectReads& reads, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& info, const std::vector<Graphics::DecodeRead>& decodeReads, StageMemoPattern& pattern, StageMemoEntry& entry, std::vector<StageMemoGrant>* grants) {
@@ -1866,13 +2353,13 @@ std::optional<Counter> stageMemoShape(bool lean, const DrawProgram& program, std
     relocatable &= ~pinned;
     pattern.decodeRoots = static_cast<std::uint32_t>(pattern.roots.size());
     entry.decodeWords = static_cast<std::uint32_t>(entry.rootValues.size());
-    struct Placed {
-        std::uint64_t address;
-        std::uint32_t slot;
-        bool nested;
-    };
+    using Placed = StageMemoPlaced;
     std::vector<Placed> placed;
     placed.reserve(use.reads.size());
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoChained) && reads.nodes.size() == use.reads.size() && entry.forwards->tape == ShaderRecompiler::SideTape::Traced) {
+        if (const auto refused = stageMemoShapeChained(userData, stage, reads, enabledKinds, pattern, entry, words, placed, grants)) return refused;
+        return stageMemoFinish(userData, use, addresses, relocatable, pattern, entry, words, placed);
+    }
     const auto placeRead = [&](std::uint64_t address, std::int32_t origin) {
         const auto found = std::lower_bound(reads.words.begin(), reads.words.end(), std::pair<std::uint64_t, std::uint32_t>{address, 0u});
         if (found == reads.words.end() || found->first != address) return false;
@@ -1918,16 +2405,18 @@ std::optional<Counter> stageMemoShape(bool lean, const DrawProgram& program, std
         for (std::size_t at = 0; at < entry.decodeWords; ++at) {
             if (words[at].key == 0xffffffffu) (*grants)[at] = StageMemoGrant::DecodeKey;
         }
-        const auto walkReason = (enabledKinds & ~(1u << StageMemoVertexKind)) == 0u ? StageMemoGrant::KindOff : readForwards.empty() ? StageMemoGrant::NoForwards : reads.nodes.size() != use.reads.size() ? StageMemoGrant::NoNodes : StageMemoGrant::Granted;
+        const auto walkReason = (enabledKinds & StageMemoWalkKinds) == 0u ? StageMemoGrant::KindOff : readForwards.empty() ? StageMemoGrant::NoForwards : reads.nodes.size() != use.reads.size() ? StageMemoGrant::NoNodes : StageMemoGrant::Granted;
         for (std::size_t at = entry.decodeWords; at < grants->size(); ++at) (*grants)[at] = walkReason;
     }
-    if ((enabledKinds & ~(1u << StageMemoVertexKind)) != 0u && !readForwards.empty() && reads.nodes.size() == use.reads.size()) {
+    if ((enabledKinds & StageMemoWalkKinds) != 0u && !readForwards.empty() && reads.nodes.size() == use.reads.size()) {
+        const bool merging = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoPatchMerged);
         struct Granted {
             std::uint64_t address;
             std::uint32_t key;
             std::uint8_t kind;
             bool pinned;
             StageMemoGrant cause = StageMemoGrant::Granted;
+            std::uint32_t kinds = 0;
         };
         struct ByNode {
             bool operator()(const ShaderRecompiler::SideReadForward& forward, std::uint32_t node) const { return forward.node < node; }
@@ -1946,8 +2435,9 @@ std::optional<Counter> stageMemoShape(bool lean, const DrawProgram& program, std
             }
             for (auto forward = first; forward != last; ++forward) {
                 const auto kind = static_cast<std::uint8_t>(forward->kind);
-                if (slot.kind != 0u && slot.kind != kind) pin(slot, StageMemoGrant::Mixed);
+                if (!merging && slot.kind != 0u && slot.kind != kind) pin(slot, StageMemoGrant::Mixed);
                 slot.kind = kind;
+                slot.kinds |= 1u << kind;
                 slot.key |= forward->keyMask;
             }
         };
@@ -1982,13 +2472,13 @@ std::optional<Counter> stageMemoShape(bool lean, const DrawProgram& program, std
             const auto note = [&](StageMemoGrant why) {
                 if (grants != nullptr && wordIndex < grants->size()) (*grants)[wordIndex] = why;
             };
-            if (slot == nullptr || slot->pinned || slot->kind == 0u || (enabledKinds & (1u << slot->kind)) == 0u || slot->key == 0xffffffffu) {
-                note(slot == nullptr || slot->kind == 0u ? StageMemoGrant::NodeForwards : slot->pinned ? slot->cause : (enabledKinds & (1u << slot->kind)) == 0u ? StageMemoGrant::KindOff : StageMemoGrant::AllKey);
+            if (slot == nullptr || slot->pinned || slot->kinds == 0u || (slot->kinds & ~enabledKinds) != 0u || slot->key == 0xffffffffu) {
+                note(slot == nullptr || slot->kinds == 0u ? StageMemoGrant::NodeForwards : slot->pinned ? slot->cause : (slot->kinds & ~enabledKinds) != 0u ? StageMemoGrant::KindOff : StageMemoGrant::AllKey);
                 continue;
             }
             const auto value = entry.rootValues[wordIndex];
             const auto patchMask = ~slot->key;
-            const bool guarded = slot->kind == static_cast<std::uint8_t>(ShaderRecompiler::SideReadKind::BufferAddress) || slot->kind == static_cast<std::uint8_t>(ShaderRecompiler::SideReadKind::BufferSize);
+            const bool guarded = (slot->kinds & StageMemoGuardedKinds) != 0u;
             if (guarded && (value & patchMask) == 0u) {
                 note(StageMemoGrant::GuardedZero);
                 continue;
@@ -2021,24 +2511,12 @@ std::optional<Counter> stageMemoShape(bool lean, const DrawProgram& program, std
                 continue;
             }
             note(StageMemoGrant::Granted);
-            words[wordIndex] = {slot->key, slot->kind};
-            pattern.patchKinds |= 1u << slot->kind;
+            const bool mergedWord = std::popcount(slot->kinds & StageMemoSideKinds) > 1;
+            words[wordIndex] = {slot->key, stageMemoWordKind(slot->kinds), static_cast<std::uint8_t>(mergedWord ? 1u : 0u)};
+            pattern.patchKinds |= slot->kinds | (mergedWord ? 1u << StageMemoMergedKind : 0u);
         }
     }
-    if (pattern.patchKinds != 0u) pattern.words = std::move(words);
-    for (std::size_t word = 0; word < userData.size() && word < ShaderRecompiler::SrtUserDataUse::TrackedWords; ++word) {
-        const auto bit = std::uint64_t{1} << word;
-        if (((use.asBase | addresses) & bit) != 0 && userData[word] == 0u) relocatable &= ~bit;
-    }
-    pattern.relocatable = relocatable;
-    pattern.values = use.asValue;
-    pattern.bases = use.asBase;
-    pattern.addresses = addresses & relocatable;
-    const auto walkRoots = static_cast<std::uint32_t>(pattern.roots.size() - pattern.decodeRoots);
-    std::sort(placed.begin(), placed.end(), [](const Placed& a, const Placed& b) { return a.address < b.address; });
-    entry.order.reserve(placed.size());
-    for (const auto& item : placed) entry.order.push_back(item.nested ? walkRoots + item.slot : item.slot);
-    return std::nullopt;
+    return stageMemoFinish(userData, use, addresses, relocatable, pattern, entry, words, placed);
 }
 
 const char* stageMemoStoreDifference(const std::optional<Counter>& refused, const StageMemoPattern& pattern, const StageMemoEntry& entry, const StageMemoPattern& todayPattern, const StageMemoEntry& today) {
@@ -2056,7 +2534,7 @@ const char* stageMemoStoreDifference(const std::optional<Counter>& refused, cons
     return nullptr;
 }
 
-std::optional<Counter> rememberStage(const LeanDrawJob& job, const DrawProgram& program, std::size_t index, std::uint32_t cursor, const InvocationSlot& slot, const ShaderRecompiler::PreparedShaderInvocation& invocation, const DirectReads& reads, DirectStages& resolved) {
+std::optional<Counter> rememberStage(const LeanDrawJob& job, const DrawProgram& program, std::size_t index, std::uint32_t cursor, const InvocationSlot& slot, const ShaderRecompiler::PreparedShaderInvocation& invocation, const DirectReads& reads, DirectStages& resolved, std::uint64_t& storedKey) {
     auto& stage = resolved.stages[index];
     const std::span<const std::uint32_t> userData = program.userData;
     if (userData.size() > 0xffffu) return Counter::StageMemoUntraced;
@@ -2092,13 +2570,22 @@ std::optional<Counter> rememberStage(const LeanDrawJob& job, const DrawProgram& 
     }
     const auto key = stageMemoKey(job.shape->decode.get(), index);
     auto& store = stageMemoStore();
-    const auto placedWay = store.Way(key, pattern);
+    const auto storeKinds = stageMemoPatchKinds();
+    pattern.arm |= stageMemoArm(storeKinds);
+    std::span<const StageMemoKeyReason> keyReasons;
+    if (grants != nullptr) {
+        struct ReasonsStorage {};
+        auto& held = HostThreadLocal<std::vector<StageMemoKeyReason>, ReasonsStorage>();
+        stageMemoKeyReasons(pattern, entry, userData, reads, stage.capture->userDataUse.reads, *grants, held);
+        keyReasons = held;
+    }
+    const auto placedWay = store.Way(key, pattern, stageMemoWayLimit(), stageMemoForeignKinds(storeKinds));
     if (!placedWay.has_value()) {
-        if (grants != nullptr) stageMemoGrantCensus(key, 0, entry.rootValues, *grants, true);
+        if (grants != nullptr) stageMemoGrantCensus(key, 0, entry.rootValues, *grants, keyReasons, true);
         return Counter::StageMemoPatternsFull;
     }
     const auto way = *placedWay;
-    if (grants != nullptr) stageMemoGrantCensus(key, way, entry.rootValues, *grants, false);
+    if (grants != nullptr) stageMemoGrantCensus(key, way, entry.rootValues, *grants, keyReasons, false);
     entry.decode = job.shape->decode;
     entry.stage = static_cast<std::uint32_t>(index);
     entry.way = static_cast<std::uint32_t>(way);
@@ -2148,7 +2635,69 @@ std::optional<Counter> rememberStage(const LeanDrawJob& job, const DrawProgram& 
         stage.pin = made;
     }
     store.Insert(contentKey, std::move(made));
+    storedKey = contentKey;
     return Counter::StageMemoStored;
+}
+
+bool stageMemoAdmitted(StageMemo& memo) {
+    using Graphics::RuntimeSwitch;
+    using Graphics::RuntimeSwitches::Set;
+    using Cause = StageMemoStore::MissCause;
+    auto& store = stageMemoStore();
+    const bool first = Set(RuntimeSwitch::StageMemoAdmitFirst);
+    const bool third = Set(RuntimeSwitch::StageMemoAdmitThird);
+    const bool ways = Set(RuntimeSwitch::StageMemoAdmitWays);
+    memo.forced = false;
+    if (memo.tried == 0) {
+        DirectDraws::Add(Counter::StageMemoNoEntryUntried);
+    } else {
+        auto cause = Cause::First;
+        if (ways) {
+            for (std::uint32_t at = 0; at < memo.missCount; ++at) cause = std::max(cause, store.Cause(memo.missKeys[at], third, first));
+        } else {
+            cause = store.Cause(memo.missKey, third, first);
+        }
+        DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::StageMemoNoEntryFirst) + static_cast<std::size_t>(cause)));
+    }
+    if (memo.noEntryPlain && memo.noEntryPatterned) DirectDraws::Add(Counter::StageMemoNoEntryBothWays);
+    if (first) return true;
+    if (!ways) return store.Admit(memo.missKey, third);
+    if (memo.tried == 0) {
+        if (memo.armWays >= stageMemoWayLimit()) return false;
+        DirectDraws::Add(Counter::StageMemoAdmitUntried);
+        return true;
+    }
+    bool admitted = false;
+    for (std::uint32_t at = 0; at < memo.missCount; ++at) admitted = store.Admit(memo.missKeys[at], third) || admitted;
+    if (memo.refusals.empty()) memo.refusals.assign(StageMemo::RefusalSlots, 0u);
+    auto& refused = memo.refusals[static_cast<std::size_t>((memo.stageKey ^ (memo.stageKey >> 17u)) % StageMemo::RefusalSlots)];
+    if (admitted) {
+        refused = 0;
+        return true;
+    }
+    if (++refused < 64u) return false;
+    refused = 0;
+    memo.forced = true;
+    DirectDraws::Add(Counter::StageMemoAdmitRefusals);
+    return true;
+}
+
+bool stageMemoLookedUp(const StageMemo& memo, std::uint64_t key) {
+    if (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoAdmitWays)) return key == memo.missKey;
+    return std::find(memo.missKeys.begin(), memo.missKeys.begin() + memo.missCount, key) != memo.missKeys.begin() + memo.missCount;
+}
+
+std::pair<std::uint64_t, std::uint32_t>& stageMemoConflictSlot(StageMemo& memo, std::uint64_t key) {
+    if (memo.conflicts.empty()) memo.conflicts.assign(StageMemo::RefusalSlots, {});
+    return memo.conflicts[static_cast<std::size_t>((key ^ (key >> 17u)) % StageMemo::RefusalSlots)];
+}
+
+bool stageMemoConflictWaits(StageMemo& memo, std::uint64_t key) {
+    if (memo.conflicts.empty() || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoChained)) return false;
+    auto& held = stageMemoConflictSlot(memo, key);
+    if (held.first != key || held.second == 0u) return false;
+    --held.second;
+    return true;
 }
 
 struct StageMemoKept {
@@ -2156,6 +2705,8 @@ struct StageMemoKept {
     std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
     std::vector<Graphics::DecodeRead> decodeReads;
     bool patched = false;
+    bool merged = false;
+    bool relocated = false;
 };
 
 const char* stageMemoDifference(const StageMemoKept& kept, const DirectResolvedStage& stage, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, const std::vector<Graphics::DecodeRead>& decodeReads, std::size_t count) {
@@ -2465,6 +3016,7 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
         const auto cursorBefore = cursor;
         std::optional<StageMemoKept> memoKept;
         bool memoAdmitted = true;
+        bool memoMissed = false;
         const bool memoStage = memo != nullptr && stageMemoCacheable(head);
         if (memo != nullptr) {
             const auto& known = cache.For(head);
@@ -2472,11 +3024,18 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
                 const auto words = resolved.worded ? std::span<const std::uint32_t>(resolved.userWords[i]) : std::span<const std::uint32_t>(head.userData);
                 const auto outcome = adoptStage(*memo, job, words, i, cursor, known, resolved);
                 DirectDraws::Add(stageMemoCounter(outcome));
-                if (outcome == StageMemoOutcome::NoEntry) memoAdmitted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoAdmitFirst) || stageMemoStore().Admit(memo->missKey, Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoAdmitThird));
+                if (outcome == StageMemoOutcome::NoEntry) {
+                    memoAdmitted = stageMemoAdmitted(*memo);
+                    memoMissed = true;
+                }
+                if (outcome == StageMemoOutcome::Inputs && memo->inputsTag) DirectDraws::Add(Counter::StageMemoInputsOlderTag);
                 if (outcome == StageMemoOutcome::Hit) {
                     const auto every = stageMemoVerifyEvery();
                     if (memo->patched) DirectDraws::Add(Counter::StageMemoPatched);
-                    if (every == 0 || (memo->patched ? ++memo->patchedOrdinal : ++memo->verifyOrdinal) % every != 0) {
+                    if (memo->merged) DirectDraws::Add(Counter::StageMemoMerged);
+                    if (memo->relocated) DirectDraws::Add(Counter::StageMemoRelocated);
+                    auto& ordinal = memo->relocated ? memo->relocatedOrdinal : memo->merged ? memo->mergedOrdinal : memo->patched ? memo->patchedOrdinal : memo->verifyOrdinal;
+                    if (every == 0 || ++ordinal % every != 0) {
                         const auto& adopted = *stage.Shared()->donor;
                         cursor += static_cast<std::uint32_t>(adopted.pushConstants.size());
                         previous = &adopted;
@@ -2484,11 +3043,13 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
                         lap(Step::Side);
                         continue;
                     }
-                    memoKept.emplace(StageMemoKept{stage, resolved.VertexInfo(i), resolved.DecodeReads(i), memo->patched});
+                    memoKept.emplace(StageMemoKept{stage, resolved.VertexInfo(i), resolved.DecodeReads(i), memo->patched, memo->merged, memo->relocated});
                     stage.shared.reset();
                     stage.capture.reset();
                     stage.Unview();
                 }
+            } else if (memoStage) {
+                DirectDraws::Add(known.handle == nullptr ? Counter::StageMemoNotLookedUpEmpty : Counter::StageMemoNotLookedUpOther);
             }
             refreshStages(job, resolved);
             decodeVertex(i);
@@ -2504,6 +3065,7 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
         InvocationSlot* slot = nullptr;
         try {
             if (InvocationCacheable(program, built)) slot = &cache.For(program);
+            const auto rebuilt = slot == nullptr ? Counter::InvocationsRebuiltUncached : slot->handle == nullptr ? Counter::InvocationsRebuiltEmpty : slot->snapshot.get() != program.snapshot.get() || slot->codeOffset != program.codeOffset ? Counter::InvocationsRebuiltOther : Counter::InvocationsRebuiltRefused;
             if (slot != nullptr && slot->handle != nullptr && slot->snapshot.get() == program.snapshot.get() && slot->codeOffset == program.codeOffset) {
                 built.context.convertedSamples = slot->convertedSamples;
                 built.context.layerRowSamples = slot->layerRowSamples;
@@ -2515,6 +3077,7 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
                 const auto fresh = request();
                 invocation.emplace(InvocationFor(*program.snapshot, program.codeOffset, fresh));
                 DirectDraws::Add(Counter::InvocationsRebuilt);
+                DirectDraws::Add(rebuilt);
                 if (slot != nullptr) {
                     const auto& context = invocation->Request().context;
                     *slot = {program.snapshot, program.codeOffset, invocation->Handle(), context.convertedSamples, context.layerRowSamples, invocation->VariantId()};
@@ -2587,6 +3150,8 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
         if (memoKept.has_value()) {
             DirectDraws::Add(Counter::StageMemoVerifyChecked);
             if (memoKept->patched) DirectDraws::Add(Counter::StageMemoVerifyPatched);
+            if (memoKept->merged) DirectDraws::Add(Counter::StageMemoVerifyMerged);
+            if (memoKept->relocated) DirectDraws::Add(Counter::StageMemoVerifyRelocated);
             if (const char* what = stageMemoDifference(*memoKept, stage, resolved.VertexInfo(i), resolved.DecodeReads(i), count); what != nullptr) {
                 DirectDraws::Add(Counter::StageMemoVerifyDiffering);
                 static std::atomic<std::uint32_t> printed{0};
@@ -2600,7 +3165,16 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
                 }
             }
         } else if (memoStage && memoAdmitted && slot != nullptr && slot->handle != nullptr) {
-            if (const auto stored = rememberStage(job, program, i, cursorBefore, *slot, *invocation, reads, resolved)) DirectDraws::Add(*stored);
+            const auto memoKey = stageMemoKey(job.shape->decode.get(), i);
+            if (stageMemoConflictWaits(*memo, memoKey)) {
+                DirectDraws::Add(Counter::StageMemoChainConflict);
+            } else {
+                std::uint64_t storedKey = 0;
+                const auto stored = rememberStage(job, program, i, cursorBefore, *slot, *invocation, reads, resolved, storedKey);
+                if (stored) DirectDraws::Add(*stored);
+                if (stored == Counter::StageMemoChainConflict) stageMemoConflictSlot(*memo, memoKey) = {memoKey, 64u};
+                if (memoMissed && memo->tried != 0 && !memo->forced && stored == Counter::StageMemoStored && !stageMemoLookedUp(*memo, storedKey)) DirectDraws::Add(Counter::StageMemoAdmitOtherKey);
+            }
         }
         if (resolveCensus()) noteStageCensus(*invocation, *stage.Capture(), reads, resolved.DecodeReads(i));
         lap(Step::Side);

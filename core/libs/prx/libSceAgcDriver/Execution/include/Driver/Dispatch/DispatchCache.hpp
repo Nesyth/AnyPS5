@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <list>
 #include <map>
@@ -21,6 +22,10 @@
 #include <utility>
 #include <vector>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
+
+namespace ShaderRecompiler {
+struct SideForwards;
+}
 
 namespace AgcDriver::DriverDetail {
 
@@ -51,6 +56,14 @@ inline bool CaptureRegisteredViewsCurrent(std::span<const ShaderRecompiler::Regi
 }
 
 inline constexpr std::size_t MaxDispatchVariants = 8;
+
+struct DispatchAddressPosition {
+    std::uint32_t position = 0;
+    std::uint32_t binding = 0;
+    std::uint32_t word = 0;
+    std::uint32_t mask = 0;
+    bool guarded = false;
+};
 
 struct DispatchVariant {
 
@@ -94,6 +107,40 @@ struct DispatchVariant {
     std::vector<ShaderRecompiler::MemoryRegion> captured;
     std::vector<std::pair<std::uint64_t, std::size_t>> spans;
     std::atomic<std::uint64_t> generation{0};
+
+    std::vector<std::uint32_t> userData;
+    std::uint64_t addressWords = 0;
+    std::uint64_t unusedWords = 0;
+    std::vector<std::array<std::uint32_t, 3>> addressForwards;
+    std::vector<DispatchAddressPosition> addressPositions;
+    bool relocated = false;
+    bool descriptorsPatched = false;
+    bool writtenPatched = false;
+};
+
+struct DispatchRelocation {
+    std::uint64_t mask = 0;
+    std::uint64_t aligned = 0;
+    std::uint64_t banned = 0;
+    std::uint32_t lookups = 0;
+    std::uint32_t hits = 0;
+    std::uint32_t idle = 0;
+    std::vector<std::uint32_t> lastUserData;
+    std::uint64_t lastRelocatable = 0;
+    std::uint64_t lastAddresses = 0;
+    std::uint64_t lastUnused = 0;
+    std::uint64_t lastForwarded = 0;
+    std::uint64_t lastValues = 0;
+};
+
+using DispatchAliasOf = std::function<std::uint64_t(const DispatchRelocation&)>;
+
+struct DispatchProvenance {
+    std::uint64_t identity = 0;
+    std::span<const std::uint32_t> userData;
+    std::vector<std::uint32_t> readNodes;
+    std::shared_ptr<const ShaderRecompiler::SideForwards> sides;
+    DispatchAliasOf aliasOf;
 };
 
 struct DispatchEntry {
@@ -127,6 +174,7 @@ struct EntryCounters {
 struct DataMask {
     std::span<const std::uint32_t> positions;
     std::vector<std::pair<std::uint32_t, std::uint32_t>>* live;
+    std::span<const DispatchAddressPosition> addresses{};
 };
 
 enum class EntryOutcome { Equal, EqualData, Differing, QueuedStores, Inaccessible, QueuedLabel, FlushingImage, PublishMoved, PendingMoved, ForgetMoved, DeviceImageFallback };

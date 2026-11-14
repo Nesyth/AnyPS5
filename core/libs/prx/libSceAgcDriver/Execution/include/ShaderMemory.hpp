@@ -93,8 +93,10 @@ public:
     // The image view hooks a capture installs (1D array layer clamping and the allocation
     // generation), for a walk over another reader.
     static void SetImageViewHooks(ShaderRecompiler::SrtRuntime& runtime);
+    void RecordReadNodes(std::vector<std::uint32_t>* nodes) { readNodes = nodes; }
 
 private:
+    std::vector<std::uint32_t>* readNodes = nullptr;
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation);
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> captureWaitingOnFailure(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation);
     static constexpr std::size_t PageBytes = 4096;

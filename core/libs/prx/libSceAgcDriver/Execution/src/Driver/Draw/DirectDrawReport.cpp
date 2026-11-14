@@ -62,7 +62,11 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "snapshot loads skipped", "snapshot loads taken", "skips verified", "skips differing",
     "cached", "built", "today's refresh", "lazy refreshes", "GPU-indirect draws refreshed today's way", "prologue verify checked", "prologue verify differing",
     "inputs memo hits", "inputs memo stored", "missed by key", "missed by serial", "GPU-indirect draws not memoized", "inputs memo verify checked", "inputs memo verify differing",
-    "set plans built", "set plans hit", "push lists from the plan", "plan verify checked", "plan verify differing", "blobs appended", "lean hand-offs"
+    "set plans built", "set plans hit", "push lists from the plan", "plan verify checked", "plan verify differing", "blobs appended", "lean hand-offs",
+    "first sighting or forgotten", "second sighting", "admitted at this miss", "stored and missing otherwise", "stored and rotated out", "no way of this arm to try",
+    "stored under a key not looked up", "no entry under plain and patterned ways", "admitted without a way to try", "admitted after 64 refusals", "under an older tag",
+    "hits with a merged word", "hits with a moved chained root", "verified merged hits", "verified relocated hits", "chain conflicts", "slot empty", "slot of another program",
+    "not cacheable", "slot empty", "another program", "prepared key refused"
 };
 static_assert(static_cast<std::size_t>(Counter::ExpressReprovedStaging) - static_cast<std::size_t>(Counter::ExpressReprovedNotProved) == static_cast<std::size_t>(Graphics::ShaderResources::ExpressMiss::Staging) - static_cast<std::size_t>(Graphics::ShaderResources::ExpressMiss::NotProved), "every reason an express commit reproves its template needs a counter");
 static_assert(static_cast<std::size_t>(Counter::BindingsLeftUnpushedRebound) - static_cast<std::size_t>(Counter::BindingsLeftUnpushedRefused) + 2 == static_cast<std::size_t>(Graphics::ShaderResources::DynamicLeave::Count), "every way an unpushed draw leaves the dynamic route needs a counter");
@@ -424,9 +428,15 @@ void Report(bool force) {
             perCommit(Counter::FragmentsTodayNanoseconds, Counter::FragmentsTodayTimed), static_cast<unsigned long long>(at(Counter::FragmentsTodayTimed)));
     }
     if (sum(Counter::StageMemoHits, Counter::StageMemoVerifyDiffering) != 0) {
-        AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] stage memo: %llu hits (%llu with a patched word), %llu stored, %llu not adopted%s; not stored%s; %llu cleared; verify %llu checked (%llu of patched hits), %llu differing\n",
+        const auto kinds = reasons(counts, Counter::StageMemoMerged, Counter::StageMemoVerifyRelocated);
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] stage memo: %llu hits (%llu with a patched word), %llu stored, %llu not adopted%s; not stored%s; %llu cleared; verify %llu checked (%llu of patched hits), %llu differing%s%s\n",
             static_cast<unsigned long long>(at(Counter::StageMemoHits)), static_cast<unsigned long long>(at(Counter::StageMemoPatched)), static_cast<unsigned long long>(at(Counter::StageMemoStored)), static_cast<unsigned long long>(sum(Counter::StageMemoNoPattern, Counter::StageMemoSide)), reasons(counts, Counter::StageMemoNoPattern, Counter::StageMemoSide).c_str(),
-            reasons(counts, Counter::StageMemoUntraced, Counter::StageMemoPatternsFull).c_str(), static_cast<unsigned long long>(at(Counter::StageMemoCleared)), static_cast<unsigned long long>(at(Counter::StageMemoVerifyChecked)), static_cast<unsigned long long>(at(Counter::StageMemoVerifyPatched)), static_cast<unsigned long long>(at(Counter::StageMemoVerifyDiffering)));
+            reasons(counts, Counter::StageMemoUntraced, Counter::StageMemoPatternsFull).c_str(), static_cast<unsigned long long>(at(Counter::StageMemoCleared)), static_cast<unsigned long long>(at(Counter::StageMemoVerifyChecked)), static_cast<unsigned long long>(at(Counter::StageMemoVerifyPatched)), static_cast<unsigned long long>(at(Counter::StageMemoVerifyDiffering)), kinds.empty() ? "" : "; merged and chained hits", kinds.c_str());
+    }
+    if (sum(Counter::StageMemoNoEntryFirst, Counter::InvocationsRebuiltRefused) != 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] memo misses: no entry by sighting%s; admission%s; other inputs%s; not stored%s; stages not looked up%s; invocations rebuilt%s\n",
+            reasons(counts, Counter::StageMemoNoEntryFirst, Counter::StageMemoNoEntryUntried).c_str(), reasons(counts, Counter::StageMemoAdmitOtherKey, Counter::StageMemoAdmitRefusals).c_str(), reasons(counts, Counter::StageMemoInputsOlderTag, Counter::StageMemoInputsOlderTag).c_str(),
+            reasons(counts, Counter::StageMemoChainConflict, Counter::StageMemoChainConflict).c_str(), reasons(counts, Counter::StageMemoNotLookedUpEmpty, Counter::StageMemoNotLookedUpOther).c_str(), reasons(counts, Counter::InvocationsRebuiltUncached, Counter::InvocationsRebuiltRefused).c_str());
     }
     if (sum(Counter::StageViewSides, Counter::HandoffsLean) != 0) {
         AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] finisher reuse: stage views%s; memo stores%s; settle serial%s; shape prologue%s; inputs memo%s; fragments%s; buffers%s; hand-off%s\n",

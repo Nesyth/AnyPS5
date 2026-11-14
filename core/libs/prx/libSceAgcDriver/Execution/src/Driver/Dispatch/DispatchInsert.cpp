@@ -14,7 +14,152 @@ bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled) {
     });
 }
 
-void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming) {
+bool Driver::tagDispatchRelocation(DispatchVariant& fresh, std::span<const ShaderRecompiler::MemoryRegion> srtRegions, const ShaderRecompiler::ResourceCapture& capture, const DispatchProvenance& provenance, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied) {
+    if (stampValidate() || fresh.compiled == nullptr) return false;
+    const auto& compiled = *fresh.compiled;
+    if (compiled.gpuResolvedImages || compiled.deviceImageTables || compiled.heapTemplateId != 0) return false;
+    if (std::any_of(compiled.bindings.begin(), compiled.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTable || binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap; })) return false;
+    const auto userData = provenance.userData;
+    const auto& use = capture.userDataUse;
+    if (!supplied.empty()) return false;
+    std::vector<std::uint64_t> read;
+    read.reserve(use.reads.size());
+    for (const auto& entry : use.reads) read.push_back(entry.first);
+    std::sort(read.begin(), read.end());
+    read.erase(std::unique(read.begin(), read.end()), read.end());
+    std::size_t regionWords = 0;
+    for (const auto& region : srtRegions) regionWords += region.bytes.size() / sizeof(std::uint32_t);
+    if (read.size() != regionWords) return false;
+    for (const auto address : read) {
+        if (std::none_of(srtRegions.begin(), srtRegions.end(), [&](const ShaderRecompiler::MemoryRegion& region) { return address >= region.guestAddress && address - region.guestAddress + sizeof(std::uint32_t) <= region.bytes.size() && (address - region.guestAddress) % sizeof(std::uint32_t) == 0; })) return false;
+    }
+    const auto count = std::min<std::size_t>(userData.size(), 64);
+    const std::uint64_t countMask = count >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << count) - 1u;
+    const auto bit = [](std::uint32_t word) { return word < 64 ? std::uint64_t{1} << word : std::uint64_t{0}; };
+    std::uint64_t forwarded = 0;
+    for (const auto word : compiled.shaderDataUserWords) forwarded |= bit(word);
+    const auto* sides = provenance.sides.get();
+    std::uint64_t addresses = 0;
+    std::vector<std::array<std::uint32_t, 3>> addressForwards;
+    if (sides != nullptr && sides->traced) {
+        addresses = sides->addressWords & countMask;
+        for (const auto& forward : sides->forwards) {
+            if (forward.push || (addresses & bit(forward.word)) == 0) continue;
+            const bool held = forward.binding < compiled.bindings.size() && compiled.bindings[forward.binding].role == ShaderRecompiler::DescriptorRole::GuestBuffers && forward.position % 4u == 0 && forward.position < compiled.bindings[forward.binding].guestDescriptor.size() && compiled.bindings[forward.binding].guestDescriptor[forward.position] == userData[forward.word];
+            if (!held) {
+                addresses &= ~bit(forward.word);
+                continue;
+            }
+            addressForwards.push_back({forward.word, forward.binding, forward.position});
+        }
+    }
+    auto walk = use;
+    walk.asValue &= ~addresses;
+    tagVariantRuns(fresh, srtRegions, walk, true, 0, supplied);
+    fresh.relocatableWords &= countMask;
+    fresh.userWordsWalked = use.asBase | use.asValue;
+    addresses &= ~(use.asBase & ~fresh.relocatableWords);
+    std::erase_if(addressForwards, [&](const std::array<std::uint32_t, 3>& forward) { return (addresses & bit(forward[0])) == 0; });
+    fresh.addressWords = addresses;
+    fresh.addressForwards = std::move(addressForwards);
+    fresh.unusedWords = countMask & ~(use.asBase | use.asValue | compiled.userDataRegisterReads | forwarded);
+    if (fresh.shader != nullptr && fresh.shader->userDataTailRegister) {
+        const auto tail = *fresh.shader->userDataTailRegister;
+        fresh.unusedWords &= ~(bit(tail) | bit(tail + 1u));
+    }
+    fresh.userData.assign(userData.begin(), userData.end());
+    const auto& nodes = provenance.readNodes;
+    if (sides == nullptr || !sides->traced || sides->reads.empty() || nodes.size() != use.reads.size()) return true;
+    const auto positionOf = [&](std::uint64_t address) -> std::optional<std::uint32_t> {
+        std::size_t offset = 0;
+        for (const auto& [begin, end] : fresh.runs) {
+            if (address >= begin && address + sizeof(std::uint32_t) <= end && (address - begin) % sizeof(std::uint32_t) == 0) return static_cast<std::uint32_t>(offset + (address - begin) / sizeof(std::uint32_t));
+            offset += static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
+        }
+        return std::nullopt;
+    };
+    struct ByNode {
+        bool operator()(const ShaderRecompiler::SideReadForward& forward, std::uint32_t node) const { return forward.node < node; }
+        bool operator()(std::uint32_t node, const ShaderRecompiler::SideReadForward& forward) const { return node < forward.node; }
+    };
+    struct Granted {
+        std::uint64_t address;
+        std::uint32_t key;
+        std::uint8_t kind;
+        bool pinned;
+    };
+    std::vector<Granted> granted;
+    for (std::size_t at = 0; at < use.reads.size(); ++at) {
+        const auto address = use.reads[at].first;
+        auto slot = std::find_if(granted.begin(), granted.end(), [&](const Granted& known) { return known.address == address; });
+        if (slot == granted.end()) slot = granted.insert(granted.end(), Granted{address, 0u, 0u, false});
+        const auto node = nodes[at];
+        const auto [first, last] = std::equal_range(sides->reads.begin(), sides->reads.end(), node, ByNode{});
+        if (node == ShaderRecompiler::SrtNoReadNode || first == last) {
+            slot->pinned = true;
+            continue;
+        }
+        for (auto forward = first; forward != last; ++forward) {
+            const auto kind = static_cast<std::uint8_t>(forward->kind);
+            if (slot->kind != 0u && slot->kind != kind) slot->pinned = true;
+            slot->kind = kind;
+            slot->key |= forward->keyMask;
+        }
+    }
+    for (const auto& slot : granted) {
+        if (slot.pinned || (slot.kind != static_cast<std::uint8_t>(ShaderRecompiler::SideReadKind::BufferAddress) && slot.kind != static_cast<std::uint8_t>(ShaderRecompiler::SideReadKind::BufferSize))) continue;
+        const auto mask = ~slot.key;
+        const auto position = positionOf(slot.address);
+        if (mask == 0u || !position.has_value()) continue;
+        const auto value = fresh.words[*position];
+        if ((value & mask) == 0u) continue;
+        bool fits = true;
+        std::vector<DispatchAddressPosition> entries;
+        for (std::size_t at = 0; fits && at < use.reads.size(); ++at) {
+            if (use.reads[at].first != slot.address) continue;
+            const auto [first, last] = std::equal_range(sides->reads.begin(), sides->reads.end(), nodes[at], ByNode{});
+            for (auto forward = first; fits && forward != last; ++forward) {
+                fits = forward->binding < compiled.bindings.size() && compiled.bindings[forward->binding].role == ShaderRecompiler::DescriptorRole::GuestBuffers && forward->position < compiled.bindings[forward->binding].guestDescriptor.size() && ((compiled.bindings[forward->binding].guestDescriptor[forward->position] ^ value) & mask) == 0u;
+                if (fits && std::none_of(entries.begin(), entries.end(), [&](const DispatchAddressPosition& entry) { return entry.binding == forward->binding && entry.word == forward->position; })) entries.push_back({*position, forward->binding, forward->position, mask, true});
+            }
+        }
+        if (fits) fresh.addressPositions.insert(fresh.addressPositions.end(), entries.begin(), entries.end());
+    }
+    std::stable_sort(fresh.addressPositions.begin(), fresh.addressPositions.end(), [](const DispatchAddressPosition& a, const DispatchAddressPosition& b) { return a.position < b.position; });
+    return true;
+}
+
+void Driver::learnDispatchRelocation(std::uint64_t key, const DispatchVariant& fresh, const DispatchProvenance& provenance) {
+    constexpr std::size_t MaxShapes = 16384;
+    if (dispatchRelocations.size() >= MaxShapes && !dispatchRelocations.contains(provenance.identity)) dispatchRelocations.clear();
+    auto& shape = dispatchRelocations[provenance.identity];
+    const auto count = std::min<std::size_t>(fresh.userData.size(), 64);
+    const std::uint64_t countMask = count >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << count) - 1u;
+    const auto movable = (fresh.relocatableWords | fresh.addressWords | fresh.unusedWords) & countMask;
+    shape.banned |= countMask & ~movable;
+    shape.mask = (shape.mask | movable) & ~shape.banned;
+    shape.aligned |= (fresh.relocatableWords | fresh.addressWords) & countMask;
+    if (dispatchCensusEnabled()) {
+        shape.lastUserData = fresh.userData;
+        shape.lastRelocatable = fresh.relocatableWords;
+        shape.lastAddresses = fresh.addressWords;
+        shape.lastUnused = fresh.unusedWords;
+        shape.lastValues = fresh.userWordsWalked & ~fresh.relocatableWords;
+        shape.lastForwarded = 0;
+        for (const auto word : fresh.compiled->shaderDataUserWords) shape.lastForwarded |= word < 64 ? std::uint64_t{1} << word : std::uint64_t{0};
+    }
+    if (!provenance.aliasOf || shape.mask == 0) return;
+    constexpr std::size_t MaxAliases = 16384;
+    const auto alias = provenance.aliasOf(shape);
+    if (dispatchAliases.size() >= MaxAliases && !dispatchAliases.contains(alias)) dispatchAliases.clear();
+    auto& donors = dispatchAliases[alias];
+    auto held = std::find(donors.begin(), donors.end(), key);
+    if (held == donors.end()) held = donors.end() - 1;
+    std::rotate(donors.begin(), held, held + 1);
+    donors.front() = key;
+}
+
+void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, const DispatchProvenance* provenance) {
     if (!noDispatchCache) {
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->compiled = compiledResult;
@@ -31,15 +176,18 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             capturedWords += region.bytes.size() / sizeof(std::uint32_t);
         }
         const auto supplied = shaderMemory->SuppliedBlocks();
-        fresh->runs.reserve(srtRegions.size());
-        fresh->words.reserve(capturedWords);
-        for (const auto& region : srtRegions) {
-            fresh->runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
-            const auto count = region.bytes.size() / sizeof(std::uint32_t);
-            const auto offset = fresh->words.size();
-            fresh->words.resize(offset + count);
-            std::memcpy(fresh->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
-            AppendSharedWords(fresh->shared, fresh->runs.size() - 1u, offset, region.bytes, supplied);
+        const bool relocation = provenance != nullptr && capture != nullptr && tagDispatchRelocation(*fresh, srtRegions, *capture, *provenance, supplied);
+        if (!relocation) {
+            fresh->runs.reserve(srtRegions.size());
+            fresh->words.reserve(capturedWords);
+            for (const auto& region : srtRegions) {
+                fresh->runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+                const auto count = region.bytes.size() / sizeof(std::uint32_t);
+                const auto offset = fresh->words.size();
+                fresh->words.resize(offset + count);
+                std::memcpy(fresh->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
+                AppendSharedWords(fresh->shared, fresh->runs.size() - 1u, offset, region.bytes, supplied);
+            }
         }
 
         DataWordPositionCounts dataCounts;
@@ -51,6 +199,8 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 break;
             }
         }
+        if (relocation && !fresh->dataPositions.empty()) std::erase_if(fresh->addressPositions, [&](const DispatchAddressPosition& entry) { return std::binary_search(fresh->dataPositions.begin(), fresh->dataPositions.end(), entry.position); });
+        const auto learned = relocation ? fresh : nullptr;
         bool stable = true;
         if (stampValidate()) {
 
@@ -141,6 +291,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                     dispatchCacheVariantBytes = 0;
                 }
             }
+            if (learned != nullptr) learnDispatchRelocation(key, *learned, *provenance);
         } else {
             ++entryCounters.unstable;
         }

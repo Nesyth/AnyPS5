@@ -91,7 +91,10 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
             std::memcpy(&fresh, live.data() + i * sizeof(std::uint32_t), sizeof(fresh));
             if (stored == fresh) continue;
             const auto position = static_cast<std::uint32_t>(first + i);
-            if (!std::binary_search(data->positions.begin(), data->positions.end(), position)) return GuestMemory::Compare::Differs;
+            if (!std::binary_search(data->positions.begin(), data->positions.end(), position)) {
+                const auto found = std::lower_bound(data->addresses.begin(), data->addresses.end(), position, [](const DispatchAddressPosition& entry, std::uint32_t value) { return entry.position < value; });
+                if (found == data->addresses.end() || found->position != position || ((stored ^ fresh) & ~found->mask) != 0 || (found->guarded && (fresh & found->mask) == 0)) return GuestMemory::Compare::Differs;
+            }
             data->live->emplace_back(position, fresh);
         }
         return GuestMemory::Compare::Equal;

@@ -80,11 +80,22 @@ struct SideReadForward {
     std::uint32_t keyMask = 0;
     SideReadKind kind = SideReadKind::BufferAddress;
 };
+struct SideReadBase {
+    std::uint32_t parent = 0;
+    std::uint32_t child = 0;
+};
+enum class SideNodeUse : std::uint8_t { Forward = 1, Base = 2, ReadArgument = 4, Argument = 8, Condition = 16, Clean = 32, DwordKept = 64, Uncovered = 128 };
+enum class SideTape : std::uint8_t { Traced, None, UniformFill, GcnGuest };
 struct SideForwards {
     bool traced = false;
     std::uint64_t addressWords = 0;
     std::vector<SideForward> forwards;
     std::vector<SideReadForward> reads;
+    std::vector<SideReadForward> chainedReads;
+    std::vector<SideReadBase> bases;
+    std::vector<SideReadBase> children;
+    std::vector<std::uint8_t> nodeUses;
+    SideTape tape = SideTape::Traced;
 };
 class PreparedShaderInvocation {
 public:

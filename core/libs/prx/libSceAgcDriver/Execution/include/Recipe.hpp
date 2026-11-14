@@ -55,6 +55,7 @@ struct Recipe {
     // Both false for every recipe (only reusable objects get one); kept for the asserts.
     bool needsCompletion = false;
     bool holdsLease = false;
+    bool moves = false;
 };
 
 // Recorded: the dispatch went into the open batch from the recipe; Rebuild: the proof failed or an

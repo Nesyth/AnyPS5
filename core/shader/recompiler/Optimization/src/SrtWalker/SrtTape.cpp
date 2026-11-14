@@ -624,6 +624,64 @@ std::vector<SrtTape::ReadForward> SrtTape::ReadForwards(const IrResourcePlan& pl
     return forwards;
 }
 
+SrtTape::ReadUses SrtTape::ChainedReadUses(const IrResourcePlan& plan) const {
+    ReadUses uses;
+    if (plan.uniformFill.fill.kind != UniformFillKind::None) return uses;
+    std::vector<std::uint8_t> impure(nodes.size(), 0u);
+    uses.flags.assign(nodes.size(), 0u);
+    const auto read = [&](std::uint32_t index) { return index != NoNode && index < nodes.size() && (nodes[index].op == Op::Read || nodes[index].op == Op::ReadConstBuffer) && !nodes[index].clean; };
+    for (std::size_t at = 0; at < nodes.size(); ++at) {
+        const auto& node = nodes[at];
+        const bool reader = node.op == Op::Read || node.op == Op::ReadConstBuffer;
+        if (reader && node.clean) uses.flags[at] |= UseClean;
+        for (std::uint8_t argument = 0; argument < node.argumentCount; ++argument) {
+            const auto index = node.arguments[argument];
+            if (index >= impure.size()) continue;
+            if (argument == 0u && reader && node.baseWord < 0 && !node.clean && read(index)) {
+                uses.bases.push_back({index, static_cast<std::uint32_t>(at)});
+                uses.flags[index] |= UseBase;
+                continue;
+            }
+            impure[index] = 1u;
+            uses.flags[index] |= reader ? UseReadArgument : UseArgument;
+        }
+    }
+    for (const auto root : conditionRoots) {
+        if (root >= impure.size()) continue;
+        impure[root] = 1u;
+        uses.flags[root] |= UseCondition;
+    }
+    for (std::size_t position = 0; position < plan.materializationSources.size(); ++position) {
+        const auto source = plan.materializationSources[position];
+        if (source >= sourceDwords.size()) return {};
+        for (std::size_t dword = 0; dword < sourceDwords[source].size(); ++dword) {
+            const auto index = sourceDwords[source][dword];
+            if (!read(index)) continue;
+            if (position < plan.info.buffers.size() && dword < 3u) {
+                uses.forwards.push_back({index, static_cast<std::uint32_t>(position), static_cast<std::uint8_t>(dword), false});
+            } else {
+                impure[index] = 1u;
+                uses.flags[index] |= UseDwordKept;
+            }
+        }
+    }
+    for (std::size_t slot = 0; slot < flatRoots.size() && slot < plan.srtReads.size(); ++slot) {
+        const auto index = flatRoots[slot];
+        if (!read(index)) continue;
+        const auto offset = plan.srtReads[slot].flatOffset;
+        if (offset < plan.cleanFlatSlots.size() && plan.cleanFlatSlots[offset] != 0u) {
+            impure[index] = 1u;
+            uses.flags[index] |= UseClean;
+        } else {
+            uses.forwards.push_back({index, offset, 0, true});
+        }
+    }
+    std::erase_if(uses.forwards, [&](const ReadForward& forward) { return impure[forward.node] != 0u; });
+    std::erase_if(uses.bases, [&](const ReadBase& base) { return impure[base.parent] != 0u; });
+    for (const auto& forward : uses.forwards) uses.flags[forward.node] |= UseForward;
+    return uses;
+}
+
 bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources) const {
     if (!plan.srtPlanComplete) return false;
     if (std::any_of(plan.cleanFlatSlots.begin(), plan.cleanFlatSlots.end(), [](std::uint8_t clean) { return clean != 0u; }) && runtime.readSpecializationMemory == nullptr) return false;

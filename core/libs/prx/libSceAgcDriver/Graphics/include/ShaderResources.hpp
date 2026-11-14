@@ -285,6 +285,7 @@ public:
         std::uint64_t begin = 0;
         std::size_t bytes = 0;
         bool behind = false;
+        bool written = false;
     };
     enum class MovedCount : std::uint8_t { Shape, Patched, NotGuest, Written, Oversize, Budget, Unmapped, TemplateWrites, PendingWrite, PendingStorage, Shadowed, Resized, ResizedClamped, PreparedResized, PreparedResizedClamped, InPlaceRanges, InPlaceHits, NotEligible, InPlaceStorage, InPlaceShadowed, CpuPublish, Label, QueuedStore, CopiedWriter, OverRange, NoImport, Misaligned, PreparedInPlaceHits, PreparedInPlaceRanges, PreparedInPlaceSerials, PreparedInPlaceSwitch, PreparedInPlaceWrites, Count };
     static const char* MovedCountName(MovedCount count);
@@ -595,14 +596,21 @@ public:
     // MovedReadOnlyBuffers left from the same ticket.
     static PreparedDifference ComparePreparedTickets(const MoveTicket* prepared, const MoveTicket& today);
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
-    enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
+    enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, WrittenTemplate, WrittenInPlace, WrittenAlias, Count };
     struct MoveProof {
         MoveRefusal refusal = MoveRefusal::None;
         std::size_t buffers = 0;
         std::size_t bytes = 0;
+        std::size_t written = 0;
     };
     static const char* MoveRefusalName(MoveRefusal refusal);
-    std::optional<std::vector<MovedBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof) const;
+    std::optional<std::vector<MovedBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof, bool writes = false) const;
+    bool MovableWrites() const;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> MovedGpuWrites(std::span<const MovedBuffer> moved) const;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> MovedInPlaceReads(std::span<const MovedBuffer> moved) const;
+    std::vector<std::string> VerifyMovedWrites(const CompiledShader& shader, std::span<const MovedBuffer> moved) const;
+    enum class NotReusable : std::uint8_t { None, HtileClear, CopiedWrites, LeaseOrTable, MultisampleSources, PerUseTextures, DataBuffers, NoImportSerial, Count };
+    NotReusable NotReusableReason() const { return notReusable; }
     static std::size_t MaxDrawSnapshotBytes();
     static std::size_t DrawUploadLimit();
     struct MovedSnapshotCounts {
@@ -618,6 +626,7 @@ public:
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
     // once the work completed.
     void MarkGpuWrites(Recorder& recorder);
+    void MarkGpuWrites(Recorder& recorder, std::span<const MovedBuffer> moved);
     void WriteBackBuffers();
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
     bool NeedsCompletion() const { return (bda != nullptr && faultChecks) || guestMemory.HasCopiedWrites(); }
@@ -676,8 +685,8 @@ public:
     // Without `dataWords` the ShaderData and FlattenedSrt descriptor words stay out of the key
     // (their count and size remain): a compute template then serves dispatches whose constants
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
-    static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
-    static void AppendContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key);
+    static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false, bool movableWrites = false);
+    static void AppendContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key, bool movableWrites = false);
     static bool DiffContentKeys(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> key, bool draw, ContentKeyDiff& diff);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
@@ -1339,6 +1348,7 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    NotReusable notReusable = NotReusable::None;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     std::vector<std::array<std::uint64_t, 4>> storageUntracked;

@@ -197,6 +197,13 @@ enum class RuntimeSwitch : std::size_t {
     DirectHandoff,
     InputsMemo,
     WorkerHelps,
+    DispatchMovedWrites,
+    DispatchRelocate,
+    DispatchMovedRecipes,
+    StageMemoPatchMerged,
+    StageMemoChained,
+    StageMemoAdmitWays,
+    StageMemoInvocationWays,
     Count,
 };
 

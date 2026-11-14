@@ -894,6 +894,10 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.normalizeImageView = &normalizeImageView;
     runtime.imageViewGeneration = &imageViewGeneration;
     runtime.snapshotCurrent = &snapshotCurrent;
+    if (readNodes != nullptr) {
+        readNodes->clear();
+        runtime.readNodes = readNodes;
+    }
     auto capture = invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);

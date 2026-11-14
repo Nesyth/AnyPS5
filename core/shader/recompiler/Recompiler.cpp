@@ -2699,7 +2699,10 @@ SideForwards PreparedShaderInvocation::TraceSideForwards(const ResourceCapture& 
     out.traced = true;
     const auto& plan = *capture.plan;
     const auto* tape = Detail::SrtTape::For(plan);
-    if (tape == nullptr) return out;
+    if (tape == nullptr) {
+        out.tape = SideTape::None;
+        return out;
+    }
     const auto bit = [](std::uint32_t word) { return std::uint64_t {1} << word; };
     std::vector<SideForward> moved;
     std::uint64_t seen = 0;
@@ -2727,28 +2730,55 @@ SideForwards PreparedShaderInvocation::TraceSideForwards(const ResourceCapture& 
     for (const auto& forward : moved) {
         if ((out.addressWords & bit(forward.word)) != 0u) out.forwards.push_back(forward);
     }
-    if (GcnGuestShaders()) return out;
-    std::vector<std::uint32_t> uncoveredNodes;
-    for (const auto& forward : tape->ReadForwards(plan)) {
+    if (GcnGuestShaders()) {
+        out.tape = SideTape::GcnGuest;
+        return out;
+    }
+    if (plan.uniformFill.fill.kind != UniformFillKind::None) out.tape = SideTape::UniformFill;
+    const auto place = [&](const Detail::SrtTape::ReadForward& forward, std::vector<SideReadForward>& into) {
         bool covered = false;
         if (forward.flat) {
             if (patch.flattenedSrt != MemoPatch::NoBinding && patch.flattenedSrt < count) {
-                out.reads.push_back({forward.node, patch.flattenedSrt, forward.index, 0u, SideReadKind::FlatWord});
+                into.push_back({forward.node, patch.flattenedSrt, forward.index, 0u, SideReadKind::FlatWord});
                 covered = true;
             }
         } else {
             for (const auto& [binding, resources] : patch.buffers) {
                 for (std::size_t element = 0; element < resources.size(); ++element) {
                     if (resources[element] != forward.index || binding >= count) continue;
-                    out.reads.push_back({forward.node, binding, static_cast<std::uint32_t>(element * 4u + forward.dword), forward.dword == 1u ? 0xffff0000u : 0x00000003u, forward.dword == 2u ? SideReadKind::BufferSize : SideReadKind::BufferAddress});
+                    into.push_back({forward.node, binding, static_cast<std::uint32_t>(element * 4u + forward.dword), forward.dword == 1u ? 0xffff0000u : 0x00000003u, forward.dword == 2u ? SideReadKind::BufferSize : SideReadKind::BufferAddress});
                     covered = true;
                 }
             }
         }
-        if (!covered) uncoveredNodes.push_back(forward.node);
+        return covered;
+    };
+    std::vector<std::uint32_t> uncoveredNodes;
+    for (const auto& forward : tape->ReadForwards(plan)) {
+        if (!place(forward, out.reads)) uncoveredNodes.push_back(forward.node);
     }
     std::erase_if(out.reads, [&](const SideReadForward& read) { return std::find(uncoveredNodes.begin(), uncoveredNodes.end(), read.node) != uncoveredNodes.end(); });
     std::sort(out.reads.begin(), out.reads.end(), [](const SideReadForward& a, const SideReadForward& b) { return a.node < b.node; });
+    static_assert(Detail::SrtTape::UseForward == static_cast<std::uint8_t>(SideNodeUse::Forward) && Detail::SrtTape::UseBase == static_cast<std::uint8_t>(SideNodeUse::Base) && Detail::SrtTape::UseReadArgument == static_cast<std::uint8_t>(SideNodeUse::ReadArgument) && Detail::SrtTape::UseArgument == static_cast<std::uint8_t>(SideNodeUse::Argument) && Detail::SrtTape::UseCondition == static_cast<std::uint8_t>(SideNodeUse::Condition) && Detail::SrtTape::UseClean == static_cast<std::uint8_t>(SideNodeUse::Clean) && Detail::SrtTape::UseDwordKept == static_cast<std::uint8_t>(SideNodeUse::DwordKept), "the tape's node uses and the side's must agree");
+    auto uses = tape->ChainedReadUses(plan);
+    std::vector<std::uint32_t> uncoveredChained;
+    for (const auto& forward : uses.forwards) {
+        if (!place(forward, out.chainedReads)) uncoveredChained.push_back(forward.node);
+    }
+    std::sort(uncoveredChained.begin(), uncoveredChained.end());
+    const auto chainedUncovered = [&](std::uint32_t node) { return std::binary_search(uncoveredChained.begin(), uncoveredChained.end(), node); };
+    std::erase_if(out.chainedReads, [&](const SideReadForward& read) { return chainedUncovered(read.node); });
+    std::sort(out.chainedReads.begin(), out.chainedReads.end(), [](const SideReadForward& a, const SideReadForward& b) { return a.node < b.node; });
+    out.nodeUses = std::move(uses.flags);
+    for (const auto node : uncoveredChained) {
+        if (node < out.nodeUses.size()) out.nodeUses[node] |= static_cast<std::uint8_t>(SideNodeUse::Uncovered);
+    }
+    for (const auto& base : uses.bases) {
+        if (!chainedUncovered(base.parent)) out.bases.push_back({base.parent, base.child});
+    }
+    out.children = out.bases;
+    std::sort(out.bases.begin(), out.bases.end(), [](const SideReadBase& a, const SideReadBase& b) { return a.child != b.child ? a.child < b.child : a.parent < b.parent; });
+    std::sort(out.children.begin(), out.children.end(), [](const SideReadBase& a, const SideReadBase& b) { return a.parent != b.parent ? a.parent < b.parent : a.child < b.child; });
     return out;
 }
 

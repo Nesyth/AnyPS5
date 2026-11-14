@@ -7118,6 +7118,28 @@ void GuestBufferMemory::MarkDirectWrites() const {
     }
 }
 
+void GuestBufferMemory::MarkDirectWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> dropped, std::span<const std::pair<std::uint64_t, std::uint64_t>> added) const {
+    for (const auto& range : writes) {
+        if (std::find(dropped.begin(), dropped.end(), range) != dropped.end()) continue;
+        const auto* found = owner(range.first, range.second);
+        if (found == nullptr || (found->direct == nullptr && !(found->gpuCopy && found->copiedBack))) continue;
+        std::uint64_t order = 0;
+        static_cast<void>(GuestMemory::MarkPossiblyWritten(range.first, static_cast<std::size_t>(range.second - range.first), order));
+        directWritesGeneration = std::max(directWritesGeneration, order);
+    }
+    for (const auto& [begin, end] : added) {
+        std::uint64_t order = 0;
+        static_cast<void>(GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin), order));
+        directWritesGeneration = std::max(directWritesGeneration, order);
+    }
+}
+
+bool GuestBufferMemory::BoundInPlace(std::uint64_t begin, std::uint64_t end) const {
+    if (!uploaded || committed || space != nullptr) return false;
+    const auto* found = owner(begin, end);
+    return found != nullptr && found->direct != nullptr && !found->gpuCopy && found->mirror == nullptr && found->begin <= begin && end <= inPlaceEnd(*found);
+}
+
 namespace {
 
 using ChangedStore = void (*)(std::uint64_t, std::span<const std::byte>, std::span<const std::byte>);
