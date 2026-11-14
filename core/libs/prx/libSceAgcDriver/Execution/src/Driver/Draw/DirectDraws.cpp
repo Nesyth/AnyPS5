@@ -1297,6 +1297,30 @@ const char* stageMemoDifference(const StageMemoKept& kept, const DirectResolvedS
 
 }
 
+namespace {
+
+struct RefreshedDecode {
+    std::shared_ptr<const DrawDecode> source;
+    std::optional<DrawDecode> decode;
+};
+struct RefreshedDecodeStorage {};
+
+std::shared_ptr<const DrawDecode> refreshedDecode(const std::shared_ptr<const DrawDecode>& from, const DrawUserWords& words) {
+    auto& scratch = HostThreadLocal<RefreshedDecode, RefreshedDecodeStorage>();
+    if (scratch.source != from) {
+        if (scratch.decode.has_value()) *scratch.decode = *from;
+        else scratch.decode.emplace(*from);
+        scratch.source = from;
+    }
+    for (auto& program : scratch.decode->programs) {
+        ReadUserWordsFrom(words, program);
+        if (program.merged) InitializeMergedFrom(words, program, program.mergedPointer, program.mergedPointerRequired);
+    }
+    return std::shared_ptr<const DrawDecode>(std::shared_ptr<void>(), &*scratch.decode);
+}
+
+}
+
 std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const LeanAnchor& anchor, DirectStages& resolved, DirectStepClock* clock) {
     DrawPipeline::FollowEpoch(job.epoch);
     DrawPipeline::Active() = true;
@@ -1311,7 +1335,7 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
     resolved.tag = stores.Follow(job.deviceSerial);
     const auto& shape = *job.shape;
     const auto& device = *anchor.device;
-    resolved.decode = LeanRefreshedDecode(*shape.decode, job.words);
+    resolved.decode = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::LeanPrepare) ? refreshedDecode(shape.decode, job.words) : LeanRefreshedDecode(*shape.decode, job.words);
     const auto& decode = *resolved.decode;
     const auto& graphics = decode.state;
     const auto& programs = decode.programs;

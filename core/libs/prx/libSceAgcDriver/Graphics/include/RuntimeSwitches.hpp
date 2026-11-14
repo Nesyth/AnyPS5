@@ -138,6 +138,7 @@ enum class RuntimeSwitch : std::size_t {
     AppendCommits,
     XpNoBarriers,
     DrawRuns,
+    LeanPrepare,
     Count,
 };
 

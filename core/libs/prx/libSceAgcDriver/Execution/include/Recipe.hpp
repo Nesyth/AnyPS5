@@ -363,6 +363,7 @@ struct DrawRecordCommit {
     const void* pushTemplate = nullptr;
     std::uint64_t touchedPresent = ~std::uint64_t{0};
     std::uint64_t builds = 0;
+    std::uint8_t writers = 0;
     bool cleanProofs = false;
     // Set by the committer for the next commit: compare the hit's prepared buffers with today's way
     // (APS5_VERIFY_DIRECT_BUFFERS) and draw today's way.

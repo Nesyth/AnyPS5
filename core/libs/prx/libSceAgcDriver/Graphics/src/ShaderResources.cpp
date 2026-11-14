@@ -9704,6 +9704,7 @@ bool ShaderResources::PrepareDirectBuffers(const BufferPlan& plan, std::span<con
     out.moved.clear();
     out.selected.clear();
     out.blob.clear();
+    if (out.blob.capacity() == 0) out.blob.reserve(8192);
     out.refusal = Refusal::None;
     out.depthGuards = DepthGuardsGeneration_nid_no_patch();
     out.forget = GuestMemory::ForgetSerial();

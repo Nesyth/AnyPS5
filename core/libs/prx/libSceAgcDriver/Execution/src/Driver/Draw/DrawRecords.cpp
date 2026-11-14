@@ -1834,8 +1834,9 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         }
     } submitDue{*this, localDevice};
     recordLabelsForPacket(localDevice.get(), queue);
-    noteDrawWriters(hit.stages, queue);
     auto& commit = *hit.record->commit;
+    if (commit.writers == 0) commit.writers = StagesMayWriteBuffers(hit.stages) ? 2 : 1;
+    if (commit.writers == 2) noteDrawWriters(hit.stages, queue);
     commit.cleanProofs = hit.direct ? Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectCleanProofs) : hit.planned && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoPlanCleanProofs);
     static std::uint64_t ordinal = 0;
     const auto every = DrawRecords::VerifyEvery();
