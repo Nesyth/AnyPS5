@@ -1471,6 +1471,29 @@ std::shared_ptr<DrawRecordHit> Driver::fetchDrawRecords(const LeanDrawJob& job, 
     return nullptr;
 }
 
+namespace {
+
+struct HitRelease {
+    std::shared_ptr<DrawRecordHit> hit;
+    std::shared_ptr<VulkanDevice> device;
+    std::shared_ptr<const DrawDecode> decode;
+
+    HitRelease(std::shared_ptr<DrawRecordHit> kept, std::shared_ptr<VulkanDevice> keptDevice, std::shared_ptr<const DrawDecode> keptDecode) : hit(std::move(kept)), device(std::move(keptDevice)), decode(std::move(keptDecode)) {}
+    HitRelease(const HitRelease&) = default;
+    HitRelease(HitRelease&&) noexcept = default;
+    HitRelease& operator=(const HitRelease&) = delete;
+    HitRelease& operator=(HitRelease&&) = delete;
+
+    ~HitRelease() {
+        if (hit == nullptr && device == nullptr && decode == nullptr) return;
+        std::array<std::shared_ptr<const void>, 3> held{std::move(hit), std::move(device), std::move(decode)};
+        if (DrawFinisher::DeferRelease(held)) return;
+        for (auto& entry : held) entry.reset();
+    }
+};
+
+}
+
 void Driver::commitRecordDraw(const LeanDrawJob& job, const LeanAnchor& anchor, std::shared_ptr<DrawRecordHit> hit) {
     auto writes = hit->record->writes;
     auto reads = std::move(hit->reads);
@@ -1502,6 +1525,24 @@ void Driver::commitRecordDraw(const LeanDrawJob& job, const LeanAnchor& anchor, 
         };
         DirectDraws::Add(DirectDraws::Counter::HandoffsLean);
         DrawPipeline::Queue0().EnqueueKept(std::move(lean), std::move(writes), std::move(reads), std::move(hit));
+        return;
+    }
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::IdleHitRelease)) {
+        auto released = [this, held = HitRelease{std::move(hit), anchor.device, job.shape->decode}, queue = job.queue, opcode = job.opcode, epoch = job.epoch, trace, shape = job.shapeKey] {
+            DrawPipeline::FollowEpoch(epoch);
+            GuestMemory::SetCurrentPacket(opcode, queue);
+            const bool following = held.device != nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow);
+            const bool attempted = following && Graphics::ExpressRunLed();
+            static std::uint32_t itemOrdinal = 0;
+            const bool timed = following && (++itemOrdinal & 7u) == 0;
+            const auto began = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (attempted && followRecord(*held.device, queue, held.decode->state, *held.hit, trace)) return;
+            const auto committing = timed && attempted ? std::chrono::steady_clock::now() : began;
+            commitRecord(held.device, queue, held.decode->state, *held.hit, trace, shape);
+            if (timed) Graphics::NoteExpressNonFollower(attempted, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(committing - began).count()), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - committing).count()));
+            if (following) Graphics::DropExpressFollowVerify();
+        };
+        DrawPipeline::Queue0().Enqueue(std::move(released), std::move(writes), 0, {}, std::move(reads), true);
         return;
     }
     auto commit = [this, hit = std::move(hit), localDevice = anchor.device, decode = job.shape->decode, queue = job.queue, opcode = job.opcode, epoch = job.epoch, trace, shape = job.shapeKey] {
@@ -1674,6 +1715,16 @@ void NoteDirectBuffers(const DrawRecordCommit& commit, bool prepared) {
         break;
     default: break;
     }
+    if (effects.bufferShortcuts == 0) return;
+    const auto kind = effects.buffers == DrawRecordBuffers::Checked ? 0u : effects.buffers == DrawRecordBuffers::Differs ? 1u : effects.buffers == DrawRecordBuffers::MemoryChanged ? 2u : effects.buffers == DrawRecordBuffers::Unwatched ? 3u : 4u;
+    if (kind == 4u) return;
+    using Prepared = Graphics::ShaderResources::PreparedBuffers;
+    constexpr std::array<std::pair<std::uint8_t, Counter>, 3> shortcuts{{{Prepared::DeferredImports, Counter::VerifyDeferredChecked}, {Prepared::MergedSettle, Counter::VerifyMergedChecked}, {Prepared::ExactCapacity, Counter::VerifyCapacityChecked}}};
+    for (const auto& [bit, first] : shortcuts) {
+        if ((effects.bufferShortcuts & bit) == 0) continue;
+        DirectDraws::Add(first);
+        if (kind != 0u) DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(first) + kind));
+    }
 }
 
 void NoteDirectInputs(const DrawRecordCommit& commit, bool prepared) {
@@ -1697,6 +1748,9 @@ void NoteDirectInputs(const DrawRecordCommit& commit, bool prepared) {
         break;
     default: break;
     }
+    if (!commit.effects.inputsCapacity || (commit.effects.inputs != DrawRecordInputs::Checked && commit.effects.inputs != DrawRecordInputs::Differs)) return;
+    DirectDraws::Add(Counter::InputsVerifyCapacityChecked);
+    if (commit.effects.inputs == DrawRecordInputs::Differs) DirectDraws::Add(Counter::InputsVerifyCapacityDiffering);
 }
 
 void PublishInputsRecipe(DrawRecordCommit& commit) {

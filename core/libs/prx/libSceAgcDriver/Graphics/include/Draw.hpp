@@ -104,6 +104,7 @@ struct PreparedInputs {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
     std::vector<Range> ranges;
     std::size_t indirectRanges = 0;
+    bool exactCapacity = false;
 };
 bool PrepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, PreparedInputs& prepared);
 enum class InputsMemoOutcome : std::uint8_t { None, Hit, MissKey, MissSerial, Indirect };

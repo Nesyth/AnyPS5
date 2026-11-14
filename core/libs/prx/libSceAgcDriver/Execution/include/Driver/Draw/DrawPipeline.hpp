@@ -257,6 +257,8 @@ public:
     PublishedKeys::Answer KeyBefore(std::uint64_t key, std::uint64_t shape, bool insertsOnly) const;
     bool AheadBusy() const;
     static bool AheadOfTurn();
+    static bool DeferRelease(std::array<std::shared_ptr<const void>, 3>& held) noexcept;
+    static std::uint64_t TakeDeepestRelease();
 
 private:
     friend class DrawPipeline;
@@ -318,6 +320,8 @@ private:
     void signalSlots(std::uint32_t bits);
     void wakeParked(std::uint32_t slotted, unsigned wanted);
     bool parkInSlot(unsigned index);
+    bool releaseRetiredHits(bool stopForJobs);
+    void releaseAllRetiredHits();
     void verifiedIdleWait(std::unique_lock<std::mutex>& lock, const std::function<bool()>& ready);
     bool aheadWait(std::span<const Range> ranges);
     inline static std::atomic<std::size_t> outstanding{0};

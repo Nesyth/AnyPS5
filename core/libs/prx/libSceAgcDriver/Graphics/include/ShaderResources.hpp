@@ -263,6 +263,9 @@ public:
         std::uint32_t DynamicCount(std::size_t set) const { return dynamic != nullptr ? dynamic->counts[set] : 0u; }
         const std::uint32_t* DynamicOffsets(std::size_t set) const { return dynamic != nullptr ? dynamic->offsets.data() + (set == 0 ? 0u : dynamic->counts[0]) : nullptr; }
         ~DrawBindings();
+        std::shared_ptr<OwnDrawSets> parkedSets;
+        std::array<bool, 2> parkable{};
+        std::array<std::uint64_t, 2> parkStamps{};
     };
     struct PushPlan {
         std::uint32_t set = 0;
@@ -381,6 +384,12 @@ public:
         mutable std::shared_ptr<DrawBindings> placed;
         VkDevice placedDevice = VK_NULL_HANDLE;
         bool aliasesClear = false;
+        static constexpr std::uint8_t DeferredImports = 1;
+        static constexpr std::uint8_t MergedSettle = 2;
+        static constexpr std::uint8_t ExactCapacity = 4;
+        std::uint8_t shortcuts = 0;
+        std::uint32_t lookupsDeferred = 0;
+        std::uint32_t lookupsForced = 0;
     };
     enum class BindingTaken : std::uint8_t { None, Placed, Copied, OtherDevice, Count };
     enum class DynamicLeave : std::uint8_t { None, Refused, Prepared, Stages, HeapPipeline, Heap, Address, AfterBind, Addressed, Faults, Shape, Uniform, OtherType, Flags, NoStorage, Limit, PushHeld, OtherSet, First, Repeats, Pipeline, Rebound, Count };
@@ -445,6 +454,7 @@ public:
     // False, with the reason in `out.refusal`, where the draw's buffers cannot be prepared.
     static bool PrepareDirectBuffers(const BufferPlan& plan, std::span<const CompiledShader> shaders, const ColorTarget* target, PreparedBuffers& out, const Context* inPlace = nullptr);
     static bool TakePreparedInPlace(PreparedBuffers& prepared, std::size_t index);
+    static bool FindPreparedImport(const Context& context, const BufferPlan& plan, PreparedBuffers& prepared, std::size_t index);
     const PushPlan* PushLayouts() const;
     struct DynamicPlan {
         std::array<bool, 2> written{};
@@ -505,6 +515,25 @@ public:
         std::uint32_t differing = 0;
     };
     static FragmentPlanNote TakeFragmentPlanNote();
+    struct ParkedSetsNote {
+        std::uint32_t taken = 0;
+        std::uint32_t fresh = 0;
+        std::uint32_t today = 0;
+        std::uint32_t parkedBuffers = 0;
+        std::uint32_t parkedOthers = 0;
+        std::uint32_t freshBuffers = 0;
+        std::uint32_t freshOthers = 0;
+        std::uint32_t checked = 0;
+        std::uint32_t differing = 0;
+    };
+    static ParkedSetsNote TakeParkedSetsNote();
+    struct ParkedSetsCounts {
+        std::uint64_t parked = 0;
+        std::uint64_t refusedCapacity = 0;
+        std::uint64_t refusedCap = 0;
+        std::uint64_t refusedClosed = 0;
+    };
+    static ParkedSetsCounts TakeParkedSetsCounts();
     void RewriteFragmentFaults(const DrawBindings& placed) const;
     DescriptorCache* FragmentDescriptorCache() const { return context.descriptorCache; }
     struct RepeatPush {
@@ -1314,8 +1343,12 @@ private:
     bool writeDynamicSets(DrawBindings& result, std::span<const std::size_t> selected, BindingRoute& route, std::int32_t pushedSet) const;
     mutable std::shared_ptr<const BufferPlan> bufferPlan;
     mutable bool bufferPlanBuilt = false;
-    std::shared_ptr<OwnDrawSets> makeOwnDrawSets() const;
+    std::shared_ptr<OwnDrawSets> makeOwnDrawSets(bool fragmentStore = false) const;
     mutable std::shared_ptr<OwnDrawSets> ownDrawSets;
+    void writeParkedFragmentSets(DrawBindings& result, std::span<const std::size_t> selected, std::int32_t pushedSet) const;
+    mutable std::once_flag fragmentSetsOnce;
+    mutable std::atomic<bool> fragmentSetsReady{false};
+    mutable std::shared_ptr<OwnDrawSets> fragmentSets;
     mutable std::vector<std::shared_ptr<RepeatSets>> repeatSets;
     void writeAddressedOverlay(DrawBindings& result, std::span<const std::size_t> selected) const;
     std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);

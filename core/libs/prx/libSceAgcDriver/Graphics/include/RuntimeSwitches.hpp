@@ -209,6 +209,11 @@ enum class RuntimeSwitch : std::size_t {
     KeepBindingsMoved,
     FollowWider,
     ExpressDepthIntent,
+    LazyInPlaceImports,
+    PreparedCapacity,
+    MergedSettle,
+    IdleHitRelease,
+    FragmentParkedSets,
     Count,
 };
 

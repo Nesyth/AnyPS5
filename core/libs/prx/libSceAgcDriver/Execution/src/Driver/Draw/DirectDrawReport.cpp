@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -66,13 +67,23 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "first sighting or forgotten", "second sighting", "admitted at this miss", "stored and missing otherwise", "stored and rotated out", "no way of this arm to try",
     "stored under a key not looked up", "no entry under plain and patterned ways", "admitted without a way to try", "admitted after 64 refusals", "under an older tag",
     "hits with a merged word", "hits with a moved chained root", "verified merged hits", "verified relocated hits", "chain conflicts", "slot empty", "slot of another program",
-    "not cacheable", "slot empty", "another program", "prepared key refused"
+    "not cacheable", "slot empty", "another program", "prepared key refused",
+    "in-place lookups skipped", "in-place lookups made at the settle", "in-place lookups found at the settle", "in-place lookups forced",
+    "settle ranges before merging", "settle ranges after merging", "merged settles passed", "merged settles refused", "merged refusals settled per range",
+    "hits released at idle", "hits released in place at the cap", "idle release ns",
+    "parked sets taken", "fresh sets on the parked route", "parked route writes of today's way", "buffer descriptors into parked sets", "other descriptors into parked sets", "buffer descriptors into fresh sets", "other descriptors into fresh sets", "parked verify checked", "parked verify differing",
+    "census hits", "census ranges", "census bytes", "census repeated ranges", "census repeated bytes", "census hits repeating every slice",
+    "verified with deferred imports", "differing with deferred imports", "memory changed with deferred imports", "unwatched with deferred imports",
+    "verified with a merged settle", "differing with a merged settle", "memory changed with a merged settle", "unwatched with a merged settle",
+    "verified with exact capacities", "differing with exact capacities", "memory changed with exact capacities", "unwatched with exact capacities",
+    "inputs verified with exact capacities", "inputs differing with exact capacities",
+    "merged settles rechecked per range", "merged settles refused per range"
 };
 static_assert(static_cast<std::size_t>(Counter::ExpressReprovedStaging) - static_cast<std::size_t>(Counter::ExpressReprovedNotProved) == static_cast<std::size_t>(Graphics::ShaderResources::ExpressMiss::Staging) - static_cast<std::size_t>(Graphics::ShaderResources::ExpressMiss::NotProved), "every reason an express commit reproves its template needs a counter");
 static_assert(static_cast<std::size_t>(Counter::BindingsLeftUnpushedRebound) - static_cast<std::size_t>(Counter::BindingsLeftUnpushedRefused) + 2 == static_cast<std::size_t>(Graphics::ShaderResources::DynamicLeave::Count), "every way an unpushed draw leaves the dynamic route needs a counter");
 static_assert(static_cast<std::size_t>(Counter::BindingsLeftPushedRebound) - static_cast<std::size_t>(Counter::BindingsLeftPushedRefused) + 2 == static_cast<std::size_t>(Graphics::ShaderResources::DynamicLeave::Count), "every way a pushed draw leaves the dynamic route needs a counter");
 
-constexpr std::array<const char*, StepCount> StepNames{"request", "invocation", "walk", "key", "side", "class", "checks", "buffers", "inputs", "hand-off"};
+constexpr std::array<const char*, StepCount> StepNames{"request", "invocation", "walk", "key", "side", "class", "checks", "buffers", "inputs", "hand-off", "buffers prepare", "buffers settle", "buffers place", "hand-off fragment", "hand-off commit"};
 
 static_assert(CounterNames.back() != nullptr && StepNames.back() != nullptr, "every direct draw counter and step needs a name");
 static_assert(static_cast<std::size_t>(Counter::FragmentsThrown) - static_cast<std::size_t>(Counter::FragmentsNoBlock) + 2 == static_cast<std::size_t>(DrawFragmentRefusal::Count), "every reason a finisher makes no fragment needs a counter");
@@ -322,6 +333,15 @@ void Report(bool force) {
         static_cast<unsigned long long>(stagesKnown.load(std::memory_order_relaxed)), static_cast<unsigned long long>(at(Counter::StagesBuilt)),
         static_cast<unsigned long long>(at(Counter::InvocationsRebuilt)), static_cast<unsigned long long>(at(Counter::VerifyChecked)), static_cast<unsigned long long>(at(Counter::VerifyDiffering)),
         perDraw(Step::Request), perDraw(Step::Invocation), perDraw(Step::Walk), perDraw(Step::Key), perDraw(Step::Side), perDraw(Step::Class), perDraw(Step::Checks), perDraw(Step::Buffers), perDraw(Step::Inputs), perDraw(Step::HandOff));
+    std::uint64_t splitDraws = 0;
+    for (auto index = static_cast<std::size_t>(Step::BuffersPrepare); index < StepCount; ++index) splitDraws += since.stepDraws[index];
+    if (splitDraws != 0) AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] split us per direct draw: buffers prepare %.2f, settle %.2f, place %.2f; hand-off fragment %.2f, commit %.2f\n", perDraw(Step::BuffersPrepare), perDraw(Step::BuffersSettle), perDraw(Step::BuffersPlace), perDraw(Step::Fragment), perDraw(Step::Commit));
+    if (at(Counter::CensusHits) != 0) {
+        const auto share = [&](Counter part, Counter whole) { return at(whole) == 0 ? 0.0 : 100.0 * static_cast<double>(at(part)) / static_cast<double>(at(whole)); };
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] repeat census: %llu hits, %llu ranges, %llu bytes; %.1f%% of bytes and %.1f%% of ranges repeat a range this thread uploaded with equal bytes; %.1f%% of hits repeat every slice\n",
+            static_cast<unsigned long long>(at(Counter::CensusHits)), static_cast<unsigned long long>(at(Counter::CensusRanges)), static_cast<unsigned long long>(at(Counter::CensusBytes)),
+            share(Counter::CensusRepeatBytes, Counter::CensusBytes), share(Counter::CensusRepeatRanges, Counter::CensusRanges), share(Counter::CensusHitsAllRepeat, Counter::CensusHits));
+    }
     const auto commits = at(Counter::CommitHits) + at(Counter::CommitFirst) + at(Counter::CommitMisses);
     if (commits != 0) {
         std::uint64_t refreshed = 0;
@@ -364,19 +384,36 @@ void Report(bool force) {
     }
     if (sum(Counter::BuffersPrepared, Counter::BuffersUnwatched) != 0) {
         const auto prepared = at(Counter::BuffersPrepared);
-        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] buffers: %llu hits prepared, %llu used, %llu not prepared%s, %llu not used%s; %.1f blob bytes per prepared hit; verify %llu checked, %llu differing, %llu memory changed, %llu differing in unwatched memory\n",
+        std::string shortcuts;
+        const auto verified = [&](const char* name, Counter first) {
+            const auto index = static_cast<std::size_t>(first);
+            if (counts[index] == 0) return;
+            shortcuts += "; verify of " + std::string(name) + " " + std::to_string(counts[index]) + " checked, " + std::to_string(counts[index + 1]) + " differing, " + std::to_string(counts[index + 2]) + " memory changed, " + std::to_string(counts[index + 3]) + " differing in unwatched memory";
+        };
+        verified("deferred imports", Counter::VerifyDeferredChecked);
+        verified("merged settles", Counter::VerifyMergedChecked);
+        verified("exact capacities", Counter::VerifyCapacityChecked);
+        if (at(Counter::MergedSettlesRechecked) != 0) shortcuts += "; merged settles rechecked per range " + std::to_string(at(Counter::MergedSettlesRechecked)) + ", " + std::to_string(at(Counter::MergedSettlesRecheckRefused)) + " refused per range";
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] buffers: %llu hits prepared, %llu used, %llu not prepared%s, %llu not used%s; %.1f blob bytes per prepared hit; verify %llu checked, %llu differing, %llu memory changed, %llu differing in unwatched memory%s\n",
             static_cast<unsigned long long>(prepared), static_cast<unsigned long long>(at(Counter::BuffersUsed)),
             static_cast<unsigned long long>(sum(Counter::BuffersNoPlan, Counter::BuffersUnsettled)), reasons(counts, Counter::BuffersNoPlan, Counter::BuffersUnsettled).c_str(),
             static_cast<unsigned long long>(sum(Counter::BuffersPlanDiffers, Counter::BuffersDropped)), reasons(counts, Counter::BuffersPlanDiffers, Counter::BuffersDropped).c_str(),
             prepared != 0 ? static_cast<double>(at(Counter::BuffersBlobBytes)) / static_cast<double>(prepared) : 0.0,
-            static_cast<unsigned long long>(at(Counter::BuffersVerifyChecked)), static_cast<unsigned long long>(at(Counter::BuffersVerifyDiffering)), static_cast<unsigned long long>(at(Counter::BuffersMemoryChanged)), static_cast<unsigned long long>(at(Counter::BuffersUnwatched)));
+            static_cast<unsigned long long>(at(Counter::BuffersVerifyChecked)), static_cast<unsigned long long>(at(Counter::BuffersVerifyDiffering)), static_cast<unsigned long long>(at(Counter::BuffersMemoryChanged)), static_cast<unsigned long long>(at(Counter::BuffersUnwatched)), shortcuts.c_str());
+    }
+    if (sum(Counter::LookupsDeferred, Counter::MergedSettlesRecovered) != 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] buffer shortcuts: in-place lookups %llu skipped, %llu made at the settle (%llu found), %llu forced; settle ranges %llu before, %llu after merging; merged settles %llu passed, %llu refused (%llu of them settled per range)\n",
+            static_cast<unsigned long long>(at(Counter::LookupsDeferred)), static_cast<unsigned long long>(at(Counter::LookupsAtSettle)), static_cast<unsigned long long>(at(Counter::LookupsAtSettleFound)), static_cast<unsigned long long>(at(Counter::LookupsForced)),
+            static_cast<unsigned long long>(at(Counter::SettleRangesBefore)), static_cast<unsigned long long>(at(Counter::SettleRangesAfter)),
+            static_cast<unsigned long long>(at(Counter::MergedSettlesPassed)), static_cast<unsigned long long>(at(Counter::MergedSettlesRefused)), static_cast<unsigned long long>(at(Counter::MergedSettlesRecovered)));
     }
     if (sum(Counter::InputsPrepared, Counter::InputsVerifyDiffering) != 0) {
-        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] inputs: %llu hits prepared, %llu used (%llu after an import recheck), %llu not prepared%s, %llu not used%s; verify %llu checked, %llu differing\n",
+        const auto capacities = at(Counter::InputsVerifyCapacityChecked) == 0 ? std::string() : "; verify of exact capacities " + std::to_string(at(Counter::InputsVerifyCapacityChecked)) + " checked, " + std::to_string(at(Counter::InputsVerifyCapacityDiffering)) + " differing";
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] inputs: %llu hits prepared, %llu used (%llu after an import recheck), %llu not prepared%s, %llu not used%s; verify %llu checked, %llu differing%s\n",
             static_cast<unsigned long long>(at(Counter::InputsPrepared)), static_cast<unsigned long long>(at(Counter::InputsUsed)), static_cast<unsigned long long>(at(Counter::InputsRechecked)),
             static_cast<unsigned long long>(sum(Counter::InputsNoRecipe, Counter::InputsUnsettled)), reasons(counts, Counter::InputsNoRecipe, Counter::InputsUnsettled).c_str(),
             static_cast<unsigned long long>(sum(Counter::InputsImportChanged, Counter::InputsDropped)), reasons(counts, Counter::InputsImportChanged, Counter::InputsDropped).c_str(),
-            static_cast<unsigned long long>(at(Counter::InputsVerifyChecked)), static_cast<unsigned long long>(at(Counter::InputsVerifyDiffering)));
+            static_cast<unsigned long long>(at(Counter::InputsVerifyChecked)), static_cast<unsigned long long>(at(Counter::InputsVerifyDiffering)), capacities.c_str());
     }
     if (sum(Counter::RepeatTaken, Counter::RepeatSharedTimed) != 0) {
         const auto perCommit = [&](Counter nanoseconds, Counter timed) { return at(timed) == 0 ? 0.0 : static_cast<double>(at(nanoseconds)) / static_cast<double>(at(timed)) / 1000.0; };
@@ -417,7 +454,8 @@ void Report(bool force) {
     }
     if (sum(Counter::FragmentsMade, Counter::FragmentsTodayTimed) != 0) {
         const auto perCommit = [&](Counter nanoseconds, Counter timed) { return at(timed) == 0 ? 0.0 : static_cast<double>(at(nanoseconds)) / static_cast<double>(at(timed)); };
-        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] fragments: %llu made on the finisher (%llu with a written set), %llu not made%s; %llu spliced, %llu replayed, %llu dropped%s; verify %llu checked, %llu differing; ns on the finisher per fragment %.0f (%llu); committer ns per commit: spliced %.0f (%llu), today's %.0f (%llu)\n",
+        const auto parked = at(Counter::ParkedVerifyChecked) == 0 ? std::string() : "; verify of parked sets " + std::to_string(at(Counter::ParkedVerifyChecked)) + " checked, " + std::to_string(at(Counter::ParkedVerifyDiffering)) + " differing";
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] fragments: %llu made on the finisher (%llu with a written set), %llu not made%s; %llu spliced, %llu replayed, %llu dropped%s; verify %llu checked, %llu differing; ns on the finisher per fragment %.0f (%llu); committer ns per commit: spliced %.0f (%llu), today's %.0f (%llu)%s\n",
             static_cast<unsigned long long>(at(Counter::FragmentsMade)), static_cast<unsigned long long>(at(Counter::FragmentsWritten)),
             static_cast<unsigned long long>(sum(Counter::FragmentsNoBlock, Counter::FragmentsThrown)), reasons(counts, Counter::FragmentsNoBlock, Counter::FragmentsThrown).c_str(),
             static_cast<unsigned long long>(at(Counter::FragmentsSpliced)), static_cast<unsigned long long>(at(Counter::FragmentsReplayed)),
@@ -425,7 +463,16 @@ void Report(bool force) {
             static_cast<unsigned long long>(at(Counter::FragmentsVerifyChecked)), static_cast<unsigned long long>(at(Counter::FragmentsVerifyDiffering)),
             perCommit(Counter::FragmentsFinisherNanoseconds, Counter::FragmentsFinisherTimed), static_cast<unsigned long long>(at(Counter::FragmentsFinisherTimed)),
             perCommit(Counter::FragmentsSplicedNanoseconds, Counter::FragmentsSplicedTimed), static_cast<unsigned long long>(at(Counter::FragmentsSplicedTimed)),
-            perCommit(Counter::FragmentsTodayNanoseconds, Counter::FragmentsTodayTimed), static_cast<unsigned long long>(at(Counter::FragmentsTodayTimed)));
+            perCommit(Counter::FragmentsTodayNanoseconds, Counter::FragmentsTodayTimed), static_cast<unsigned long long>(at(Counter::FragmentsTodayTimed)), parked.c_str());
+    }
+    if (sum(Counter::HitsReleasedIdle, Counter::ParkedVerifyDiffering) != 0) {
+        const auto parks = Graphics::ShaderResources::TakeParkedSetsCounts();
+        const auto perSet = [&](Counter descriptors, Counter sets) { return at(sets) == 0 ? 0.0 : static_cast<double>(at(descriptors)) / static_cast<double>(at(sets)); };
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] fragment shortcuts: hits released at idle %llu (%.0f ns per hit), in place at the cap %llu, deepest graveyard %llu; parked sets %llu taken, %llu fresh, %llu writes of today's way; parks refused %llu by capacity, %llu by the cap, %llu closed; %llu sets parked; descriptors per set: parked %.1f buffer, %.1f other; fresh %.1f buffer, %.1f other\n",
+            static_cast<unsigned long long>(at(Counter::HitsReleasedIdle)), at(Counter::HitsReleasedIdle) == 0 ? 0.0 : static_cast<double>(at(Counter::HitsReleaseNanoseconds)) / static_cast<double>(at(Counter::HitsReleasedIdle)), static_cast<unsigned long long>(at(Counter::HitsReleasedAtCap)), static_cast<unsigned long long>(DrawFinisher::TakeDeepestRelease()),
+            static_cast<unsigned long long>(at(Counter::ParkedTakes)), static_cast<unsigned long long>(at(Counter::ParkedFreshSets)), static_cast<unsigned long long>(at(Counter::ParkedTodayWrites)),
+            static_cast<unsigned long long>(parks.refusedCapacity), static_cast<unsigned long long>(parks.refusedCap), static_cast<unsigned long long>(parks.refusedClosed), static_cast<unsigned long long>(parks.parked),
+            perSet(Counter::ParkedBufferDescriptors, Counter::ParkedTakes), perSet(Counter::ParkedOtherDescriptors, Counter::ParkedTakes), perSet(Counter::FreshBufferDescriptors, Counter::ParkedFreshSets), perSet(Counter::FreshOtherDescriptors, Counter::ParkedFreshSets));
     }
     if (sum(Counter::StageMemoHits, Counter::StageMemoVerifyDiffering) != 0) {
         const auto kinds = reasons(counts, Counter::StageMemoMerged, Counter::StageMemoVerifyRelocated);

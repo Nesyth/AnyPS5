@@ -2676,6 +2676,9 @@ bool prepareMemoInputs(const Context& context, const State& state, const Pm4::Dr
     if (draw.indexed && (draw.indexAddress % draw.indexSize != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)))) return refuse(Refusal::Inaccessible);
     Require(!draw.indexed || !state.hasColorTarget || draw.indexAddress + indexBytes <= state.color.MemoryAddress() || state.color.MemoryAddress() + state.color.bytes <= draw.indexAddress, "index buffer aliases the render target");
     const auto& attributes = DrawVertexAttributes(shaders.front());
+    const bool capacity = RuntimeSwitches::Set(RuntimeSwitch::PreparedCapacity);
+    prepared.exactCapacity = capacity;
+    if (capacity) prepared.ranges.reserve((draw.indexed ? 1u : 0u) + attributes.size() + 2u);
     std::uint32_t maxIndex = draw.indexed || args != nullptr ? 0u : draw.firstVertex + draw.indexCount - 1u;
     if (draw.indexed) {
         const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -2804,6 +2807,7 @@ bool prepareMemoInputs(const Context& context, const State& state, const Pm4::Dr
         }
         prepared.indirectRanges = args->countIndirect ? 2u : 1u;
     }
+    if (capacity) prepared.inPlaceReads.reserve(prepared.ranges.size());
     for (const auto& range : prepared.ranges) prepared.inPlaceReads.emplace_back(range.begin, range.end);
     auto& found = scratch.found;
     found.assign(prepared.ranges.size(), {});
@@ -6833,6 +6837,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
                 if (record.verifyInputs) {
                     today();
                     std::string difference;
+                    record.effects.inputsCapacity = preparedInputs->exactCapacity;
                     record.effects.inputs = verifyPreparedInputs(context, state, draw, shaders, recipe, *preparedInputs, inputs, timer, timing, difference);
                     if (!difference.empty()) noteInputsDifference(difference);
                     ready = true;
@@ -6948,8 +6953,10 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     const ShaderResources::PreparedBuffers* checked = nullptr;
     if (recording && prepared != nullptr && RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers)) {
         if (prepared->plan == nullptr || prepared->plan != resources->DirectBufferPlan(shaders)) record.effects.buffers = DrawRecordBuffers::PlanDiffers;
-        else if (record.verifyBuffers) checked = prepared;
-        else bound = prepared;
+        else if (record.verifyBuffers) {
+            checked = prepared;
+            record.effects.bufferShortcuts = prepared->shortcuts;
+        } else bound = prepared;
     }
     std::vector<ShaderResources::MovedBuffer> moved;
     {

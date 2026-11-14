@@ -5271,6 +5271,11 @@ bool VulkanDevice::PrepareDirectBuffers(const Graphics::ShaderResources::BufferP
     return Graphics::ShaderResources::PrepareDirectBuffers(plan, shaders, target, prepared, state->contextReady ? &state->context : nullptr);
 }
 
+bool VulkanDevice::FindPreparedImport(const Graphics::ShaderResources::BufferPlan& plan, Graphics::ShaderResources::PreparedBuffers& prepared, std::size_t index) const {
+    if (!state->contextReady) return false;
+    return Graphics::ShaderResources::FindPreparedImport(state->context, plan, prepared, index);
+}
+
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey, const std::uint32_t* fragmentOutputs, bool recordRecipe) {
     startJournalReplay();
     for (const auto& shader : shaders) {

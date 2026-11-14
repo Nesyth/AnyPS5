@@ -261,6 +261,8 @@ struct DrawRecordEffects {
     DrawRecordInputs inputs = DrawRecordInputs::None;
     DrawRecordBindings bindings;
     DrawRecordFragment fragment;
+    std::uint8_t bufferShortcuts = 0;
+    bool inputsCapacity = false;
 };
 
 struct DrawRecordAccess {

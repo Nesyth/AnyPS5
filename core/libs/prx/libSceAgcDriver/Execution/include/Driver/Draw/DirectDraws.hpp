@@ -234,12 +234,14 @@ struct DirectStages {
 // The per-step times of a sampled direct draw (every StepSampleEvery-th draw on a thread).
 class DirectStepClock {
 public:
-    void Start() { mark = std::chrono::steady_clock::now(); }
+    void Start() { mark = splitMark = std::chrono::steady_clock::now(); }
     void Lap(DirectDraws::Step step);
+    void Split(DirectDraws::Step step);
     void Report() const;
 
 private:
     std::chrono::steady_clock::time_point mark{};
+    std::chrono::steady_clock::time_point splitMark{};
     std::array<std::uint64_t, static_cast<std::size_t>(DirectDraws::Step::Count)> nanoseconds{};
     std::array<bool, static_cast<std::size_t>(DirectDraws::Step::Count)> reached{};
 };

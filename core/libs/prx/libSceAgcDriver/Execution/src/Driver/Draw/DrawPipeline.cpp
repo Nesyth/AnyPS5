@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
@@ -71,6 +72,19 @@ using FinisherProducer = HostThreadSlot<bool, FinisherProducerSlot>;
 using FinisherSeq = HostThreadSlot<std::uint64_t, FinisherSeqSlot>;
 using FinisherAhead = HostThreadSlot<bool, FinisherAheadSlot>;
 using FinisherDeposits = HostThreadSlot<bool, FinisherDepositSlot>;
+struct FinisherRunLoopSlot {};
+struct FinisherRetiredSlot {};
+using FinisherRunLoop = HostThreadSlot<bool, FinisherRunLoopSlot>;
+using FinisherRetired = HostThreadSlot<bool, FinisherRetiredSlot>;
+
+struct RetiredHits {
+    static constexpr std::size_t Cap = 256;
+    std::size_t head = 0;
+    std::size_t count = 0;
+    std::array<std::array<std::shared_ptr<const void>, 3>, Cap> held;
+};
+struct RetiredHitsStorage {};
+std::atomic<std::uint64_t> deepestRetiredHits{0};
 
 enum LeanSlotState : std::uint8_t { LeanFree, LeanReady, LeanDone, LeanDeposited, LeanForwarding };
 
@@ -714,6 +728,71 @@ std::string DrawFinisher::DrainText() {
 
 bool DrawFinisher::OnFinisherThread() {
     return FinisherThread::Get();
+}
+
+bool DrawFinisher::DeferRelease(std::array<std::shared_ptr<const void>, 3>& held) noexcept {
+    if (!FinisherRunLoop::Get() || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::IdleHitRelease)) return false;
+    try {
+        auto& retired = HostThreadLocal<RetiredHits, RetiredHitsStorage>();
+        if (retired.count == RetiredHits::Cap) {
+            DirectDraws::Add(DirectDraws::Counter::HitsReleasedAtCap);
+            return false;
+        }
+        auto& slot = retired.held[(retired.head + retired.count) % RetiredHits::Cap];
+        for (std::size_t index = 0; index < held.size(); ++index) slot[index] = std::move(held[index]);
+        ++retired.count;
+        FinisherRetired::Set(true);
+        const std::uint64_t depth = retired.count;
+        auto seen = deepestRetiredHits.load(std::memory_order_relaxed);
+        while (seen < depth && !deepestRetiredHits.compare_exchange_weak(seen, depth, std::memory_order_relaxed)) {
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::uint64_t DrawFinisher::TakeDeepestRelease() {
+    return deepestRetiredHits.exchange(0, std::memory_order_relaxed);
+}
+
+bool DrawFinisher::releaseRetiredHits(bool stopForJobs) {
+    if (!FinisherRetired::Get()) return true;
+    auto& retired = HostThreadLocal<RetiredHits, RetiredHitsStorage>();
+    const auto began = std::chrono::steady_clock::now();
+    std::uint64_t released = 0;
+    while (retired.count != 0 && !leanReady() && (!stopForJobs || untakenJobs.load(std::memory_order_acquire) == 0)) {
+        auto entry = std::move(retired.held[retired.head]);
+        retired.head = (retired.head + 1) % RetiredHits::Cap;
+        --retired.count;
+        for (auto& part : entry) part.reset();
+        ++released;
+    }
+    if (released != 0) {
+        DirectDraws::Add(DirectDraws::Counter::HitsReleasedIdle, released);
+        DirectDraws::Add(DirectDraws::Counter::HitsReleaseNanoseconds, elapsedNs(began));
+    }
+    if (retired.count != 0) return false;
+    FinisherRetired::Set(false);
+    return true;
+}
+
+void DrawFinisher::releaseAllRetiredHits() {
+    if (!FinisherRetired::Get()) return;
+    auto& retired = HostThreadLocal<RetiredHits, RetiredHitsStorage>();
+    const auto began = std::chrono::steady_clock::now();
+    std::uint64_t released = 0;
+    while (retired.count != 0) {
+        auto entry = std::move(retired.held[retired.head]);
+        retired.head = (retired.head + 1) % RetiredHits::Cap;
+        --retired.count;
+        for (auto& part : entry) part.reset();
+        ++released;
+    }
+    FinisherRetired::Set(false);
+    if (released == 0) return;
+    DirectDraws::Add(DirectDraws::Counter::HitsReleasedIdle, released);
+    DirectDraws::Add(DirectDraws::Counter::HitsReleaseNanoseconds, elapsedNs(began));
 }
 
 DrawFinisher::Slot* DrawFinisher::untaken() {
@@ -1502,6 +1581,7 @@ void DrawFinisher::checkDrainDeposits() {
 void DrawFinisher::run(unsigned index) {
     PerformanceTrace::BindThread(FinisherNames[index]);
     if (index == 0) StartFinisherSampler();
+    FinisherRunLoop::Set(true);
     ThreadReport::Clock::time_point lastEnd{};
     bool woken = false;
     for (;;) {
@@ -1518,6 +1598,7 @@ void DrawFinisher::run(unsigned index) {
         bool failed = false;
         const bool slots = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FinisherParkSlots) && ringMode.load(std::memory_order_acquire) && finisherTakes(index) && !closed.load(std::memory_order_acquire);
         if (slots) idleSpinners.fetch_add(1, std::memory_order_seq_cst);
+        static_cast<void>(releaseRetiredHits(true));
         if (finisherTakes(index) && spinHandoff()) SpinUntil(HandoffSpinWindow(), [&] { return untakenJobs.load(std::memory_order_acquire) != 0 || leanReady(); });
         else if (finisherTakes(index)) SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         if (slots) idleSpinners.fetch_sub(1, std::memory_order_seq_cst);
@@ -1526,6 +1607,7 @@ void DrawFinisher::run(unsigned index) {
             runLean(leanSeq, lastEnd);
             continue;
         }
+        if (!releaseRetiredHits(true) && finisherTakes(index) && untakenJobs.load(std::memory_order_acquire) == 0) continue;
         if (slots && finisherTakes(index)) {
             woken = parkInSlot(index);
             continue;
@@ -1538,6 +1620,7 @@ void DrawFinisher::run(unsigned index) {
             auto lock = lockFor(mutex);
             if (!finisherTakes(index) && !closing) {
                 lock.unlock();
+                releaseAllRetiredHits();
                 ReleaseFinisherThread(FinisherNames[index]);
                 lock.lock();
                 dormant.fetch_or(1u << index, std::memory_order_seq_cst);
@@ -1549,6 +1632,10 @@ void DrawFinisher::run(unsigned index) {
                     if (index >= 5) PlaceFinisherSiblingThread(FinisherNames[index]);
                     else if (index < 3 || std::getenv("APS5_EXTRA_FINISHERS_UNPINNED") == nullptr) PlaceFinisherThread(FinisherNames[index]);
                 }
+                continue;
+            }
+            if (FinisherRetired::Get() && !closing && untaken() == nullptr && !leanReady()) {
+                lock.unlock();
                 continue;
             }
             ++sleepers;
@@ -1610,6 +1697,8 @@ void DrawFinisher::run(unsigned index) {
         if (idleWaiters != 0) idle.notify_all();
         if (turnSleepers != 0) turnWake.notify_all();
     }
+    releaseAllRetiredHits();
+    FinisherRunLoop::Set(false);
     runningFinishers.fetch_sub(1, std::memory_order_acq_rel);
 }
 
