@@ -587,7 +587,9 @@ void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
     const auto pending = Graphics::Recorder::PendingLabelSince();
     const bool due = pending.has_value() && std::chrono::steady_clock::now() - *pending >= labelFlushDeadline();
     const bool capped = batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap();
-    if (due || capped) localDevice->SubmitRecorded(true);
+    if (!due && !capped) return;
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    localDevice->SubmitRecorded(true);
 }
 
 }
