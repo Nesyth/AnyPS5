@@ -7,6 +7,7 @@
 namespace AgcDriver::Graphics {
 
 VkDeviceAddress BufferDeviceAddress(const Context& context, VkBuffer buffer);
+VkMemoryPropertyFlags UploadMemoryProperties(const Context& context);
 
 class Buffer {
 public:
@@ -21,6 +22,7 @@ public:
     // shadows of GuestBufferMemory) has no mapping and its bytes move by GPU copies alone.
     std::span<std::byte> Bytes();
     bool Mapped() const { return mapping != nullptr; }
+    VkMemoryPropertyFlags Properties() const { return properties; }
     void Invalidate();
 
 private:

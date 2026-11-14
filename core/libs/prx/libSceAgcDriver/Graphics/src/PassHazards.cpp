@@ -47,7 +47,7 @@ bool PassHazards::overlapsAny(const GuestRangeSet& set, GuestRangeList ranges) c
     return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return set.Overlaps(range.first, range.second); });
 }
 
-PassHazard PassHazards::Check(const PassAccess& access, bool samePass) {
+PassHazard PassHazards::Check(const PassAccess& access, bool samePass, bool attachmentsFree) {
     const auto touchesMemory = [](const PassAccess& use) {
         const auto nonEmpty = [](GuestRangeList ranges) { return std::any_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.first < range.second; }); };
         return use.anyReads || use.anyWrites || nonEmpty(use.reads) || nonEmpty(use.writes) || nonEmpty(use.writeOnly);
@@ -70,7 +70,7 @@ PassHazard PassHazards::Check(const PassAccess& access, bool samePass) {
     for (const auto& [image, written] : access.attachments) {
         if (image == VK_NULL_HANDLE) continue;
         if (std::any_of(images.begin(), images.end(), [&](const auto& seen) { return seen.first == image && conflicts(seen.second, written); })) return PassHazard::Image;
-        if (std::any_of(attachments.begin(), attachments.end(), [&](const Attachment& seen) { return seen.image == image && !(samePass && seen.pass == pass) && conflicts(seen.written, written); })) return PassHazard::Image;
+        if (!attachmentsFree && std::any_of(attachments.begin(), attachments.end(), [&](const Attachment& seen) { return seen.image == image && !(samePass && seen.pass == pass) && conflicts(seen.written, written); })) return PassHazard::Image;
     }
     return PassHazard::None;
 }
@@ -79,6 +79,17 @@ bool PassHazards::ReadsFollow(GuestRangeList first, GuestRangeList second) const
     const auto nonEmpty = [](GuestRangeList ranges) { return std::any_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.first < range.second; }); };
     if (anyWrites && (nonEmpty(first) || nonEmpty(second))) return false;
     return !overlapsAny(writes, first) && !overlapsAny(writeOnly, first) && !overlapsAny(writes, second) && !overlapsAny(writeOnly, second);
+}
+
+void PassHazards::CarryAttachments() {
+    std::vector<Attachment> carried;
+    carried.reserve(attachments.size());
+    for (const auto& entry : attachments) {
+        const auto it = std::find_if(carried.begin(), carried.end(), [&](const Attachment& seen) { return seen.image == entry.image; });
+        if (it == carried.end()) carried.push_back({entry.image, entry.written, pass});
+        else it->written = it->written || entry.written;
+    }
+    attachments = std::move(carried);
 }
 
 void PassHazards::Add(const PassAccess& access, bool lazyReads) {

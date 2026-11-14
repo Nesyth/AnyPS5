@@ -1900,15 +1900,20 @@ void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
 }
 
-Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
+Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, VkImage depth) {
     ensureOpen();
     flushDeferredDispatch();
     auto& pass = open->renderPass;
     const auto led = [](VkAccessFlags covered) { return RuntimeSwitches::Set(RuntimeSwitch::PassBarriersMerged) && BarrierBatch() && (covered & DrawLeadingAccess) == DrawLeadingAccess; };
+    const auto noteDepth = [&] {
+        open->renderPass.restartDepth = depth;
+        open->renderPass.restartSwitches = RuntimeSwitches::Generation();
+    };
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
         const auto reason = !pass.open ? pass.closedBy : forced ? PassBreak::Forced : PassBreak::Segment;
         VkAccessFlags covered = 0;
         const auto commands = Commands(&covered);
+        noteDepth();
         open->passHazards.Clear();
         open->passHazards.BeginPass();
         const bool merged = led(covered);
@@ -1921,9 +1926,28 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     const auto reason = PassBreakFor(hazard);
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
+    const bool restartable = !elide && (hazard == PassHazard::None || hazard == PassHazard::Image) && MergeBarriers() && !pass.afterPass;
+    const bool sameDepth = depth != VK_NULL_HANDLE && depth == pass.restartDepth && pass.restartSwitches == RuntimeSwitches::Generation();
+    const bool loose = restartable && RuntimeSwitches::Set(RuntimeSwitch::XpTargetRestarts) && ((!fenced && !pass.fenced) || sameDepth);
+    const bool narrow = restartable && !loose && hazard == PassHazard::Image && !fenced && !pass.fenced && RuntimeSwitches::Set(RuntimeSwitch::TargetRestarts);
+    if ((loose || narrow) && (hazard == PassHazard::None || open->passHazards.Check(access, pass.key == key, true) == PassHazard::None)) {
+        endOpenRenderPass(reason, false);
+        const auto commands = Commands();
+        if (narrow) {
+            recordBarrier(commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+            CountBarriers(CommandClass::Draw);
+        }
+        noteDepth();
+        open->passHazards.BeginPass();
+        open->passHazards.CarryAttachments();
+        passCensus[PassBreakCount + 2u].fetch_add(1, std::memory_order_relaxed);
+        CountGpuSide(narrow ? GpuSide::NarrowRestarts : GpuSide::TargetRestarts);
+        return {commands, false, false, reason};
+    }
     endOpenRenderPass(reason, !merge);
     VkAccessFlags covered = 0;
     const auto commands = Commands(&covered);
+    noteDepth();
     if (!elide) open->passHazards.Clear();
     open->passHazards.BeginPass();
     const bool merged = !elide && led(covered);
@@ -1971,6 +1995,36 @@ void recordAttachmentLayouts(const Context& context, VkCommandBuffer commands, s
     }
     context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, intoPass ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, intoPass ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, static_cast<std::uint32_t>(barriers.size()), barriers.data());
 }
+
+void recordDepthLayout(const Context& context, VkCommandBuffer commands, VkImage image, VkImageAspectFlags aspects, bool intoPass) {
+    constexpr VkPipelineStageFlags tests = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    constexpr VkAccessFlags attachment = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = intoPass ? VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    barrier.dstAccessMask = intoPass ? attachment : VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | attachment;
+    barrier.oldLayout = intoPass ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    barrier.newLayout = intoPass ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange = {aspects, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, intoPass ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : tests, intoPass ? tests : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    Recorder::CountBarriers(Recorder::CommandClass::Draw);
+}
+}
+
+bool Recorder::BeginDepthLayout(VkCommandBuffer commands, VkImage image, VkImageAspectFlags aspects) {
+    if (open == nullptr || open->commands != commands || open->renderPass.open || image == VK_NULL_HANDLE || aspects == 0) return false;
+    recordDepthLayout(context, commands, image, aspects, true);
+    open->renderPass.depthImage = image;
+    open->renderPass.depthAspects = aspects;
+    CountGpuSide(GpuSide::DepthLayoutPasses);
+    return true;
+}
+
+VkImage Recorder::AttachedDepthImage() const {
+    if (open == nullptr || !open->renderPass.open) return VK_NULL_HANDLE;
+    return open->renderPass.depthImage != VK_NULL_HANDLE ? open->renderPass.depthImage : open->renderPass.restartDepth;
 }
 
 bool Recorder::BeginPassLayouts(VkCommandBuffer commands, std::span<const std::pair<VkImage, bool>> attachments) {
@@ -2019,6 +2073,7 @@ void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
     if (open->segmentActive) endSegment(*open);
     EndRenderPass(context, open->commands);
     if (!pass.layoutImages.empty()) recordAttachmentLayouts(context, open->commands, pass.layoutImages, false);
+    if (pass.depthImage != VK_NULL_HANDLE) recordDepthLayout(context, open->commands, pass.depthImage, pass.depthAspects, false);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
     // host sees them at the batch's fence).
     const VkAccessFlags leading = barrier && !pass.afterPass && RuntimeSwitches::Set(RuntimeSwitch::PassBarriersMerged) ? DrawLeadingAccess : 0;
@@ -2464,6 +2519,54 @@ void reportBarriers() {
     AgcDriver::ProfilePrint_nid_no_patch("[samples] occlusion dumps (cumulative): %llu queued (%llu inside an open pass), %llu recorded at once; %llu segments closed; %llu folds of queued dumps\n", static_cast<unsigned long long>(dumpsQueued.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpsQueuedInPass.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpsAtOnce.load(std::memory_order_relaxed)), static_cast<unsigned long long>(segmentsClosed.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpFolds.load(std::memory_order_relaxed)));
 }
 
+constexpr std::size_t GpuSideCount = static_cast<std::size_t>(Recorder::GpuSide::Count);
+constexpr std::size_t SubmitReasonCount = static_cast<std::size_t>(Recorder::SubmitReason::Count);
+constexpr std::array<const char*, SubmitReasonCount> SubmitReasonNames{"other", "cap", "deadline", "packet", "label", "end", "suspend", "flip", "interrupt", "wait", "idle", "present", "sync", "budget"};
+std::array<std::atomic<std::uint64_t>, GpuSideCount> gpuSideCounts{};
+std::array<std::atomic<std::uint64_t>, SubmitReasonCount> submitReasonCounts{};
+
+void reportGpuSide() {
+    static std::mutex mutex;
+    static std::int64_t reportedAt = 0;
+    static std::array<std::uint64_t, GpuSideCount> lastSide{};
+    static std::array<std::uint64_t, SubmitReasonCount> lastSubmits{};
+    static std::uint64_t lastPresents = 0;
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    std::lock_guard lock(mutex);
+    if (reportedAt == tenSeconds) return;
+    reportedAt = tenSeconds;
+    std::array<std::uint64_t, GpuSideCount> side{};
+    for (std::size_t index = 0; index < GpuSideCount; ++index) {
+        const auto now = gpuSideCounts[index].load(std::memory_order_relaxed);
+        side[index] = now - lastSide[index];
+        lastSide[index] = now;
+    }
+    std::uint64_t submits = 0;
+    std::string reasons;
+    for (std::size_t index = 0; index < SubmitReasonCount; ++index) {
+        const auto now = submitReasonCounts[index].load(std::memory_order_relaxed);
+        const auto delta = now - lastSubmits[index];
+        lastSubmits[index] = now;
+        submits += delta;
+        if (delta == 0) continue;
+        reasons += reasons.empty() ? "" : ", ";
+        reasons += SubmitReasonNames[index];
+        reasons += ' ';
+        reasons += std::to_string(delta);
+    }
+    const auto presentsNow = presentSerial.load(std::memory_order_relaxed);
+    const auto presents = presentsNow - lastPresents;
+    lastPresents = presentsNow;
+    if (presents == 0) return;
+    const auto at = [&](Recorder::GpuSide which) { return static_cast<unsigned long long>(side[static_cast<std::size_t>(which)]); };
+    using Side = Recorder::GpuSide;
+    AgcDriver::ProfilePrint_nid_no_patch("[gpu-side] %llu presents: depth clears outside passes %llu (%llu at surface creation); depth plane copies %llu (%llu slices); sample-shadow refreshes %llu; pipeline binds %llu optimized, %llu fast-linked, %llu whole; relinks failed %llu; submits %llu (%s); device-local upload bytes %.0f per present; target restarts without a barrier %llu, behind an attachment barrier %llu; passes with depth in an attachment layout %llu (two image barriers each); express records refused for sampling their depth %llu\n",
+        static_cast<unsigned long long>(presents), at(Side::DepthClears), at(Side::DepthCreationClears), at(Side::PlaneCopies), at(Side::PlaneSlices), at(Side::SampleShadowRefreshes),
+        at(Side::OptimizedBinds), at(Side::FastLinkedBinds), at(Side::WholeBinds), at(Side::RelinksFailed),
+        static_cast<unsigned long long>(submits), reasons.empty() ? "none" : reasons.c_str(), static_cast<double>(side[static_cast<std::size_t>(Side::DeviceUploadBytes)]) / static_cast<double>(presents),
+        at(Side::TargetRestarts), at(Side::NarrowRestarts), at(Side::DepthLayoutPasses), at(Side::DepthSampleRefusals));
+}
+
 }
 
 bool Recorder::GpuTimingEnabled() {
@@ -2478,6 +2581,16 @@ bool Recorder::BatchStampsEnabled() {
 void Recorder::CountBarriers(CommandClass which, std::uint32_t count) {
     if (!DrawOrGpuProfiled()) return;
     classBarriers[static_cast<std::size_t>(which)].fetch_add(count, std::memory_order_relaxed);
+}
+
+bool Recorder::GpuSideStats() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return stats;
+}
+
+void Recorder::CountGpuSide(GpuSide which, std::uint64_t amount) {
+    if (!GpuSideStats()) return;
+    gpuSideCounts[static_cast<std::size_t>(which)].fetch_add(amount, std::memory_order_relaxed);
 }
 
 bool Recorder::MergeBarriers() {
@@ -2552,6 +2665,7 @@ void Recorder::CountPresent() {
     timingPresents.fetch_add(1, std::memory_order_relaxed);
     presentSerial.fetch_add(1, std::memory_order_relaxed);
     ReferenceStorage::Shared().ReleaseIdle();
+    if (GpuSideStats()) reportGpuSide();
 }
 
 std::uint64_t Recorder::Presents() {
@@ -3483,7 +3597,7 @@ void Recorder::KeepOnce(std::shared_ptr<void> object, std::size_t bytes) {
 
 void Recorder::BoundKeptBytes() {
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
-    if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();
+    if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit(SubmitReason::Budget);
     if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) DestroyDeferred(TakeDeferred(), false);
     while (!inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget) {
         auto batch = std::move(inFlight.front());
@@ -3507,12 +3621,20 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
 
 Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
+    const auto properties = UploadMemoryProperties(context);
+    if (drawUpload != nullptr && drawUploadProperties != properties) {
+        drawUpload.reset();
+        unwrittenSnapshots.clear();
+        unwrittenBytes = 0;
+    }
     auto offset = (drawUploadUsed + alignment - 1) & ~(alignment - 1);
     if (drawUpload == nullptr || offset + bytes > drawUpload->Bytes().size()) {
-        drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, properties);
+        drawUploadProperties = properties;
         offset = 0;
     }
     drawUploadUsed = offset + bytes;
+    if ((properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && GpuSideStats()) CountGpuSide(GpuSide::DeviceUploadBytes, bytes);
     return {drawUpload, offset, drawUpload->Bytes().data() + offset};
 }
 
@@ -4536,7 +4658,7 @@ void Recorder::FailNextSubmitsForTest(unsigned count) {
     injectedSubmitFailures.store(count, std::memory_order_relaxed);
 }
 
-void Recorder::Submit() {
+void Recorder::Submit(SubmitReason reason) {
     PerformanceTimer frameTiming("Recorder.Submit");
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
@@ -4546,6 +4668,7 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    if (GpuSideStats()) submitReasonCounts[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     flushDeferredDispatch();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass(PassBreak::NewBatch);
@@ -4780,7 +4903,7 @@ void Recorder::Sync() {
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
-    Submit();
+    Submit(SubmitReason::Sync);
     // Counted only when something is waited for: an idle recorder's Sync is free and would only
     // swamp the site table with the callers that check nothing first.
     const auto previousSite = inFlight.empty() ? activeSyncSite : BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0));
@@ -4931,7 +5054,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     // SyncThrough disabled everything is the target as well.
     std::uint64_t targetSerial = 0;
     if (!SyncThroughEnabled() || (open != nullptr && overlaps(*open, address, end))) {
-        Submit();
+        Submit(SubmitReason::Sync);
         targetSerial = submissions;
     } else {
         for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {

@@ -22,6 +22,11 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
 VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, bool stencilWritten, std::optional<std::uint8_t> overwrittenStencil = std::nullopt);
 bool ClaimDepthTargetMemory(const DepthTarget& target);
 std::shared_ptr<const std::atomic<bool>> DepthSurfaceActive(const Context& context, const DepthTarget& target, VkImageView view);
+struct DepthAttachmentImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageAspectFlags aspects = 0;
+};
+DepthAttachmentImage DepthSurfaceAttachmentImage(const Context& context, VkImageView view);
 VkImageView RecheckDepthSurfaceView(const Context& context, const DepthTarget& target, bool stencilTested);
 SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTarget& target);
 DepthSampleLocations DepthSurfaceSampleLocations(const Context& context, const DepthTarget& target);

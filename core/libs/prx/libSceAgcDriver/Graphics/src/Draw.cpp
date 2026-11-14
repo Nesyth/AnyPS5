@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DeviceImageTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuZones.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StagedMerge.hpp"
@@ -1520,6 +1521,7 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     DrawInputCopy copy;
+    const auto properties = use == Recorder::SnapshotUse::Vertex ? UploadMemoryProperties(context) : VkMemoryPropertyFlags{VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
     if (recorder != nullptr && bytes != 0) {
         GuestMemory::FlushGpuWrites(address, bytes);
 #ifdef _WIN32
@@ -1528,6 +1530,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         constexpr bool owned = false;
 #endif
         if (owned) copy.buffer = recorder->ReusableOwnedDrawInput(address, bytes, use, &copy.derived);
+        if (copy.buffer != nullptr && copy.buffer->Properties() != properties) copy.buffer = nullptr;
         if (copy.buffer != nullptr) {
             copy.reused = true;
             return copy;
@@ -1536,13 +1539,15 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         copy.generation = GuestMemory::CollectWrites(address, bytes);
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
         else if (owned) copy.owned = recorder->ArmOwnedDrawInput(address, bytes);
+        if (copy.buffer != nullptr && copy.buffer->Properties() != properties) copy.buffer = nullptr;
         if (copy.buffer != nullptr) {
             copy.reused = true;
             return copy;
         }
     }
-    copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT, properties);
     GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
+    if ((properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && Recorder::GpuSideStats()) Recorder::CountGpuSide(Recorder::GpuSide::DeviceUploadBytes, bytes);
     return copy;
 }
 
@@ -1557,22 +1562,24 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
     if (readable != 0) GuestMemory::FlushGpuWrites(address, readable);
     DrawInputCopy copy;
     auto* recorder = context.recorder;
+    const auto properties = UploadMemoryProperties(context);
     const bool keep = recorder != nullptr && readable != 0 && readable <= std::numeric_limits<std::uint32_t>::max();
     if (keep) {
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, readable);
         std::uint32_t keptReadable = 0;
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, Recorder::SnapshotUse::PaddedVertex, &keptReadable);
-        if (copy.buffer != nullptr && keptReadable == readable) {
+        if (copy.buffer != nullptr && keptReadable == readable && copy.buffer->Properties() == properties) {
             copy.reused = true;
             return copy;
         }
         copy.buffer = nullptr;
     }
-    copy.buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    copy.buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, properties);
     const auto span = copy.buffer->Bytes();
     GuestMemory::Read(address, span.subspan(0, readable), 1);
     std::fill(span.begin() + static_cast<std::ptrdiff_t>(readable), span.end(), std::byte{0});
+    if ((properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && Recorder::GpuSideStats()) Recorder::CountGpuSide(Recorder::GpuSide::DeviceUploadBytes, bytes);
     if (keep) recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable));
     return copy;
 }
@@ -3531,6 +3538,37 @@ void keepFragmentBindings(Recorder& recorder, const std::shared_ptr<ShaderResour
     for (const auto& snapshot : bindings->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
 }
 
+namespace {
+
+bool samplesImage(const ShaderResources& resources, VkImage image) {
+    if (image == VK_NULL_HANDLE) return false;
+    const auto& textures = resources.SampledTextures();
+    return std::any_of(textures.begin(), textures.end(), [&](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->Image() == image; });
+}
+
+bool samplesAttachedDepth(const Recorder& recorder, const ShaderResources& resources) {
+    return samplesImage(resources, recorder.AttachedDepthImage());
+}
+
+bool beginDepthLayout(const Context& context, Recorder& recorder, VkCommandBuffer commands, const Pipeline& pipeline, const Framebuffer& framebuffer, const State& state, const ShaderResources& resources) {
+    if (!RuntimeSwitches::Set(RuntimeSwitch::XpDepthLayouts) || !pipeline.DynamicDepth() || !state.depth.has_value() || state.depth->samples != 1u || state.rasterizerDiscard || state.customSampleLocations || GpuPathEnabled()) return false;
+    const auto views = framebuffer.Views();
+    if (views.empty()) return false;
+    const auto attached = DepthSurfaceAttachmentImage(context, views.back());
+    if (attached.image == VK_NULL_HANDLE || samplesImage(resources, attached.image)) return false;
+    return recorder.BeginDepthLayout(commands, attached.image, attached.aspects);
+}
+
+VkImage passRestartDepth(const Context& context, const Framebuffer& framebuffer, const State& state, const ShaderResources& resources) {
+    if (!RuntimeSwitches::Set(RuntimeSwitch::XpTargetRestarts) || !state.depth.has_value() || state.depth->samples != 1u || GpuPathEnabled()) return VK_NULL_HANDLE;
+    const auto views = framebuffer.Views();
+    if (views.empty()) return VK_NULL_HANDLE;
+    const auto attached = DepthSurfaceAttachmentImage(context, views.back()).image;
+    return samplesImage(resources, attached) ? VK_NULL_HANDLE : attached;
+}
+
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
@@ -3741,7 +3779,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     resources.RequireGuestBuffers();
     if (UsesMeshWindow(shaders)) PrepareMeshWindow(context);
     if (record.replay) resources.ConfirmHeapReplay(*recorder, shaders, drawBindings, replayProof);
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || captured || !record.staged.empty() || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
+    const VkImage restartDepth = record.framebuffer != nullptr && record.proxies.empty() && record.reordered.empty() && !record.depthLocations ? passRestartDepth(context, *record.framebuffer, state, resources) : VK_NULL_HANDLE;
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || captured || !record.staged.empty() || PixelFunctionLdsSubgroup(shaders) != 0u || samplesAttachedDepth(*recorder, resources), fenced, passAccess, restartDepth);
     if (ReplayCensusEnabled()) noteReplayPassCensus(recorder, &resources, record.pipeline.get(), record.framebuffer.get(), start.continued, hitCensus);
     // The memo names the pass the draw now records in.
     if (memoUsable && !memoHit) {
@@ -3836,11 +3875,15 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         for (const auto& write : record.staged) RecordStagedClear(context, commands, *write.temporary);
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
+        const bool optimalDepth = record.proxies.empty() && record.reordered.empty() && !record.depthLocations && beginDepthLayout(context, *recorder, commands, *record.pipeline, *record.framebuffer, state, resources);
         if (spliceFragment) {
-            record.pipeline->BeginPass(commands, *record.framebuffer, state.renderExtent, state);
+            record.pipeline->BeginPass(commands, *record.framebuffer, state.renderExtent, state, false, optimalDepth);
         } else if (verifyFragment) {
-            record.pipeline->BeginPass(commands, *record.framebuffer, state.renderExtent, state);
+            record.pipeline->BeginPass(commands, *record.framebuffer, state.renderExtent, state, false, optimalDepth);
             fragmentMark = batchStream->MarkOps();
+            record.pipeline->Continue(commands, state);
+        } else if (optimalDepth) {
+            record.pipeline->BeginPass(commands, *record.framebuffer, state.renderExtent, state, false, true);
             record.pipeline->Continue(commands, state);
         } else {
             record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
@@ -6125,6 +6168,15 @@ void captureExpress(const Context& context, const State& state, const DrawRecipe
     express->recipe = &recipe;
     express->state = &state;
     express->switches = RuntimeSwitches::Generation();
+    if ((RuntimeSwitches::Set(RuntimeSwitch::XpDepthLayouts) || RuntimeSwitches::Set(RuntimeSwitch::XpTargetRestarts)) && recipe.hasDepth && state.depth.has_value() && !recipe.targetViews.empty()) {
+        const auto attached = DepthSurfaceAttachmentImage(context, recipe.targetViews.back()).image;
+        if (samplesImage(*resources, attached)) {
+            noted = DrawExpressCapture::Access;
+            Recorder::CountGpuSide(Recorder::GpuSide::DepthSampleRefusals);
+            return;
+        }
+        if (RuntimeSwitches::Set(RuntimeSwitch::XpTargetRestarts) && !GpuPathEnabled()) express->restartDepth = attached;
+    }
     express->device = context.device;
     auto keep = std::make_shared<DrawExpressKeep>();
     keep->resources = resources;
@@ -7049,7 +7101,7 @@ RepeatOutcome RepeatCommit(const Context& context, const State& state, const Pm4
     for (const auto* target : block->targets) passAttachments.emplace_back(target->Image(), true);
     const PassAccess passAccess{passReads, memo.writes, memo.images, passAttachments, false, false, memo.writeOnly};
     resources.RequireGuestBuffers();
-    const auto start = recorder->StartDrawPass(block->passKey, false, block->fenced, passAccess);
+    const auto start = recorder->StartDrawPass(block->passKey, samplesAttachedDepth(*recorder, resources), block->fenced, passAccess, block->framebuffer != nullptr ? passRestartDepth(context, *block->framebuffer, state, resources) : VK_NULL_HANDLE);
     record.access.generation = recorder->RenderPassGeneration();
     const auto commands = start.commands;
     out.passBegun = !start.continued;
@@ -7865,7 +7917,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         recorder->NotePassReads(inPlaceReads);
         start = {recorder->AppendablePass(express->passKey), true, false, PassBreak::Continued};
     } else {
-        start = recorder->StartDrawPass(express->passKey, false, express->fenced, passAccess);
+        start = recorder->StartDrawPass(express->passKey, false, express->fenced, passAccess, express->restartDepth);
         if (followVerifyPending) noteRunFollowVerify(followPassHeld && start.continued, followPassHeld ? PassBreakNames[static_cast<std::size_t>(start.reason)] : "the pass ended inside the express commit");
         if (passSeenVerify) {
             const auto checked = passReadsChecked.fetch_add(1, std::memory_order_relaxed) + 1u;
@@ -7906,7 +7958,8 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
             Recorder::CountBarriers(Recorder::CommandClass::Draw, 1);
         }
         const bool optimalColors = RuntimeSwitches::Set(RuntimeSwitch::XpAttachmentLayouts) && keep.pipeline->DynamicRendering() && recorder->BeginPassLayouts(commands, passAttachments);
-        keep.pipeline->BeginPass(commands, *keep.framebuffer, state.renderExtent, state, optimalColors);
+        const bool optimalDepth = beginDepthLayout(context, *recorder, commands, *keep.pipeline, *keep.framebuffer, state, resources);
+        keep.pipeline->BeginPass(commands, *keep.framebuffer, state.renderExtent, state, optimalColors, optimalDepth);
     }
     NoteHeapRecord(false, false);
     if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);

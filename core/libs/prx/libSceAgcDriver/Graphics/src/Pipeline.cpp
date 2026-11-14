@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -943,7 +944,7 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
     Continue(commands, state);
 }
 
-void Pipeline::BeginPass(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, bool optimalColors) const {
+void Pipeline::BeginPass(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, bool optimalColors, bool optimalDepth) const {
     if (dynamicRendering) {
         const auto views = framebuffer.Views();
         Require(views.size() == attachments, "render targets do not match the pipeline's attachments");
@@ -958,7 +959,7 @@ void Pipeline::BeginPass(VkCommandBuffer commands, const Framebuffer& framebuffe
         VkRenderingAttachmentInfoKHR depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
         if (depthFormat != VK_FORMAT_UNDEFINED) {
             depth.imageView = views.back();
-            depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            depth.imageLayout = optimalDepth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
             depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         }
@@ -1047,6 +1048,7 @@ void notePipelineRun(VkCommandBuffer commands, VkPipeline pipeline, const State&
 void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
     if (optimized != nullptr) optimized->Schedule();
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
+    if (Recorder::GpuSideStats()) Recorder::CountGpuSide(!libraries ? Recorder::GpuSide::WholeBinds : best != VK_NULL_HANDLE ? Recorder::GpuSide::OptimizedBinds : Recorder::GpuSide::FastLinkedBinds);
     notePipelineRun(commands, best != VK_NULL_HANDLE ? best : pipeline, state);
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, best != VK_NULL_HANDLE ? best : pipeline);
     context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);

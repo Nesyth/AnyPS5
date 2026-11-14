@@ -281,7 +281,7 @@ bool Driver::endSegment(const Submission& submission, FlipHold& flipHold, bool p
         const auto localDevice = device.Load();
 
         recordDeferredLabels(localDevice.get(), submission.queue);
-        if (localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
+        if (localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0, Graphics::Recorder::SubmitReason::End);
     }
     flipHold.Finish();
     endTiming.Finish();
@@ -356,7 +356,7 @@ void Driver::execute(const Submission& submission) {
             recordDeferredLabels(localDevice.get(), submission.queue);
             if (localDevice != nullptr) {
                 if (suspendDrain) localDevice->WaitIdle();
-                else localDevice->SubmitRecorded(submission.queue == 0);
+                else localDevice->SubmitRecorded(submission.queue == 0, Graphics::Recorder::SubmitReason::Suspend);
             }
             ++costs.suspends;
             if (profile) costs.suspendNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
@@ -566,7 +566,7 @@ void Driver::execute(const Submission& submission) {
                 const auto localDevice = device.Load();
                 if (localDevice != nullptr) static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("flip"));
 
-                if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
+                if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0, Graphics::Recorder::SubmitReason::Flip);
                 if (localDevice != nullptr) localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
             }
             ++flipsCounted;

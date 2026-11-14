@@ -3125,10 +3125,10 @@ void VulkanDevice::StoreIdleResults(bool reapFirst, const std::function<bool()>&
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     static_cast<void>(Graphics::StorageTexture::FlushAllPendingUntil("idle", stop, state->device));
-    SubmitRecorded(reapFirst);
+    SubmitRecorded(reapFirst, Graphics::Recorder::SubmitReason::Idle);
 }
 
-void VulkanDevice::SubmitRecorded(bool reapFirst) {
+void VulkanDevice::SubmitRecorded(bool reapFirst, Graphics::Recorder::SubmitReason reason) {
     if (!state->recorder) return;
     // Finished batches are retired first (a non-blocking fence status check on the front of the
     // in-flight list), so PendingWriteOverlaps/HasCompletions scans stay short and a label recorded
@@ -3136,7 +3136,7 @@ void VulkanDevice::SubmitRecorded(bool reapFirst) {
     // Not for cross-queue submitters: a retired batch's write-back may sync a later batch under the
     // mutex (see the header), which a poller or compute worker must never do for queue 0.
     if (reapFirst && OpportunisticReap()) state->recorder->Reap();
-    state->recorder->Submit();
+    state->recorder->Submit(reason);
 }
 
 bool VulkanDevice::CanWaitUnlocked() const {
@@ -4407,7 +4407,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     // The frame's recorded work (and a refresh of the resident image) must reach the queue before the
     // presentation's own submission, which reads the image in queue order. No reap first: queue 0
     // reaps at its next packet, so the presenter's hold carries no completions.
-    SubmitRecorded(false);
+    SubmitRecorded(false, Graphics::Recorder::SubmitReason::Present);
     std::chrono::steady_clock::time_point lastSubmittedAt{};
     const std::uint64_t batchesAtBlit = state->recorder ? state->recorder->NewestSubmitted(&lastSubmittedAt) : 0;
     CaptureTrace::Log("blit dump=%d batch=%llu slot=%zu image=%u direct=%d", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(batchesAtBlit), state->presentCursor, index, direct);

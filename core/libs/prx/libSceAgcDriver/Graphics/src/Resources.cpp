@@ -8,10 +8,13 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/QueueSubmitter.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <exception>
+#include <optional>
 #ifdef __APPLE__
 #include <cstring>
 #endif
@@ -58,6 +61,30 @@ VkBufferUsageFlags UsageWithoutUnsupportedAddress(const Context& context, VkBuff
     return pooled;
 }
 
+bool UploadReadersConfigured() {
+    static const bool configured = [] {
+        for (const char* name : {"APS5_VERIFY_DIRECT_BUFFERS", "APS5_VERIFY_DIRECT_DRAWS", "APS5_VERIFY_DRAW_RECORDS", "APS5_VERIFY_DIRECT_REPEAT", "APS5_VERIFY_COMMIT_BINDINGS", "APS5_VERIFY_COMMIT_FRAGMENTS", "APS5_VERIFY_EXPRESS_COMMITS", "APS5_VERIFY_DRAW_SNAPSHOTS", "APS5_VERIFY_OWNED_DRAW_INPUTS", "APS5_CAPTURE_INPUTS"}) {
+            if (std::getenv(name) != nullptr) return true;
+        }
+        return false;
+    }();
+    return configured;
+}
+
+}
+
+VkMemoryPropertyFlags UploadMemoryProperties(const Context& context) {
+    constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    constexpr VkMemoryPropertyFlags device = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | host;
+    if (!RuntimeSwitches::Set(RuntimeSwitch::XpDeviceUploads) || UploadReadersConfigured()) return host;
+    std::optional<std::uint32_t> localHeap;
+    std::optional<std::uint32_t> mappedHeap;
+    for (std::uint32_t index = 0; index < context.memory.memoryTypeCount; ++index) {
+        const auto& type = context.memory.memoryTypes[index];
+        if (!localHeap && (type.propertyFlags & device) == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) localHeap = type.heapIndex;
+        if (!mappedHeap && (type.propertyFlags & device) == device) mappedHeap = type.heapIndex;
+    }
+    return mappedHeap.has_value() && (!localHeap.has_value() || *localHeap == *mappedHeap) ? device : host;
 }
 
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : Buffer(context, size, usage, properties, false) {}

@@ -169,6 +169,10 @@ enum class RuntimeSwitch : std::size_t {
     DispatchEnvOnce,
     PlainRegisterPackets,
     UserWordBlocks,
+    XpDeviceUploads,
+    XpDepthLayouts,
+    XpTargetRestarts,
+    TargetRestarts,
     Count,
 };
 

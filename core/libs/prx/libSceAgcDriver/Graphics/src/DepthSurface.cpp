@@ -756,6 +756,7 @@ public:
             barrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
             const VkClearDepthStencilValue clear{this->sampling.initialDepth.value_or(target.clearDepth), this->sampling.initialStencil.value_or(this->sampling.aliasStencil.value_or(target.clearStencil))};
             context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &toGeneral.subresourceRange);
+            Recorder::CountGpuSide(Recorder::GpuSide::DepthCreationClears);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
             if (batch) batch->SubmitAndWait();
             else Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
@@ -933,6 +934,7 @@ public:
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access, VK_ACCESS_TRANSFER_WRITE_BIT);
         const VkClearDepthStencilValue clear{depth, stencil};
         context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        Recorder::CountGpuSide(Recorder::GpuSide::DepthClears);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, access);
         if (batch) batch->SubmitAndWait();
         else {
@@ -1917,6 +1919,7 @@ private:
         region.dstSubresource = region.srcSubresource;
         region.extent = {target.extent.width, target.extent.height, 1};
         context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, sampleShadow->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        Recorder::CountGpuSide(Recorder::GpuSide::SampleShadowRefreshes);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, accesses);
         if (batch) batch->SubmitAndWait();
         else Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
@@ -2275,6 +2278,8 @@ private:
         std::unique_ptr<CommandBatch> batch;
         if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
         const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        Recorder::CountGpuSide(Recorder::GpuSide::PlaneCopies);
+        Recorder::CountGpuSide(Recorder::GpuSide::PlaneSlices, copiedLayers.size());
         const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         std::vector<VkBufferImageCopy> regions;
@@ -3515,6 +3520,17 @@ std::shared_ptr<const std::atomic<bool>> DepthSurfaceActive(const Context& conte
         if (surface->active->load(std::memory_order_acquire) && surface->context.device == context.device && sameSurface(surface->target, target)) return surface->view == view ? surface->active : nullptr;
     }
     return nullptr;
+}
+
+DepthAttachmentImage DepthSurfaceAttachmentImage(const Context& context, VkImageView view) {
+    if (view == VK_NULL_HANDLE) return {};
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (surface->view != view || surface->context.device != context.device || !surface->active->load(std::memory_order_acquire)) continue;
+        if (surface->target.samples != 1u || surface->image == VK_NULL_HANDLE) return {};
+        return {surface->image, VK_IMAGE_ASPECT_DEPTH_BIT | (HasStencil(surface->hostFormat) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u)};
+    }
+    return {};
 }
 
 VkImageView RecheckDepthSurfaceView(const Context& context, const DepthTarget& target, bool stencilTested) {

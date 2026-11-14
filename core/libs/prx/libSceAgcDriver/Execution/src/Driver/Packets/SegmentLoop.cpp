@@ -892,7 +892,7 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());
                 const auto localDevice = device.Load();
                 if (localDevice != nullptr) static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("flip"));
-                if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(true);
+                if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(true, Graphics::Recorder::SubmitReason::Flip);
                 if (localDevice != nullptr) localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
             }
             ++flipsCounted;

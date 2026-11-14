@@ -8588,6 +8588,7 @@ struct SharedUpload {
     std::size_t current = 0;
     std::shared_ptr<Buffer> overflow;
     std::size_t used = 0;
+    VkMemoryPropertyFlags properties = 0;
 };
 
 struct UploadRingTally {
@@ -8642,8 +8643,9 @@ bool ShaderResources::PlaceDirectBuffers(const Context& context, PreparedBuffers
         const bool shared = RuntimeSwitches::Set(RuntimeSwitch::CommitBindingsDynamic);
         const auto chosen = uploadChunkBytes.load(std::memory_order_relaxed);
         const auto chunkBytes = chosen != 0 ? chosen : shared ? SharedUploadChunk : Recorder::DrawUploadChunk;
+        const auto properties = UploadMemoryProperties(context);
         const auto make = [&] {
-            auto* made = new Buffer(context, std::max(chunkBytes, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            auto* made = new Buffer(context, std::max(chunkBytes, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, properties);
             placedUploadChunks.fetch_add(1, std::memory_order_acq_rel);
             return std::shared_ptr<Buffer>(made, [](Buffer* held) {
                 delete held;
@@ -8654,11 +8656,12 @@ bool ShaderResources::PlaceDirectBuffers(const Context& context, PreparedBuffers
             auto& common = sharedUpload();
             auto& tally = uploadRingTally();
             std::lock_guard lock(common.mutex);
-            if (common.device != context.device || common.chunkBytes != chunkBytes) {
+            if (common.device != context.device || common.chunkBytes != chunkBytes || common.properties != properties) {
                 common.ring.clear();
                 common.overflow.reset();
                 common.device = context.device;
                 common.chunkBytes = chunkBytes;
+                common.properties = properties;
                 common.current = 0;
                 common.used = 0;
                 tally.chunks.store(0, std::memory_order_relaxed);
@@ -8698,6 +8701,7 @@ bool ShaderResources::PlaceDirectBuffers(const Context& context, PreparedBuffers
             common.used = offset + bytes;
         } else {
             buffer = upload.device == context.device ? upload.chunk.lock() : nullptr;
+            if (buffer != nullptr && buffer->Properties() != properties) buffer = nullptr;
             offset = (upload.used + alignment - 1) & ~(alignment - 1);
             if (buffer == nullptr || offset + bytes > buffer->Bytes().size()) {
                 buffer = make();
@@ -8708,6 +8712,7 @@ bool ShaderResources::PlaceDirectBuffers(const Context& context, PreparedBuffers
             upload.used = offset + bytes;
         }
         std::memcpy(buffer->Bytes().data() + offset, prepared.blob.data(), bytes);
+        if ((properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && Recorder::GpuSideStats()) Recorder::CountGpuSide(Recorder::GpuSide::DeviceUploadBytes, bytes);
     }
     auto placed = std::make_shared<DrawBindings>();
     placed->snapshots.reserve(prepared.selected.size());

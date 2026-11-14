@@ -51,8 +51,9 @@ public:
     std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<void>> owners, VkExtent2D extent, std::uint32_t layers = 1);
     // Begins the render pass on the framebuffer, binds the pipeline and sets its dynamic state.
     void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const;
-    void BeginPass(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, bool optimalColors = false) const;
+    void BeginPass(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, bool optimalColors = false, bool optimalDepth = false) const;
     bool DynamicRendering() const { return dynamicRendering; }
+    bool DynamicDepth() const { return dynamicRendering && depthFormat != VK_FORMAT_UNDEFINED; }
     // The same inside a render pass another pipeline of the same attachments began (compatible by
     // construction: the attachment formats alone decide).
     void Continue(VkCommandBuffer commands, const State& state) const;

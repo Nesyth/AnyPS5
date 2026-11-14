@@ -123,7 +123,7 @@ public:
     // that). A reap runs completion actions, and a write-back can wait for a later batch under the
     // mutex through the flush hook, so a thread submitting on another queue's behalf (a WAIT_REG_MEM
     // poller, a compute worker's between-packet flush) passes false: it must only submit, never wait.
-    void SubmitRecorded(bool reapFirst = true);
+    void SubmitRecorded(bool reapFirst = true, Graphics::Recorder::SubmitReason reason = Graphics::Recorder::SubmitReason::Other);
     void StoreIdleResults(bool reapFirst = true, const std::function<bool()>& stop = [] { return false; });
     // Unlocked drain: SubmitAndEpoch (under the mutex) returns the serial covering every recorded
     // batch (0: nothing in flight); WaitRecorded(serial) waits for it WITHOUT the mutex (the caller

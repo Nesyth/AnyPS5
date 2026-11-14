@@ -3821,7 +3821,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
         const auto target = state.newestLeaseSerial;
         if (recorder != nullptr && recorder == state.leaseRecorder && target > state.finishedLeaseSerial) {
             Recorder::CountSync(4);
-            recorder->Submit();
+            recorder->Submit(Recorder::SubmitReason::Sync);
             recorder->FinishUpTo(target);
             state.finishedLeaseSerial = target;
             synced = true;
@@ -3941,7 +3941,7 @@ void FinishLeaseWork() {
     auto* recorder = Recorder::Active();
     const auto target = state.newestLeaseSerial;
     if (recorder == nullptr || recorder != state.leaseRecorder || target <= recorder->CompletedThrough()) return;
-    if (target >= recorder->OpenSerial()) recorder->Submit();
+    if (target >= recorder->OpenSerial()) recorder->Submit(Recorder::SubmitReason::Sync);
     Recorder::AnnounceSyncSite(__builtin_return_address(0));
     recorder->FinishUpTo(target);
 }

@@ -203,6 +203,7 @@ struct DrawExpress {
     std::uint64_t passKey = 0;
     bool fenced = false;
     bool hasDepth = false;
+    VkImage restartDepth = VK_NULL_HANDLE;
     std::uint64_t depthSerial = 0;
     std::uint64_t depthReleased = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;

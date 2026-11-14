@@ -96,7 +96,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 const auto queueId = submission.queue;
                 const auto context = *interrupt;
                 interruptDeferred = localDevice->AfterRecordedWork([this, queueId, context] { deliverGuestEopInterrupt(queueId, context); }, submission.queue == 0);
-                if (interruptDeferred && workOpen) localDevice->SubmitRecorded(submission.queue == 0);
+                if (interruptDeferred && workOpen) localDevice->SubmitRecorded(submission.queue == 0, Graphics::Recorder::SubmitReason::Interrupt);
                 wroteOnGpu = true;
             } else if (reason == 1) {
                 wroteOnGpu = true;
@@ -575,7 +575,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         if (bytes.empty() && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("interrupt") != 0) workOpen = true;
         if (localDevice != nullptr && (reason == 0 || reason == 5 || reason == 6)) {
             deferred = localDevice->AfterRecordedWork([this, queue, context] { deliverGuestEopInterrupt(queue, context); }, queue == 0);
-            if (deferred && workOpen) localDevice->SubmitRecorded(queue == 0);
+            if (deferred && workOpen) localDevice->SubmitRecorded(queue == 0, Graphics::Recorder::SubmitReason::Interrupt);
         }
         if (!deferred) deliverGuestEopInterrupt(queue, context);
     }
@@ -589,7 +589,7 @@ void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
     const bool capped = batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap();
     if (!due && !capped) return;
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
-    localDevice->SubmitRecorded(true);
+    localDevice->SubmitRecorded(true, capped ? Graphics::Recorder::SubmitReason::Cap : Graphics::Recorder::SubmitReason::Deadline);
 }
 
 }

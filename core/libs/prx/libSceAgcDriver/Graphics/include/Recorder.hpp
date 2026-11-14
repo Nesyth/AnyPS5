@@ -93,7 +93,7 @@ public:
         bool barrier = true;
         PassBreak reason = PassBreak::Continued;
     };
-    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
+    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, VkImage depth = VK_NULL_HANDLE);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     void SealPassWriteOnly();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
@@ -260,8 +260,9 @@ public:
         std::size_t batchesToFinish;
     };
     std::optional<PendingWriteInfo> DescribePendingWrite(std::uint64_t address, std::size_t bytes) const;
+    enum class SubmitReason : std::uint8_t { Other, Cap, Deadline, Packet, Label, End, Suspend, Flip, Interrupt, Wait, Idle, Present, Sync, Budget, Count };
     // Ends and submits the open batch without waiting.
-    void Submit();
+    void Submit(SubmitReason reason = SubmitReason::Other);
     void HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value);
     // Submits the open batch and returns the serial of the newest submitted batch (0 when nothing was
     // ever submitted); WaitSerial(serial) then covers all recorded work.
@@ -506,6 +507,8 @@ public:
     bool PassReadsFollow(GuestRangeList first, GuestRangeList second) const;
     static std::uint64_t QueuedLabelSerial();
     bool BeginPassLayouts(VkCommandBuffer commands, std::span<const std::pair<VkImage, bool>> attachments);
+    bool BeginDepthLayout(VkCommandBuffer commands, VkImage image, VkImageAspectFlags aspects);
+    VkImage AttachedDepthImage() const;
     void NotePassReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     std::uint64_t RenderPassGeneration() const { return passGeneration; }
     VkDevice Device() const { return context.device; }
@@ -582,6 +585,9 @@ public:
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
     std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
     static void CountBarriers(CommandClass which, std::uint32_t count = 1);
+    enum class GpuSide : std::uint8_t { DepthClears, DepthCreationClears, PlaneCopies, PlaneSlices, SampleShadowRefreshes, OptimizedBinds, FastLinkedBinds, WholeBinds, RelinksFailed, DeviceUploadBytes, TargetRestarts, NarrowRestarts, DepthLayoutPasses, DepthSampleRefusals, Count };
+    static bool GpuSideStats();
+    static void CountGpuSide(GpuSide which, std::uint64_t amount = 1);
     // A leading barrier a command left out because the previous trailing barrier covered its
     // accesses (see Commands), on the [barriers] line as 'merged'. Debug aid: APS5_FULL_BARRIERS=1
     // (or APS5_NO_BARRIER_ELISION=1) records every leading barrier, as before.
@@ -785,6 +791,10 @@ private:
         } tracker;
         struct RenderPass {
             std::vector<VkImage> layoutImages;
+            VkImage depthImage = VK_NULL_HANDLE;
+            VkImageAspectFlags depthAspects = 0;
+            VkImage restartDepth = VK_NULL_HANDLE;
+            std::uint64_t restartSwitches = 0;
             bool open = false;
             bool fenced = false;
             std::uint64_t key = 0;
@@ -1007,6 +1017,7 @@ private:
     std::uint64_t writeNoteCount = 0;
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
+    VkMemoryPropertyFlags drawUploadProperties = 0;
     std::vector<VkFence> spare;
     std::vector<VkCommandBuffer> spareCommands;
     std::vector<VkQueryPool> sparePools;

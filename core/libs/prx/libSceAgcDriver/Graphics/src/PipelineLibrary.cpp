@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <array>
 #include <atomic>
@@ -333,7 +334,10 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
                 auto pipelineCacheLock = cacheSynchronization != nullptr ? cacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
                 return createPipelines(slot->device, cache, 1, &create, nullptr, &result);
             }();
-            if (pipelineCreationResult != VK_SUCCESS) return;
+            if (pipelineCreationResult != VK_SUCCESS) {
+                Recorder::CountGpuSide(Recorder::GpuSide::RelinksFailed);
+                return;
+            }
             slot->handle.store(result);
             if (slot->released.load()) {
                 if (const auto handle = slot->handle.exchange(VK_NULL_HANDLE)) slot->destroy(slot->device, handle, nullptr);
