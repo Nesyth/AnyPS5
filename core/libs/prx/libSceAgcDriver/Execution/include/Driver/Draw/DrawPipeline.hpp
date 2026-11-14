@@ -43,6 +43,7 @@ class PublishedKeys {
 public:
     static constexpr std::uint32_t Capacity = 64;
     static constexpr std::uint32_t DeepDepth = 64;
+    static constexpr std::uint64_t AnyKey = ~std::uint64_t{0};
     enum class Answer : std::uint8_t { Clear, Hit, Unsure };
     void Push(std::uint64_t seqNumber, std::uint64_t key, std::uint64_t shape, bool inserts);
     void Retire(std::uint64_t frontSeq);
@@ -121,6 +122,7 @@ private:
         CommitKind kind = CommitKind::Other;
         bool quiet = false;
         std::uint64_t order = 0;
+        std::uint32_t parts = 1;
     };
     DrawPipeline() = default;
     void enqueue(Item item);
@@ -222,7 +224,14 @@ public:
     static bool Enabled();
     static bool OnFinisherThread();
     static unsigned Finishers();
-    static bool Busy() { return outstanding.load(std::memory_order_acquire) != 0; }
+    static bool Busy();
+    using RunFlusher = void (*)();
+    void SetOpenRun(RunFlusher flusher) {
+        openRun = flusher;
+        runOpen.store(flusher != nullptr, std::memory_order_release);
+    }
+    void FlushOpenRun();
+    void HoldOpenRunWrite(const Range& range);
     std::uint64_t Issued() const { return issued.load(std::memory_order_relaxed); }
     std::uint64_t Front() const { return frontSeq.load(std::memory_order_acquire); }
     unsigned IdleState() const;
@@ -236,7 +245,7 @@ public:
     bool Adopt(bool ring);
     bool RingStore() const { return ringMode.load(std::memory_order_acquire); }
     std::byte* ReserveLean();
-    void PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape, LeanRetirer retirer = nullptr);
+    void PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape, LeanRetirer retirer = nullptr, bool batch = false);
     static bool AnswerLean(std::shared_ptr<const void> answer);
     PublishedKeys::Answer KeyBefore(std::uint64_t key, std::uint64_t shape, bool insertsOnly) const;
     bool AheadBusy() const;
@@ -259,6 +268,7 @@ private:
         std::atomic<std::uint8_t> state{0};
         LeanRunner runner = nullptr;
         LeanRetirer retirer = nullptr;
+        bool batch = false;
         std::shared_ptr<const void> answer;
         Job closure;
         Pending pending;
@@ -279,6 +289,7 @@ private:
     bool deposit(DrawPipeline& pipeline, DrawPipeline::Item& item);
     void forwardOwn(std::uint64_t seq);
     bool forwardLean(LeanSlot& slot, std::uint64_t seq, std::uint64_t& forwardNs);
+    static void forwardMerged(std::vector<Deposit>& deposits, std::size_t& sent);
     const std::vector<Deposit>& ownDeposits();
     bool depositsWrite(std::span<const Range> ranges);
     bool depositsRead(std::uint64_t address, std::size_t bytes);
@@ -290,6 +301,8 @@ private:
     void publishLean(LeanSlot& slot);
     bool aheadWait(std::span<const Range> ranges);
     inline static std::atomic<std::size_t> outstanding{0};
+    inline static std::atomic<bool> runOpen{false};
+    RunFlusher openRun = nullptr;
     std::atomic<std::size_t> untakenJobs{0};
     std::mutex mutex;
     std::condition_variable wake;

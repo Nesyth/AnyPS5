@@ -341,6 +341,10 @@ private:
     static bool leanShapeCurrent(const LeanShape& shape, const QueueState& queue, const ShaderRegistry& registry);
     void finishLeanDraw(const LeanDrawJob& job, const LeanAnchor& anchor);
     static void runLeanDraw(const std::byte* payload);
+    static void runLeanRun(const std::byte* payload);
+    static void flushLeanRun();
+    void openLeanRun(std::byte* payload, std::uint64_t anchor, std::uint64_t seq);
+    void publishLeanRun();
     void probeDrawRecord(LeanDrawJob& job, const LeanShape& shape);
     void settleDrawRecord(const LeanDrawJob& job, const DrawRecordSink& sink, bool hit, std::size_t checked);
     void finishRecordDraw(const LeanDrawJob& job);
@@ -584,6 +588,17 @@ private:
     alignas(64) LeanFront::Latch frontLatch;
     LeanTails leanTails;
     LeanDraws leanDraws;
+    struct OpenLeanRun {
+        std::byte* payload = nullptr;
+        LeanDrawJob* jobs = nullptr;
+        std::uint32_t count = 0;
+        std::uint64_t anchor = 0;
+        std::uint64_t key = 0;
+        std::uint64_t shape = 0;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+    };
+    OpenLeanRun leanRun;
+    std::vector<LeanDrawJob> leanRunJobs;
     SegmentSlots segmentSlots;
     std::array<std::chrono::steady_clock::time_point, SubmissionQueueEnd - 0x20 + 1> lastReapTries{};
 

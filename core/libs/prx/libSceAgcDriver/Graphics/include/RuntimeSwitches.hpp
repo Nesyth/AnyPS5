@@ -137,6 +137,7 @@ enum class RuntimeSwitch : std::size_t {
     PreciseSettle,
     AppendCommits,
     XpNoBarriers,
+    DrawRuns,
     Count,
 };
 

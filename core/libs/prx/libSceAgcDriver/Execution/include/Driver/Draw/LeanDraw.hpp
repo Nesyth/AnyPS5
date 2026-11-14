@@ -70,6 +70,13 @@ struct LeanDrawJob {
 
 static_assert(std::is_trivially_copyable_v<LeanDrawJob> && sizeof(LeanDrawJob) <= DrawFinisher::LeanPayloadBytes && alignof(LeanDrawJob) <= 16, "a lean draw job must fit a finisher ring slot as plain bytes");
 
+inline constexpr std::uint32_t LeanRunCap = 8;
+
+struct LeanRunHeader {
+    std::uint32_t count = 0;
+    LeanDrawJob* jobs = nullptr;
+};
+
 struct LeanAnchor {
     std::shared_ptr<const ShaderRegistry> registry;
     std::shared_ptr<VulkanDevice> device;

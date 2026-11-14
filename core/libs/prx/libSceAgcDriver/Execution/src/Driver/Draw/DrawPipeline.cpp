@@ -287,7 +287,7 @@ PublishedKeys::Answer PublishedKeys::Find(std::uint64_t key, std::uint64_t shape
             const auto heldKey = slots[slot].load(std::memory_order_relaxed);
             const auto heldShape = slots[slot + 1].load(std::memory_order_relaxed);
             const bool heldInserts = slots[slot + 2].load(std::memory_order_relaxed) != 0;
-            hit = (heldKey == key || (shape != 0 && heldShape == shape)) && (heldInserts || !insertsOnly);
+            hit = (heldKey == AnyKey || heldKey == key || (shape != 0 && heldShape == shape)) && (heldInserts || !insertsOnly);
         }
         std::atomic_thread_fence(std::memory_order_acquire);
         if (seq.load(std::memory_order_relaxed) != before) continue;
@@ -313,7 +313,7 @@ PublishedKeys::Answer PublishedKeys::FindBefore(std::uint64_t key, std::uint64_t
             const auto heldKey = slots[slot].load(std::memory_order_relaxed);
             const auto heldShape = slots[slot + 1].load(std::memory_order_relaxed);
             const bool heldInserts = slots[slot + 2].load(std::memory_order_relaxed) != 0;
-            hit = (heldKey == key || (shape != 0 && heldShape == shape)) && (heldInserts || !insertsOnly);
+            hit = (heldKey == AnyKey || heldKey == key || (shape != 0 && heldShape == shape)) && (heldInserts || !insertsOnly);
         }
         std::atomic_thread_fence(std::memory_order_acquire);
         if (seq.load(std::memory_order_relaxed) != version) continue;
@@ -456,6 +456,7 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
 }
 
 bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
+    FlushOpenRun();
     if (!Busy() || !FinisherProducer::Get()) return false;
     const bool precise = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PreciseLookupDrain);
     const bool ring = ringMode.load(std::memory_order_acquire);
@@ -644,12 +645,26 @@ bool DrawFinisher::countPending(const Pending& held, bool added) {
     return changed;
 }
 
+bool DrawFinisher::Busy() {
+    return outstanding.load(std::memory_order_acquire) != 0 || (runOpen.load(std::memory_order_relaxed) && FinisherProducer::Get());
+}
+
+void DrawFinisher::FlushOpenRun() {
+    if (!runOpen.load(std::memory_order_relaxed) || !FinisherProducer::Get()) return;
+    if (const auto flush = std::exchange(openRun, nullptr); flush != nullptr) flush();
+}
+
+void DrawFinisher::HoldOpenRunWrite(const Range& range) {
+    if (countRange(pendingWrites, range, true)) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
+}
+
 void DrawFinisher::Enqueue(Job job) {
     Enqueue(std::move(job), Pending{});
 }
 
 void DrawFinisher::Enqueue(Job job, Pending held) {
     FinisherProducer::Set(true);
+    FlushOpenRun();
     if (ringMode.load(std::memory_order_acquire)) {
         rethrowLeanFailure();
         if (closed.load(std::memory_order_acquire)) {
@@ -664,6 +679,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         auto& slot = leanSlot(nextSeq);
         slot.runner = nullptr;
         slot.retirer = nullptr;
+        slot.batch = false;
         slot.answer = nullptr;
         slot.closure = std::move(job);
         slot.pending = std::move(held);
@@ -836,7 +852,7 @@ void DrawFinisher::awaitLeanIdle() {
 
 void DrawFinisher::publishLean(LeanSlot& slot) {
     const auto seq = nextSeq;
-    if (countPending(slot.pending, true)) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
+    if (!slot.batch && countPending(slot.pending, true)) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
     keys.Push(seq, slot.pending.key, slot.pending.shape, slot.pending.inserts);
     slot.seq.store(seq, std::memory_order_relaxed);
     slot.state.store(LeanReady, std::memory_order_relaxed);
@@ -863,6 +879,7 @@ void DrawFinisher::publishLean(LeanSlot& slot) {
 
 std::byte* DrawFinisher::ReserveLean() {
     FinisherProducer::Set(true);
+    FlushOpenRun();
     rethrowLeanFailure();
     if (closed.load(std::memory_order_acquire)) return nullptr;
     awaitLeanRoom();
@@ -870,10 +887,11 @@ std::byte* DrawFinisher::ReserveLean() {
     return leanSlot(nextSeq).payload.data();
 }
 
-void DrawFinisher::PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape, LeanRetirer retirer) {
+void DrawFinisher::PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape, LeanRetirer retirer, bool batch) {
     auto& slot = leanSlot(nextSeq);
     slot.runner = runner;
     slot.retirer = retirer;
+    slot.batch = batch;
     slot.answer = nullptr;
     auto& held = slot.pending;
     held.key = key;
@@ -989,14 +1007,57 @@ DrawFinisher::DepositCounts DrawFinisher::Deposits() {
 bool DrawFinisher::deposit(DrawPipeline& pipeline, DrawPipeline::Item& item) {
     const auto seq = FinisherSeq::Get();
     if (seq == 0 || !ringMode.load(std::memory_order_acquire)) return false;
-    if (frontSeq.load(std::memory_order_acquire) == seq) {
+    auto& slot = leanSlot(seq);
+    if (frontSeq.load(std::memory_order_acquire) == seq && !(slot.batch && item.draw && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DrawRuns))) {
         turnItems.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    leanSlot(seq).deposits.push_back({&pipeline, std::move(item)});
+    slot.deposits.push_back({&pipeline, std::move(item)});
     FinisherDeposits::Set(true);
     depositedItems.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+void DrawFinisher::forwardMerged(std::vector<Deposit>& deposits, std::size_t& sent) {
+    const bool merging = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DrawRuns);
+    for (std::size_t first = 0; first < deposits.size();) {
+        auto& head = deposits[first];
+        const auto joins = [&](const Deposit& held) {
+            const auto& item = held.item;
+            return held.pipeline == head.pipeline && item.draw && !item.store && !item.quiet && item.labelAddress == 0 && item.labelBytes.empty() && item.order == 0 && item.kind == head.item.kind;
+        };
+        std::size_t last = first + 1;
+        if (merging && joins(head)) {
+            while (last < deposits.size() && joins(deposits[last])) ++last;
+        }
+        if (last - first < 2) {
+            head.pipeline->queueItem(std::move(head.item));
+            ++sent;
+            ++first;
+            continue;
+        }
+        DrawPipeline::Item merged;
+        merged.draw = true;
+        merged.kind = head.item.kind;
+        merged.parts = static_cast<std::uint32_t>(last - first);
+        auto parts = std::make_shared<std::vector<DrawPipeline::Item>>();
+        parts->reserve(last - first);
+        for (std::size_t at = first; at < last; ++at) {
+            auto& item = deposits[at].item;
+            for (const auto& range : item.writes) {
+                if (std::find(merged.writes.begin(), merged.writes.end(), range) == merged.writes.end()) merged.writes.push_back(range);
+            }
+            merged.reads.insert(merged.reads.end(), item.reads.begin(), item.reads.end());
+            parts->push_back(std::move(item));
+        }
+        merged.commit = [parts] {
+            for (auto& part : *parts) part.commit();
+        };
+        auto* const pipeline = head.pipeline;
+        pipeline->queueItem(std::move(merged));
+        sent += last - first;
+        first = last;
+    }
 }
 
 void DrawFinisher::forwardOwn(std::uint64_t seq) {
@@ -1021,10 +1082,7 @@ void DrawFinisher::forwardOwn(std::uint64_t seq) {
         ThreadReport::Add(ThreadReport::Count::FinisherForwardNs, ThreadReport::Nanoseconds(start, ThreadReport::Clock::now()));
     };
     try {
-        for (auto& held : deposits) {
-            held.pipeline->queueItem(std::move(held.item));
-            ++sent;
-        }
+        forwardMerged(deposits, sent);
     } catch (...) {
         count();
         throw;
@@ -1043,10 +1101,7 @@ bool DrawFinisher::forwardLean(LeanSlot& slot, std::uint64_t seq, std::uint64_t&
     std::exception_ptr error;
     std::size_t sent = 0;
     try {
-        for (auto& held : slot.deposits) {
-            held.pipeline->queueItem(std::move(held.item));
-            ++sent;
-        }
+        forwardMerged(slot.deposits, sent);
     } catch (...) {
         error = std::current_exception();
     }
@@ -1233,6 +1288,7 @@ void DrawFinisher::run(unsigned index) {
 }
 
 void DrawFinisher::Settle() {
+    FlushOpenRun();
     if (!Busy() || OnFinisherThread()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher settle under the GPU lock");
     if (ringMode.load(std::memory_order_acquire)) {
@@ -1248,6 +1304,7 @@ void DrawFinisher::Settle() {
 
 void DrawFinisher::Drain() {
     if (OnFinisherThread()) return;
+    FlushOpenRun();
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
     const auto drainStart = ThreadReport::Enabled() && Busy() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
     const ThreadReport::WorkerStateScope draining(ThreadReport::WorkerState::DrainFinisher, drainStart != ThreadReport::Clock::time_point{} && ThreadReport::OnQueue0Worker());
@@ -1279,6 +1336,7 @@ void DrawFinisher::Drain() {
 }
 
 void DrawFinisher::Stop() {
+    FlushOpenRun();
     std::thread finishers[9];
     {
         const auto lock = lockFor(mutex);
@@ -1403,6 +1461,7 @@ std::atomic<std::uint64_t> itemsByTurn{0};
 }
 
 void DrawPipeline::enqueue(Item item) {
+    if (!DrawFinisher::OnFinisherThread()) DrawFinisher::Get().FlushOpenRun();
     if (depositVerifyEvery() != 0) item.order = orderKey();
     if (DrawFinisher::OnFinisherThread()) {
         auto& finisher = DrawFinisher::Get();
@@ -1575,6 +1634,7 @@ void DrawPipeline::run() {
         bool isDraw = false;
         bool rangedItem = false;
         bool quietItem = false;
+        std::uint32_t itemParts = 1;
         std::vector<Range> itemRanges;
         static const bool idleCensus = std::getenv("APS5_PIPELINE_STATS") != nullptr;
         const bool idleNow = idleCensus && outstanding.load(std::memory_order_acquire) == 0;
@@ -1592,6 +1652,7 @@ void DrawPipeline::run() {
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
             quietItem = items.front().quiet;
+            itemParts = items.front().parts;
             rangedItem = !isDraw && GuestMemory::RangeProofs();
             if (rangedItem) {
                 itemRanges = items.front().writes;
@@ -1630,7 +1691,7 @@ void DrawPipeline::run() {
         const auto spent = elapsedNs(start);
         if (ThreadReport::Enabled()) {
             const auto end = start + std::chrono::nanoseconds(spent);
-            ThreadReport::Add(isDraw ? ThreadReport::Count::CommitterDraws : ThreadReport::Count::CommitterOther, 1);
+            ThreadReport::Add(isDraw ? ThreadReport::Count::CommitterDraws : ThreadReport::Count::CommitterOther, itemParts);
             ThreadReport::Add(isDraw ? ThreadReport::Count::CommitterDrawNs : ThreadReport::Count::CommitterOtherNs, spent);
             ThreadReport::NoteCommitterDraw(ThreadReport::TakeItemMark(), spent);
             if (lastEnd != ThreadReport::Clock::time_point{}) {
@@ -1652,11 +1713,11 @@ void DrawPipeline::run() {
             retiredItems.fetch_add(1, std::memory_order_release);
             countWrites(items.front().writes, false);
             const auto kindIndex = static_cast<std::size_t>(items.front().kind);
-            kindCommits[kindIndex].fetch_add(1, std::memory_order_relaxed);
+            kindCommits[kindIndex].fetch_add(itemParts, std::memory_order_relaxed);
             kindNs[kindIndex].fetch_add(spent, std::memory_order_relaxed);
             retired.push_back(std::move(items.front()));
             items.pop_front();
-            ++commits;
+            commits += itemParts;
             commitNs += spent;
             if (failed) ++commitErrors;
             if (fatal != nullptr && failure == nullptr) failure = fatal;
@@ -1701,6 +1762,7 @@ void DrawPipeline::ReleaseRetired() {
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     if (DrawFinisher::OnFinisherThread()) DrawFinisher::Get().AwaitTurn();
+    else DrawFinisher::Get().FlushOpenRun();
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
     reasonRequests[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();

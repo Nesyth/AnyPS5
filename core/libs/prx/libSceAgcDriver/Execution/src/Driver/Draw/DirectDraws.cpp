@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <atomic>
 #include <algorithm>
+#include <new>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -1690,6 +1691,13 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
         return;
     }
     finishLeanDraw(job, anchor);
+}
+
+void Driver::runLeanRun(const std::byte* payload) {
+    auto& driver = Get();
+    const auto& header = *std::launder(reinterpret_cast<const LeanRunHeader*>(payload));
+    if (header.count > 1 && ThreadReport::Enabled()) ThreadReport::Add(ThreadReport::Count::FinisherJobs, header.count - 1);
+    for (std::uint32_t index = 0; index < header.count; ++index) driver.finishDirectDraw(header.jobs[index]);
 }
 
 }

@@ -497,10 +497,28 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
     }
     if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpHalfWorkerDraws) && HalfWorkerDrawDropped()) return DrawVerdict::Drawn;
     if (shape.skipped) return DrawVerdict::Drawn;
-    auto* payload = finisher.ReserveLean();
-    const auto anchor = payload != nullptr ? leanDraws.AnchorFor(submission.shaders, leanDraws.device, finisher.Issued()) : std::nullopt;
+    const bool runs = direct && LeanFront::SwitchSet(frontLatch, Graphics::RuntimeSwitch::DrawRuns);
+    std::byte* payload = nullptr;
+    std::optional<std::uint64_t> anchor;
+    if (leanRun.count != 0) {
+        if (runs) anchor = leanDraws.AnchorFor(submission.shaders, leanDraws.device, finisher.Issued());
+        if (runs && anchor && *anchor == leanRun.anchor) payload = leanRun.payload;
+        else publishLeanRun();
+    }
+    if (payload == nullptr) {
+        payload = finisher.ReserveLean();
+        anchor = payload != nullptr ? leanDraws.AnchorFor(submission.shaders, leanDraws.device, finisher.Issued()) : std::nullopt;
+    }
     std::optional<LeanDrawJob> local;
-    auto* job = payload != nullptr && anchor ? ::new (payload) LeanDrawJob : &local.emplace();
+    LeanDrawJob* job = nullptr;
+    if (payload == nullptr || !anchor) {
+        job = &local.emplace();
+    } else if (runs) {
+        if (leanRun.count == 0) openLeanRun(payload, *anchor, finisher.Issued());
+        job = ::new (static_cast<void*>(leanRun.jobs + leanRun.count)) LeanDrawJob;
+    } else {
+        job = ::new (payload) LeanDrawJob;
+    }
     job->shape = &shape;
     job->anchor = anchor.value_or(0);
     job->serial = submission.serial;
@@ -534,9 +552,48 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
         probeDrawRecord(*job, shape);
     }
     record.lastSeq = finisher.Issued();
+    if (runs) {
+        if (++leanRun.count == 1) {
+            leanRun.key = job->drawKey;
+            leanRun.shape = job->shapeKey;
+        }
+        for (const auto& range : shape.writes) {
+            if (std::find(leanRun.writes.begin(), leanRun.writes.end(), range) != leanRun.writes.end()) continue;
+            leanRun.writes.push_back(range);
+            finisher.HoldOpenRunWrite(range);
+        }
+        if (leanRun.count == LeanRunCap) publishLeanRun();
+        return DrawVerdict::Drawn;
+    }
     const bool answered = !direct && (job->recordFlags & (DrawRecordFlags::BuildWanted | DrawRecordFlags::VerifyDue)) != 0;
     finisher.PublishLean(&Driver::runLeanDraw, shape.writes, job->drawKey, job->shapeKey, !answered ? nullptr : plans ? &Driver::retireStagePlans : &Driver::retireDrawRecord);
     return DrawVerdict::Drawn;
+}
+
+void Driver::openLeanRun(std::byte* payload, std::uint64_t anchor, std::uint64_t seq) {
+    if (leanRunJobs.empty()) leanRunJobs.resize(DrawFinisher::LeanSlots * static_cast<std::size_t>(LeanRunCap));
+    leanRun.payload = payload;
+    leanRun.jobs = leanRunJobs.data() + static_cast<std::size_t>(seq % DrawFinisher::LeanSlots) * LeanRunCap;
+    leanRun.count = 0;
+    leanRun.anchor = anchor;
+    leanRun.writes.clear();
+    DrawFinisher::Get().SetOpenRun(&Driver::flushLeanRun);
+}
+
+void Driver::publishLeanRun() {
+    auto& finisher = DrawFinisher::Get();
+    finisher.SetOpenRun(nullptr);
+    const auto count = std::exchange(leanRun.count, 0u);
+    if (count == 0) return;
+    auto* const header = ::new (static_cast<void*>(leanRun.payload)) LeanRunHeader;
+    header->count = count;
+    header->jobs = leanRun.jobs;
+    const bool single = count == 1;
+    finisher.PublishLean(&Driver::runLeanRun, leanRun.writes, single ? leanRun.key : PublishedKeys::AnyKey, single ? leanRun.shape : 0, nullptr, true);
+}
+
+void Driver::flushLeanRun() {
+    Get().publishLeanRun();
 }
 
 DrawVerdict Driver::verifyLeanDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected, ShapeRecord& record, LeanVerdict verdict, const Pm4::DrawParameters& parameters, const LeanDrawJob* job) {

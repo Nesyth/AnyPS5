@@ -592,6 +592,17 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
     const auto& packets = table.packets;
     const auto& commands = submission.commands;
     const auto skipTo = [&](const LeanPacket& entry) { return entry.skip != LeanPacket::NoSkip ? static_cast<std::size_t>(entry.skip) : table.IndexAt(submission.conditionalEnds.at(entry.cursor)); };
+    struct LeanRunEnd {
+        Driver& driver;
+        ~LeanRunEnd() {
+            try {
+                driver.publishLeanRun();
+            } catch (...) {
+                driver.leanRun.count = 0;
+                DrawFinisher::Get().SetOpenRun(nullptr);
+            }
+        }
+    } leanRunEnd{*this};
     for (std::size_t index = 0; index < packets.size();) {
         const auto& entry = packets[index];
         if (run.packetEpoch) bumpEpoch(&EpochBumps::packets);
