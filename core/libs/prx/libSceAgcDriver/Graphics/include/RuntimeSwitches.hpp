@@ -173,6 +173,12 @@ enum class RuntimeSwitch : std::size_t {
     XpDepthLayouts,
     XpTargetRestarts,
     TargetRestarts,
+    MovedInPlace,
+    IndirectInPass,
+    FragmentOwnSets,
+    DirectBuffersInPlace,
+    DirectGpuIndirect,
+    ExpressGpuIndirect,
     Count,
 };
 

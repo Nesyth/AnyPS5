@@ -104,6 +104,8 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes);
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 std::uint64_t ShadowLiveSerial();
+bool CpuPublishPendingOverlaps(std::uint64_t address, std::size_t bytes);
+std::uint64_t CpuPublishesNoted();
 std::vector<std::pair<std::uint64_t, std::uint64_t>> LiveShadowedRanges(std::uint64_t address, std::size_t bytes, PublishScope scope);
 
 // The sources of a storage upload's surface-relative runs: [begin, end) pieces of them, each read

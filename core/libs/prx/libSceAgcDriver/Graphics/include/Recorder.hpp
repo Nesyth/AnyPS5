@@ -501,6 +501,9 @@ public:
     // and for helpers that must not recycle resources the recorded work still uses.
     static Recorder* Active();
     bool RenderPassOpen() const;
+    bool PassIndirectReads() const;
+    bool BegunPassIndirectReads() const;
+    void NotePassIndirectReads();
     VkCommandBuffer AppendablePass(std::uint64_t key);
     bool PassPureReads() const;
     bool PassFenced() const;
@@ -799,6 +802,7 @@ private:
             std::uint64_t restartSwitches = 0;
             bool open = false;
             bool fenced = false;
+            bool indirectReads = false;
             std::uint64_t key = 0;
             std::uint32_t timing = NoTiming;
             std::function<void(VkCommandBuffer)> afterPass;

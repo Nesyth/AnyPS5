@@ -1918,6 +1918,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
         open->passHazards.BeginPass();
         const bool merged = led(covered);
         if (merged) CountMerged(CommandClass::Draw);
+        open->renderPass.indirectReads = merged && (covered & VK_ACCESS_INDIRECT_COMMAND_READ_BIT) != 0;
         passCensus[PassBreakCount + (merged ? 1u : 0u)].fetch_add(1, std::memory_order_relaxed);
         return {commands, false, !merged, reason};
     }
@@ -1952,6 +1953,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     open->passHazards.BeginPass();
     const bool merged = !elide && led(covered);
     if (merged) CountMerged(CommandClass::Draw);
+    open->renderPass.indirectReads = merged && (covered & VK_ACCESS_INDIRECT_COMMAND_READ_BIT) != 0;
     passCensus[PassBreakCount + (elide ? 2u : merged ? 1u : 0u)].fetch_add(1, std::memory_order_relaxed);
     return {commands, false, !elide && !merged, reason};
 }
@@ -2068,6 +2070,18 @@ bool Recorder::RenderPassOpen() const {
     return open != nullptr && open->renderPass.open;
 }
 
+bool Recorder::PassIndirectReads() const {
+    return open != nullptr && open->renderPass.open && open->renderPass.indirectReads;
+}
+
+bool Recorder::BegunPassIndirectReads() const {
+    return open != nullptr && open->renderPass.indirectReads;
+}
+
+void Recorder::NotePassIndirectReads() {
+    if (open != nullptr) open->renderPass.indirectReads = true;
+}
+
 std::array<std::uint64_t, PassBreakCount + 3> Recorder::PassCensus() {
     std::array<std::uint64_t, PassBreakCount + 3> counts{};
     for (std::size_t index = 0; index < counts.size(); ++index) counts[index] = passCensus[index].load(std::memory_order_relaxed);
@@ -2084,7 +2098,7 @@ void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
     if (pass.depthImage != VK_NULL_HANDLE) recordDepthLayout(context, open->commands, pass.depthImage, pass.depthAspects, false);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
     // host sees them at the batch's fence).
-    const VkAccessFlags leading = barrier && !pass.afterPass && RuntimeSwitches::Set(RuntimeSwitch::PassBarriersMerged) ? DrawLeadingAccess : 0;
+    const VkAccessFlags leading = barrier && !pass.afterPass && RuntimeSwitches::Set(RuntimeSwitch::PassBarriersMerged) ? DrawLeadingAccess | (RuntimeSwitches::Set(RuntimeSwitch::IndirectInPass) ? static_cast<VkAccessFlags>(VK_ACCESS_INDIRECT_COMMAND_READ_BIT) : VkAccessFlags{0}) : 0;
     if (barrier) {
         recordBarrier(open->commands, PassEndBarrier.srcStage, PassEndBarrier.dstStage, PassEndBarrier.srcAccess, PassEndBarrier.dstAccess | leading);
         CountBarriers(CommandClass::Draw);

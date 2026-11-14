@@ -261,6 +261,40 @@ bool& publishOnCpu() {
 
 std::atomic<void (*)(std::uint64_t, std::uint64_t)> publishSelectedHook{nullptr};
 
+struct CpuPublishRange {
+    std::uint64_t ticket;
+    std::uint64_t begin;
+    std::uint64_t end;
+};
+
+struct CpuPublishes {
+    std::mutex mutex;
+    std::atomic<std::size_t> live{0};
+    std::uint64_t next = 0;
+    std::vector<CpuPublishRange> ranges;
+};
+
+CpuPublishes& cpuPublishes() {
+    static auto* kept = new CpuPublishes;
+    return *kept;
+}
+
+std::uint64_t noteCpuPublish(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    auto& kept = cpuPublishes();
+    std::lock_guard lock(kept.mutex);
+    const auto ticket = ++kept.next;
+    for (const auto& [begin, end] : ranges) kept.ranges.push_back({ticket, begin, end});
+    kept.live.store(kept.ranges.size(), std::memory_order_release);
+    return ticket;
+}
+
+void dropCpuPublish(std::uint64_t ticket) {
+    auto& kept = cpuPublishes();
+    std::lock_guard lock(kept.mutex);
+    std::erase_if(kept.ranges, [&](const CpuPublishRange& range) { return range.ticket == ticket; });
+    kept.live.store(kept.ranges.size(), std::memory_order_release);
+}
+
 bool recordCopiesOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes, std::uint64_t checked) {
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return false;
@@ -294,7 +328,8 @@ bool recordCopiesOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& 
     recorder->EndGpuTiming(timing, bytes);
     const Recorder::WriterScope writerScope{Recorder::WriterTag(7)};
     recorder->NotePendingWrites(ranges);
-    recorder->OnComplete([host, pieces = std::move(pieces), checked] {
+    const auto ticket = noteCpuPublish(ranges);
+    recorder->OnComplete([host, pieces = std::move(pieces), checked, ticket] {
         host->Invalidate();
         for (const auto& piece : pieces) {
             for (std::uint64_t at = piece.address; at < piece.address + piece.size;) {
@@ -305,6 +340,7 @@ bool recordCopiesOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& 
                 at = next;
             }
         }
+        dropCpuPublish(ticket);
     });
     return true;
 }
@@ -623,6 +659,19 @@ bool anyShadowedLocked(const Shadows& registry, std::uint64_t address, std::size
     });
 }
 
+}
+
+bool CpuPublishPendingOverlaps(std::uint64_t address, std::size_t bytes) {
+    auto& kept = cpuPublishes();
+    if (bytes == 0 || kept.live.load(std::memory_order_acquire) == 0) return false;
+    std::lock_guard lock(kept.mutex);
+    return std::any_of(kept.ranges.begin(), kept.ranges.end(), [&](const CpuPublishRange& range) { return range.begin < address + bytes && address < range.end; });
+}
+
+std::uint64_t CpuPublishesNoted() {
+    auto& kept = cpuPublishes();
+    std::lock_guard lock(kept.mutex);
+    return kept.next;
 }
 
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {

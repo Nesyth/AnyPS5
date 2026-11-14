@@ -6026,14 +6026,16 @@ void ResourceCache::noteMiss(const Key& key) {
     }
 }
 
-void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+bool ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     std::lock_guard lock(mutex);
     dropReleasedTextures(evicted);
-    if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) return;
+    if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) return false;
+    bool replaced = false;
     if (const auto found = index.find(key); found != index.end()) {
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
         entries.erase(found->second);
         index.erase(found);
+        replaced = true;
     }
     entries.emplace_front(key, std::move(resources));
     index.emplace(key, entries.begin());
@@ -6057,7 +6059,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         index.erase(entries.back().first);
         entries.pop_back();
     }
-    if (entries.front().second->TableElements() == 0) return;
+    if (entries.front().second->TableElements() == 0) return replaced;
     std::uint64_t tables = 0;
     for (const auto& entry : entries) tables += entry.second->TableElements();
     for (auto it = std::prev(entries.end()); tables > TableElementBudget() && it != entries.begin();) {
@@ -6071,6 +6073,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         index.erase(it->first);
         it = std::prev(entries.erase(it));
     }
+    return replaced;
 }
 
 void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
@@ -6544,16 +6547,20 @@ public:
 };
 
 std::uint64_t ShaderResources::guestBufferBytes(std::span<const std::uint32_t> words) const {
+    return ClampedBufferBytes(words, context.limits.maxStorageBufferRange);
+}
+
+std::uint64_t ShaderResources::ClampedBufferBytes(std::span<const std::uint32_t> words, std::uint64_t maxStorageBufferRange) {
     const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1] & ~0x40000000u, words[2], words[3]}};
     const auto address = descriptor.Base48();
     auto byteSize = descriptor.GetSize();
-    if (byteSize > context.limits.maxStorageBufferRange) {
+    if (byteSize > maxStorageBufferRange) {
         const auto mappedEnd = RegisteredReadableEnd(address);
         if (mappedEnd <= address) byteSize = 0;
-        else if (mappedEnd - address < context.limits.maxStorageBufferRange) byteSize = mappedEnd - address;
+        else if (mappedEnd - address < maxStorageBufferRange) byteSize = mappedEnd - address;
     }
     if (byteSize == 0 || address == 0) return 0;
-    if (const std::uint64_t stride = descriptor.Stride(); stride != 0 && byteSize <= context.limits.maxStorageBufferRange) {
+    if (const std::uint64_t stride = descriptor.Stride(); stride != 0 && byteSize <= maxStorageBufferRange) {
         constexpr std::uint64_t GuestPageBytes = 0x4000;
         const auto end = address + byteSize;
         const auto overhang = end % GuestPageBytes;
@@ -7980,32 +7987,76 @@ ShaderResources::DrawBindings::~DrawBindings() {
     release(1, fragmentLayout, fragmentAllocation);
 }
 
+namespace {
+
+bool movedCensus() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return stats;
+}
+
+std::array<std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderResources::MovedCount::Count)>, ShaderResources::MovedCountArms> movedCounts{};
+
+void noteMoved(ShaderResources::MovedCount what) {
+    if (!movedCensus() || what == ShaderResources::MovedCount::Count) return;
+    const auto arm = (RuntimeSwitches::Set(RuntimeSwitch::MovedInPlace) ? 1u : 0u) | (RuntimeSwitches::Set(RuntimeSwitch::DirectBuffersInPlace) ? 2u : 0u);
+    movedCounts[arm][static_cast<std::size_t>(what)].fetch_add(1, std::memory_order_relaxed);
+}
+
+constexpr std::array<const char*, static_cast<std::size_t>(ShaderResources::MovedCount::Count)> MovedCountNames{
+    "bindings differ", "patched data", "template buffer not in guest memory", "written or emptied", "over the range limit", "snapshot budget", "unmapped", "template writes", "pending write", "pending storage image", "shadowed",
+    "same address, raw size differs and stays unequal", "same address, raw size differs but equal once clamped", "finisher: same address, raw size differs and stays unequal", "finisher: same address, raw size differs but equal once clamped",
+    "ranges bound in place", "hits with a range in place",
+    "not in place: template not eligible", "not in place: pending storage image", "not in place: shadowed", "not in place: CPU publish pending", "not in place: label", "not in place: queued store", "not in place: copied writer", "not in place: over the range", "not in place: no import", "not in place: misaligned",
+    "prepared hits committed with a range in place", "prepared ranges committed in place", "prepared in place refused: forget, import or mapping serial moved", "prepared in place refused: switch off at the commit", "prepared in place refused: template writes"};
+static_assert(MovedCountNames.back() != nullptr, "every moved-buffer count needs a name");
+
+}
+
+const char* ShaderResources::MovedCountName(MovedCount count) {
+    return count < MovedCount::Count ? MovedCountNames[static_cast<std::size_t>(count)] : "?";
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::MovedCount::Count)> ShaderResources::TakeMovedCounts(std::size_t arm) {
+    std::array<std::uint64_t, static_cast<std::size_t>(MovedCount::Count)> taken{};
+    if (arm >= MovedCountArms) return taken;
+    for (std::size_t index = 0; index < taken.size(); ++index) taken[index] = movedCounts[arm][index].exchange(0, std::memory_order_relaxed);
+    return taken;
+}
+
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData, MoveTicket* ticket) const {
     std::vector<MovedBuffer> moved;
     std::size_t movedBytes = 0;
     struct RangesStorage {};
     auto& ranges = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::size_t>>, RangesStorage>();
     ranges.clear();
+    struct RangeMovesStorage {};
+    auto& rangeMoves = HostThreadLocal<std::vector<std::size_t>, RangeMovesStorage>();
+    rangeMoves.clear();
+    const bool inPlaceRule = RuntimeSwitches::Set(RuntimeSwitch::MovedInPlace);
+    const auto refuse = [](MovedCount why) {
+        noteMoved(why);
+        return std::optional<std::vector<MovedBuffer>>{};
+    };
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE && !heapStage) || (usesBda && !spaceReuse)) return moved;
     for (const auto& shader : shaders) {
-        if (shader.program == nullptr) return std::nullopt;
+        if (shader.program == nullptr) return refuse(MovedCount::Shape);
         const bool heapShader = HeapShader(shader);
         for (const auto& binding : shader.program->bindings) {
             if (heapShader && (DataRole(binding.role) || binding.role == ShaderRecompiler::DescriptorRole::GuestImages || binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers)) continue;
             if (DataRole(binding.role)) {
                 const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
-                if (kept == bindings.end() || kept->allocations.size() != 1) return std::nullopt;
+                if (kept == bindings.end() || kept->allocations.size() != 1) return refuse(MovedCount::Shape);
                 const auto index = kept->allocations.front();
                 const auto& item = allocations[index];
                 const auto& guestWords = DrawGuestWords(shader, binding);
-                if (item.guest || item.buffer == nullptr || item.size != guestWords.size() * sizeof(std::uint32_t)) return std::nullopt;
+                if (item.guest || item.buffer == nullptr || item.size != guestWords.size() * sizeof(std::uint32_t)) return refuse(MovedCount::Shape);
                 const bool patched = std::any_of(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& patch) { return patch.allocation == index; });
                 const bool same = !item.dataWords.empty() ? item.dataWords == guestWords : !patched && std::memcmp(item.buffer->Bytes().data(), guestWords.data(), item.size) == 0;
                 if (same) continue;
                 if (item.dataWords.empty() && patched) {
                     // A moved range walked before the patch that is not clear refuses the draw first.
                     if (patchedData != nullptr && movedRangesClear(recorder, ranges, nullptr, false)) *patchedData = true;
-                    return std::nullopt;
+                    return refuse(MovedCount::Patched);
                 }
                 if (moved.empty()) moved.reserve(allocations.size());
                 moved.push_back({index, 0, item.size, guestWords});
@@ -8014,33 +8065,64 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
             const auto& guestWords = DrawGuestWords(shader, binding);
             const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
-            if (kept == bindings.end() || kept->allocations.size() != binding.count || guestWords.size() != static_cast<std::size_t>(binding.count) * 4u) return std::nullopt;
+            if (kept == bindings.end() || kept->allocations.size() != binding.count || guestWords.size() != static_cast<std::size_t>(binding.count) * 4u) return refuse(MovedCount::Shape);
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto* words = guestWords.data() + static_cast<std::size_t>(element) * 4u;
                 const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
                 const auto address = descriptor.Base48();
                 const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
-                const auto size = BytesUpToTarget(address, descriptor.GetSize(), descriptor.Stride(), written ? nullptr : target);
+                const auto rawSize = BytesUpToTarget(address, descriptor.GetSize(), descriptor.Stride(), written ? nullptr : target);
                 const auto index = kept->allocations[element];
                 const auto& item = allocations[index];
+                const bool resized = item.guest && item.address == address && item.size != rawSize;
+                auto size = rawSize;
+                if (inPlaceRule && !(item.guest && item.address == address && item.size == size)) size = BytesUpToTarget(address, guestBufferBytes(std::span<const std::uint32_t>(words, 4)), descriptor.Stride(), written ? nullptr : target);
                 const bool empty = size == 0 || address == 0;
                 if (!item.guest) {
                     if (empty) continue;
-                    return std::nullopt;
+                    return refuse(MovedCount::NotGuest);
                 }
+                if (resized) noteMoved(item.size == size ? MovedCount::ResizedClamped : MovedCount::Resized);
                 if (item.address == address && item.size == size) continue;
-                if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return std::nullopt;
+                if (written || empty || item.written) return refuse(MovedCount::Written);
+                if (size > context.limits.maxStorageBufferRange) return refuse(MovedCount::Oversize);
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
-                if (bytes > maxDrawSnapshotBytes - movedBytes) return std::nullopt;
+                if (!inPlaceRule && bytes > maxDrawSnapshotBytes - movedBytes) return refuse(MovedCount::Budget);
                 ranges.emplace_back(begin, bytes);
                 if (moved.empty()) moved.reserve(allocations.size());
+                rangeMoves.push_back(moved.size());
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
                 movedBytes += bytes;
             }
         }
     }
-    if (!movedRangesClear(recorder, ranges, ticket, false)) return std::nullopt;
+    auto why = MovedCount::Count;
+    if (!inPlaceRule) {
+        if (!movedRangesClear(recorder, ranges, ticket, false, nullptr, &why)) return refuse(why);
+        return moved;
+    }
+    struct PlacedStorage {};
+    auto& placed = HostThreadLocal<std::vector<InPlaceRange>, PlacedStorage>();
+    if (!movedRangesClear(recorder, ranges, ticket, false, &placed, &why)) return refuse(why);
+    std::size_t copied = 0;
+    for (std::size_t at = 0; at < ranges.size(); ++at) {
+        if (placed[at].buffer == VK_NULL_HANDLE) copied += ranges[at].second;
+    }
+    if (copied > maxDrawSnapshotBytes) return refuse(MovedCount::Budget);
+    bool any = false;
+    for (std::size_t at = 0; at < ranges.size(); ++at) {
+        if (placed[at].buffer == VK_NULL_HANDLE) continue;
+        auto& entry = moved[rangeMoves[at]];
+        entry.inPlace = placed[at].buffer;
+        entry.importOffset = placed[at].offset;
+        entry.begin = ranges[at].first;
+        entry.bytes = ranges[at].second;
+        entry.behind = true;
+        noteMoved(MovedCount::InPlaceRanges);
+        any = true;
+    }
+    if (any) noteMoved(MovedCount::InPlaceHits);
     return moved;
 }
 
@@ -8062,22 +8144,35 @@ void noteZoneCensus(bool countsClear, bool testsBusy) {
 
 }
 
-bool ShaderResources::movedRangesClear(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::size_t>> ranges, MoveTicket* ticket, bool accessible) const {
+bool ShaderResources::movedRangesClear(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::size_t>> ranges, MoveTicket* ticket, bool accessible, std::vector<InPlaceRange>* inPlace, MovedCount* why) const {
     const bool ticketed = ticket != nullptr && ticket->ranges != nullptr;
     const bool stamped = ticketed && ticket->valid && ticket->recorder == recorder.Id() && ticket->pending == StorageTexture::PendingSerial() && ticket->allocations == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && ticket->epoch == GuestMemory::CollectEpoch();
     struct FreshStorage {};
     auto& fresh = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, FreshStorage>();
     fresh.clear();
-    for (const auto& [begin, bytes] : ranges) {
+    if (inPlace != nullptr) inPlace->assign(ranges.size(), InPlaceRange{});
+    const auto refuse = [why](MovedCount cause) {
+        if (why != nullptr) *why = cause;
+        return false;
+    };
+    for (std::size_t at = 0; at < ranges.size(); ++at) {
+        const auto begin = ranges[at].first;
+        const auto bytes = ranges[at].second;
         const auto range = std::pair<std::uint64_t, std::uint64_t>{begin, begin + bytes};
         if (zoneCensus()) noteZoneCensus(PendingZones::Clear(begin, bytes), recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr));
         if (ticketed) ++ticket->checked;
         if (stamped && std::find(ticket->ranges->begin(), ticket->ranges->end(), range) != ticket->ranges->end() && !recorder.WriteNotedSince(ticket->note, begin, bytes)) {
             ++ticket->trusted;
-            if (AnyShadowedOverlaps(begin, bytes)) return false;
+            if (AnyShadowedOverlaps(begin, bytes)) return refuse(MovedCount::Shadowed);
         } else {
-            if (!accessible && !GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return false;
-            if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return false;
+            if (!accessible && !GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return refuse(MovedCount::Unmapped);
+            if (guestMemory.WritesOverlap(begin, bytes)) return refuse(MovedCount::TemplateWrites);
+            if (recorder.PendingWriteOverlaps(begin, bytes)) {
+                if (inPlace == nullptr || !takeMovedInPlace(recorder, begin, bytes, (*inPlace)[at])) return refuse(MovedCount::PendingWrite);
+                continue;
+            }
+            if (PendingStorageOverlaps(begin, bytes, nullptr)) return refuse(MovedCount::PendingStorage);
+            if (AnyShadowedOverlaps(begin, bytes)) return refuse(MovedCount::Shadowed);
         }
         if (ticketed) fresh.push_back(range);
     }
@@ -8093,13 +8188,44 @@ bool ShaderResources::movedRangesClear(Recorder& recorder, std::span<const std::
     return true;
 }
 
+ShaderResources::MovedCount ShaderResources::InPlaceRefusal(const Recorder& recorder, std::uint64_t begin, std::size_t bytes) const {
+    if (heapStage || addressedBuffers || usesBda || rebound) return MovedCount::NotEligible;
+    if (PendingStorageOverlaps(begin, bytes, nullptr)) return MovedCount::InPlaceStorage;
+    if (AnyShadowedOverlaps(begin, bytes)) return MovedCount::InPlaceShadowed;
+    if (CpuPublishPendingOverlaps(begin, bytes)) return MovedCount::CpuPublish;
+    if (recorder.PendingLabelIn(begin, bytes) || recorder.CompletionLabelIn(begin, bytes)) return MovedCount::Label;
+    if (recorder.QueuedStoreOverlaps(begin, bytes) || recorder.QueuedKeyStoreOverlaps(begin, bytes)) return MovedCount::QueuedStore;
+    const auto overlaps = [&](const std::shared_ptr<ShaderResources>& writer) { return writer != nullptr && writer->CopiedWritesOverlap(begin, bytes); };
+    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return MovedCount::CopiedWriter;
+    const auto drawWriters = DrawCopiedWriters();
+    if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return MovedCount::CopiedWriter;
+    if (bytes > context.limits.maxStorageBufferRange) return MovedCount::OverRange;
+    return MovedCount::Count;
+}
+
+bool ShaderResources::takeMovedInPlace(const Recorder& recorder, std::uint64_t begin, std::size_t bytes, InPlaceRange& out) const {
+    const auto refuse = [](MovedCount why) {
+        noteMoved(why);
+        return false;
+    };
+    if (const auto why = InPlaceRefusal(recorder, begin, bytes); why != MovedCount::Count) return refuse(why);
+    const auto* import = HostImportFor(context, begin, bytes);
+    if (import == nullptr) return refuse(MovedCount::NoImport);
+    if (begin < import->base || begin + bytes > import->base + import->bytes) return refuse(MovedCount::OverRange);
+    const auto offset = HostImportOffset(*import, begin);
+    if (offset % std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4) != 0) return refuse(MovedCount::Misaligned);
+    static_cast<void>(FlushDepthPlanes(begin, bytes));
+    out = {import->buffer, offset};
+    return true;
+}
+
 bool ShaderResources::PreparedMovesClear(const PreparedBuffers& prepared, Recorder& recorder, MoveTicket* ticket) const {
     struct RangesStorage {};
     auto& ranges = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::size_t>>, RangesStorage>();
     ranges.clear();
     for (const auto& entry : prepared.moved) {
         const auto& item = allocations[entry.allocation];
-        if (!item.guest) continue;
+        if (!item.guest || entry.inPlace != VK_NULL_HANDLE) continue;
         ranges.emplace_back(entry.address - item.adjustment, static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment)));
     }
     // The finisher's accessibility answers hold while no mapping changed since.
@@ -8112,7 +8238,7 @@ bool ShaderResources::PreparedZonesClear(const PreparedBuffers& prepared, const 
     if ((prepared.forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared.forget) return false;
     for (const auto& entry : prepared.moved) {
         const auto& item = allocations[entry.allocation];
-        if (!item.guest) continue;
+        if (!item.guest || entry.inPlace != VK_NULL_HANDLE) continue;
         const auto begin = entry.address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment));
         if (!PendingZones::Clear(begin, bytes) && (recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr))) return false;
@@ -8131,7 +8257,7 @@ bool ShaderResources::PreparedZonesClearBy(const PreparedBuffers& prepared, Zone
     if ((prepared.forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared.forget) return false;
     for (const auto& entry : prepared.moved) {
         const auto& item = allocations[entry.allocation];
-        if (!item.guest) continue;
+        if (!item.guest || entry.inPlace != VK_NULL_HANDLE) continue;
         const auto begin = entry.address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment));
         if (guestMemory.WritesOverlap(begin, bytes) || !clear(tests, begin, bytes, true)) return false;
@@ -8142,6 +8268,40 @@ bool ShaderResources::PreparedZonesClearBy(const PreparedBuffers& prepared, Zone
         if (guestMemory.WritesOverlap(allocation.address, allocation.size) || !clear(tests, allocation.address, static_cast<std::size_t>(allocation.size), false)) return false;
     }
     return true;
+}
+
+bool ShaderResources::PreparedInPlaceHolds(const PreparedBuffers& prepared, const Recorder& recorder, bool& behind) const {
+    if (!prepared.inPlace) return true;
+    const auto refuse = [](MovedCount why) {
+        noteMoved(why);
+        return false;
+    };
+    if (!RuntimeSwitches::Set(RuntimeSwitch::DirectBuffersInPlace)) return refuse(MovedCount::PreparedInPlaceSwitch);
+    if ((prepared.forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared.forget || HostImportSetGeneration() != prepared.imports || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != prepared.mapping) return refuse(MovedCount::PreparedInPlaceSerials);
+    for (const auto& entry : prepared.moved) {
+        if (entry.inPlace == VK_NULL_HANDLE) continue;
+        if (guestMemory.WritesOverlap(entry.begin, entry.bytes)) return refuse(MovedCount::PreparedInPlaceWrites);
+        if (const auto why = InPlaceRefusal(recorder, entry.begin, entry.bytes); why != MovedCount::Count) return refuse(why);
+    }
+    for (const auto& entry : prepared.moved) {
+        if (entry.inPlace == VK_NULL_HANDLE) continue;
+        static_cast<void>(FlushDepthPlanes(entry.begin, entry.bytes));
+        behind = behind || recorder.PendingWriteOverlaps(entry.begin, entry.bytes);
+    }
+    return true;
+}
+
+void ShaderResources::NotePreparedInPlaceTaken(const PreparedBuffers& prepared) {
+    if (!prepared.inPlace) return;
+    for (const auto& entry : prepared.moved) {
+        if (entry.inPlace != VK_NULL_HANDLE) noteMoved(MovedCount::PreparedInPlaceRanges);
+    }
+    noteMoved(MovedCount::PreparedInPlaceHits);
+}
+
+bool ShaderResources::PreparedInPlaceOverlaps(const PreparedBuffers& prepared, std::uint64_t begin, std::uint64_t end) {
+    if (!prepared.inPlace) return false;
+    return std::ranges::any_of(prepared.moved, [&](const MovedBuffer& entry) { return entry.inPlace != VK_NULL_HANDLE && begin < entry.begin + entry.bytes && entry.begin < end; });
 }
 
 bool ShaderResources::PreparedUntouched(const PreparedBuffers& prepared) const {
@@ -8315,7 +8475,7 @@ constexpr std::uint32_t LenderRest = 64;
 
 void ShaderResources::lendDrawSets(DrawBindings& result, std::span<const std::size_t> selected, std::int32_t pushedSet, BindingRoute& route) const {
     const auto* prepared = route.selection;
-    if (prepared == nullptr || prepared->selected.size() != selected.size() || selected.size() > result.snapshots.size()) return;
+    if (prepared == nullptr || prepared->inPlace || prepared->selected.size() != selected.size() || selected.size() > result.snapshots.size()) return;
     if (ownDrawSets == nullptr) ownDrawSets = makeOwnDrawSets();
     const auto& plan = ownDrawSets->plan;
     for (std::size_t set = 0; set < 2u; ++set) {
@@ -8381,7 +8541,7 @@ void ShaderResources::noteSetLenders(const std::shared_ptr<DrawBindings>& result
     if (ownDrawSets == nullptr) return;
     const auto& plan = ownDrawSets->plan;
     const auto* prepared = route.selection;
-    const bool copied = prepared != nullptr && prepared->selected.size() == selected.size();
+    const bool copied = prepared != nullptr && !prepared->inPlace && prepared->selected.size() == selected.size();
     for (std::size_t set = 0; set < 2u; ++set) {
         const auto handle = set == 0 ? result->allocation.set : result->fragmentAllocation.set;
         if (handle == VK_NULL_HANDLE || result->lent[set]) continue;
@@ -8444,15 +8604,21 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::finishDrawBindin
         }
     }
     if (heapStage && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind) && !RuntimeSwitches::Set(RuntimeSwitch::NoHeapSetSkip)) {
-        for (const auto& snapshot : result->snapshots) recorder.KeepOnce(snapshot.buffer, snapshot.buffer->Bytes().size());
+        for (const auto& snapshot : result->snapshots) {
+            if (snapshot.buffer != nullptr) recorder.KeepOnce(snapshot.buffer, snapshot.buffer->Bytes().size());
+        }
         return result;
     }
     recorder.Keep(result);
     if (RuntimeSwitches::Set(RuntimeSwitch::KeepBytesOnce)) {
-        for (const auto& snapshot : result->snapshots) recorder.KeepSnapshotBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+        for (const auto& snapshot : result->snapshots) {
+            if (snapshot.buffer != nullptr) recorder.KeepSnapshotBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+        }
         return result;
     }
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    for (const auto& snapshot : result->snapshots) {
+        if (snapshot.buffer != nullptr) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    }
     return result;
 }
 
@@ -8499,6 +8665,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
                 ++counted.uploads;
                 counted.bytes += override->size;
             }
+            continue;
+        }
+        if (override != moved.end() && override->inPlace != VK_NULL_HANDLE) {
+            selected.push_back(index);
+            keep({override->begin, nullptr, override->importOffset, override->bytes, override->inPlace});
+            if (census) ++counted.moved;
             continue;
         }
         std::uint64_t address = item.address;
@@ -8752,7 +8924,8 @@ bool ShaderResources::PlaceDirectBuffers(const Context& context, PreparedBuffers
     placed->snapshots.reserve(prepared.selected.size());
     placed->pushSelected.reserve(prepared.selected.size());
     for (const auto& item : prepared.selected) {
-        placed->snapshots.push_back({item.begin, buffer, offset + item.offset, item.bytes});
+        if (item.inPlace) placed->snapshots.push_back({item.begin, nullptr, item.importOffset, item.bytes, item.handle});
+        else placed->snapshots.push_back({item.begin, buffer, offset + item.offset, item.bytes});
         placed->pushSelected.push_back(item.allocation);
     }
     prepared.placed = std::move(placed);
@@ -8776,7 +8949,7 @@ bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const
     // memory it overlaps, after the finisher read that memory; a guard set up or dropped since the
     // read may have published them already.
     const bool guardsMoved = DepthGuardsGeneration_nid_no_patch() != prepared.depthGuards;
-    if ((guardsMoved || HasResidentDepthGuards_nid_no_patch()) && std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && (guardsMoved || MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes)); })) {
+    if ((guardsMoved || HasResidentDepthGuards_nid_no_patch()) && std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && !item.inPlace && (guardsMoved || MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes)); })) {
         selection = Selection::DepthGuards;
         return false;
     }
@@ -8837,7 +9010,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectPreparedSn
     result->snapshots.reserve(prepared.selected.size());
     for (const auto& item : prepared.selected) {
         selected.push_back(item.allocation);
-        result->snapshots.push_back({item.begin, slice.buffer, slice.offset + item.offset, item.bytes});
+        if (item.inPlace) result->snapshots.push_back({item.begin, nullptr, item.importOffset, item.bytes, item.handle});
+        else result->snapshots.push_back({item.begin, slice.buffer, slice.offset + item.offset, item.bytes});
         if (!binds || item.begin == 0) continue;
         if (item.moved && item.bytes > plan.uploadLimit && MovedSnapshotStats()) {
             movedSnapshotTally().uploaded.fetch_add(1, std::memory_order_relaxed);
@@ -8927,7 +9101,7 @@ void ShaderResources::writeFreshDrawSets(DrawBindings& result, std::span<const s
                 const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
                 if (snapshotIndex == selected.size()) continue;
                 const auto& snapshot = result.snapshots[snapshotIndex];
-                buffers[offset + element] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+                buffers[offset + element] = wholeDwordRange({snapshot.Handle(), snapshot.offset, snapshot.bytes});
             }
         }
     }
@@ -9013,7 +9187,7 @@ void ShaderResources::writeOwnDrawSets(DrawBindings& result, std::span<const std
     }
     for (std::size_t index = 0; index < selected.size(); ++index) {
         const auto& snapshot = result.snapshots[index];
-        for (const auto slot : plan.slots[selected[index]]) buffers[slot] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+        for (const auto slot : plan.slots[selected[index]]) buffers[slot] = wholeDwordRange({snapshot.Handle(), snapshot.offset, snapshot.bytes});
     }
     struct WritesStorage {};
     auto& writes = HostThreadLocal<std::vector<VkWriteDescriptorSet>, WritesStorage>();
@@ -9038,7 +9212,7 @@ void ShaderResources::writeAddressedOverlay(DrawBindings& result, std::span<cons
     bool overridden = false;
     for (std::size_t index = 0; index < selected.size(); ++index) {
         const auto& snapshot = result.snapshots[index];
-        overrides[selected[index]] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
+        overrides[selected[index]] = {snapshot.Handle(), snapshot.offset, snapshot.bytes};
     }
     for (const auto& binding : bindings) {
         if (!binding.addressed) continue;
@@ -9749,13 +9923,32 @@ const std::shared_ptr<const ShaderResources::BufferPlan>& ShaderResources::Direc
     return bufferPlan;
 }
 
-bool ShaderResources::PrepareDirectBuffers(const BufferPlan& plan, std::span<const CompiledShader> shaders, const ColorTarget* target, PreparedBuffers& out) {
+bool ShaderResources::TakePreparedInPlace(PreparedBuffers& prepared, std::size_t index) {
+    if (index >= prepared.selected.size()) return false;
+    auto& item = prepared.selected[index];
+    if (!item.moved || item.begin == 0 || item.handle == VK_NULL_HANDLE) return false;
+    const auto entry = std::find_if(prepared.moved.begin(), prepared.moved.end(), [&](const MovedBuffer& candidate) { return candidate.allocation == item.allocation; });
+    if (entry == prepared.moved.end() || !entry->words.empty()) return false;
+    item.inPlace = true;
+    entry->inPlace = item.handle;
+    entry->importOffset = item.importOffset;
+    entry->begin = item.begin;
+    entry->bytes = item.bytes;
+    entry->behind = false;
+    prepared.inPlace = true;
+    return true;
+}
+
+bool ShaderResources::PrepareDirectBuffers(const BufferPlan& plan, std::span<const CompiledShader> shaders, const ColorTarget* target, PreparedBuffers& out, const Context* inPlace) {
     using Refusal = PreparedBuffers::Refusal;
     out.moved.clear();
     out.selected.clear();
     out.blob.clear();
     if (out.blob.capacity() == 0) out.blob.reserve(8192);
     out.refusal = Refusal::None;
+    out.inPlace = false;
+    out.imports = inPlace != nullptr ? HostImportSetGeneration() : 0;
+    out.mapping = inPlace != nullptr ? GuestAllocations::GuestAllocationsGeneration_nid_postfix() : 0;
     out.depthGuards = DepthGuardsGeneration_nid_no_patch();
     out.forget = GuestMemory::ForgetSerial();
     const auto refuse = [&](Refusal why) {
@@ -9763,6 +9956,7 @@ bool ShaderResources::PrepareDirectBuffers(const BufferPlan& plan, std::span<con
         return false;
     };
     if (shaders.size() != plan.stages) return refuse(Refusal::Classification);
+    const bool clamped = RuntimeSwitches::Set(RuntimeSwitch::MovedInPlace);
     std::size_t next = 0;
     std::size_t movedBytes = 0;
     for (std::size_t stage = 0; stage < shaders.size(); ++stage) {
@@ -9796,15 +9990,20 @@ bool ShaderResources::PrepareDirectBuffers(const BufferPlan& plan, std::span<con
                 const auto* words = guestWords.data() + static_cast<std::size_t>(element) * 4u;
                 const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
                 const auto address = descriptor.Base48();
-                const auto size = BytesUpToTarget(address, descriptor.GetSize(), descriptor.Stride(), written ? nullptr : target);
+                const auto rawSize = BytesUpToTarget(address, descriptor.GetSize(), descriptor.Stride(), written ? nullptr : target);
                 const auto& item = plan.allocations[entry.allocation];
+                const bool resized = item.guest && item.address == address && item.size != rawSize;
+                auto size = rawSize;
+                if (clamped && !(item.guest && item.address == address && item.size == size)) size = BytesUpToTarget(address, ClampedBufferBytes(std::span<const std::uint32_t>(words, 4), plan.maxStorageBufferRange), descriptor.Stride(), written ? nullptr : target);
                 const bool empty = size == 0 || address == 0;
                 if (!item.guest) {
                     if (empty) continue;
-                    return refuse(Refusal::Classification);
+                    return refuse(Refusal::NotGuest);
                 }
+                if (resized) noteMoved(item.size == size ? MovedCount::PreparedResizedClamped : MovedCount::PreparedResized);
                 if (item.address == address && item.size == size) continue;
-                if (written || empty || item.written || size > plan.maxStorageBufferRange) return refuse(Refusal::Classification);
+                if (written || empty || item.written) return refuse(Refusal::Written);
+                if (size > plan.maxStorageBufferRange) return refuse(Refusal::Oversize);
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
                 if (bytes > plan.maxDrawSnapshotBytes - movedBytes) return refuse(Refusal::Budget);
@@ -9840,22 +10039,37 @@ bool ShaderResources::PrepareDirectBuffers(const BufferPlan& plan, std::span<con
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(moved ? override->size : item.size, item.adjustment));
         if (!moved && (bytes > plan.maxDrawSnapshotBytes || totalSnapshotBytes + bytes > plan.maxDrawSnapshotBytes)) continue;
         const bool movedUpload = moved && bytes > plan.uploadLimit && bytes <= plan.movedUploadBytes && movedUploads;
-        if (bytes == 0 || (bytes > plan.uploadLimit && !movedUpload)) return refuse(Refusal::UploadLimit);
+        VkBuffer handle = VK_NULL_HANDLE;
+        VkDeviceSize importOffset = 0;
+        if (moved && inPlace != nullptr && bytes != 0 && bytes <= plan.maxStorageBufferRange) {
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{begin, begin + bytes}}};
+            std::array<ExistingHostImport, 1> found{};
+            if (ExistingHostImportsFor(*inPlace, range, found) && found[0].offset % std::max<VkDeviceSize>(inPlace->limits.minStorageBufferOffsetAlignment, 4) == 0) {
+                handle = found[0].buffer;
+                importOffset = found[0].offset;
+            }
+        }
+        if (bytes == 0 || (bytes > plan.uploadLimit && !movedUpload)) {
+            if (handle == VK_NULL_HANDLE) return refuse(Refusal::UploadLimit);
+            out.selected.push_back({index, begin, bytes, 0, true, false, handle, importOffset});
+            if (!TakePreparedInPlace(out, out.selected.size() - 1)) return refuse(Refusal::UploadLimit);
+            continue;
+        }
         if (!moved && !GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return refuse(Refusal::Inaccessible);
         const auto offset = place(bytes);
         std::memcpy(out.blob.data() + offset, reinterpret_cast<const void*>(begin), bytes);
-        out.selected.push_back({index, begin, bytes, offset, moved});
+        out.selected.push_back({index, begin, bytes, offset, moved, false, handle, importOffset});
         totalSnapshotBytes += bytes;
     }
     return true;
 }
 
 ShaderResources::PreparedDifference ShaderResources::ComparePreparedMoves(const PreparedBuffers& prepared, std::span<const MovedBuffer> moved) {
-    const auto same = [](const MovedBuffer& a, const MovedBuffer& b) { return a.allocation == b.allocation && a.address == b.address && a.size == b.size && std::ranges::equal(a.words, b.words); };
+    const auto same = [](const MovedBuffer& a, const MovedBuffer& b) { return a.allocation == b.allocation && a.address == b.address && a.size == b.size && std::ranges::equal(a.words, b.words) && (a.inPlace == VK_NULL_HANDLE || b.inPlace == VK_NULL_HANDLE || (a.inPlace == b.inPlace && a.importOffset == b.importOffset && a.begin == b.begin && a.bytes == b.bytes)); };
     std::size_t index = 0;
     while (index < prepared.moved.size() && index < moved.size() && same(prepared.moved[index], moved[index])) ++index;
     if (index == prepared.moved.size() && index == moved.size()) return {};
-    const auto describe = [&](std::span<const MovedBuffer> list) { return index < list.size() ? "allocation " + std::to_string(list[index].allocation) + " at 0x" + HexText(list[index].address) + " (" + std::to_string(list[index].size) + " bytes, " + std::to_string(list[index].words.size()) + " words)" : std::string("nothing"); };
+    const auto describe = [&](std::span<const MovedBuffer> list) { return index < list.size() ? "allocation " + std::to_string(list[index].allocation) + " at 0x" + HexText(list[index].address) + " (" + std::to_string(list[index].size) + " bytes, " + std::to_string(list[index].words.size()) + " words" + (list[index].inPlace != VK_NULL_HANDLE ? ", in place at import offset " + std::to_string(list[index].importOffset) + " for " + std::to_string(list[index].bytes) + " bytes" : std::string()) + ")" : std::string("nothing"); };
     return {"moved buffers", "the finisher moves " + std::to_string(prepared.moved.size()) + " buffers, today's way " + std::to_string(moved.size()) + "; at " + std::to_string(index) + " the finisher has " + describe(prepared.moved) + ", today's way " + describe(moved)};
 }
 
@@ -9871,6 +10085,7 @@ ShaderResources::PreparedDifference ShaderResources::ComparePreparedSelection(co
     }
     for (index = 0; index < count; ++index) {
         const auto& item = prepared.selected[index];
+        if (snapshots[index].buffer == nullptr || item.inPlace) continue;
         const auto held = snapshots[index].Bytes();
         const auto* blob = prepared.blob.data() + item.offset;
         if (std::memcmp(held.data(), blob, item.bytes) == 0) continue;
@@ -9919,6 +10134,7 @@ ShaderResources::PreparedDifference ShaderResources::ComparePreparedBinding(Reco
     }
     for (index = 0; index < taken.size(); ++index) {
         const auto& item = prepared.selected[index];
+        if (bound->snapshots[index].buffer == nullptr) continue;
         const auto held = bound->snapshots[index].Bytes();
         if (held.size() == item.bytes && std::memcmp(held.data(), prepared.blob.data() + item.offset, item.bytes) == 0) continue;
         return {"bound bytes", "allocation " + std::to_string(item.allocation) + ": the committer's slice holds other bytes than the finisher's block at offset " + std::to_string(item.offset)};
@@ -10140,7 +10356,7 @@ ShaderResources::PreparedDifference ShaderResources::CompareRepeatPush(RepeatPus
     }
     for (const auto& [slot, index] : push.patches) {
         const auto& snapshot = bound.snapshots[index];
-        push.buffers[slot] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+        push.buffers[slot] = wholeDwordRange({snapshot.Handle(), snapshot.offset, snapshot.bytes});
     }
     const VkDescriptorSet today = plan.set == 1u ? _set : splitSets ? fragment.set : VK_NULL_HANDLE;
     if (push.sets == nullptr && push.boundSet != today) return {"push writes", "the block binds another set beside the pushed one than today's way"};
@@ -10164,7 +10380,7 @@ ShaderResources::PreparedDifference ShaderResources::CompareRepeatPush(RepeatPus
                             const auto chosen = std::find(bound.pushSelected.begin(), bound.pushSelected.end(), binding.allocations[element]);
                             if (chosen == bound.pushSelected.end()) continue;
                             const auto& snapshot = bound.snapshots[static_cast<std::size_t>(chosen - bound.pushSelected.begin())];
-                            expected[offset + element] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+                            expected[offset + element] = wholeDwordRange({snapshot.Handle(), snapshot.offset, snapshot.bytes});
                         }
                     }
                 }
@@ -10175,7 +10391,7 @@ ShaderResources::PreparedDifference ShaderResources::CompareRepeatPush(RepeatPus
         for (std::size_t at = 0; at < pool.patches.size(); ++at) {
             const auto& snapshot = bound.snapshots[push.outsideAt[pool.patchSelected[at]]];
             const auto slot = pool.patchSlots[at];
-            content[slot] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+            content[slot] = wholeDwordRange({snapshot.Handle(), snapshot.offset, snapshot.bytes});
             const auto write = std::find_if(setWrites.begin(), setWrites.end(), [&](std::size_t index) {
                 const auto& candidate = descriptorWrites[index];
                 if (candidate.pBufferInfo == nullptr) return false;
@@ -10276,8 +10492,8 @@ void ShaderResources::overlayPushedBuffers(const DrawBindings& result, const Pus
         if (allocation >= plan.slots.size() || index >= result.snapshots.size()) continue;
         const auto& snapshot = result.snapshots[index];
         for (const auto slot : plan.slots[allocation]) {
-            buffers[slot] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
-            if (!owners.empty()) owners[slot] = index;
+            buffers[slot] = wholeDwordRange({snapshot.Handle(), snapshot.offset, snapshot.bytes});
+            if (!owners.empty() && snapshot.buffer != nullptr) owners[slot] = index;
         }
     }
 }
@@ -10313,8 +10529,8 @@ void ShaderResources::DescribeDrawBindings(const DrawBindings* bound, std::span<
                 const auto snapshot = snapshotOf[binding.allocations[element]];
                 if (snapshot == none) continue;
                 const auto& held = bound->snapshots[snapshot];
-                buffers[offset + element] = wholeDwordRange({held.buffer->Handle(), held.offset, held.bytes});
-                owners[offset + element] = snapshot;
+                buffers[offset + element] = wholeDwordRange({held.Handle(), held.offset, held.bytes});
+                if (held.buffer != nullptr) owners[offset + element] = snapshot;
             }
         }
     }
@@ -10344,6 +10560,34 @@ void ShaderResources::DescribeDrawBindings(const DrawBindings* bound, std::span<
         for (const auto index : plan->writes) emit(plan->set, descriptorWrites[index]);
     }
     std::ranges::sort(out, [](const BoundBuffer& a, const BoundBuffer& b) { return std::tie(a.set, a.binding, a.element) < std::tie(b.set, b.binding, b.element); });
+}
+
+void ShaderResources::DescribeMovedInPlace(std::span<const MovedBuffer> moved, std::vector<BoundBuffer>& out) const {
+    out.clear();
+    std::size_t next = 0;
+    for (const auto& binding : bindings) {
+        if (binding.heap) continue;
+        const auto set = setOf(binding);
+        const auto original = set == 0 ? _set : fragment.set;
+        while (next < descriptorWrites.size() && descriptorWrites[next].dstBinding == binding.layout.binding && descriptorWrites[next].dstSet == original) {
+            const auto& write = descriptorWrites[next++];
+            if (binding.allocations.empty() || write.pBufferInfo == nullptr) continue;
+            for (std::size_t element = 0; element < binding.allocations.size() && element < write.descriptorCount; ++element) {
+                const auto entry = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& candidate) { return candidate.allocation == binding.allocations[element] && candidate.inPlace != VK_NULL_HANDLE; });
+                if (entry == moved.end()) continue;
+                BoundBuffer bound{static_cast<std::uint32_t>(set), write.dstBinding, write.dstArrayElement + static_cast<std::uint32_t>(element), wholeDwordRange({entry->inPlace, entry->importOffset, entry->bytes})};
+                bound.address = entry->begin;
+                bound.bytes = entry->bytes;
+                out.push_back(bound);
+            }
+        }
+    }
+    std::ranges::sort(out, [](const BoundBuffer& a, const BoundBuffer& b) { return std::tie(a.set, a.binding, a.element) < std::tie(b.set, b.binding, b.element); });
+}
+
+void ShaderResources::BindFragmentOwnSets(VkCommandBuffer commands, VkPipelineLayout layout) const {
+    if (_set != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &_set, SetBindSite::Draw);
+    if (fragment.set != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragment.set, SetBindSite::Draw);
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
@@ -11285,7 +11529,9 @@ void ShaderResources::refreshHeapReplayFallback(Recorder& recorder, std::span<co
     }
     if (bindings == nullptr || heap.SubmitEpoch() == provenEpoch) return;
     recorder.Keep(bindings);
-    for (const auto& snapshot : bindings->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    for (const auto& snapshot : bindings->snapshots) {
+        if (snapshot.buffer != nullptr) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    }
 }
 
 void ShaderResources::ConfirmHeapReplay(Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& bindings, const HeapReplayProof& proof) {

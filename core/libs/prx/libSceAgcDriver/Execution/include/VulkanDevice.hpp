@@ -383,6 +383,7 @@ public:
     std::vector<std::uint32_t> DrawContentKey(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) const;
     bool PrepareDrawInputs(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, Graphics::PreparedInputs& prepared) const;
     bool PlaceDirectBuffers(Graphics::ShaderResources::PreparedBuffers& prepared) const;
+    bool PrepareDirectBuffers(const Graphics::ShaderResources::BufferPlan& plan, std::span<const Graphics::CompiledShader> shaders, const Graphics::ColorTarget* target, Graphics::ShaderResources::PreparedBuffers& prepared) const;
     bool DrawInputsInPlace() const;
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders, std::optional<std::uint32_t>* fragmentOutputs = nullptr) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);

@@ -510,19 +510,35 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
     } catch (const std::exception&) {
         return today(Counter::DrawsOnTodaysPath);
     }
-    if (parameters.indirect) return today(Counter::IndirectDrawsOnTodaysPath);
-    if (!parameters.indexed && (parameters.indexCount == 0 || parameters.instanceCount == 0)) return DrawVerdict::Nothing;
-    if (!deferredLabels().labels.empty() || !leanDrawDevice()) return today(Counter::DrawsOnTodaysPath);
+    static const bool pipelinedIndirect = std::getenv("APS5_NO_PIPELINED_INDIRECT") == nullptr;
+    if (parameters.indirect && !(direct && pipelinedIndirect && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectGpuIndirect) && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelinedGpuIndirect))) return today(Counter::IndirectDrawsOnTodaysPath);
+    const auto todayCounter = parameters.indirect ? Counter::IndirectDrawsOnTodaysPath : Counter::DrawsOnTodaysPath;
+    if (!parameters.indirect && !parameters.indexed && (parameters.indexCount == 0 || parameters.instanceCount == 0)) return DrawVerdict::Nothing;
+    if (!deferredLabels().labels.empty() || !leanDrawDevice()) return today(todayCounter);
     auto& record = *leanShapeRecord(queue, submission);
     const auto verdict = leanVerdict(queue, record, parameters);
-    if (verdict == LeanVerdict::Fallback) return today(Counter::DrawsOnTodaysPath);
+    if (verdict == LeanVerdict::Fallback) return today(todayCounter);
     if (verdict == LeanVerdict::Nothing) {
         if (LeanFront::Due(frontLatch, LeanFront::Item::Draw)) return verifyLeanDraw(queue, packet, submission, packetOffset, rejected, record, verdict, parameters, nullptr);
         LeanFront::AddOnWorker(Counter::LeanDraws);
         return DrawVerdict::Nothing;
     }
-    if (!buildLeanShape(queue, submission, record)) return today(Counter::DrawsOnTodaysPath);
+    if (!buildLeanShape(queue, submission, record)) return today(todayCounter);
     const auto& shape = *record.built;
+    if (parameters.indirect) {
+        const auto& decode = *shape.decode;
+        const auto& graphics = decode.state;
+        if (decode.programs.empty() || decode.roles.size() != decode.programs.size() || !KnownGpuIndirectProgram(decode.programs.front().binary.codeAddress) || graphics.quadList || graphics.rectList || graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.stages.mesh || graphics.stages.tessellation || graphics.stages.tessellationGeometry || graphics.tessellationCapture != nullptr) return today(Counter::IndirectDrawsOnTodaysPath);
+        auto& indirect = *parameters.indirect;
+        const auto sgprOf = [&](std::uint32_t location) -> std::int32_t {
+            const auto words = UserDataWords(decode.programs, decode.roles, location);
+            if (words.empty() || words.front().first != 0) return -1;
+            return static_cast<std::int32_t>(decode.programs.front().firstUserSgpr + words.front().second);
+        };
+        indirect.baseVertexSgpr = sgprOf(indirect.baseVertexLocation);
+        indirect.startInstanceSgpr = sgprOf(indirect.startInstanceLocation);
+        indirect.drawIndexSgpr = sgprOf(indirect.drawIndexLocation);
+    }
     if (LeanFront::Due(frontLatch, LeanFront::Item::Draw)) {
         LeanDrawJob job{};
         job.shape = &shape;
@@ -550,7 +566,7 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
             return *prechecked;
         }
     }
-    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpHalfWorkerDraws) && HalfWorkerDrawDropped()) return DrawVerdict::Drawn;
+    if (!parameters.indirect && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpHalfWorkerDraws) && HalfWorkerDrawDropped()) return DrawVerdict::Drawn;
     if (shape.skipped) return DrawVerdict::Drawn;
     const bool runs = direct && LeanFront::SwitchSet(frontLatch, Graphics::RuntimeSwitch::DrawRuns);
     std::byte* payload = nullptr;
@@ -564,6 +580,7 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
         payload = finisher.ReserveLean();
         anchor = payload != nullptr ? leanDraws.AnchorFor(submission.shaders, leanDraws.device, finisher.Issued()) : std::nullopt;
     }
+    if (parameters.indirect && (payload == nullptr || !anchor)) return today(Counter::IndirectDrawsOnTodaysPath);
     std::optional<LeanDrawJob> local;
     LeanDrawJob* job = nullptr;
     if (payload == nullptr || !anchor) {
@@ -737,7 +754,8 @@ DrawVerdict Driver::verifyLeanDraw(QueueState& queue, std::span<const std::uint3
         }
         const auto& today = sink.parameters;
         const auto& mine = job->parameters;
-        const bool sameParameters = today.indexAddress == mine.indexAddress && today.indexCount == mine.indexCount && today.indexSize == mine.indexSize && today.instanceCount == mine.instanceCount && today.flags == mine.flags && today.indexed == mine.indexed && today.firstVertex == mine.firstVertex && today.firstInstance == mine.firstInstance && !today.indirect && !mine.indirect;
+        const auto sameIndirect = [](const Pm4::DrawParameters::IndirectDraw& a, const Pm4::DrawParameters::IndirectDraw& b) { return a.arguments == b.arguments && a.opcode == b.opcode && a.recordBytes == b.recordBytes && a.stride == b.stride && a.count == b.count && a.countIndirect == b.countIndirect && a.countAddress == b.countAddress && a.baseVertexLocation == b.baseVertexLocation && a.startInstanceLocation == b.startInstanceLocation && a.drawIndexLocation == b.drawIndexLocation && a.drawIndexEnabled == b.drawIndexEnabled && a.indxOffset == b.indxOffset && a.indexLimitKnown == b.indexLimitKnown && a.baseVertexSgpr == b.baseVertexSgpr && a.startInstanceSgpr == b.startInstanceSgpr && a.drawIndexSgpr == b.drawIndexSgpr; };
+        const bool sameParameters = today.indexAddress == mine.indexAddress && today.indexCount == mine.indexCount && today.indexSize == mine.indexSize && today.instanceCount == mine.instanceCount && today.flags == mine.flags && today.indexed == mine.indexed && today.firstVertex == mine.firstVertex && today.firstInstance == mine.firstInstance && today.indirect.has_value() == mine.indirect.has_value() && (!mine.indirect || sameIndirect(*today.indirect, *mine.indirect));
         if (!sameParameters || sink.held.key != job->drawKey || sink.held.shape != job->shapeKey || sink.reg207 != shape.reg207) {
             LeanFront::NoteDifference(Field::Jobs, at + ": the lean job's " + (!sameParameters ? "draw parameters" : sink.reg207 != shape.reg207 ? "PA_CL_VS_OUT_CNTL" : "held key") + " differ from today's hand-off");
             demote = true;

@@ -185,6 +185,7 @@ static thread_local GuestBufferMemory* buildingBufferMemory = nullptr;
 static thread_local std::vector<RefreshBlock>* buildingBlocks = nullptr;
 
 std::atomic<std::uint64_t> importSetGeneration{1};
+std::array<std::atomic<std::uint64_t>, 4> importRetires{};
 
 struct RetiredImport;
 
@@ -565,8 +566,13 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
         ++state.settlesParked;
     }
 #endif
+    importRetires[0].fetch_add(1, std::memory_order_relaxed);
     auto* recorder = Recorder::Active();
-    if (recorder == nullptr) return;
+    if (recorder == nullptr) {
+        importRetires[1].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (recorder->Idle()) importRetires[hold ? 2u : 3u].fetch_add(1, std::memory_order_relaxed);
     if (hold) recorder->KeepThroughHold(std::move(holder));
     else if (!recorder->Idle()) recorder->Keep(std::move(holder));
 }
@@ -4750,6 +4756,10 @@ std::uint64_t RegisteredReadableEnd(std::uint64_t address) {
 
 std::uint64_t HostImportSetGeneration() {
     return importSetGeneration.load(std::memory_order_acquire);
+}
+
+std::array<std::uint64_t, 4> HostImportRetires() {
+    return {importRetires[0].load(std::memory_order_relaxed), importRetires[1].load(std::memory_order_relaxed), importRetires[2].load(std::memory_order_relaxed), importRetires[3].load(std::memory_order_relaxed)};
 }
 
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes) {

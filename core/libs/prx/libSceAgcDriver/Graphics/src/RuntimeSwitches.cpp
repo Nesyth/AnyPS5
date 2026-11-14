@@ -179,6 +179,12 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_XP_DEPTH_LAYOUTS",
     "APS5_XP_TARGET_RESTARTS",
     "APS5_TARGET_RESTARTS",
+    "APS5_MOVED_IN_PLACE",
+    "APS5_INDIRECT_IN_PASS",
+    "APS5_FRAGMENT_OWN_SETS",
+    "APS5_DIRECT_BUFFERS_IN_PLACE",
+    "APS5_DIRECT_GPU_INDIRECT",
+    "APS5_EXPRESS_GPU_INDIRECT",
 };
 static_assert(SwitchNames.back() != nullptr, "every runtime switch needs a name");
 
@@ -358,6 +364,12 @@ struct SwitchValues {
             std::getenv("APS5_XP_DEPTH_LAYOUTS") != nullptr,
             std::getenv("APS5_XP_TARGET_RESTARTS") != nullptr,
             std::getenv("APS5_TARGET_RESTARTS") != nullptr,
+            std::getenv("APS5_MOVED_IN_PLACE") != nullptr,
+            std::getenv("APS5_INDIRECT_IN_PASS") != nullptr,
+            std::getenv("APS5_FRAGMENT_OWN_SETS") != nullptr,
+            std::getenv("APS5_DIRECT_BUFFERS_IN_PLACE") != nullptr,
+            std::getenv("APS5_DIRECT_GPU_INDIRECT") != nullptr,
+            std::getenv("APS5_EXPRESS_GPU_INDIRECT") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

@@ -920,6 +920,11 @@ void DrawRecordView::Capture(std::span<const Graphics::CompiledShader> shaders, 
         push = {};
     }
     parameters = {drawParameters.indexAddress, drawParameters.indexCount | static_cast<std::uint64_t>(drawParameters.indexSize) << 32u, drawParameters.instanceCount | static_cast<std::uint64_t>(drawParameters.flags) << 32u, drawParameters.firstVertex | static_cast<std::uint64_t>(drawParameters.firstInstance) << 32u, drawParameters.indexed ? 1u : 0u, drawParameters.indirect.has_value() ? 1u : 0u, 0, 0};
+    if (const auto& indirect = drawParameters.indirect) {
+        using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
+        parameters[6] = indirect->arguments | static_cast<std::uint64_t>(indirect->vertexRule == Rule::InPlace ? 1u : 0u) << 56u | static_cast<std::uint64_t>(indirect->instanceRule == Rule::InPlace ? 1u : 0u) << 57u | static_cast<std::uint64_t>(indirect->countIndirect ? 1u : 0u) << 58u;
+        parameters[7] = indirect->vertexConstant | static_cast<std::uint64_t>(indirect->instanceConstant) << 32u;
+    }
 }
 
 void DrawRecordView::CaptureSnapshots(std::span<const Graphics::GuestMemorySnapshot> snapshots) {
@@ -2027,7 +2032,11 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
             if (expressed.taken) {
                 expressedOutcome = expressed.result;
                 DirectDraws::Add(Counter::ExpressTaken);
-                if (expressed.reproved) DirectDraws::Add(Counter::ExpressReproved);
+                if (expressed.reproved) {
+                    using ExpressMiss = Graphics::ShaderResources::ExpressMiss;
+                    DirectDraws::Add(Counter::ExpressReproved);
+                    if (expressed.reproveMiss >= ExpressMiss::NotProved && expressed.reproveMiss <= ExpressMiss::Staging) DirectDraws::Add(static_cast<Counter>(static_cast<std::size_t>(Counter::ExpressReprovedNotProved) + static_cast<std::size_t>(expressed.reproveMiss) - static_cast<std::size_t>(ExpressMiss::NotProved)));
+                }
                 if (expressed.refreshed != 0) DirectDraws::Add(Counter::ExpressRefreshed, expressed.refreshed);
                 if (fragmentTimed) {
                     DirectDraws::Add(Counter::ExpressNanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - expressBegan).count()));
@@ -2045,7 +2054,13 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         }
         const auto outcome = expressedOutcome.has_value() ? *expressedOutcome : repeatedOutcome.has_value() ? *repeatedOutcome : localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, nullptr, prepared, fullInputs, fragment);
         if (verifyKeep != nullptr) NoteExpressVerify(*hit.record, commit, outcome, verifyKeep, verifyVersions, verifyReprove);
-        if (fragment != nullptr && !expressedOutcome.has_value() && !repeatedOutcome.has_value() && tracePtr == nullptr && commit.effects.fragment.expressCapture == DrawExpressCapture::None && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ExpressCommits)) DirectDraws::Add(DirectDraws::Counter::ExpressCaptureUnreached);
+        const bool captureUnreached = fragment != nullptr && !expressedOutcome.has_value() && !repeatedOutcome.has_value() && tracePtr == nullptr && commit.effects.fragment.expressCapture == DrawExpressCapture::None && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ExpressCommits);
+        if (captureUnreached) DirectDraws::Add(DirectDraws::Counter::ExpressCaptureUnreached);
+        if (fragmentsOn && hit.parameters.indirect) {
+            const auto capture = commit.effects.fragment.expressCapture;
+            if (capture == DrawExpressCapture::Captured) DirectDraws::Add(DirectDraws::Counter::ExpressIndirectCaptured);
+            else if (captureUnreached || (capture != DrawExpressCapture::None && capture != DrawExpressCapture::Count)) DirectDraws::Add(DirectDraws::Counter::ExpressIndirectNotCaptured);
+        }
         if (fragmentsOn) NoteCommitFragments(*hit.record, commit, fragmentTimed && outcome.recorded, fragmentTimed ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - fragmentBegan).count()) : 0u);
         if (timed && !repeatedOutcome.has_value() && outcome.recorded && commit.effects.hold == DrawRecordHold::Held && !commit.effects.sharedHold) {
             DirectDraws::Add(DirectDraws::Counter::RepeatFullNanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - fullBegan).count()));

@@ -3138,6 +3138,7 @@ bool OpportunisticReap() {
 
 void VulkanDevice::StoreIdleResults(bool reapFirst, const std::function<bool()>& stop) {
     if (!Graphics::StorageTexture::AnyPending()) return;
+    Graphics::NoteIdleStore();
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
@@ -5266,6 +5267,10 @@ bool VulkanDevice::PlaceDirectBuffers(Graphics::ShaderResources::PreparedBuffers
     return Graphics::ShaderResources::PlaceDirectBuffers(state->context, prepared);
 }
 
+bool VulkanDevice::PrepareDirectBuffers(const Graphics::ShaderResources::BufferPlan& plan, std::span<const Graphics::CompiledShader> shaders, const Graphics::ColorTarget* target, Graphics::ShaderResources::PreparedBuffers& prepared) const {
+    return Graphics::ShaderResources::PrepareDirectBuffers(plan, shaders, target, prepared, state->contextReady ? &state->context : nullptr);
+}
+
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey, const std::uint32_t* fragmentOutputs, bool recordRecipe) {
     startJournalReplay();
     for (const auto& shader : shaders) {
@@ -6567,7 +6572,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             if (htileClear.has_value()) Graphics::CompleteHtileDepthClear(htileClear->first, htileClear->second);
         });
         // Listed after the registration: a throw there leaves nothing that would pin the CPU path forever.
-        if (resources.HasCopiedWrites()) writers->push_back(kept);
+        if (resources.HasCopiedWrites()) {
+            writers->push_back(kept);
+            Graphics::NoteCopiedWriter(false);
+        }
     }
     recordStep(PhaseRecordCompletion);
 }

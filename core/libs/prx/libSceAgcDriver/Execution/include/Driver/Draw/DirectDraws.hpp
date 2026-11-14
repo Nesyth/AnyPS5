@@ -80,6 +80,7 @@ struct DirectClassKey {
     std::array<const DirectStage*, MaxStages> stages{};
     std::uint32_t count = 0;
     bool indexed = false;
+    std::uint64_t indirect = 0;
 
     static DirectClassKey For(const LeanDrawJob& job, const DirectStages& resolved);
     std::uint64_t Probe() const;
@@ -187,6 +188,7 @@ struct DirectStages {
     std::shared_ptr<const Graphics::Recorder::WriteRanges> before;
     std::uint64_t generation = 0;
     std::uint64_t tag = 0;
+    std::optional<Pm4::DrawParameters::IndirectDraw> indirect;
 };
 
 // The per-step times of a sampled direct draw (every StepSampleEvery-th draw on a thread).

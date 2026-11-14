@@ -95,6 +95,7 @@ struct DrawRecipe {
     // with its own data words and read-only buffer bases, which DrawWithRecipe moves per draw as a
     // template hit does.
     bool perDrawMoves = false;
+    bool indirect = false;
 };
 
 struct DrawRecordPass {
@@ -178,6 +179,11 @@ struct DrawFragment {
     VkDevice device = VK_NULL_HANDLE;
     std::uint64_t nanoseconds = 0;
     std::uint64_t faultGeneration = 0;
+    bool indirect = false;
+    VkBuffer arguments = VK_NULL_HANDLE;
+    VkDeviceSize argumentOffset = 0;
+    VkBuffer count = VK_NULL_HANDLE;
+    VkDeviceSize countOffset = 0;
 };
 
 struct DrawExpressKeep {

@@ -138,6 +138,7 @@ struct DrawTail {
     Pm4::DrawParameters resolvedParameters{};
     bool pipelined = false;
     bool traceIndirect = false;
+    bool readsAfterTurn = false;
     std::uint64_t dumpTarget = 0;
     std::uint64_t dumpSlot1 = 0;
     std::shared_ptr<VulkanDevice> localDevice;
@@ -384,6 +385,14 @@ std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
 bool HalfWorkerDrawDropped() {
     static std::atomic<std::uint64_t> halfWorkerDraws{0};
     return (halfWorkerDraws.fetch_add(1, std::memory_order_relaxed) & 1u) != 0;
+}
+
+bool KnownGpuIndirectProgram(std::uint64_t code) {
+    return knownGpuIndirect(code);
+}
+
+void NoteIndirectProgramPath(std::uint64_t code, bool cpu) {
+    noteIndirectPath(code, cpu);
 }
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
@@ -947,6 +956,7 @@ void Driver::finishLeanDraw(const LeanDrawJob& job, const LeanAnchor& anchor) {
         drawParameters = job.parameters;
         tail.resolvedParameters = job.parameters;
         tail.pipelined = true;
+        tail.readsAfterTurn = job.parameters.indirect.has_value();
         static const bool traceIndirectEnabled = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
         tail.traceIndirect = traceIndirectEnabled;
         auto& localDevice = tail.localDevice;
@@ -1613,6 +1623,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         phaseTiming.Phase(DrawRowLabels);
     };
     if (drawParameters.indirect && indirectCpu) {
+        if (tail.readsAfterTurn && DrawFinisher::OnFinisherThread()) {
+            DrawFinisher::Get().AwaitTurn();
+            if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+        }
 
         const auto indirect = *drawParameters.indirect;
         results.reserve(programs.size() + 2u);

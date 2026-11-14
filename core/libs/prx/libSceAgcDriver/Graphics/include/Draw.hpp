@@ -103,6 +103,7 @@ struct PreparedInputs {
     std::vector<VkDeviceSize> vertexOffsets;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
     std::vector<Range> ranges;
+    std::size_t indirectRanges = 0;
 };
 bool PrepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, PreparedInputs& prepared);
 DrawRecordInputs VerifyPreparedInputsForTest(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, PreparedInputs& prepared, std::string& difference, DrawRecordInputs* taken = nullptr);
@@ -168,6 +169,7 @@ struct ExpressOutcome {
     bool taken = false;
     bool verify = false;
     bool reproved = false;
+    ShaderResources::ExpressMiss reproveMiss = ShaderResources::ExpressMiss::None;
     std::uint32_t refreshed = 0;
     DrawExpressMiss miss = DrawExpressMiss::None;
     DrawRecipeOutcome result;
@@ -176,7 +178,7 @@ std::array<std::uint64_t, 8> ExpressTargetMissCauses();
 bool DrawBufferAliasesClear(std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::uint64_t indexBytes);
 ExpressOutcome ExpressCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs, DrawFragment* fragment, bool verifyDue);
 enum class ExpressRunEnd : std::uint8_t { NotQueued, NotDraw, Cap, LockWaiter, IdleWaiter, Refusal, Switch, Stop, Count };
-enum class ExpressRunRefusal : std::uint8_t { NotDirect, Verifies, Unlocked, Labels, Experiment, Device, State, Switches, Objects, Recorder, Generation, Key, OwnWrites, OwnImages, NotAppendable, Serials, Linear, Writers, Targets, Multisample, Depth, Template, Prepared, Inputs, PassWrites, Fenced, InputWrites, InputStores, Buffers, Stores, Verify, Selection, Staging, PassMoved, OwnTargets, OwnSerials, ImageHazard, Count };
+enum class ExpressRunRefusal : std::uint8_t { NotDirect, Verifies, Unlocked, Labels, Experiment, Device, State, Switches, Objects, Recorder, Generation, Key, OwnWrites, OwnImages, NotAppendable, Serials, Linear, Writers, Targets, Multisample, Depth, Template, Prepared, Inputs, PassWrites, Fenced, InputWrites, InputStores, Buffers, Stores, Verify, Selection, Staging, PassMoved, OwnTargets, OwnSerials, ImageHazard, Indirect, InPlace, Count };
 void BeginExpressRun();
 void EndExpressRun(ExpressRunEnd reason);
 void BreakExpressRun();
@@ -276,6 +278,17 @@ void CountDrawSkip(DrawSkip kind, double us);
 // which the switch can turn into APS5_NO_RECORD_COPIED_DRAWS. Until then such draws are recorded and
 // waited for at once. Read and written under GuestMemory::GpuMutex, like the device's list.
 std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters();
+void NoteCopiedWriter(bool draw);
+std::array<std::uint64_t, 2> CopiedWriterTotals();
+void NoteIdleStore();
+struct ResidentCensusTotals {
+    std::uint64_t cpuPublishes = 0;
+    std::uint64_t idleStores = 0;
+    std::array<std::uint64_t, 4> retires{};
+    std::uint64_t templatesReplaced = 0;
+};
+ResidentCensusTotals ResidentCensus();
+std::string TakeFullDrawLookupText();
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> PipelinedColorMetadataPassWrites(const ColorMetadataPass& pass);

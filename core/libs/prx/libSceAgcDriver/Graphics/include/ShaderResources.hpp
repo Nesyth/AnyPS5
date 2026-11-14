@@ -235,7 +235,9 @@ public:
             std::shared_ptr<Buffer> buffer;
             VkDeviceSize offset = 0;
             std::size_t bytes = 0;
+            VkBuffer handle = VK_NULL_HANDLE;
             std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes); }
+            VkBuffer Handle() const { return buffer != nullptr ? buffer->Handle() : handle; }
         };
         DescriptorCache* cache = nullptr;
         VkDescriptorSetLayout layout = VK_NULL_HANDLE;
@@ -278,7 +280,18 @@ public:
         std::uint64_t address;
         std::size_t size;
         std::span<const std::uint32_t> words;
+        VkBuffer inPlace = VK_NULL_HANDLE;
+        VkDeviceSize importOffset = 0;
+        std::uint64_t begin = 0;
+        std::size_t bytes = 0;
+        bool behind = false;
     };
+    enum class MovedCount : std::uint8_t { Shape, Patched, NotGuest, Written, Oversize, Budget, Unmapped, TemplateWrites, PendingWrite, PendingStorage, Shadowed, Resized, ResizedClamped, PreparedResized, PreparedResizedClamped, InPlaceRanges, InPlaceHits, NotEligible, InPlaceStorage, InPlaceShadowed, CpuPublish, Label, QueuedStore, CopiedWriter, OverRange, NoImport, Misaligned, PreparedInPlaceHits, PreparedInPlaceRanges, PreparedInPlaceSerials, PreparedInPlaceSwitch, PreparedInPlaceWrites, Count };
+    static const char* MovedCountName(MovedCount count);
+    static constexpr std::size_t MovedCountArms = 4;
+    static std::array<std::uint64_t, static_cast<std::size_t>(MovedCount::Count)> TakeMovedCounts(std::size_t arm);
+    MovedCount InPlaceRefusal(const Recorder& recorder, std::uint64_t begin, std::size_t bytes) const;
+    void BindFragmentOwnSets(VkCommandBuffer commands, VkPipelineLayout layout) const;
     // What MovedReadOnlyBuffers and selectDrawSnapshots read from this object to decide a draw's
     // buffers, copied by value once so a finisher thread can make that decision from the plan, the
     // draw's stages and guest memory alone (PrepareDirectBuffers). Immutable once built; it points
@@ -334,7 +347,7 @@ public:
     // 0) and offsets into `blob`, which holds every selected byte, each slice aligned as
     // Recorder::DrawUpload aligns its slices. `plan` is the plan it was prepared from.
     struct PreparedBuffers {
-        enum class Refusal : std::uint8_t { None, Classification, Inaccessible, UploadLimit, Budget, Count };
+        enum class Refusal : std::uint8_t { None, Classification, Inaccessible, UploadLimit, Budget, NotGuest, Written, Oversize, Count };
         // Whether the committer's selection took them, or today's selection ran instead: an
         // unmoved range no longer clear (or slices the device would not align), or a depth guard
         // that may have published samples into a selected range.
@@ -345,6 +358,9 @@ public:
             std::size_t bytes = 0;
             std::size_t offset = 0;
             bool moved = false;
+            bool inPlace = false;
+            VkBuffer handle = VK_NULL_HANDLE;
+            VkDeviceSize importOffset = 0;
         };
         std::shared_ptr<const BufferPlan> plan;
         std::vector<MovedBuffer> moved;
@@ -358,6 +374,9 @@ public:
         std::uint64_t depthGuards = 0;
         // GuestMemory::ForgetSerial taken before the moved ranges were found accessible.
         std::uint64_t forget = 0;
+        std::uint64_t imports = 0;
+        std::uint64_t mapping = 0;
+        bool inPlace = false;
         mutable std::shared_ptr<DrawBindings> placed;
         VkDevice placedDevice = VK_NULL_HANDLE;
         bool aliasesClear = false;
@@ -423,7 +442,8 @@ public:
     // Prepares the buffers of a draw with `shaders` from the plan, its stages' words and guest
     // memory alone, on any thread; `target` is the colour target MovedReadOnlyBuffers would get.
     // False, with the reason in `out.refusal`, where the draw's buffers cannot be prepared.
-    static bool PrepareDirectBuffers(const BufferPlan& plan, std::span<const CompiledShader> shaders, const ColorTarget* target, PreparedBuffers& out);
+    static bool PrepareDirectBuffers(const BufferPlan& plan, std::span<const CompiledShader> shaders, const ColorTarget* target, PreparedBuffers& out, const Context* inPlace = nullptr);
+    static bool TakePreparedInPlace(PreparedBuffers& prepared, std::size_t index);
     const PushPlan* PushLayouts() const;
     struct DynamicPlan {
         std::array<bool, 2> written{};
@@ -510,6 +530,7 @@ public:
     };
     void DescribeDrawBindings(const DrawBindings* bound, std::span<const std::size_t> selected, const PushPlan* plan, std::vector<BoundBuffer>& out, bool contents = false) const;
     void DescribeDynamicBindings(const DrawBindings& bound, std::span<const std::size_t> selected, const PushPlan* plan, std::vector<BoundBuffer>& out) const;
+    void DescribeMovedInPlace(std::span<const MovedBuffer> moved, std::vector<BoundBuffer>& out) const;
     bool RecordLean() const;
     std::uint8_t LeanMiss() const;
     struct DrawUse {
@@ -558,6 +579,9 @@ public:
     bool PreparedZonesClear(const PreparedBuffers& prepared, const Recorder& recorder) const;
     using ZoneClear = bool (*)(void* tests, std::uint64_t begin, std::size_t bytes, bool moved);
     bool PreparedZonesClearBy(const PreparedBuffers& prepared, ZoneClear clear, void* tests) const;
+    bool PreparedInPlaceHolds(const PreparedBuffers& prepared, const Recorder& recorder, bool& behind) const;
+    static void NotePreparedInPlaceTaken(const PreparedBuffers& prepared);
+    static bool PreparedInPlaceOverlaps(const PreparedBuffers& prepared, std::uint64_t begin, std::uint64_t end);
     bool UnmovedRangesClear(const PreparedBuffers& prepared, Recorder& recorder) const;
     // The ticket PreparedMovesClear left (null: it refused the ranges) against the one today's
     // MovedReadOnlyBuffers left from the same ticket.
@@ -896,6 +920,7 @@ private:
     // is its bufferAtomic (see GuestBufferMemory::AddWritable).
     std::size_t addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read, std::uint32_t extent);
     std::uint64_t guestBufferBytes(std::span<const std::uint32_t> words) const;
+    static std::uint64_t ClampedBufferBytes(std::span<const std::uint32_t> words, std::uint64_t maxStorageBufferRange);
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
     void requireGuestBuffers(std::span<const MovedBuffer> moved = {}) const;
     bool requireMovedGuestBuffers(std::span<const MovedBuffer> moved) const;
@@ -1152,7 +1177,12 @@ private:
     void verifyHeapReplay(Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& bindings, const HeapReplayProof& proof, bool overlaid);
     // The hazard tests of moved read-only (begin, bytes) ranges and the ticket's use of them (a range
     // the ticket trusts needs only the shadow test); `accessible`: the caller found every range mapped.
-    bool movedRangesClear(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::size_t>> ranges, MoveTicket* ticket, bool accessible) const;
+    struct InPlaceRange {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+    };
+    bool movedRangesClear(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::size_t>> ranges, MoveTicket* ticket, bool accessible, std::vector<InPlaceRange>* inPlace = nullptr, MovedCount* why = nullptr) const;
+    bool takeMovedInPlace(const Recorder& recorder, std::uint64_t begin, std::size_t bytes, InPlaceRange& out) const;
     std::shared_ptr<DrawBindings> selectDrawSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, std::vector<std::size_t>& selected, bool census) const;
     // The selection of prepared buffers, their blob in one upload slice; null, before any upload,
     // when an unmoved range is no longer clear or a resident depth surface may hold a selected
@@ -1416,7 +1446,7 @@ public:
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).
-    void Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
+    bool Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
     // With `object`, erases the entry only while it still holds that object (a replacement made
     // meanwhile by another worker stays).
     void Remove(const Key& key, const ShaderResources* object = nullptr);
