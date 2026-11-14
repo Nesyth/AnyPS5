@@ -715,7 +715,7 @@ std::uint32_t DeviceImageTable::chunkFor(Recorder& recorder, bool mayWait) {
     auto found = free();
     if (found == chunks.end()) {
         ++totals.chunkWaits;
-        static_cast<void>(recorder.Reap());
+        static_cast<void>(recorder.Reap(true));
         found = free();
     }
     if (found == chunks.end() && mayWait) {

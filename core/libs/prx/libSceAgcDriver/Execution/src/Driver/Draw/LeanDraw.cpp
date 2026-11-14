@@ -87,6 +87,36 @@ void captureUserWords(DrawUserWords& words, const Registers& shader, bool blocks
     if (window.exchange(now, std::memory_order_relaxed) != now) std::fprintf(stderr, "[user-word-blocks-verify] %llu draws checked, %llu differing\n", static_cast<unsigned long long>(checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(differing.load(std::memory_order_relaxed)));
 }
 
+std::uint64_t leanDrawKey(const LeanShape& shape, const DrawUserWords& words, bool unordered) {
+    const auto key = LeanExactKey(shape, words, unordered);
+    if (!unordered) return key;
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_UNORDERED_DRAW_KEYS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    static std::atomic<std::uint64_t> ordinal{0};
+    if (every == 0 || ordinal.fetch_add(1, std::memory_order_relaxed) % every != 0) return key;
+    struct Seen {
+        std::uint64_t key = 0;
+        std::uint64_t other = 0;
+    };
+    constexpr std::size_t Slots = 4096;
+    static std::array<Seen, Slots> byNew{}, byOld{};
+    static std::atomic<std::uint64_t> checked{0}, collisions{0};
+    static std::atomic<std::int64_t> window{-1};
+    const auto old = LeanExactKey(shape, words, false);
+    checked.fetch_add(1, std::memory_order_relaxed);
+    auto& sameNew = byNew[static_cast<std::size_t>(key % Slots)];
+    if (sameNew.key == key && sameNew.other != old && collisions.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[unordered-keys-verify] new key 0x%llx old keys 0x%llx and 0x%llx\n", static_cast<unsigned long long>(key), static_cast<unsigned long long>(sameNew.other), static_cast<unsigned long long>(old));
+    sameNew = {key, old};
+    auto& sameOld = byOld[static_cast<std::size_t>(old % Slots)];
+    if (sameOld.key == old && sameOld.other != key && collisions.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[unordered-keys-verify] old key 0x%llx new keys 0x%llx and 0x%llx\n", static_cast<unsigned long long>(old), static_cast<unsigned long long>(sameOld.other), static_cast<unsigned long long>(key));
+    sameOld = {old, key};
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (window.exchange(now, std::memory_order_relaxed) != now) std::fprintf(stderr, "[unordered-keys-verify] %llu draws checked, %llu collisions\n", static_cast<unsigned long long>(checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(collisions.load(std::memory_order_relaxed)));
+    return key;
+}
+
 bool runtimeRegister(std::uint32_t offset) {
     return offset - 0x00cu < 32u || offset - 0x04cu < 16u || offset - 0x08cu < 32u || offset - 0x10cu < 32u || offset == 0x082u || offset == 0x083u || offset == 0x102u || offset == 0x103u;
 }
@@ -142,7 +172,21 @@ std::shared_ptr<DrawDecode> LeanRefreshedDecode(const DrawDecode& from, const Dr
     return refreshed;
 }
 
-std::uint64_t LeanExactKey(const LeanShape& shape, const DrawUserWords& words) {
+std::uint64_t LeanExactKey(const LeanShape& shape, const DrawUserWords& words, bool unordered) {
+    if (unordered) {
+        std::array<std::uint64_t, KeyedBases.size()> banks{};
+        for (std::size_t base = 0; base < KeyedBases.size(); ++base) {
+            const auto [first, resource] = KeyedBases[base];
+            const auto limit = first == 0x04cu ? 16u : 32u;
+            auto& part = banks[base];
+            forEachPresent(words, first, 32u * base, allUserWords() ? limit : std::min(userWordCount(words.resources[resource]), limit), [&](std::uint32_t offset, std::uint32_t value) { part ^= Registers::Contribution(offset, value); });
+        }
+        std::uint64_t auxiliary = 0;
+        const auto auxiliaryWord = [&](std::uint32_t offset, std::uint32_t value) { auxiliary ^= Registers::Contribution(offset, value); };
+        forEachPresent(words, 0x082u, 128, 2, auxiliaryWord);
+        forEachPresent(words, 0x102u, 130, 2, auxiliaryWord);
+        return fold(UnorderedUserWordKey(shape.shape, banks[0] ^ banks[1] ^ banks[2] ^ banks[3], auxiliary), shape.keySuffix);
+    }
     auto exact = shape.shape;
     const auto mix = [&](std::uint32_t offset, std::uint32_t value) {
         exact = (exact ^ offset) * FnvPrime;
@@ -548,7 +592,7 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
         job.opcode = (packet[0] >> 8u) & 0xffu;
         job.parameters = parameters;
         captureUserWords(job.words, queue.shader, LeanFront::SwitchSet(frontLatch, Graphics::RuntimeSwitch::UserWordBlocks));
-        job.drawKey = LeanExactKey(shape, job.words);
+        job.drawKey = leanDrawKey(shape, job.words, unorderedDrawKeys.load(std::memory_order_relaxed));
         job.shapeKey = shape.finalShape;
         job.deviceSerial = record.deviceSerial;
         job.records = nullptr;
@@ -600,7 +644,7 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
     job->opcode = (packet[0] >> 8u) & 0xffu;
     job->parameters = parameters;
     captureUserWords(job->words, queue.shader, LeanFront::SwitchSet(frontLatch, Graphics::RuntimeSwitch::UserWordBlocks));
-    job->drawKey = LeanExactKey(shape, job->words);
+    job->drawKey = leanDrawKey(shape, job->words, unorderedDrawKeys.load(std::memory_order_relaxed));
     job->shapeKey = shape.finalShape;
     job->deviceSerial = record.deviceSerial;
     job->records = nullptr;

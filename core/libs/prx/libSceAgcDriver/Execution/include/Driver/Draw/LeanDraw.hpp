@@ -149,7 +149,7 @@ private:
 };
 
 std::shared_ptr<DrawDecode> LeanRefreshedDecode(const DrawDecode& from, const DrawUserWords& words);
-std::uint64_t LeanExactKey(const LeanShape& shape, const DrawUserWords& words);
+std::uint64_t LeanExactKey(const LeanShape& shape, const DrawUserWords& words, bool unordered = false);
 std::uint64_t LeanIdentityKey(const LeanShape& shape, const DrawUserWords& words);
 void LeanAliasKey(const LeanShape& shape, const DrawUserWords& words, const DrawRelocation* relocation, std::uint64_t deviceSerial, std::uint64_t& alias);
 bool HalfWorkerDrawDropped();

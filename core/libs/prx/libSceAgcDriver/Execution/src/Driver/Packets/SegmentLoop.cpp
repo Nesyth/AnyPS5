@@ -220,6 +220,191 @@ void notePlainVerify(bool drains, bool flushDue, const Submission& submission, s
     if (newCounterWindow(window)) std::fprintf(stderr, "[plain-register-verify] %llu packets checked, %llu with a flush due deferred to the next full packet, %llu differing\n", static_cast<unsigned long long>(checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(deferred.load(std::memory_order_relaxed)), static_cast<unsigned long long>(differing.load(std::memory_order_relaxed)));
 }
 
+std::uint64_t everyFrom(const char* name) {
+    const char* text = std::getenv(name);
+    return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+}
+
+std::optional<std::uint32_t> firstRegisterDifference(const Registers& left, const Registers& right) {
+    auto a = left.begin();
+    auto b = right.begin();
+    while (a != left.end() || b != right.end()) {
+        if (a == left.end()) return (*b).first;
+        if (b == right.end()) return (*a).first;
+        const auto [leftOffset, leftValue] = *a;
+        const auto [rightOffset, rightValue] = *b;
+        if (leftOffset != rightOffset) return std::min(leftOffset, rightOffset);
+        if (leftValue != rightValue) return leftOffset;
+        ++a;
+        ++b;
+    }
+    return std::nullopt;
+}
+
+std::uint32_t heldValue(const Registers& bank, std::uint32_t offset) {
+    return bank.contains(offset) ? bank.at(offset) : 0u;
+}
+
+struct RegisterRunsScratch {};
+
+void executeRegisters(std::span<const std::uint32_t> packet, const RegisterListView* list, QueueState& queue, const Submission& submission, std::size_t cursor) {
+    static const std::uint64_t every = everyFrom("APS5_VERIFY_REGISTER_RUNS");
+    static std::atomic<std::uint64_t> ordinal{0};
+    if (every == 0 || ordinal.fetch_add(1, std::memory_order_relaxed) % every != 0) {
+        if (list != nullptr) Pm4::ExecuteListedRegisters(packet, list->pairs, queue);
+        else Pm4::ExecuteRegisterRun(packet, queue);
+        return;
+    }
+    static std::atomic<std::uint64_t> packetsChecked{0}, listsChecked{0}, differing{0};
+    static std::atomic<std::int64_t> window{-1};
+    const auto opcode = (packet[0] >> 8u) & 0xffu;
+    auto& scratch = HostThreadLocal<QueueState, RegisterRunsScratch>();
+    auto& today = Pm4::RegistersFor(scratch, opcode);
+    today = Pm4::RegistersFor(queue, opcode);
+    scratch.indexType = queue.indexType;
+    if (list != nullptr) Pm4::ExecuteIndirectRegisters(packet, list->pairs, scratch);
+    else Pm4::Execute(packet, scratch);
+    if (list != nullptr) Pm4::ExecuteListedRegisters(packet, list->pairs, queue);
+    else Pm4::ExecuteRegisterRun(packet, queue);
+    (list != nullptr ? listsChecked : packetsChecked).fetch_add(1, std::memory_order_relaxed);
+    auto& fresh = Pm4::RegistersFor(queue, opcode);
+    const auto at = firstRegisterDifference(fresh, today);
+    const bool same = !at.has_value() && fresh.size() == today.size() && fresh.HeldFingerprint() == today.HeldFingerprint() && queue.indexType == scratch.indexType;
+    if (!same) {
+        if (differing.fetch_add(1, std::memory_order_relaxed) < 16) {
+            const auto name = where(submission, cursor);
+            if (at.has_value()) std::fprintf(stderr, "[register-runs-verify] %s: register 0x%x new 0x%08x (%s), today 0x%08x (%s)\n", name.c_str(), *at, heldValue(fresh, *at), fresh.contains(*at) ? "set" : "unset", heldValue(today, *at), today.contains(*at) ? "set" : "unset");
+            else if (queue.indexType != scratch.indexType) std::fprintf(stderr, "[register-runs-verify] %s: index type new %u, today %u\n", name.c_str(), queue.indexType, scratch.indexType);
+            else if (fresh.size() != today.size()) std::fprintf(stderr, "[register-runs-verify] %s: register count new %zu, today %zu\n", name.c_str(), fresh.size(), today.size());
+            else std::fprintf(stderr, "[register-runs-verify] %s: fingerprint differs\n", name.c_str());
+        }
+        fresh = today;
+        queue.indexType = scratch.indexType;
+    }
+    if (newCounterWindow(window)) std::fprintf(stderr, "[register-runs-verify] %llu register packets checked, %llu register lists checked, %llu differing\n", static_cast<unsigned long long>(packetsChecked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(listsChecked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(differing.load(std::memory_order_relaxed)));
+}
+
+bool listPacketVerifyDue() {
+    static const std::uint64_t every = everyFrom("APS5_VERIFY_LIST_REGISTER_PACKETS");
+    static std::atomic<std::uint64_t> ordinal{0};
+    return every != 0 && ordinal.fetch_add(1, std::memory_order_relaxed) % every == 0;
+}
+
+void noteListPacketVerify(const char* drains, bool flushDue, const Submission& submission, std::size_t cursor) {
+    static std::atomic<std::uint64_t> checked{0}, deferred{0}, moved{0};
+    static std::atomic<std::int64_t> window{-1};
+    checked.fetch_add(1, std::memory_order_relaxed);
+    if (flushDue) deferred.fetch_add(1, std::memory_order_relaxed);
+    if (drains != nullptr && moved.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[list-packets-verify] %s: kept on the short path, the verdict asked again drains (%s)\n", where(submission, cursor).c_str(), drains);
+    if (newCounterWindow(window)) std::fprintf(stderr, "[list-packets-verify] %llu list packets checked, %llu with a flush due deferred to the next full packet, %llu with a verdict that moved\n", static_cast<unsigned long long>(checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(deferred.load(std::memory_order_relaxed)), static_cast<unsigned long long>(moved.load(std::memory_order_relaxed)));
+}
+
+struct PacketClass {
+    std::uint32_t flags = 0;
+    LeanPacket::Pipeline pipeline = LeanPacket::Pipeline::Drains;
+    LeanPacket::Pipeline shortPipeline = LeanPacket::Pipeline::Drains;
+    bool exact = false;
+};
+
+constexpr std::size_t ClassSizeLimit = 8;
+constexpr std::size_t ClassSizeSplit = 5;
+
+const std::array<PacketClass, 256>& packetClasses() {
+    static const std::array<PacketClass, 256> classes = [] {
+        std::array<PacketClass, 256> built{};
+        std::array<std::uint32_t, ClassSizeLimit> words{};
+        for (std::uint32_t opcode = 0; opcode < built.size(); ++opcode) {
+            if (opcode == 0x10 || opcode == 0x46 || opcode == 0x50) continue;
+            auto& known = built[opcode];
+            bool exact = true;
+            for (std::size_t size = 2; size <= ClassSizeLimit; ++size) {
+                words.fill(0);
+                words[0] = 0xc0000000u | (static_cast<std::uint32_t>(size - 2) << 16u) | (opcode << 8u);
+                const auto entry = classify(std::span<const std::uint32_t>(words).first(size), 0);
+                if (size == 2) {
+                    known.flags = entry.flags;
+                    known.shortPipeline = entry.pipeline;
+                }
+                if (size == ClassSizeSplit) known.pipeline = entry.pipeline;
+                exact = exact && entry.flags == known.flags && entry.pipeline == (size >= ClassSizeSplit ? known.pipeline : known.shortPipeline);
+            }
+            known.exact = exact;
+        }
+        return built;
+    }();
+    return classes;
+}
+
+std::atomic<std::uint64_t> classPacketsChecked{0};
+std::atomic<std::uint64_t> classTailsChecked{0};
+std::atomic<std::uint64_t> classDiffering{0};
+std::atomic<std::int64_t> classWindow{-1};
+
+std::uint64_t packetClassesVerifyEvery() {
+    static const std::uint64_t every = everyFrom("APS5_VERIFY_PACKET_CLASSES");
+    return every;
+}
+
+void notePacketClassCounts() {
+    if (!newCounterWindow(classWindow)) return;
+    std::fprintf(stderr, "[packet-classes-verify] %llu packets checked, %llu tails checked, %llu differing\n", static_cast<unsigned long long>(classPacketsChecked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(classTailsChecked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(classDiffering.load(std::memory_order_relaxed)));
+}
+
+LeanPacket classifyByTable(const Submission& submission, std::span<const std::uint32_t> packet, std::size_t cursor) {
+    const auto header = packet[0];
+    const auto opcode = (header >> 8u) & 0xffu;
+    const auto& known = packetClasses()[opcode];
+    if ((header >> 30u) != 3u || !known.exact) return classify(packet, cursor);
+    LeanPacket entry;
+    entry.cursor = static_cast<std::uint32_t>(cursor);
+    entry.words = static_cast<std::uint32_t>(packet.size());
+    entry.header = header;
+    entry.opcode = static_cast<std::uint8_t>(opcode);
+    entry.flags = known.flags;
+    entry.pipeline = packet.size() >= ClassSizeSplit ? known.pipeline : known.shortPipeline;
+    if ((header & 1u) != 0) entry.flags = (entry.flags & ~LeanPacket::Plain) | LeanPacket::Predicated;
+    if (const auto every = packetClassesVerifyEvery(); every != 0) {
+        static std::atomic<std::uint64_t> ordinal{0};
+        if (ordinal.fetch_add(1, std::memory_order_relaxed) % every == 0) {
+            classPacketsChecked.fetch_add(1, std::memory_order_relaxed);
+            const auto today = classify(packet, cursor);
+            if ((today.flags != entry.flags || today.pipeline != entry.pipeline) && classDiffering.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::fprintf(stderr, "[packet-classes-verify] %s: table flags 0x%x pipeline %u, today flags 0x%x pipeline %u\n", where(submission, cursor).c_str(), entry.flags, static_cast<unsigned>(entry.pipeline), today.flags, static_cast<unsigned>(today.pipeline));
+            }
+            if (today.flags != entry.flags || today.pipeline != entry.pipeline) entry = today;
+            notePacketClassCounts();
+        }
+    }
+    return entry;
+}
+
+void verifyTableLists(const Submission& submission, const PacketTable& table) {
+    const auto every = packetClassesVerifyEvery();
+    static std::atomic<std::uint64_t> ordinal{0};
+    if (every == 0 || ordinal.fetch_add(1, std::memory_order_relaxed) % every != 0) return;
+    classTailsChecked.fetch_add(1, std::memory_order_relaxed);
+    const auto& commands = submission.commands;
+    std::size_t index = 0;
+    for (std::size_t cursor = 0; cursor < commands.size(); cursor += Pm4::PacketWords(commands[cursor])) {
+        const auto header = commands[cursor];
+        if ((header >> 30u) != 3u || !Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) continue;
+        const bool listed = index < table.lists.size() && table.packets[table.lists[index]].cursor == cursor;
+        if (!listed) {
+            if (classDiffering.fetch_add(1, std::memory_order_relaxed) < 16) {
+                if (index < table.lists.size()) std::fprintf(stderr, "[packet-classes-verify] serial %llu: today's walk finds a register list at DWORD %zu, the table's next list is at DWORD %u\n", static_cast<unsigned long long>(submission.serial), cursor, table.packets[table.lists[index]].cursor);
+                else std::fprintf(stderr, "[packet-classes-verify] serial %llu: today's walk finds a register list at DWORD %zu, the table lists no more\n", static_cast<unsigned long long>(submission.serial), cursor);
+            }
+            notePacketClassCounts();
+            return;
+        }
+        ++index;
+    }
+    if (index != table.lists.size() && classDiffering.fetch_add(1, std::memory_order_relaxed) < 16) {
+        std::fprintf(stderr, "[packet-classes-verify] serial %llu: the table lists a register list at DWORD %u that today's walk does not find\n", static_cast<unsigned long long>(submission.serial), table.packets[table.lists[index]].cursor);
+    }
+    notePacketClassCounts();
+}
+
 }
 
 std::size_t PacketTable::IndexAt(std::size_t cursor) const {
@@ -242,7 +427,7 @@ SegmentSlot& SegmentSlots::Take() {
     return slot;
 }
 
-void Driver::scanSegment(const Submission& submission, PacketTable& table, bool validating, const std::uint32_t* guest) {
+void Driver::scanSegment(const Submission& submission, PacketTable& table, bool validating, const std::uint32_t* guest, bool byTable) {
     table.Clear();
     const auto& commands = submission.commands;
     std::vector<std::size_t> guarded;
@@ -276,7 +461,12 @@ void Driver::scanSegment(const Submission& submission, PacketTable& table, bool 
             }
         }
         require(count <= commands.size() - cursor, "truncated PM4 packet");
-        table.packets.push_back(classify(std::span(commands).subspan(cursor, count), cursor));
+        if (byTable) {
+            if (validating && (header >> 30u) == 3u && Pm4::IndirectRegisterOpcode(opcode)) table.lists.push_back(static_cast<std::uint32_t>(table.packets.size()));
+            table.packets.push_back(classifyByTable(submission, std::span(commands).subspan(cursor, count), cursor));
+        } else {
+            table.packets.push_back(classify(std::span(commands).subspan(cursor, count), cursor));
+        }
         const bool type3 = (header >> 30u) == 3u;
         if (header == FlipPacketHeader || header == RenderingWaitPacketHeader || (type3 && (opcode == 0x49 || opcode == 0x37 || opcode == 0x3c || opcode == 0x93))) table.outputs.push_back(static_cast<std::uint32_t>(cursor));
         if (header == FlipPacketHeader) ++table.flipHeaders;
@@ -287,6 +477,7 @@ void Driver::scanSegment(const Submission& submission, PacketTable& table, bool 
         const auto end = submission.conditionalEnds.find(entry.cursor);
         if (end != submission.conditionalEnds.end()) entry.skip = static_cast<std::uint32_t>(table.IndexAt(end->second));
     }
+    if (byTable && validating) verifyTableLists(submission, table);
 }
 
 void Driver::markOutputs(const Submission& submission, PacketTable& table) {
@@ -553,6 +744,10 @@ void Driver::runLeanSegment(const Submission& submission, QueueState& queue, Seg
     includeTimingSubmission(submission, true);
     DrawPipeline::Active() = true;
     if (!orderedCompletion()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+    if (const bool unordered = LeanFront::SwitchSet(frontLatch, Graphics::RuntimeSwitch::UnorderedDrawKeys); unordered != unorderedDrawKeys.load(std::memory_order_relaxed)) {
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+        unorderedDrawKeys.store(unordered, std::memory_order_relaxed);
+    }
     if (traceGpu()) std::fprintf(stderr, "[gpu] %.1f execute serial=%llu queue=0x%x dwords=%zu\n", TraceMs(), static_cast<unsigned long long>(submission.serial), submission.queue, submission.commands.size());
     PacketRules::dumpQueue(submission);
     ++run.packetProfile.submissions;
@@ -564,7 +759,7 @@ void Driver::runLeanSegment(const Submission& submission, QueueState& queue, Seg
     gateOpened() = true;
     prepareLeanDraws();
     if (!slot.table.built) {
-        scanSegment(submission, slot.table);
+        scanSegment(submission, slot.table, false, nullptr, LeanFront::SwitchSet(frontLatch, Graphics::RuntimeSwitch::PacketClassTable));
         markOutputs(submission, slot.table);
         LeanFront::AddOnWorker(Counter::PacketTables);
     }
@@ -627,6 +822,8 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
         }
     } leanRunEnd{*this};
     const bool plainRegisters = LeanFront::SwitchSet(frontLatch, RuntimeSwitch::PlainRegisterPackets);
+    const bool registerRuns = LeanFront::SwitchSet(frontLatch, RuntimeSwitch::RegisterRuns);
+    const bool listRegisters = LeanFront::SwitchSet(frontLatch, RuntimeSwitch::ListRegisterPackets);
     std::uint64_t plainDone = 0;
     struct PlainProgress {
         Driver& driver;
@@ -674,10 +871,50 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                 if (report) CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
                 recent.Record(cursor);
                 ++plainDone;
-                Pm4::Execute(packet, queue);
+                if (registerRuns) executeRegisters(packet, nullptr, queue, submission, cursor);
+                else Pm4::Execute(packet, queue);
                 ++run.gate.skipped;
                 index = next;
                 continue;
+            }
+            if (listRegisters && !verifyPacket && !profilePackets && entry.Has(LeanPacket::Plain) && entry.Has(LeanPacket::IndirectRegisters) && entry.pipeline == LeanPacket::Pipeline::AsksLists && !predicated && submission.leanLists && !run.gate.everyPacket && deferredLabels().labels.empty()) {
+                const auto* ref = submission.lists.Next(cursor, listHint);
+                if (ref != nullptr && (ref->flags & RegisterLists::Valid) != 0) {
+                    bool keeps = true;
+                    bool asked = false;
+                    if (DrawFinisher::Busy()) {
+                        if (!DrawFinisher::Overlap()) {
+                            keeps = false;
+                        } else {
+                            keeps = PacketRules::keepsDrawPipeline(packet, header, opcode);
+                            asked = true;
+                        }
+                    }
+                    if (keeps && !asked && DrawPipeline::Queue0().Busy()) keeps = PacketRules::keepsDrawPipeline(packet, header, opcode);
+                    if (keeps) {
+                        if (asked) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Packet, false);
+                        if (listPacketVerifyDue()) {
+                            FlushInputs listInputs;
+                            const char* drains = nullptr;
+                            if (DrawFinisher::Busy() && (!DrawFinisher::Overlap() || !PacketRules::keepsDrawPipeline(packet, header, opcode))) drains = "finisher";
+                            else if (DrawPipeline::Queue0().Busy() && !PacketRules::keepsDrawPipeline(packet, header, opcode)) drains = "committer";
+                            noteListPacketVerify(drains, flushDue(run.gate, listInputs), submission, cursor);
+                        }
+                        if (opcode != tagged) {
+                            GuestMemory::SetCurrentPacket(opcode, submission.queue);
+                            tagged = opcode;
+                        }
+                        if (report) CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
+                        recent.Record(cursor);
+                        ++plainDone;
+                        const auto view = submission.lists.View(*ref);
+                        if (registerRuns) executeRegisters(packet, &view, queue, submission, cursor);
+                        else Pm4::ExecuteIndirectRegisters(packet, view.pairs, queue);
+                        ++run.gate.skipped;
+                        index = next;
+                        continue;
+                    }
+                }
             }
         }
         if (plainDone != 0) packetsDone.fetch_add(std::exchange(plainDone, 0), std::memory_order_seq_cst);
@@ -1047,7 +1284,8 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                     const auto list = RegisterListAt(submission, cursor, listHint);
                     const auto listed = list.pairs;
                     if (list.valid) {
-                        Pm4::ExecuteIndirectRegisters(packet, listed, queue);
+                        if (registerRuns) executeRegisters(packet, &list, queue, submission, cursor);
+                        else Pm4::ExecuteIndirectRegisters(packet, listed, queue);
                     } else {
                         landPendingWaits(submission.queue);
                         recordQueuedLabelsBeforeRead(submission.queue);
@@ -1065,6 +1303,8 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                         }
                         Pm4::ExecuteIndirectRegisters(packet, current, queue, skipInvalidLists());
                     }
+                } else if (registerRuns && (opcode == 0x69 || opcode == 0x76 || opcode == 0x79 || opcode == 0x7a)) {
+                    executeRegisters(packet, nullptr, queue, submission, cursor);
                 } else {
                     Pm4::Execute(packet, queue);
                 }

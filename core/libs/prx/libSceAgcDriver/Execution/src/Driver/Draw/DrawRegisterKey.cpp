@@ -49,7 +49,7 @@ void forEachKeyedUserWord(const QueueState& queue, bool allUserWords, TVisit&& v
 
 }
 
-std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental, std::uint64_t* shapeKey, RegisterStateKeyParts* parts) {
+std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental, std::uint64_t* shapeKey, RegisterStateKeyParts* parts, bool unordered) {
     const auto& masks = registerMasks();
     const auto fingerprint = [&](const Registers& registers, Graphics::RegisterBank bank) {
         const auto& mask = masks[static_cast<std::size_t>(bank)];
@@ -59,6 +59,23 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
     shape = (shape ^ fingerprint(queue.shader, Graphics::RegisterBank::Shader)) * 0x100000001b3ull;
     shape = (shape ^ fingerprint(queue.userConfig, Graphics::RegisterBank::UserConfig)) * 0x100000001b3ull;
     if (shapeKey != nullptr) *shapeKey = shape;
+    if (unordered) {
+        std::uint64_t banks = 0;
+        std::uint64_t auxiliary = 0;
+        const auto fold = [&](std::uint32_t base, std::uint32_t count, std::uint64_t& part) {
+            for (auto it = queue.shader.lower_bound(base); it != queue.shader.end() && it->first < base + count; ++it) part ^= Registers::Contribution(it->first, it->second);
+        };
+        for (const auto base : {0x00cu, 0x04cu, 0x08cu, 0x10cu}) {
+            const auto limit = base == 0x04cu ? 16u : 32u;
+            const auto resources = queue.shader.find(base - 1);
+            const auto count = resources == queue.shader.end() ? 0u : ((resources->second >> 1u) & 0x1fu) | (((resources->second >> 27u) & 1u) << 5u);
+            fold(base, allUserWords ? limit : std::min(count, limit), banks);
+        }
+        fold(0x082u, 2, auxiliary);
+        fold(0x102u, 2, auxiliary);
+        if (parts != nullptr) *parts = {shape, banks, auxiliary};
+        return UnorderedUserWordKey(shape, banks, auxiliary);
+    }
     auto exact = shape;
     std::uint64_t userData = 0xcbf29ce484222325ull;
     std::uint64_t auxiliary = 0xcbf29ce484222325ull;
@@ -164,7 +181,7 @@ std::uint64_t Driver::drawIdentityKey(const QueueState& queue, const ShaderRegis
     return key == 0 ? 1 : key;
 }
 
-std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape, std::array<std::uint64_t, 5>* components, const DrawRelocation* relocation, std::uint64_t* alias) {
+std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape, std::array<std::uint64_t, 5>* components, const DrawRelocation* relocation, std::uint64_t* alias, bool unordered) {
     const bool aliased = alias != nullptr && relocation != nullptr && !relocation->words.empty();
     bool readable = true;
     std::uint64_t other = 0x6c62272e07bb0142ull;
@@ -176,8 +193,8 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     static const bool verify = std::getenv("APS5_VERIFY_REGISTER_KEYS") != nullptr;
     std::uint64_t shapeKey = 0;
     RegisterStateKeyParts parts;
-    auto key = RegisterStateKey(queue, allUserWords, true, &shapeKey, components != nullptr ? &parts : nullptr);
-    if (verify && key != RegisterStateKey(queue, allUserWords, false)) throw std::runtime_error("incremental register fingerprint disagrees with full state");
+    auto key = RegisterStateKey(queue, allUserWords, true, &shapeKey, components != nullptr ? &parts : nullptr, unordered);
+    if (verify && key != RegisterStateKey(queue, allUserWords, false, nullptr, nullptr, unordered)) throw std::runtime_error("incremental register fingerprint disagrees with full state");
     if (aliased) {
         mixOther(shapeKey);
         forEachKeyedUserWord(queue, allUserWords, [&](std::uint32_t offset, std::uint32_t value) {

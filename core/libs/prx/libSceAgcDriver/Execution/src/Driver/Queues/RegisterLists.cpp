@@ -147,12 +147,33 @@ bool listSpanIdle(const std::pair<std::uint64_t, std::uint64_t>& span) {
     return Graphics::Recorder::FlushHookIdle({&span, 1}) && Graphics::ReadGuardIdle(span.first, static_cast<std::size_t>(span.second - span.first));
 }
 
-void planListHooks(LeanTails& tails, std::span<const std::uint32_t> commands) {
+class ListCursors {
+public:
+    ListCursors(std::span<const std::uint32_t> words, const PacketTable* scanned) : commands(words), table(scanned) {}
+    std::size_t First() {
+        index = 0;
+        return table == nullptr ? 0 : at();
+    }
+    std::size_t Next(std::size_t cursor) {
+        if (table == nullptr) return cursor + Pm4::PacketWords(commands[cursor]);
+        ++index;
+        return at();
+    }
+
+private:
+    std::size_t at() const { return index < table->lists.size() ? table->packets[table->lists[index]].cursor : commands.size(); }
+    std::span<const std::uint32_t> commands;
+    const PacketTable* table;
+    std::size_t index = 0;
+};
+
+void planListHooks(LeanTails& tails, std::span<const std::uint32_t> commands, const PacketTable* table) {
     auto& spans = tails.spans;
     auto& idle = tails.spanIdle;
     spans.clear();
     idle.clear();
-    for (std::size_t cursor = 0; cursor < commands.size(); cursor += Pm4::PacketWords(commands[cursor])) {
+    ListCursors walk(commands, table);
+    for (std::size_t cursor = walk.First(); cursor < commands.size(); cursor = walk.Next(cursor)) {
         const auto header = commands[cursor];
         if ((header >> 30u) != 3u || !Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) continue;
         if (Pm4::PacketWords(header) > commands.size() - cursor) break;
@@ -400,7 +421,7 @@ void RegisterListCache::Refuse(std::uint64_t address) {
     if (!Refused(address)) refused.push_back(address);
 }
 
-void Driver::resolveLeanLists(Submission& submission, bool cacheable) {
+void Driver::resolveLeanLists(Submission& submission, bool cacheable, const PacketTable* table) {
     if (cacheable && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::LeanListDirect)) {
         cacheable = false;
         LeanFront::AddOnWorker(LeanFront::Counter::DirectListTails);
@@ -423,7 +444,7 @@ void Driver::resolveLeanLists(Submission& submission, bool cacheable) {
     std::uint64_t resolved = 0;
     const bool hooksOnce = LeanFront::SwitchSet(frontLatch, Graphics::RuntimeSwitch::ListHooksOnce);
     leanTails.spans.clear();
-    if (hooksOnce) planListHooks(leanTails, commands);
+    if (hooksOnce) planListHooks(leanTails, commands, table);
     const bool verifyHooks = hooksOnce && listHooksVerifyDue(leanTails);
     const auto ownRead = [&] { leanTails.spans.clear(); };
     const auto hook = [&](const ListShape& list, std::size_t at) {
@@ -434,7 +455,8 @@ void Driver::resolveLeanLists(Submission& submission, bool cacheable) {
         ownRead();
         hookList(list);
     };
-    for (std::size_t cursor = 0; cursor < commands.size(); cursor += Pm4::PacketWords(commands[cursor])) {
+    ListCursors walk(commands, table);
+    for (std::size_t cursor = walk.First(); cursor < commands.size(); cursor = walk.Next(cursor)) {
         const auto header = commands[cursor];
         if ((header >> 30u) != 3u || !Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) continue;
         const auto packet = std::span<const std::uint32_t>(commands).subspan(cursor, Pm4::PacketWords(header));

@@ -23,7 +23,7 @@
 namespace AgcDriver::Graphics {
 Recorder* Recorder::Active() { return nullptr; }
 void Recorder::Submit(SubmitReason) { Require(false, "the device tests have no recorder"); }
-bool Recorder::Reap() { Require(false, "the device tests have no recorder"); return false; }
+bool Recorder::Reap(bool) { Require(false, "the device tests have no recorder"); return false; }
 }
 
 namespace {

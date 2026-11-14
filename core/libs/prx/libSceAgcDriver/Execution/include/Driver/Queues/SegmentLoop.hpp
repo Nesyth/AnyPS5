@@ -46,12 +46,14 @@ struct LeanPacket {
 struct PacketTable {
     std::vector<LeanPacket> packets;
     std::vector<std::uint32_t> outputs;
+    std::vector<std::uint32_t> lists;
     std::uint32_t flipHeaders = 0;
     bool built = false;
 
     void Clear() {
         packets.clear();
         outputs.clear();
+        lists.clear();
         flipHeaders = 0;
         built = false;
     }

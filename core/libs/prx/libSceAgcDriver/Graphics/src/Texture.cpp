@@ -256,11 +256,182 @@ void countStorageEviction(const char* reason) {
     ++traffic.evictions[reason];
 }
 
+std::uint64_t VerifyEvery(const char* text) {
+    return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+}
+
+bool TenSecondsPassed(std::atomic<std::int64_t>& window) {
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    return window.exchange(now, std::memory_order_relaxed) != now;
+}
+
+bool PipelineStatsOn() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return stats;
+}
+
+std::atomic<bool> fillIndexBroken{false};
+std::atomic<std::uint64_t> fillIndexChecked{0}, fillIndexDiffering{0};
+std::atomic<std::int64_t> fillIndexVerifyWindow{-1};
+
+bool FillIndexOn() {
+    return RuntimeSwitches::Set(RuntimeSwitch::FillImageIndex) && !fillIndexBroken.load(std::memory_order_relaxed);
+}
+
+bool FillIndexVerifyDue() {
+    static const std::uint64_t every = VerifyEvery(std::getenv("APS5_VERIFY_FILL_IMAGE_INDEX"));
+    static std::atomic<std::uint64_t> ordinal{0};
+    return every != 0 && ordinal.fetch_add(1, std::memory_order_relaxed) % every == 0;
+}
+
+void ReportFillIndexVerify() {
+    if (TenSecondsPassed(fillIndexVerifyWindow)) AgcDriver::ProfilePrint_nid_no_patch("[fill-image-index-verify] %llu fills checked, %llu differing\n", static_cast<unsigned long long>(fillIndexChecked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(fillIndexDiffering.load(std::memory_order_relaxed)));
+}
+
 // Every storage image alive, for the fill HLE's cover check (StorageTexture::ClassifyFill): the
 // storage cache indexes surfaces by key, not by address range. Its mutex is a leaf.
 struct LiveImages {
+    struct Indexed {
+        std::uint64_t order;
+        StorageTexture* texture;
+    };
+    static constexpr unsigned PageShift = 21;
+    static constexpr std::uint64_t WidePages = 4096;
+    using Index = std::unordered_map<std::uint64_t, std::vector<Indexed>>;
+
     MapImportGate::LeafMutex<AgcDriver::Mutex> mutex;
     std::vector<StorageTexture*> textures;
+    bool indexed = false;
+    std::uint64_t nextOrder = 0;
+    Index pages;
+    Index keys;
+    std::vector<Indexed> wide;
+    std::uint64_t queries = 0;
+    std::uint64_t visited = 0;
+    std::uint64_t fallbacks = 0;
+
+    static bool PagesOf(std::uint64_t base, std::uint64_t bytes, std::uint64_t& first, std::uint64_t& last) {
+        if (bytes != 0 && bytes - 1 > std::numeric_limits<std::uint64_t>::max() - base) return false;
+        first = base >> PageShift;
+        last = bytes == 0 ? first : (base + bytes - 1) >> PageShift;
+        return true;
+    }
+
+    static bool Unlist(Index& index, std::uint64_t key, const StorageTexture* texture) {
+        const auto found = index.find(key);
+        if (found == index.end()) return false;
+        auto& list = found->second;
+        const auto it = std::find_if(list.begin(), list.end(), [&](const Indexed& entry) { return entry.texture == texture; });
+        if (it == list.end()) return false;
+        list.erase(it);
+        if (list.empty()) index.erase(found);
+        return true;
+    }
+
+    void add(StorageTexture* texture, std::uint64_t order) {
+        const Indexed entry{order, texture};
+        const auto& descriptor = texture->Descriptor();
+        std::uint64_t first = 0, last = 0;
+        if (!PagesOf(descriptor.baseAddress, texture->GuestBytes(), first, last) || last - first >= WidePages) {
+            wide.push_back(entry);
+        } else {
+            for (auto page = first; page <= last; ++page) pages[page].push_back(entry);
+        }
+        if (descriptor.dccAddress != 0) keys[descriptor.dccAddress].push_back(entry);
+    }
+
+    bool unlist(const StorageTexture* texture) {
+        const auto& descriptor = texture->Descriptor();
+        std::uint64_t first = 0, last = 0;
+        bool found = true;
+        if (!PagesOf(descriptor.baseAddress, texture->GuestBytes(), first, last) || last - first >= WidePages) {
+            const auto it = std::find_if(wide.begin(), wide.end(), [&](const Indexed& entry) { return entry.texture == texture; });
+            if (it != wide.end()) wide.erase(it);
+            else found = false;
+        } else {
+            for (auto page = first; page <= last; ++page) found = Unlist(pages, page, texture) && found;
+        }
+        if (descriptor.dccAddress != 0) found = Unlist(keys, descriptor.dccAddress, texture) && found;
+        return found;
+    }
+
+    void drop() noexcept {
+        indexed = false;
+        pages.clear();
+        keys.clear();
+        wide.clear();
+    }
+
+    bool ensureIndex() {
+        if (indexed) return true;
+        try {
+            for (std::size_t position = 0; position < textures.size(); ++position) add(textures[position], position);
+            nextOrder = textures.size();
+            indexed = true;
+        } catch (...) {
+            drop();
+        }
+        return indexed;
+    }
+
+    void Registered(StorageTexture* texture) noexcept {
+        if (!indexed) return;
+        if (!FillIndexOn()) {
+            drop();
+            return;
+        }
+        try {
+            add(texture, nextOrder++);
+        } catch (...) {
+            drop();
+        }
+    }
+
+    void Destroyed(const StorageTexture* texture, std::size_t entries) noexcept {
+        if (!indexed) return;
+        if (!FillIndexOn() || entries != 1 || !unlist(texture)) drop();
+    }
+
+    template <typename TVisit>
+    void ForOverlapCandidates(std::uint64_t address, std::size_t bytes, TVisit&& visit) {
+        ++queries;
+        std::uint64_t first = 0, last = 0;
+        if (!ensureIndex() || !PagesOf(address, bytes, first, last) || last - first >= textures.size()) {
+            ++fallbacks;
+            visited += textures.size();
+            for (auto* texture : textures) visit(texture);
+            return;
+        }
+        std::vector<Indexed> found(wide);
+        for (auto page = first; page <= last; ++page) {
+            if (const auto it = pages.find(page); it != pages.end()) found.insert(found.end(), it->second.begin(), it->second.end());
+        }
+        if (first != last || !wide.empty()) {
+            std::sort(found.begin(), found.end(), [](const Indexed& a, const Indexed& b) { return a.order < b.order; });
+            found.erase(std::unique(found.begin(), found.end(), [](const Indexed& a, const Indexed& b) { return a.order == b.order; }), found.end());
+        }
+        visited += found.size();
+        for (const auto& entry : found) visit(entry.texture);
+    }
+
+    template <typename TVisit>
+    void ForKeyCandidates(std::uint64_t address, TVisit&& visit) {
+        if (!ensureIndex() || address == 0) {
+            for (auto* texture : textures) visit(texture);
+            return;
+        }
+        const auto found = keys.find(address);
+        if (found == keys.end()) return;
+        for (const auto& entry : found->second) visit(entry.texture);
+    }
+
+    void Report() {
+        if (!PipelineStatsOn()) return;
+        static std::atomic<std::int64_t> window{-1};
+        if (!TenSecondsPassed(window)) return;
+        AgcDriver::ProfilePrint_nid_no_patch("[fill-index] 10 s: %llu queries, %llu candidates, %llu walks of the whole list; %zu live images, %zu pages and %zu key addresses indexed, %zu wide images\n", static_cast<unsigned long long>(queries), static_cast<unsigned long long>(visited), static_cast<unsigned long long>(fallbacks), textures.size(), pages.size(), keys.size(), wide.size());
+        queries = visited = fallbacks = 0;
+    }
 };
 
 std::atomic<void (*)()> publishHookForTest{nullptr};
@@ -268,6 +439,60 @@ std::atomic<void (*)()> publishHookForTest{nullptr};
 LiveImages& Live() {
     static LiveImages live;
     return live;
+}
+
+void NoteFillIndexDifference(LiveImages& live, std::uint64_t address, std::size_t bytes, const char* what, std::size_t index, std::size_t walk) {
+    if (fillIndexDiffering.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[fill-image-index-verify] fill 0x%llx+0x%zx: index %s %zu, walk %zu (%zu live images)\n", static_cast<unsigned long long>(address), bytes, what, index, walk, live.textures.size());
+    fillIndexBroken.store(true, std::memory_order_relaxed);
+    live.drop();
+}
+
+template <typename TTest>
+std::vector<StorageTexture*> LiveOverlapping(LiveImages& live, std::uint64_t address, std::size_t bytes, bool indexed, TTest&& test) {
+    std::vector<StorageTexture*> found;
+    if (indexed) {
+        live.ForOverlapCandidates(address, bytes, [&](StorageTexture* texture) {
+            if (test(texture)) found.push_back(texture);
+        });
+    } else {
+        for (auto* texture : live.textures) {
+            if (test(texture)) found.push_back(texture);
+        }
+    }
+    return found;
+}
+
+template <typename TTest>
+std::vector<StorageTexture*> LiveKeyed(LiveImages& live, std::uint64_t address, bool indexed, TTest&& test) {
+    std::vector<StorageTexture*> found;
+    if (indexed) {
+        live.ForKeyCandidates(address, [&](StorageTexture* texture) {
+            if (test(texture)) found.push_back(texture);
+        });
+    } else {
+        for (auto* texture : live.textures) {
+            if (test(texture)) found.push_back(texture);
+        }
+    }
+    return found;
+}
+
+template <typename TTest>
+std::vector<StorageTexture*> CheckedOverlapping(LiveImages& live, std::uint64_t address, std::size_t bytes, const char* what, TTest&& test) {
+    auto walk = LiveOverlapping(live, address, bytes, false, test);
+    if (!FillIndexOn()) return walk;
+    const auto index = LiveOverlapping(live, address, bytes, true, test);
+    if (index != walk) NoteFillIndexDifference(live, address, bytes, what, index.size(), walk.size());
+    return walk;
+}
+
+template <typename TTest>
+std::vector<StorageTexture*> CheckedKeyed(LiveImages& live, std::uint64_t address, std::size_t bytes, const char* what, TTest&& test) {
+    auto walk = LiveKeyed(live, address, false, test);
+    if (!FillIndexOn()) return walk;
+    const auto index = LiveKeyed(live, address, true, test);
+    if (index != walk) NoteFillIndexDifference(live, address, bytes, what, index.size(), walk.size());
+    return walk;
 }
 
 // Per-layer validity of array surfaces (see StorageTexture::layerBegin): a fill of one layer clears
@@ -1684,6 +1909,7 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
         auto& live = Live();
         std::lock_guard lock(live.mutex);
         live.textures.push_back(texture.get());
+        live.Registered(texture.get());
     }
     if (profile) {
         auto& totals = Profile();
@@ -1771,6 +1997,20 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
 
 namespace {
 
+std::atomic<bool> pendingIndexBroken{false};
+std::atomic<std::uint64_t> pendingIndexChecked{0}, pendingIndexDiffering{0};
+std::atomic<std::int64_t> pendingIndexVerifyWindow{-1};
+
+bool PendingIndexVerifyDue() {
+    static const std::uint64_t every = VerifyEvery(std::getenv("APS5_VERIFY_PENDING_INDEX"));
+    static std::atomic<std::uint64_t> ordinal{0};
+    return every != 0 && ordinal.fetch_add(1, std::memory_order_relaxed) % every == 0;
+}
+
+void ReportPendingIndexVerify() {
+    if (TenSecondsPassed(pendingIndexVerifyWindow)) AgcDriver::ProfilePrint_nid_no_patch("[pending-index-verify] %llu queries checked, %llu differing\n", static_cast<unsigned long long>(pendingIndexChecked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(pendingIndexDiffering.load(std::memory_order_relaxed)));
+}
+
 class PendingList {
 public:
     using iterator = std::vector<StorageTexture*>::iterator;
@@ -1782,22 +2022,44 @@ public:
         PendingZones::Add(texture->Descriptor().baseAddress, texture->GuestBytes());
         textures.push_back(texture);
         changed();
+        if (spansValid) keepPushed(SpanOf(texture));
     }
     iterator erase(iterator it) {
         PendingZones::Remove((*it)->Descriptor().baseAddress, (*it)->GuestBytes());
+        const auto span = spansValid ? SpanOf(*it) : Span{};
         const auto next = textures.erase(it);
         changed();
+        if (spansValid) keepErased(span, 1);
         return next;
     }
     void remove(const StorageTexture* texture) {
         const auto erased = std::erase(textures, texture);
         for (std::size_t index = 0; index < erased; ++index) PendingZones::Remove(texture->Descriptor().baseAddress, texture->GuestBytes());
         if (erased != 0) changed();
+        if (erased != 0 && spansValid) keepErased(SpanOf(texture), erased);
     }
     std::uint64_t Version() const { return version; }
     bool MayOverlap(std::uint64_t address, std::size_t bytes) {
+        if (KeptOn()) return keptOverlap(address, bytes);
         if (indexed != version) rebuild();
         return !textures.empty() && Overlaps(ranges, address, bytes);
+    }
+    bool KeptApart(std::uint64_t address, std::size_t bytes) {
+        if (!KeptOn() || bytes == 0 || bytes - 1 > std::numeric_limits<std::uint64_t>::max() - address || MayOverlap(address, bytes)) return false;
+        if (!KeptOn() || !spansValid || oddSpans != 0) return false;
+        ++kept.discardsSkipped;
+        if (!PendingIndexVerifyDue()) return true;
+        pendingIndexChecked.fetch_add(1, std::memory_order_relaxed);
+        const auto last = address + bytes;
+        const auto met = std::find_if(textures.begin(), textures.end(), [&](const StorageTexture* texture) {
+            const auto span = SpanOf(texture);
+            return (span.first >= address && span.second <= last) || (address < span.second && span.first < last);
+        });
+        ReportPendingIndexVerify();
+        if (met == textures.end()) return true;
+        if (pendingIndexDiffering.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[pending-index-verify] fill discard 0x%llx+0x%zx: kept index says apart, pending image 0x%llx+0x%llx meets it (%zu pending, %zu merged)\n", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>((*met)->Descriptor().baseAddress), static_cast<unsigned long long>((*met)->GuestBytes()), textures.size(), ranges.size());
+        dropKept();
+        return false;
     }
     bool SurelyClear(std::uint64_t address, std::size_t bytes) const {
         const auto current = published.load(std::memory_order_acquire);
@@ -1840,12 +2102,180 @@ private:
         indexed = version;
         published.store(std::make_shared<const Snapshot>(Snapshot{version, ranges}), std::memory_order_release);
     }
+
+    using Span = std::pair<std::uint64_t, std::uint64_t>;
+    enum class Merge : std::uint8_t { Stale, Exact, Superset };
+
+    static Span SpanOf(const StorageTexture* texture) { return {texture->Descriptor().baseAddress, texture->Descriptor().baseAddress + texture->GuestBytes()}; }
+    static bool KeptOn() { return RuntimeSwitches::Set(RuntimeSwitch::PendingIndexKept) && !pendingIndexBroken.load(std::memory_order_relaxed); }
+
+    static void MergeSorted(const Ranges& sorted, Ranges& merged) {
+        merged.clear();
+        for (const auto& span : sorted) {
+            if (!merged.empty() && span.first <= merged.back().second) merged.back().second = std::max(merged.back().second, span.second);
+            else merged.push_back(span);
+        }
+    }
+
+    void buildSpans() {
+        merge = Merge::Stale;
+        keptSpans.clear();
+        oddSpans = 0;
+        for (const auto* texture : textures) {
+            keptSpans.push_back(SpanOf(texture));
+            if (keptSpans.back().second <= keptSpans.back().first) ++oddSpans;
+        }
+        std::sort(keptSpans.begin(), keptSpans.end());
+        spansValid = true;
+        ++kept.builds;
+    }
+
+    void remerge() {
+        merge = Merge::Stale;
+        MergeSorted(keptSpans, ranges);
+        merge = Merge::Exact;
+        ++kept.remerges;
+    }
+
+    void publishKept() {
+        const bool exact = merge == Merge::Exact;
+        if (publishedVersion == version && (publishedExact || !exact)) return;
+        published.store(std::make_shared<const Snapshot>(Snapshot{version, ranges}), std::memory_order_release);
+        publishedVersion = version;
+        publishedExact = exact;
+        ++kept.publishes;
+    }
+
+    void dropKept() {
+        pendingIndexBroken.store(true, std::memory_order_relaxed);
+        spansValid = false;
+        merge = Merge::Stale;
+        rebuild();
+    }
+
+    bool keptOverlap(std::uint64_t address, std::size_t bytes) {
+        indexed = ~std::uint64_t{0};
+        ++kept.queries;
+        if (!spansValid) buildSpans();
+        bool answer = false;
+        if (merge == Merge::Superset && !Overlaps(ranges, address, bytes)) {
+            ++kept.supersetClear;
+        } else {
+            if (merge != Merge::Exact) remerge();
+            answer = !textures.empty() && Overlaps(ranges, address, bytes);
+        }
+        publishKept();
+        if (PendingIndexVerifyDue()) answer = verifyKept(address, bytes, answer);
+        reportKept();
+        return answer;
+    }
+
+    bool verifyKept(std::uint64_t address, std::size_t bytes, bool answer) {
+        pendingIndexChecked.fetch_add(1, std::memory_order_relaxed);
+        Ranges sorted;
+        sorted.reserve(textures.size());
+        for (const auto* texture : textures) sorted.push_back(SpanOf(texture));
+        std::sort(sorted.begin(), sorted.end());
+        Ranges merged;
+        MergeSorted(sorted, merged);
+        const bool expected = !textures.empty() && Overlaps(merged, address, bytes);
+        const bool spansDiffer = sorted != keptSpans;
+        const bool rangesDiffer = merge == Merge::Exact && merged != ranges;
+        ReportPendingIndexVerify();
+        if (expected == answer && !spansDiffer && !rangesDiffer) return answer;
+        if (pendingIndexDiffering.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[pending-index-verify] 0x%llx+0x%zx: kept index says %d, rebuild says %d (%zu pending, %zu merged%s%s)\n", static_cast<unsigned long long>(address), bytes, answer ? 1 : 0, expected ? 1 : 0, textures.size(), merged.size(), spansDiffer ? ", kept spans differ" : "", rangesDiffer ? ", kept merged ranges differ" : "");
+        dropKept();
+        return expected;
+    }
+
+    void keepPushed(const Span& span) noexcept {
+        if (!KeptOn()) {
+            spansValid = false;
+            return;
+        }
+        spansValid = false;
+        try {
+            keptSpans.insert(std::upper_bound(keptSpans.begin(), keptSpans.end(), span), span);
+        } catch (...) {
+            return;
+        }
+        spansValid = true;
+        ++kept.pushes;
+        if (span.second <= span.first) ++oddSpans;
+        if (merge == Merge::Stale) return;
+        if (oddSpans != 0) {
+            merge = Merge::Stale;
+            return;
+        }
+        const auto from = std::lower_bound(ranges.begin(), ranges.end(), span.first, [](const Span& range, std::uint64_t value) { return range.second < value; });
+        const auto to = std::upper_bound(from, ranges.end(), span.second, [](std::uint64_t value, const Span& range) { return value < range.first; });
+        if (from == to) {
+            try {
+                ranges.insert(from, span);
+            } catch (...) {
+                merge = Merge::Stale;
+            }
+            return;
+        }
+        const Span joined{std::min(from->first, span.first), std::max(std::prev(to)->second, span.second)};
+        *from = joined;
+        ranges.erase(std::next(from), to);
+    }
+
+    void keepErased(const Span& span, std::size_t count) noexcept {
+        if (!KeptOn()) {
+            spansValid = false;
+            return;
+        }
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto it = std::lower_bound(keptSpans.begin(), keptSpans.end(), span);
+            if (it == keptSpans.end() || *it != span) {
+                spansValid = false;
+                return;
+            }
+            keptSpans.erase(it);
+        }
+        kept.erases += count;
+        if (span.second <= span.first) {
+            oddSpans -= std::min(oddSpans, count);
+            merge = Merge::Stale;
+        } else if (oddSpans != 0) {
+            merge = Merge::Stale;
+        } else if (merge == Merge::Exact) {
+            merge = Merge::Superset;
+        }
+    }
+
+    void reportKept() {
+        if (!PipelineStatsOn() || kept.queries % 1024 != 1) return;
+        static std::atomic<std::int64_t> window{-1};
+        if (!TenSecondsPassed(window)) return;
+        AgcDriver::ProfilePrint_nid_no_patch("[pending-index] 10 s: %llu queries, %llu answered clear by the kept superset, %llu re-merges, %llu index builds, %llu pushes and %llu erases kept, %llu snapshots published, %llu fill discards skipped; %zu pending\n", static_cast<unsigned long long>(kept.queries), static_cast<unsigned long long>(kept.supersetClear), static_cast<unsigned long long>(kept.remerges), static_cast<unsigned long long>(kept.builds), static_cast<unsigned long long>(kept.pushes), static_cast<unsigned long long>(kept.erases), static_cast<unsigned long long>(kept.publishes), static_cast<unsigned long long>(kept.discardsSkipped), textures.size());
+        kept = {};
+    }
+
     std::vector<StorageTexture*> textures;
     Ranges ranges;
     std::uint64_t version = 0;
     std::uint64_t indexed = ~std::uint64_t{0};
     std::atomic<std::uint64_t> changes{0};
     AtomicSharedPtr<const Snapshot> published;
+    Ranges keptSpans;
+    bool spansValid = false;
+    Merge merge = Merge::Stale;
+    std::size_t oddSpans = 0;
+    std::uint64_t publishedVersion = ~std::uint64_t{0};
+    bool publishedExact = false;
+    struct KeptCounters {
+        std::uint64_t queries = 0;
+        std::uint64_t supersetClear = 0;
+        std::uint64_t remerges = 0;
+        std::uint64_t builds = 0;
+        std::uint64_t pushes = 0;
+        std::uint64_t erases = 0;
+        std::uint64_t publishes = 0;
+        std::uint64_t discardsSkipped = 0;
+    } kept;
 };
 
 // Storage images whose results have not reached guest memory yet.
@@ -6060,6 +6490,7 @@ bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
 std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::size_t bytes) {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
+    if (pending.textures.KeptApart(address, bytes)) return 0;
     std::size_t discarded = 0;
     const auto end = address + bytes;
     const auto* exempt = Refreshing::Get();
@@ -6110,10 +6541,16 @@ StorageTexture::FillCoverage StorageTexture::ClassifyFill(std::uint64_t address,
     FillCoverage coverage;
     auto& live = Live();
     std::lock_guard lock(live.mutex);
-    std::vector<StorageTexture*> overlapping;
-    for (auto* texture : live.textures) {
-        if (texture->overlapsLive(address, bytes)) overlapping.push_back(texture);
-    }
+    const bool indexed = FillIndexOn();
+    const bool verify = indexed && FillIndexVerifyDue();
+    if (verify) fillIndexChecked.fetch_add(1, std::memory_order_relaxed);
+    const auto overlapsFill = [&](const StorageTexture* texture) { return texture->overlapsLive(address, bytes); };
+    std::vector<StorageTexture*> overlapping = verify ? CheckedOverlapping(live, address, bytes, "overlapping images", overlapsFill) : LiveOverlapping(live, address, bytes, indexed, overlapsFill);
+    const auto keysFill = [&] {
+        const auto matches = [&](const StorageTexture* texture) { return texture->keysFillMatches(address, bytes, !overlapping.empty()); };
+        if (!indexed) return std::any_of(live.textures.begin(), live.textures.end(), matches);
+        return !(verify ? CheckedKeyed(live, address, bytes, "key images", matches) : LiveKeyed(live, address, true, matches)).empty();
+    };
     const auto end = address + bytes;
     StorageTexture* covered = nullptr;
     // The newest of several exact matches (the registry is in construction order): the same
@@ -6153,7 +6590,7 @@ StorageTexture::FillCoverage StorageTexture::ClassifyFill(std::uint64_t address,
                 if (texture->descriptor.baseAddress >= address && texture->descriptor.baseAddress + texture->guestBytes <= end) ++coverage.inside;
             }
         }
-    } else if (std::any_of(live.textures.begin(), live.textures.end(), [&](const StorageTexture* texture) { return texture->keysFillMatches(address, bytes, !overlapping.empty()); })) {
+    } else if (keysFill()) {
         coverage.cover = FillCover::Keys;
     } else if (overlapping.size() > 1) {
         coverage.cover = FillCover::Several;
@@ -6180,6 +6617,8 @@ StorageTexture::FillCoverage StorageTexture::ClassifyFill(std::uint64_t address,
         }
         std::fprintf(stderr, "\n");
     }
+    if (verify) ReportFillIndexVerify();
+    if (indexed) live.Report();
     return coverage;
 }
 
@@ -6198,16 +6637,29 @@ std::size_t StorageTexture::NoteKeysFill(std::uint64_t address, std::size_t byte
     static const bool traceKeys = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;
     auto& live = Live();
     std::lock_guard lock(live.mutex);
-    const bool overlapped = std::any_of(live.textures.begin(), live.textures.end(), [&](const StorageTexture* texture) { return texture->overlapsLive(address, bytes); });
     std::size_t covered = 0;
-    for (auto* texture : live.textures) {
-        if (!texture->keysFillMatches(address, bytes, overlapped)) continue;
+    const auto apply = [&](StorageTexture* texture) {
         texture->filledKeys = keys;
         ++covered;
         if (traceKeys && IsDccClear(keys)) std::fprintf(stderr, "[dcc-keys] %s key fill over 0x%llx+0x%llx (uploaded %s, dirty %d)\n", DccKeysName(keys), static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), DccKeysName(texture->uploadedKeys), texture->dirty ? 1 : 0);
-        if (refillDisabled || !IsDccClear(keys) || texture->uploadedKeys != keys) continue;
+        if (refillDisabled || !IsDccClear(keys) || texture->uploadedKeys != keys) return;
         texture->SetUploadedKeys(DccKeys::Uncompressed);
+    };
+    const auto overlapsFill = [&](const StorageTexture* texture) { return texture->overlapsLive(address, bytes); };
+    if (!FillIndexOn()) {
+        const bool overlapped = std::any_of(live.textures.begin(), live.textures.end(), overlapsFill);
+        for (auto* texture : live.textures) {
+            if (!texture->keysFillMatches(address, bytes, overlapped)) continue;
+            apply(texture);
+        }
+        return covered;
     }
+    const bool verify = FillIndexVerifyDue();
+    if (verify) fillIndexChecked.fetch_add(1, std::memory_order_relaxed);
+    const bool overlapped = !(verify ? CheckedOverlapping(live, address, bytes, "overlapping images of a key fill", overlapsFill) : LiveOverlapping(live, address, bytes, true, overlapsFill)).empty();
+    const auto matches = [&](const StorageTexture* texture) { return texture->keysFillMatches(address, bytes, overlapped); };
+    for (auto* texture : verify ? CheckedKeyed(live, address, bytes, "key images of a key fill", matches) : LiveKeyed(live, address, true, matches)) apply(texture);
+    if (verify) ReportFillIndexVerify();
     return covered;
 }
 
@@ -6384,10 +6836,21 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
-        for (auto* texture : live.textures) {
-            if (texture == this || texture->released || !texture->overlaps(begin, bytes)) continue;
-            texture->forgetSavedOver(begin, bytes);
-            if (texture->descriptor.dccAddress != 0) aliasedKeys = true;
+        if (!FillIndexOn()) {
+            for (auto* texture : live.textures) {
+                if (texture == this || texture->released || !texture->overlaps(begin, bytes)) continue;
+                texture->forgetSavedOver(begin, bytes);
+                if (texture->descriptor.dccAddress != 0) aliasedKeys = true;
+            }
+        } else {
+            const bool verify = FillIndexVerifyDue();
+            if (verify) fillIndexChecked.fetch_add(1, std::memory_order_relaxed);
+            const auto other = [&](const StorageTexture* texture) { return texture != this && !texture->released && texture->overlaps(begin, bytes); };
+            for (auto* texture : verify ? CheckedOverlapping(live, begin, bytes, "other images under a clear", other) : LiveOverlapping(live, begin, bytes, true, other)) {
+                texture->forgetSavedOver(begin, bytes);
+                if (texture->descriptor.dccAddress != 0) aliasedKeys = true;
+            }
+            if (verify) ReportFillIndexVerify();
         }
     }
     // Debug aid (APS5_TRACE_FILL_COVER=1): the first clears of a surface with DCC keys (its own or
@@ -7620,7 +8083,7 @@ StorageTexture::~StorageTexture() {
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
-        std::erase(live.textures, this);
+        if (const auto erased = std::erase(live.textures, this); erased != 0) live.Destroyed(this, erased);
     }
     // Cache eviction flushes first; anything still pending here is being torn down with the device.
     {

@@ -185,6 +185,15 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_DIRECT_BUFFERS_IN_PLACE",
     "APS5_DIRECT_GPU_INDIRECT",
     "APS5_EXPRESS_GPU_INDIRECT",
+    "APS5_REGISTER_RUNS",
+    "APS5_LIST_REGISTER_PACKETS",
+    "APS5_PACKET_CLASS_TABLE",
+    "APS5_UNORDERED_DRAW_KEYS",
+    "APS5_RANGE_MEMO",
+    "APS5_PENDING_INDEX_KEPT",
+    "APS5_FILL_IMAGE_INDEX",
+    "APS5_WATCHED_REAPS",
+    "APS5_DEFERRED_BATCH_STAMPS",
 };
 static_assert(SwitchNames.back() != nullptr, "every runtime switch needs a name");
 
@@ -370,6 +379,15 @@ struct SwitchValues {
             std::getenv("APS5_DIRECT_BUFFERS_IN_PLACE") != nullptr,
             std::getenv("APS5_DIRECT_GPU_INDIRECT") != nullptr,
             std::getenv("APS5_EXPRESS_GPU_INDIRECT") != nullptr,
+            std::getenv("APS5_REGISTER_RUNS") != nullptr,
+            std::getenv("APS5_LIST_REGISTER_PACKETS") != nullptr,
+            std::getenv("APS5_PACKET_CLASS_TABLE") != nullptr,
+            std::getenv("APS5_UNORDERED_DRAW_KEYS") != nullptr,
+            std::getenv("APS5_RANGE_MEMO") != nullptr,
+            std::getenv("APS5_PENDING_INDEX_KEPT") != nullptr,
+            std::getenv("APS5_FILL_IMAGE_INDEX") != nullptr,
+            std::getenv("APS5_WATCHED_REAPS") != nullptr,
+            std::getenv("APS5_DEFERRED_BATCH_STAMPS") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

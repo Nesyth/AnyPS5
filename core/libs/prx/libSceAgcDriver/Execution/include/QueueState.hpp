@@ -162,6 +162,32 @@ public:
         changeFingerprint(offset, value);
         return {const_iterator{this, offset}, true};
     }
+    void AssignRun(std::uint32_t first, const std::uint32_t* run, std::uint32_t count) {
+        if (static_cast<std::size_t>(first) + count > values.size()) {
+            for (std::uint32_t index = 0; index < count; ++index) insert_or_assign(first + index, run[index]);
+            return;
+        }
+        const Mask* selected = mask.get();
+        for (std::uint32_t index = 0; index < count; ++index) {
+            const auto offset = first + index;
+            const auto value = run[index];
+            auto& word = present[offset / 64];
+            const auto bit = std::uint64_t{1} << (offset % 64);
+            auto& held = values[offset];
+            if ((word & bit) != 0) {
+                if (held == value) continue;
+                if (selected != nullptr && selected->Contains(offset)) fingerprint ^= contribution(offset, held) ^ contribution(offset, value);
+                held = value;
+                continue;
+            }
+            word |= bit;
+            ++entries;
+            held = value;
+            if (selected != nullptr && selected->Contains(offset)) fingerprint ^= contribution(offset, value);
+        }
+    }
+    std::uint64_t HeldFingerprint() const { return fingerprint; }
+    static std::uint64_t Contribution(std::uint32_t offset, std::uint32_t value) { return contribution(offset, value); }
     Reference operator[](std::uint32_t offset) {
         if (!contains(offset)) emplace(offset, 0);
         return {*this, offset};

@@ -319,7 +319,7 @@ public:
     // after the completing one, and its store is that batch's in-order write (see Recorder.cpp).
     void SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked = false);
     // Completes batches that already finished; returns whether nothing is in flight.
-    bool Reap();
+    bool Reap(bool exact = false);
     std::uint64_t Submissions() const { return submissions; }
     // Batches submitted and not yet finished (what a full Sync() waits for); under GuestMemory::GpuMutex.
     std::size_t InFlightBatches() const { return inFlight.size(); }
@@ -1031,7 +1031,14 @@ private:
     std::size_t spareStreamBytes = 0;
     std::unique_ptr<CommandEncoders> encoders;
     mutable AgcDriver::Mutex completedMutex;
-    std::array<Completed, CompletedRingSize> completed;
+    mutable std::array<Completed, CompletedRingSize> completed;
+    mutable std::array<VkQueryPool, CompletedRingSize> completedStamps{};
+    mutable std::array<std::array<double, 2>, CompletedRingSize> expectedStamps{};
+    mutable std::array<bool, CompletedRingSize> stampsChecked{};
+    mutable std::vector<VkQueryPool> returnedPools;
+    mutable std::atomic<std::size_t> returnedPoolCount{0};
+    void returnPool(VkQueryPool pool) const;
+    void takeReturnedPools();
     std::uint64_t newestSubmitted = 0;
     std::chrono::steady_clock::time_point newestSubmittedAt{};
     using DrawSnapshotKey = std::tuple<std::uint64_t, SnapshotUse, std::size_t>;

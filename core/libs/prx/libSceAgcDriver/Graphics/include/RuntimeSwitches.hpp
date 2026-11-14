@@ -179,6 +179,15 @@ enum class RuntimeSwitch : std::size_t {
     DirectBuffersInPlace,
     DirectGpuIndirect,
     ExpressGpuIndirect,
+    RegisterRuns,
+    ListRegisterPackets,
+    PacketClassTable,
+    UnorderedDrawKeys,
+    RangeMemo,
+    PendingIndexKept,
+    FillImageIndex,
+    WatchedReaps,
+    DeferredBatchStamps,
     Count,
 };
 

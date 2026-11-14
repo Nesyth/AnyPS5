@@ -209,7 +209,7 @@ private:
     static bool copySegment(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget, std::size_t depth, GuestRanges* sources);
     static bool copyLink(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget, std::size_t depth, const std::uint32_t*& chained, std::size_t& chainedWords, GuestRanges* sources);
     static void readRegisterLists(Submission& submission);
-    void resolveLeanLists(Submission& submission, bool cacheable);
+    void resolveLeanLists(Submission& submission, bool cacheable, const PacketTable* table = nullptr);
     void resolveBatchedLists(Submission& submission);
     void countServedLists(const Submission& submission);
     void settleListHits(Submission& submission);
@@ -240,7 +240,7 @@ private:
     void runLeanPackets(const Submission& submission, QueueState& queue, const PacketTable& table, FlipHold& flipHold, LeanRun& run);
     template <bool Lean>
     bool endSegment(const Submission& submission, FlipHold& flipHold, bool pipelined, FrontMode front);
-    static void scanSegment(const Submission& submission, PacketTable& table, bool validating = false, const std::uint32_t* guest = nullptr);
+    static void scanSegment(const Submission& submission, PacketTable& table, bool validating = false, const std::uint32_t* guest = nullptr, bool byTable = false);
     static void markOutputs(const Submission& submission, PacketTable& table);
     static void verifyOutputs(const Submission& submission, const PacketTable& table);
     static void verifySegmentTable(const Submission& submission, const PacketTable& table);
@@ -300,7 +300,7 @@ private:
     void maybeReportDrawCache(bool profile);
     void reportDrawCache(DrawEntryCounters& counters, bool profile);
     std::string profileDrawCacheLines(const DrawEntryCounters& counters);
-    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape = nullptr, std::array<std::uint64_t, 5>* components = nullptr, const DrawRelocation* relocation = nullptr, std::uint64_t* alias = nullptr);
+    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape = nullptr, std::array<std::uint64_t, 5>* components = nullptr, const DrawRelocation* relocation = nullptr, std::uint64_t* alias = nullptr, bool unordered = false);
     void traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, bool cacheMiss);
     static std::uint64_t drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry);
     static bool drawRelocationEnabled();
@@ -588,6 +588,7 @@ private:
     std::atomic<std::uint64_t> packetsDone{0};
 
     alignas(64) LeanFront::Latch frontLatch;
+    std::atomic<bool> unorderedDrawKeys{false};
     LeanTails leanTails;
     LeanDraws leanDraws;
     struct OpenLeanRun {

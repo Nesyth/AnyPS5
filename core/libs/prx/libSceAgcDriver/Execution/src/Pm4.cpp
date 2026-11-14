@@ -129,6 +129,12 @@ Registers& registersFor(QueueState& queue, std::uint32_t opcode) {
     return queue.userConfig;
 }
 
+#ifdef APS5_DEBUG_LOG
+constexpr bool DebugContextWrites = true;
+#else
+constexpr bool DebugContextWrites = false;
+#endif
+
 void writeRegister(QueueState& queue, std::uint32_t opcode, std::uint32_t offset, std::uint32_t value) {
     if ((opcode == 0x69 || opcode == 0x9f) && (offset == 0x8e || offset == 0x8f || offset == 0x318 || offset == 0x31b || offset == 0x31c || offset == 0x31d || offset == 0x390 || offset == 0x3b0 || offset == 0x3b8))
         APS5_LOG_OUT_DEBUG("CONTEXT WRITE opcode=0x%x offset=0x%x value=0x%x", opcode, offset, value);
@@ -1054,6 +1060,41 @@ void ExecuteIndirectRegisters(std::span<const std::uint32_t> packet, std::span<c
             if (usable(pairs[i])) std::fprintf(stderr, " %x", registerOffset(pairs[i]));
         }
         std::fprintf(stderr, "\n");
+    }
+}
+
+Registers& RegistersFor(QueueState& queue, std::uint32_t opcode) {
+    return registersFor(queue, opcode);
+}
+
+void ExecuteRegisterRun(std::span<const std::uint32_t> packet, QueueState& queue) {
+    const auto opcode = (packet[0] >> 8u) & 0xffu;
+    if (DebugContextWrites || TraceContextState() || (opcode != 0x69 && opcode != 0x76 && opcode != 0x79 && opcode != 0x7a)) {
+        Execute(packet, queue);
+        return;
+    }
+    if (IsTagMarker(packet)) return;
+    const auto offset = registerOffset(packet[1]);
+    if (packet.size() <= 2) return;
+    const auto count = static_cast<std::uint32_t>(packet.size() - 2);
+    registersFor(queue, opcode).AssignRun(offset, packet.data() + 2, count);
+    if ((opcode == 0x79 || opcode == 0x7a) && offset <= 0x243u && 0x243u - offset < count) queue.indexType = packet[2 + (0x243u - offset)] & 3u;
+}
+
+void ExecuteListedRegisters(std::span<const std::uint32_t> packet, std::span<const std::uint32_t> pairs, QueueState& queue) {
+    if (DebugContextWrites || TraceContextState()) {
+        ExecuteIndirectRegisters(packet, pairs, queue);
+        return;
+    }
+    const auto opcode = (packet[0] >> 8u) & 0xffu;
+    require(packet.size() == 5 && IndirectRegisterOpcode(opcode), "expected indirect register packet");
+    require(pairs.size() == static_cast<std::size_t>(packet[4]) * 2, "indirect register list does not match its packet");
+    auto& bank = registersFor(queue, opcode);
+    const bool indexType = opcode == 0x64;
+    for (std::size_t i = 0; i < pairs.size(); i += 2) {
+        const auto offset = pairs[i] & ~0x70000000u;
+        bank.insert_or_assign(offset, pairs[i + 1]);
+        if (indexType && offset == 0x243u) queue.indexType = pairs[i + 1] & 3u;
     }
 }
 

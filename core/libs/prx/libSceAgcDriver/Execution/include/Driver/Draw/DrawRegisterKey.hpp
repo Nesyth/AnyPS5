@@ -15,7 +15,11 @@ struct RegisterStateKeyParts {
     std::uint64_t auxiliaryRegisters = 0;
 };
 
-std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords = false, bool incremental = true, std::uint64_t* shapeKey = nullptr, RegisterStateKeyParts* parts = nullptr);
+inline std::uint64_t UnorderedUserWordKey(std::uint64_t shape, std::uint64_t banks, std::uint64_t auxiliary) {
+    return (((shape ^ banks) * 0x100000001b3ull) ^ auxiliary) * 0x100000001b3ull;
+}
+
+std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords = false, bool incremental = true, std::uint64_t* shapeKey = nullptr, RegisterStateKeyParts* parts = nullptr, bool unordered = false);
 std::uint64_t RegisterShapeKey(const QueueState& queue);
 std::uint64_t DrawShaderSetKey(const QueueState& queue, const ShaderRegistry& registry);
 

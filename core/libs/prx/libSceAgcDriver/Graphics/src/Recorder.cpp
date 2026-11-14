@@ -1340,6 +1340,8 @@ struct Recorder::ProgressWatcher {
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<bool> stop{false};
     std::atomic<std::uint32_t> wakes{0};
+    std::atomic<std::uint64_t> completed{0};
+    std::atomic<bool> stopped{false};
     std::thread thread;
 
     ProgressWatcher(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, PFN_vkGetSemaphoreCounterValueKHR counterValue) {
@@ -1361,12 +1363,14 @@ struct Recorder::ProgressWatcher {
                 const auto result = waitSemaphores(device, &info, 50'000'000ull);
                 if (result == VK_TIMEOUT) continue;
                 if (result != VK_SUCCESS) {
+                    stopped.store(true, std::memory_order_release);
                     std::fprintf(stderr, "[gpu] progress watcher: vkWaitSemaphoresKHR failed (%d), watcher stops\n", static_cast<int>(result));
                     return;
                 }
                 std::uint64_t value = target;
                 if (counterValue(device, timeline, &value) != VK_SUCCESS) value = target;
                 seen = std::max(target, value);
+                completed.store(seen, std::memory_order_release);
                 KernelWakeSleepers_nid_no_patch();
             }
         });
@@ -1497,6 +1501,15 @@ Recorder::~Recorder() {
     spareCommands.clear();
     for (const auto pool : sparePools) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, pool, nullptr);
     sparePools.clear();
+    {
+        std::lock_guard ringLock(completedMutex);
+        for (auto& pool : completedStamps) {
+            if (pool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, std::exchange(pool, VK_NULL_HANDLE), nullptr);
+        }
+        for (const auto pool : returnedPools) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, pool, nullptr);
+        returnedPools.clear();
+        returnedPoolCount.store(0, std::memory_order_release);
+    }
     stopEncoders();
     spareStreams.clear();
     // Sync() above waited for every batch, so no submission still signals the timeline.
@@ -2740,6 +2753,7 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const auto commands = open->commands;
     const std::uint32_t queryCount = full ? MaxTimedRanges * 2 : 2;
     if (open->queries == VK_NULL_HANDLE) {
+        if (!full && sparePools.empty() && returnedPoolCount.load(std::memory_order_acquire) != 0) takeReturnedPools();
         if (!full && !sparePools.empty()) {
             open->queries = sparePools.back();
             sparePools.pop_back();
@@ -3546,17 +3560,111 @@ bool Recorder::FlipReadCheck() {
     return enabled;
 }
 
+namespace {
+
+std::int64_t TenSecondWindow() {
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+}
+
+std::atomic<bool> deferredStampsBroken{false};
+
+bool DeferredStampsVerifyDue() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_DEFERRED_BATCH_STAMPS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    static std::atomic<std::uint64_t> ordinal{0};
+    return every != 0 && ordinal.fetch_add(1, std::memory_order_relaxed) % every == 0;
+}
+
+void NoteDeferredStampsCheck(std::uint64_t serial, const std::array<double, 2>& reap, double startNs, double endNs) {
+    static std::atomic<std::uint64_t> checked{0}, differing{0};
+    static std::atomic<std::int64_t> window{-1};
+    checked.fetch_add(1, std::memory_order_relaxed);
+    if (reap[0] != startNs || reap[1] != endNs) {
+        if (differing.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[deferred-batch-stamps-verify] batch %llu: reap %.0f..%.0f ns, presenter %.0f..%.0f ns\n", static_cast<unsigned long long>(serial), reap[0], reap[1], startNs, endNs);
+        deferredStampsBroken.store(true, std::memory_order_relaxed);
+    }
+    const auto now = TenSecondWindow();
+    if (window.exchange(now, std::memory_order_relaxed) != now) AgcDriver::ProfilePrint_nid_no_patch("[deferred-batch-stamps-verify] %llu batches checked, %llu differing\n", static_cast<unsigned long long>(checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(differing.load(std::memory_order_relaxed)));
+}
+
+}
+
 std::vector<Recorder::Completed> Recorder::CompletedBatches(std::uint64_t afterSerial, std::uint64_t throughSerial, std::size_t& missing) const {
     std::vector<Completed> found;
     missing = 0;
     if (throughSerial <= afterSerial) return found;
+    struct Unread {
+        std::size_t index;
+        std::uint64_t serial;
+        VkQueryPool pool;
+        bool check;
+        std::array<double, 2> expected;
+    };
+    std::vector<Unread> unread;
+    {
+        std::lock_guard lock(completedMutex);
+        try {
+            for (auto serial = afterSerial + 1; serial <= throughSerial; ++serial) {
+                const auto slot = serial % completed.size();
+                const auto& entry = completed[slot];
+                if (entry.serial != serial) {
+                    ++missing;
+                    continue;
+                }
+                found.push_back(entry);
+                if (completedStamps[slot] == VK_NULL_HANDLE) continue;
+                unread.push_back({found.size() - 1, serial, completedStamps[slot], stampsChecked[slot], expectedStamps[slot]});
+                completedStamps[slot] = VK_NULL_HANDLE;
+            }
+        } catch (...) {
+            for (const auto& stamps : unread) completedStamps[stamps.serial % completed.size()] = stamps.pool;
+            throw;
+        }
+    }
+    if (unread.empty()) return found;
+    const auto results = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults");
+    const auto period = context.limits.timestampPeriod;
+    for (const auto& stamps : unread) {
+        std::array<std::uint64_t, 2> values{};
+        auto& entry = found[stamps.index];
+        if (results(context.device, stamps.pool, 0, 2, sizeof(values), values.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && values[1] >= values[0]) {
+            entry.gpuStartNs = static_cast<double>(values[0]) * period;
+            entry.gpuEndNs = static_cast<double>(values[1]) * period;
+        }
+        if (stamps.check) NoteDeferredStampsCheck(stamps.serial, stamps.expected, entry.gpuStartNs, entry.gpuEndNs);
+    }
     std::lock_guard lock(completedMutex);
-    for (auto serial = afterSerial + 1; serial <= throughSerial; ++serial) {
-        const auto& entry = completed[serial % completed.size()];
-        if (entry.serial == serial) found.push_back(entry);
-        else ++missing;
+    for (const auto& stamps : unread) {
+        auto& entry = completed[stamps.serial % completed.size()];
+        if (entry.serial == stamps.serial) {
+            entry.gpuStartNs = found[stamps.index].gpuStartNs;
+            entry.gpuEndNs = found[stamps.index].gpuEndNs;
+        }
+        returnPool(stamps.pool);
     }
     return found;
+}
+
+void Recorder::returnPool(VkQueryPool pool) const {
+    try {
+        returnedPools.push_back(pool);
+        returnedPoolCount.store(returnedPools.size(), std::memory_order_release);
+    } catch (...) {
+        context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, pool, nullptr);
+    }
+}
+
+void Recorder::takeReturnedPools() {
+    std::lock_guard lock(completedMutex);
+    try {
+        sparePools.insert(sparePools.end(), returnedPools.begin(), returnedPools.end());
+    } catch (...) {
+        return;
+    }
+    returnedPools.clear();
+    returnedPoolCount.store(0, std::memory_order_release);
 }
 
 std::uint64_t Recorder::NewestSubmitted(std::chrono::steady_clock::time_point* submittedAt) const {
@@ -5196,27 +5304,97 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     return true;
 }
 
-bool Recorder::Reap() {
+namespace {
+
+struct WatchedReapCensus {
+    std::atomic<std::uint64_t> reaps{0}, reads{0}, retired{0}, skips{0}, backstops{0};
+    std::atomic<std::int64_t> window{-1};
+};
+
+WatchedReapCensus& WatchedReapStats() {
+    static WatchedReapCensus census;
+    return census;
+}
+
+bool WatchedReapsVerifyDue() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_WATCHED_REAPS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    static std::atomic<std::uint64_t> ordinal{0};
+    return every != 0 && ordinal.fetch_add(1, std::memory_order_relaxed) % every == 0;
+}
+
+void NoteWatchedReapCheck(std::uint64_t serial, std::uint64_t completed, std::chrono::steady_clock::duration sinceSubmit, bool late) {
+    static std::atomic<std::uint64_t> checked{0}, lateSkips{0};
+    static std::atomic<std::int64_t> window{-1};
+    checked.fetch_add(1, std::memory_order_relaxed);
+    if (late && lateSkips.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[watched-reaps-verify] batch %llu signaled with the watcher at %llu, %.0f us after its submit\n", static_cast<unsigned long long>(serial), static_cast<unsigned long long>(completed), std::chrono::duration<double, std::micro>(sinceSubmit).count());
+    const auto now = TenSecondWindow();
+    if (window.exchange(now, std::memory_order_relaxed) != now) AgcDriver::ProfilePrint_nid_no_patch("[watched-reaps-verify] %llu skips checked, %llu late\n", static_cast<unsigned long long>(checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(lateSkips.load(std::memory_order_relaxed)));
+}
+
+}
+
+bool Recorder::Reap(bool exact) {
     PerformanceTimer frameTiming("Recorder.Reap");
     dropStaleHoldKept();
     const bool profile = DrawProfiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::uint64_t retired = 0;
     const bool throttled = RuntimeSwitches::Set(RuntimeSwitch::ReapThrottle);
+    const ProgressWatcher* watcher = !exact && RuntimeSwitches::Set(RuntimeSwitch::WatchedReaps) && progressWatcher != nullptr && !progressWatcher->stopped.load(std::memory_order_acquire) ? progressWatcher.get() : nullptr;
+    std::uint64_t reads = 0, skips = 0, backstops = 0;
+    const auto watchedSignaled = [&](const Batch& front) {
+        const auto seen = watcher->completed.load(std::memory_order_acquire);
+        if (front.serial > seen) {
+            const auto now = std::chrono::steady_clock::now();
+            const bool recent = &front == reapUnfinished ? now - reapUnfinishedAt < std::chrono::milliseconds(1) : now - front.submittedAt < std::chrono::milliseconds(1);
+            if (recent) {
+                ++skips;
+                if (!WatchedReapsVerifyDue()) return false;
+                const bool late = fenceStatus(front.fence) == VK_SUCCESS;
+                NoteWatchedReapCheck(front.serial, seen, now - front.submittedAt, late);
+                return late;
+            }
+            ++backstops;
+        }
+        ++reads;
+        if (fenceStatus(front.fence) == VK_SUCCESS) return true;
+        reapUnfinished = &front;
+        reapUnfinishedAt = std::chrono::steady_clock::now();
+        return false;
+    };
     while (!inFlight.empty()) {
         const auto* front = inFlight.front().get();
-        const auto asked = throttled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        if (throttled && front == reapUnfinished && asked - reapUnfinishedAt < std::chrono::microseconds(200)) break;
-        if (fenceStatus(front->fence) != VK_SUCCESS) {
-            reapUnfinished = front;
-            reapUnfinishedAt = asked;
-            break;
+        if (watcher != nullptr) {
+            if (!watchedSignaled(*front)) break;
+        } else {
+            const auto asked = throttled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (throttled && front == reapUnfinished && asked - reapUnfinishedAt < std::chrono::microseconds(200)) break;
+            if (fenceStatus(front->fence) != VK_SUCCESS) {
+                reapUnfinished = front;
+                reapUnfinishedAt = asked;
+                break;
+            }
         }
         reapUnfinished = nullptr;
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
         finish(std::move(batch), false, 4);
         ++retired;
+    }
+    if (watcher != nullptr && GpuSideStats()) {
+        auto& census = WatchedReapStats();
+        const auto reaps = census.reaps.fetch_add(1, std::memory_order_relaxed);
+        census.reads.fetch_add(reads, std::memory_order_relaxed);
+        census.retired.fetch_add(retired, std::memory_order_relaxed);
+        census.skips.fetch_add(skips, std::memory_order_relaxed);
+        census.backstops.fetch_add(backstops, std::memory_order_relaxed);
+        if (const auto now = reaps % 256 == 0 ? TenSecondWindow() : std::int64_t{-1}; now >= 0 && census.window.exchange(now, std::memory_order_relaxed) != now) {
+            const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+            AgcDriver::ProfilePrint_nid_no_patch("[watched-reaps] 10 s: %llu reaps, %llu fence reads, %llu batches retired, %llu reads skipped, %llu backstop reads\n", take(census.reaps), take(census.reads), take(census.retired), take(census.skips), take(census.backstops));
+        }
     }
     if (profile) {
         ++holdCounters.reaps;
@@ -5313,11 +5491,25 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         }
     }
     if (batch->submitter != nullptr) batch->submitter->WaitSubmitReturned(batch->submitPosition);
-    readGpuTiming(*batch);
+    const bool deferred = RuntimeSwitches::Set(RuntimeSwitch::DeferredBatchStamps) && !deferredStampsBroken.load(std::memory_order_relaxed) && batch->serial != 0 && batch->queries != VK_NULL_HANDLE && batch->batchTiming == 0 && batch->timedKeys.size() == 1 && !GpuTimingEnabled() && !DrawProfiled() && !PerformanceTrace::Configured();
+    const bool checkStamps = deferred && DeferredStampsVerifyDue();
+    std::array<double, 2> expected{};
+    if (!deferred || checkStamps) readGpuTiming(*batch);
+    if (checkStamps) {
+        expected = {batch->gpuStartNs, batch->gpuEndNs};
+        batch->gpuStartNs = batch->gpuEndNs = 0;
+    }
     readSamples(*batch);
     if (batch->serial != 0) {
         std::lock_guard ringLock(completedMutex);
-        auto& entry = completed[batch->serial % completed.size()];
+        const auto slot = batch->serial % completed.size();
+        if (completedStamps[slot] != VK_NULL_HANDLE) returnPool(std::exchange(completedStamps[slot], VK_NULL_HANDLE));
+        if (deferred) {
+            completedStamps[slot] = std::exchange(batch->queries, VK_NULL_HANDLE);
+            expectedStamps[slot] = expected;
+            stampsChecked[slot] = checkStamps;
+        }
+        auto& entry = completed[slot];
         entry.serial = batch->serial;
         entry.gpuStartNs = batch->gpuStartNs;
         entry.gpuEndNs = batch->gpuEndNs;

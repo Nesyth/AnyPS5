@@ -839,16 +839,20 @@ struct PageStates {
     }
 
     std::atomic<std::uint64_t> accessSerial{0};
+    std::atomic<std::uint64_t> recordSerial{0};
 
     void record(std::uintptr_t base, std::uintptr_t regionEnd, bool readable, bool writable, std::uint64_t generation, std::uint64_t access) {
+        bool stored = false;
         for (PageSpan* span : {&arena, &image}) {
             if (span->size == 0 || regionEnd <= span->base || base >= span->base + span->size) continue;
             const std::uint8_t value = readable ? static_cast<std::uint8_t>(PageReadable | (writable ? PageWritable : 0u)) : PageInaccessible;
             const auto first = std::max(base, span->base);
             const auto last = std::min(regionEnd, span->base + span->size);
             span->store(first, last, value);
+            stored = true;
             if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation || accessSerial.load(std::memory_order_acquire) != access) span->forget(first, static_cast<std::size_t>(last - first));
         }
+        if (stored) recordSerial.fetch_add(1, std::memory_order_release);
     }
 
     void forgetInaccessible(std::uintptr_t address, std::size_t bytes) {
@@ -1184,14 +1188,35 @@ bool readableWithoutQuery(std::uintptr_t address, std::size_t bytes) {
 }
 #endif
 
-// Checks that [address, address + bytes) is mapped with read (and, if asked, write) access. Returns
-// an empty string when it is, otherwise why it is not.
-std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
-    const TimedAccess timed(CounterVerify, bytes);
-    if (onOwnLiveStack(address, bytes)) return {};
-#ifdef __linux__
-    if (!writable && readableWithoutQuery(address, bytes)) return {};
-#endif
+struct RangeMemoSerials {
+    std::uint64_t forgets = 0;
+    std::uint64_t access = 0;
+    std::uint64_t records = 0;
+    std::uint64_t generation = 0;
+    bool operator==(const RangeMemoSerials&) const = default;
+};
+
+RangeMemoSerials rangeMemoSerials() {
+    auto& pages = Pages();
+    return {forgetSerial.load(std::memory_order_acquire), pages.accessSerial.load(std::memory_order_acquire), pages.recordSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
+}
+
+struct RangeMemo {
+    struct Entry {
+        std::uintptr_t begin = 0;
+        std::uintptr_t end = 0;
+        bool writable = false;
+        RangeMemoSerials serials;
+    };
+    static constexpr std::size_t Entries = 4;
+    static constexpr std::uintptr_t RunLimit = 64 * 1024;
+    std::array<Entry, Entries> entries{};
+    std::size_t next = 0;
+};
+
+struct RangeMemoSlot {};
+
+std::string describedReason(std::uintptr_t address, std::size_t bytes, bool writable) {
     std::string reason;
     const bool queried = describePages(address, bytes, [&](const PageRun& run) {
         if (!run.readable) {
@@ -1204,6 +1229,97 @@ std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
         return reason.empty();
     });
     if (!queried && reason.empty()) reason = "cannot query guest memory";
+    return reason;
+}
+
+struct RangeMemoCounts {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> misses{0};
+    std::atomic<std::uint64_t> recorded{0};
+    std::atomic<std::uint64_t> checked{0};
+    std::atomic<std::uint64_t> differing{0};
+    std::atomic<std::int64_t> window{-1};
+};
+
+RangeMemoCounts& rangeMemoCounts() {
+    static RangeMemoCounts counts;
+    return counts;
+}
+
+std::uint64_t rangeMemoVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_RANGE_MEMO");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+void reportRangeMemo() {
+    auto& counts = rangeMemoCounts();
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (counts.window.exchange(now, std::memory_order_relaxed) == now) return;
+    std::fprintf(stderr, "[range-memo-verify] %llu memo hits, %llu checks without a hit, %llu runs recorded, %llu hits checked, %llu differing\n", static_cast<unsigned long long>(counts.hits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.misses.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.recorded.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.differing.load(std::memory_order_relaxed)));
+}
+
+void checkRangeMemo(const RangeMemo::Entry& entry, std::uintptr_t address, std::size_t bytes, bool writable) {
+    const auto every = rangeMemoVerifyEvery();
+    if (every == 0) return;
+    auto& counts = rangeMemoCounts();
+    if (counts.hits.fetch_add(1, std::memory_order_relaxed) % every != 0) return;
+    counts.checked.fetch_add(1, std::memory_order_relaxed);
+    const auto reason = describedReason(address, bytes, writable);
+    if (!reason.empty() && counts.differing.fetch_add(1, std::memory_order_relaxed) < 16) {
+        std::fprintf(stderr, "[range-memo-verify] 0x%llx+0x%zx (writable %d): the memo run 0x%llx-0x%llx answered accessible, today's check: %s\n", static_cast<unsigned long long>(address), bytes, writable ? 1 : 0, static_cast<unsigned long long>(entry.begin), static_cast<unsigned long long>(entry.end), reason.c_str());
+    }
+    reportRangeMemo();
+}
+
+bool rangeMemoHit(std::uintptr_t address, std::size_t bytes, bool writable) {
+    auto& memo = ThreadScratch<RangeMemo, RangeMemoSlot>();
+    const RangeMemo::Entry* found = nullptr;
+    for (const auto& entry : memo.entries) {
+        if (entry.end != 0 && entry.begin <= address && address < entry.end && bytes <= entry.end - address && (!writable || entry.writable)) {
+            found = &entry;
+            break;
+        }
+    }
+    if (found == nullptr || !(found->serials == rangeMemoSerials())) return false;
+    checkRangeMemo(*found, address, bytes, writable);
+    return true;
+}
+
+void noteRangeMemo(std::uintptr_t address, std::size_t bytes, const RangeMemoSerials& before) {
+    auto& pages = Pages();
+    auto* span = pages.spanOf(address);
+    if (span == nullptr || bytes == 0) return;
+    const auto value = span->load(address);
+    if ((value & PageReadable) == 0) return;
+    const auto begin = span->base + (address - span->base) / PageBytes * PageBytes;
+    const auto limit = std::min<std::uintptr_t>(span->base + span->size, begin + RangeMemo::RunLimit);
+    const auto end = span->runEnd(address, value, limit);
+    if (end <= address || bytes > end - address || !(rangeMemoSerials() == before)) return;
+    auto& memo = ThreadScratch<RangeMemo, RangeMemoSlot>();
+    memo.entries[memo.next] = {begin, end, (value & PageWritable) != 0, before};
+    memo.next = (memo.next + 1) % RangeMemo::Entries;
+    if (rangeMemoVerifyEvery() != 0) rangeMemoCounts().recorded.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Checks that [address, address + bytes) is mapped with read (and, if asked, write) access. Returns
+// an empty string when it is, otherwise why it is not.
+std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
+    const TimedAccess timed(CounterVerify, bytes);
+    const bool memo = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RangeMemo);
+    if (memo && rangeMemoHit(address, bytes, writable)) return {};
+    if (onOwnLiveStack(address, bytes)) return {};
+#ifdef __linux__
+    if (!writable && readableWithoutQuery(address, bytes)) return {};
+#endif
+    const auto before = memo ? rangeMemoSerials() : RangeMemoSerials{};
+    auto reason = describedReason(address, bytes, writable);
+    if (memo) {
+        if (const auto every = rangeMemoVerifyEvery(); every != 0 && rangeMemoCounts().misses.fetch_add(1, std::memory_order_relaxed) % every == 0) reportRangeMemo();
+        if (reason.empty()) noteRangeMemo(address, bytes, before);
+    }
     return reason;
 }
 

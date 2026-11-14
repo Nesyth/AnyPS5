@@ -229,8 +229,9 @@ void Driver::prepareLeanTail(const Submission& stalled, Submission& tail, bool p
     }
     if (kept != nullptr) leanTails.Pop();
     if (APS5_ENABLE_TIMING_LOG) tail.copiedAt = std::chrono::steady_clock::now();
+    const bool byTable = table != nullptr && !verify && LeanFront::SwitchSet(frontLatch, Graphics::RuntimeSwitch::PacketClassTable);
     if (table != nullptr && !verify) {
-        scanSegment(tail, *table, true, stalled.rewindTail);
+        scanSegment(tail, *table, true, stalled.rewindTail, byTable);
         LeanFront::AddOnWorker(Counter::PacketTables);
     } else {
         validate(tail, stalled.rewindTail);
@@ -248,7 +249,7 @@ void Driver::prepareLeanTail(const Submission& stalled, Submission& tail, bool p
         readRegisterLists(tail);
         verifyLeanLists(tail, cache, ownWrites);
     } else {
-        resolveLeanLists(tail, cache);
+        resolveLeanLists(tail, cache, byTable ? table : nullptr);
     }
 }
 
