@@ -1476,6 +1476,34 @@ void Driver::commitRecordDraw(const LeanDrawJob& job, const LeanAnchor& anchor, 
     auto reads = std::move(hit->reads);
     const auto& graphics = job.shape->decode->state;
     const VulkanDevice::DrawTraceContext trace{0, job.serial, job.queue, static_cast<std::size_t>(job.packetOffset), graphics.hasColorTarget ? graphics.color.address : 0};
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectHandoff)) {
+        auto& held = *hit;
+        held.device = anchor.device;
+        held.decode = job.shape->decode;
+        held.trace = trace;
+        held.epoch = job.epoch;
+        held.shape = job.shapeKey;
+        held.queue = job.queue;
+        held.opcode = job.opcode;
+        auto lean = [this, at = hit.get()] {
+            auto& kept = *at;
+            DrawPipeline::FollowEpoch(kept.epoch);
+            GuestMemory::SetCurrentPacket(kept.opcode, kept.queue);
+            const bool following = kept.device != nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow);
+            const bool attempted = following && Graphics::ExpressRunLed();
+            static std::uint32_t itemOrdinal = 0;
+            const bool timed = following && (++itemOrdinal & 7u) == 0;
+            const auto began = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (attempted && followRecord(*kept.device, kept.queue, kept.decode->state, kept, kept.trace)) return;
+            const auto committing = timed && attempted ? std::chrono::steady_clock::now() : began;
+            commitRecord(kept.device, kept.queue, kept.decode->state, kept, kept.trace, kept.shape);
+            if (timed) Graphics::NoteExpressNonFollower(attempted, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(committing - began).count()), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - committing).count()));
+            if (following) Graphics::DropExpressFollowVerify();
+        };
+        DirectDraws::Add(DirectDraws::Counter::HandoffsLean);
+        DrawPipeline::Queue0().EnqueueKept(std::move(lean), std::move(writes), std::move(reads), std::move(hit));
+        return;
+    }
     auto commit = [this, hit = std::move(hit), localDevice = anchor.device, decode = job.shape->decode, queue = job.queue, opcode = job.opcode, epoch = job.epoch, trace, shape = job.shapeKey] {
         DrawPipeline::FollowEpoch(epoch);
         GuestMemory::SetCurrentPacket(opcode, queue);

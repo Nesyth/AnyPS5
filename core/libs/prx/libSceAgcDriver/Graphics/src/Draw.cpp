@@ -2525,9 +2525,114 @@ void noteInputsDifference(const std::string& difference) {
     if (printed.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[direct-inputs] verify: %s\n", difference.c_str());
 }
 
+struct InputsMemoEntry {
+    std::shared_ptr<const DrawRecipe> recipe;
+    std::vector<ShaderRecompiler::VertexAttribute> attributes;
+    std::uint32_t firstVertex = 0;
+    std::uint32_t instanceCount = 0;
+    std::uint32_t firstInstance = 0;
+    std::uint32_t maxIndex = 0;
+    std::uint32_t indexSize = 0;
+    bool indexed = false;
+    bool hasColor = false;
+    std::uint64_t colorBegin = 0;
+    std::uint64_t colorBytes = 0;
+    std::uint64_t forget = 0;
+    std::uint64_t imports = 0;
+    std::uint64_t mapping = 0;
+    std::vector<PreparedInputs::Range> ranges;
+    std::vector<VkBuffer> handles;
+    std::vector<VkDeviceSize> offsets;
+    bool indexKnown = false;
+    std::uint64_t indexBegin = 0;
+    std::uint64_t indexEnd = 0;
+    ExistingHostImport indexFound{};
+};
+
+struct InputsMemo {
+    static constexpr std::size_t Slots = 512;
+    std::vector<InputsMemoEntry> slots;
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint64_t ordinal = 0;
+    InputsMemoNote note;
+};
+
+struct InputsMemoStorage {};
+
+std::atomic<bool> inputsMemoUsed{false};
+
+std::uint64_t inputsMemoVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_DIRECT_INPUTS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+bool sameMemoAttribute(const ShaderRecompiler::VertexAttribute& a, const ShaderRecompiler::VertexAttribute& b) {
+    return a.location == b.location && a.components == b.components && a.fetchIndex == b.fetchIndex && a.formatComponents == b.formatComponents && a.resource.fields == b.resource.fields;
+}
+
+std::size_t inputsMemoSlot(const DrawRecipe* recipe, std::span<const ShaderRecompiler::VertexAttribute> attributes, const Pm4::DrawParameters& draw, std::uint32_t maxIndex) {
+    std::uint64_t hash = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(recipe)) * 0x9e3779b97f4a7c15ull;
+    const auto mix = [&](std::uint64_t value) { hash = (hash ^ value) * 0x100000001b3ull; };
+    mix((static_cast<std::uint64_t>(draw.firstVertex) << 32u) | maxIndex);
+    mix((static_cast<std::uint64_t>(draw.instanceCount) << 32u) | draw.firstInstance);
+    for (const auto& attribute : attributes) {
+        mix((static_cast<std::uint64_t>(attribute.resource.fields[0]) << 32u) | attribute.resource.fields[1]);
+        mix((static_cast<std::uint64_t>(attribute.resource.fields[2]) << 32u) | attribute.resource.fields[3]);
+        mix(attribute.location);
+    }
+    hash ^= hash >> 29u;
+    return static_cast<std::size_t>(hash % InputsMemo::Slots);
+}
+
+bool sameInputsKey(const InputsMemoEntry& entry, std::span<const ShaderRecompiler::VertexAttribute> attributes, const Pm4::DrawParameters& draw, std::uint32_t maxIndex, const State& state) {
+    if (entry.firstVertex != draw.firstVertex || entry.instanceCount != draw.instanceCount || entry.firstInstance != draw.firstInstance || entry.maxIndex != maxIndex || entry.indexed != draw.indexed || entry.indexSize != draw.indexSize) return false;
+    if (entry.hasColor != state.hasColorTarget) return false;
+    if (state.hasColorTarget && (entry.colorBegin != static_cast<std::uint64_t>(state.color.MemoryAddress()) || entry.colorBytes != static_cast<std::uint64_t>(state.color.bytes))) return false;
+    return std::ranges::equal(entry.attributes, attributes, sameMemoAttribute);
+}
+
+const char* preparedInputsDifference(const PreparedInputs& mine, const PreparedInputs& today) {
+    if (mine.refusal != today.refusal) return "the refusal";
+    if (mine.indexBytes != today.indexBytes || mine.maxIndex != today.maxIndex) return "the index range";
+    if (mine.ranges.size() != today.ranges.size()) return "the range count";
+    for (std::size_t at = 0; at < mine.ranges.size(); ++at) {
+        const auto& a = mine.ranges[at];
+        const auto& b = today.ranges[at];
+        if (a.begin != b.begin || a.end != b.end || a.alignment != b.alignment || a.import != b.import || a.handle != b.handle || a.offset != b.offset) return "a range";
+    }
+    if (mine.vertexHandles != today.vertexHandles || mine.vertexOffsets != today.vertexOffsets) return "the vertex bindings";
+    if (mine.inPlaceReads != today.inPlaceReads) return "the in-place reads";
+    if (!sameVertexLayout(mine.vertexInput, today.vertexInput)) return "the vertex layout";
+    return nullptr;
+}
+
+bool prepareMemoInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, PreparedInputs& prepared, InputsMemo* memo);
+
+}
+
+InputsMemoNote TakeInputsMemoNote() {
+    auto& memo = HostThreadLocal<InputsMemo, InputsMemoStorage>();
+    return std::exchange(memo.note, {});
 }
 
 bool PrepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, PreparedInputs& prepared) {
+    InputsMemo* memo = nullptr;
+    if (RuntimeSwitches::Set(RuntimeSwitch::InputsMemo)) {
+        memo = &HostThreadLocal<InputsMemo, InputsMemoStorage>();
+        inputsMemoUsed.store(true, std::memory_order_relaxed);
+    } else if (inputsMemoUsed.load(std::memory_order_relaxed)) {
+        auto& held = HostThreadLocal<InputsMemo, InputsMemoStorage>();
+        if (!held.slots.empty()) held.slots.clear();
+    }
+    return prepareMemoInputs(context, state, draw, shaders, std::move(recipe), prepared, memo);
+}
+
+namespace {
+
+bool prepareMemoInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, PreparedInputs& prepared, InputsMemo* memo) {
     using Refusal = PreparedInputs::Refusal;
     const auto refuse = [&](Refusal why) {
         prepared.refusal = why;
@@ -2594,6 +2699,69 @@ bool PrepareDrawInputs(const Context& context, const State& state, const Pm4::Dr
     }
     prepared.vertexInput = recipe->vertexInput;
     const auto& layout = prepared.vertexInput;
+    InputsMemoEntry* slot = nullptr;
+    if (memo != nullptr && args != nullptr) memo->note.outcome = InputsMemoOutcome::Indirect;
+    if (memo != nullptr && args == nullptr) {
+        if (memo->device != context.device) {
+            memo->slots.clear();
+            memo->device = context.device;
+        }
+        if (memo->slots.empty()) memo->slots.resize(InputsMemo::Slots);
+        slot = &memo->slots[inputsMemoSlot(recipe.get(), attributes, draw, maxIndex)];
+        const bool keyed = slot->recipe == recipe && sameInputsKey(*slot, attributes, draw, maxIndex, state);
+        const bool current = (prepared.forget & 1u) == 0 && slot->forget == prepared.forget && slot->imports == prepared.imports && slot->mapping == prepared.mapping;
+        memo->note.outcome = !keyed ? InputsMemoOutcome::MissKey : !current ? InputsMemoOutcome::MissSerial : InputsMemoOutcome::Hit;
+        if (keyed && current) {
+            for (const auto& range : slot->ranges) {
+                if (!GuestMemory::Accessible(reinterpret_cast<const void*>(range.begin), static_cast<std::size_t>(range.end - range.begin))) return refuse(Refusal::Inaccessible);
+            }
+            if (draw.indexed) {
+                auto& index = prepared.ranges.front();
+                if (!slot->indexKnown || slot->indexBegin != index.begin || slot->indexEnd != index.end) {
+                    const std::pair<std::uint64_t, std::uint64_t> read{index.begin, index.end};
+                    ExistingHostImport found{};
+                    if (!ExistingHostImportsFor(context, std::span(&read, 1), std::span(&found, 1))) return refuse(Refusal::NotInPlace);
+                    slot->indexKnown = true;
+                    slot->indexBegin = index.begin;
+                    slot->indexEnd = index.end;
+                    slot->indexFound = found;
+                }
+                if (slot->indexFound.offset % index.alignment != 0) return refuse(Refusal::NotInPlace);
+                index.import = slot->indexFound.import;
+                index.handle = slot->indexFound.buffer;
+                index.offset = slot->indexFound.offset;
+            }
+            prepared.ranges.insert(prepared.ranges.end(), slot->ranges.begin(), slot->ranges.end());
+            for (const auto& range : prepared.ranges) prepared.inPlaceReads.emplace_back(range.begin, range.end);
+            prepared.vertexHandles.assign(slot->handles.begin(), slot->handles.end());
+            prepared.vertexOffsets.assign(slot->offsets.begin(), slot->offsets.end());
+            prepared.indexBytes = indexBytes;
+            prepared.maxIndex = maxIndex;
+            if (const auto every = inputsMemoVerifyEvery(); every != 0 && ++memo->ordinal % every == 0) {
+                struct FreshStorage {};
+                auto& fresh = HostThreadLocal<PreparedInputs, FreshStorage>();
+                fresh = {};
+                bool made = false;
+                try {
+                    made = prepareMemoInputs(context, state, draw, shaders, recipe, fresh, nullptr);
+                } catch (const std::exception&) {
+                    made = false;
+                }
+                memo->note.verified = true;
+                const char* what = made ? preparedInputsDifference(prepared, fresh) : "the refusal";
+                fresh = {};
+                if (what != nullptr) {
+                    memo->note.differed = true;
+                    static std::atomic<std::uint32_t> printed{0};
+                    if (printed.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[direct-inputs] memo verify: %s differs from today's\n", what);
+                    *slot = {};
+                    return prepareMemoInputs(context, state, draw, shaders, std::move(recipe), prepared, nullptr);
+                }
+            }
+            prepared.recipe = std::move(recipe);
+            return true;
+        }
+    }
     auto& scratch = HostThreadLocal<PreparedInputScratch, PreparedInputScratch>();
     auto& fetches = scratch.fetches;
     auto& fetchValid = scratch.fetchValid;
@@ -2656,8 +2824,34 @@ bool PrepareDrawInputs(const Context& context, const State& state, const Pm4::Dr
     }
     prepared.indexBytes = indexBytes;
     prepared.maxIndex = maxIndex;
+    if (slot != nullptr) {
+        slot->recipe = recipe;
+        slot->attributes.assign(attributes.begin(), attributes.end());
+        slot->firstVertex = draw.firstVertex;
+        slot->instanceCount = draw.instanceCount;
+        slot->firstInstance = draw.firstInstance;
+        slot->maxIndex = maxIndex;
+        slot->indexSize = draw.indexSize;
+        slot->indexed = draw.indexed;
+        slot->hasColor = state.hasColorTarget;
+        slot->colorBegin = state.hasColorTarget ? static_cast<std::uint64_t>(state.color.MemoryAddress()) : 0u;
+        slot->colorBytes = state.hasColorTarget ? static_cast<std::uint64_t>(state.color.bytes) : 0u;
+        slot->forget = prepared.forget;
+        slot->imports = prepared.imports;
+        slot->mapping = prepared.mapping;
+        slot->ranges.assign(prepared.ranges.begin() + static_cast<std::ptrdiff_t>(first), prepared.ranges.end());
+        slot->handles.assign(prepared.vertexHandles.begin(), prepared.vertexHandles.end());
+        slot->offsets.assign(prepared.vertexOffsets.begin(), prepared.vertexOffsets.end());
+        slot->indexKnown = draw.indexed;
+        slot->indexBegin = draw.indexed ? prepared.ranges.front().begin : 0u;
+        slot->indexEnd = draw.indexed ? prepared.ranges.front().end : 0u;
+        slot->indexFound = draw.indexed ? ExistingHostImport{prepared.ranges.front().import, prepared.ranges.front().handle, prepared.ranges.front().offset} : ExistingHostImport{};
+        memo->note.stored = true;
+    }
     prepared.recipe = std::move(recipe);
     return true;
+}
+
 }
 
 DrawRecordInputs VerifyPreparedInputsForTest(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, PreparedInputs& prepared, std::string& difference, DrawRecordInputs* taken) {

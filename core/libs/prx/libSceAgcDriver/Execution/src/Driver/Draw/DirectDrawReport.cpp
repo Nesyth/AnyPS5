@@ -56,7 +56,13 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "GPU-indirect", "quad list", "rect list", "not the vertex path", "mesh", "tessellation", "tessellation capture", "not recordable", "stage count", "stage kind", "stage role", "skipped shader", "GPU-indirect read on the CPU path",
     "hits with a buffer bound in place", "buffer ranges bound in place", "GPU-indirect hits",
     "GPU-indirect express states captured", "GPU-indirect express states not captured",
-    "template not proved", "template written", "forget serial", "serials", "sources", "views", "pending CPU writes", "staging"
+    "template not proved", "template written", "forget serial", "serials", "sources", "views", "pending CPU writes", "staging",
+    "sides referenced", "ranges referenced", "values referenced", "decode reads referenced", "vertex infos referenced", "read ranges from the entries", "layouts from an entry", "hit stages left out of the memory compare", "draws compared in full", "memory changed after a memo hit", "view build ns", "view builds timed",
+    "lean stores", "store verify checked", "store verify differing",
+    "snapshot loads skipped", "snapshot loads taken", "skips verified", "skips differing",
+    "cached", "built", "today's refresh", "lazy refreshes", "GPU-indirect draws refreshed today's way", "prologue verify checked", "prologue verify differing",
+    "inputs memo hits", "inputs memo stored", "missed by key", "missed by serial", "GPU-indirect draws not memoized", "inputs memo verify checked", "inputs memo verify differing",
+    "set plans built", "set plans hit", "push lists from the plan", "plan verify checked", "plan verify differing", "blobs appended", "lean hand-offs"
 };
 static_assert(static_cast<std::size_t>(Counter::ExpressReprovedStaging) - static_cast<std::size_t>(Counter::ExpressReprovedNotProved) == static_cast<std::size_t>(Graphics::ShaderResources::ExpressMiss::Staging) - static_cast<std::size_t>(Graphics::ShaderResources::ExpressMiss::NotProved), "every reason an express commit reproves its template needs a counter");
 static_assert(static_cast<std::size_t>(Counter::BindingsLeftUnpushedRebound) - static_cast<std::size_t>(Counter::BindingsLeftUnpushedRefused) + 2 == static_cast<std::size_t>(Graphics::ShaderResources::DynamicLeave::Count), "every way an unpushed draw leaves the dynamic route needs a counter");
@@ -421,6 +427,12 @@ void Report(bool force) {
         AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] stage memo: %llu hits (%llu with a patched word), %llu stored, %llu not adopted%s; not stored%s; %llu cleared; verify %llu checked (%llu of patched hits), %llu differing\n",
             static_cast<unsigned long long>(at(Counter::StageMemoHits)), static_cast<unsigned long long>(at(Counter::StageMemoPatched)), static_cast<unsigned long long>(at(Counter::StageMemoStored)), static_cast<unsigned long long>(sum(Counter::StageMemoNoPattern, Counter::StageMemoSide)), reasons(counts, Counter::StageMemoNoPattern, Counter::StageMemoSide).c_str(),
             reasons(counts, Counter::StageMemoUntraced, Counter::StageMemoPatternsFull).c_str(), static_cast<unsigned long long>(at(Counter::StageMemoCleared)), static_cast<unsigned long long>(at(Counter::StageMemoVerifyChecked)), static_cast<unsigned long long>(at(Counter::StageMemoVerifyPatched)), static_cast<unsigned long long>(at(Counter::StageMemoVerifyDiffering)));
+    }
+    if (sum(Counter::StageViewSides, Counter::HandoffsLean) != 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] finisher reuse: stage views%s; memo stores%s; settle serial%s; shape prologue%s; inputs memo%s; fragments%s; buffers%s; hand-off%s\n",
+            reasons(counts, Counter::StageViewSides, Counter::StageViewBuildsTimed).c_str(), reasons(counts, Counter::StageMemoLeanStores, Counter::StageMemoStoreVerifyDiffering).c_str(), reasons(counts, Counter::SettleLoadsSkipped, Counter::SettleVerifyDiffering).c_str(),
+            reasons(counts, Counter::PrologueCached, Counter::PrologueVerifyDiffering).c_str(), reasons(counts, Counter::InputsMemoHits, Counter::InputsMemoVerifyDiffering).c_str(), reasons(counts, Counter::FragmentSetPlansBuilt, Counter::FragmentPlanVerifyDiffering).c_str(),
+            reasons(counts, Counter::BlobAppends, Counter::BlobAppends).c_str(), reasons(counts, Counter::HandoffsLean, Counter::HandoffsLean).c_str());
     }
     if (sum(Counter::ResolveCensusNew, Counter::ResolveCensusChanged) != 0) {
         AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] resolve census: %llu resolves%s; by shape, draw parameters and read content without addresses:%s\n", static_cast<unsigned long long>(sum(Counter::ResolveCensusNew, Counter::ResolveCensusChanged)), reasons(counts, Counter::ResolveCensusNew, Counter::ResolveCensusChanged).c_str(), reasons(counts, Counter::ResolveCensusContentNew, Counter::ResolveCensusContentSeen).c_str());

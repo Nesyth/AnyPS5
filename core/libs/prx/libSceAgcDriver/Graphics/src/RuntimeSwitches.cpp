@@ -194,6 +194,14 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_FILL_IMAGE_INDEX",
     "APS5_WATCHED_REAPS",
     "APS5_DEFERRED_BATCH_STAMPS",
+    "APS5_STAGE_VIEWS",
+    "APS5_STAGE_MEMO_LEAN_STORES",
+    "APS5_SETTLE_SERIAL",
+    "APS5_FRAGMENT_PLANS",
+    "APS5_BUFFER_BLOB_APPEND",
+    "APS5_SHAPE_PROLOGUE",
+    "APS5_DIRECT_HANDOFF",
+    "APS5_INPUTS_MEMO",
 };
 static_assert(SwitchNames.back() != nullptr, "every runtime switch needs a name");
 
@@ -388,6 +396,14 @@ struct SwitchValues {
             std::getenv("APS5_FILL_IMAGE_INDEX") != nullptr,
             std::getenv("APS5_WATCHED_REAPS") != nullptr,
             std::getenv("APS5_DEFERRED_BATCH_STAMPS") != nullptr,
+            std::getenv("APS5_STAGE_VIEWS") != nullptr,
+            std::getenv("APS5_STAGE_MEMO_LEAN_STORES") != nullptr,
+            std::getenv("APS5_SETTLE_SERIAL") != nullptr,
+            std::getenv("APS5_FRAGMENT_PLANS") != nullptr,
+            std::getenv("APS5_BUFFER_BLOB_APPEND") != nullptr,
+            std::getenv("APS5_SHAPE_PROLOGUE") != nullptr,
+            std::getenv("APS5_DIRECT_HANDOFF") != nullptr,
+            std::getenv("APS5_INPUTS_MEMO") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

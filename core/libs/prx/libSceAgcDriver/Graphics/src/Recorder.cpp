@@ -727,6 +727,25 @@ bool Recorder::ReadsSettled(std::span<const std::pair<std::uint64_t, std::uint64
     return !StorageTexture::AnyPendingOverlaps(ranges) && !AnyShadowedOverlaps(ranges);
 }
 
+bool Recorder::ReadsSettledSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, const WriteRanges* before, const WriteRanges* also, std::uint64_t serial, const WriteRanges* atSerial) {
+    if (!HookSnapshotEnabled()) return false;
+    const bool labels = !QueuedLabelRanges().empty();
+    std::shared_ptr<const WriteRanges> loaded;
+    const WriteRanges* now = atSerial;
+    if (publishGeneration.load(std::memory_order_acquire) != serial) {
+        loaded = pendingWrites.load(std::memory_order_acquire);
+        now = loaded.get();
+    }
+    if (also == before) also = nullptr;
+    if (now == before || now == also) now = nullptr;
+    for (const auto& [begin, end] : ranges) {
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        if (labels && QueuedLabelOverlaps(begin, bytes)) return false;
+        if (AgcDriver::Graphics::SnapshotOverlaps(before, begin, bytes) || AgcDriver::Graphics::SnapshotOverlaps(also, begin, bytes) || AgcDriver::Graphics::SnapshotOverlaps(now, begin, bytes)) return false;
+    }
+    return !StorageTexture::AnyPendingOverlaps(ranges) && !AnyShadowedOverlaps(ranges);
+}
+
 namespace {
 
 // Whether one merged range of the snapshot contains [address, end) entirely.

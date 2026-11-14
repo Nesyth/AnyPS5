@@ -1674,6 +1674,10 @@ void DrawPipeline::EnqueueQuiet(Commit commit) {
     enqueue({std::move(commit), {}, 0, {}, {}, false, false, CommitKind::Other, true});
 }
 
+void DrawPipeline::EnqueueKept(Commit commit, std::vector<Range> writes, std::vector<Range> reads, std::shared_ptr<const void> keep) {
+    enqueue({std::move(commit), std::move(writes), 0, {}, std::move(reads), true, false, CommitKind::Other, false, 0, 1, std::move(keep)});
+}
+
 void DrawPipeline::Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw) {
     enqueue({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, false, kind});
 }

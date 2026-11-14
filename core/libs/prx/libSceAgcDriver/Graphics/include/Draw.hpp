@@ -106,6 +106,14 @@ struct PreparedInputs {
     std::size_t indirectRanges = 0;
 };
 bool PrepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, PreparedInputs& prepared);
+enum class InputsMemoOutcome : std::uint8_t { None, Hit, MissKey, MissSerial, Indirect };
+struct InputsMemoNote {
+    InputsMemoOutcome outcome = InputsMemoOutcome::None;
+    bool stored = false;
+    bool verified = false;
+    bool differed = false;
+};
+InputsMemoNote TakeInputsMemoNote();
 DrawRecordInputs VerifyPreparedInputsForTest(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, PreparedInputs& prepared, std::string& difference, DrawRecordInputs* taken = nullptr);
 
 std::array<std::uint32_t, 4> MeshIndexBufferDescriptor(const Pm4::DrawParameters& draw);

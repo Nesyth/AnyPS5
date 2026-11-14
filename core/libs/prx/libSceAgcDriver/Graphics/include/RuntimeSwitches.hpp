@@ -188,6 +188,14 @@ enum class RuntimeSwitch : std::size_t {
     FillImageIndex,
     WatchedReaps,
     DeferredBatchStamps,
+    StageViews,
+    StageMemoLeanStores,
+    SettleSerial,
+    FragmentPlans,
+    BufferBlobAppend,
+    ShapePrologue,
+    DirectHandoff,
+    InputsMemo,
     Count,
 };
 

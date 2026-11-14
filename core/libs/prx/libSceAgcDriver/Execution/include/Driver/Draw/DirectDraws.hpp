@@ -170,6 +170,34 @@ struct DirectResolvedStage {
     ShaderRecompiler::HeapStageWords side;
     AddressRanges ranges;
     std::vector<std::uint32_t> values;
+    std::shared_ptr<const void> pin;
+    const void* memo = nullptr;
+    const std::shared_ptr<const DirectStage>* sharedView = nullptr;
+    const std::shared_ptr<const ShaderRecompiler::ResourceCapture>* captureView = nullptr;
+    const ShaderRecompiler::HeapStageWords* sideView = nullptr;
+    const AddressRanges* rangesView = nullptr;
+    const std::vector<std::uint32_t>* valuesView = nullptr;
+    const std::vector<Graphics::DecodeRead>* decodeView = nullptr;
+    const std::optional<ShaderRecompiler::ShaderVertexStageInfo>* vertexView = nullptr;
+    bool adopted = false;
+
+    const std::shared_ptr<const DirectStage>& Shared() const { return sharedView != nullptr ? *sharedView : shared; }
+    const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& Capture() const { return captureView != nullptr ? *captureView : capture; }
+    const ShaderRecompiler::HeapStageWords& Side() const { return sideView != nullptr ? *sideView : side; }
+    const AddressRanges& Ranges() const { return rangesView != nullptr ? *rangesView : ranges; }
+    const std::vector<std::uint32_t>& Values() const { return valuesView != nullptr ? *valuesView : values; }
+    void Unview() {
+        pin.reset();
+        memo = nullptr;
+        sharedView = nullptr;
+        captureView = nullptr;
+        sideView = nullptr;
+        rangesView = nullptr;
+        valuesView = nullptr;
+        decodeView = nullptr;
+        vertexView = nullptr;
+        adopted = false;
+    }
 };
 
 // A lean draw's stages resolved without today's finish. `regions` covers the program memory, the
@@ -189,6 +217,18 @@ struct DirectStages {
     std::uint64_t generation = 0;
     std::uint64_t tag = 0;
     std::optional<Pm4::DrawParameters::IndirectDraw> indirect;
+    std::vector<std::vector<std::uint32_t>> userWords;
+    bool refreshed = true;
+    bool worded = false;
+    std::size_t compared = 0;
+    std::uint64_t layoutHash = 0;
+    bool layoutHashed = false;
+    std::uint64_t beforeSerial = 0;
+    bool serialed = false;
+    bool viewing = false;
+
+    const std::vector<Graphics::DecodeRead>& DecodeReads(std::size_t index) const { return stages[index].decodeView != nullptr ? *stages[index].decodeView : decodeReads[index]; }
+    const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& VertexInfo(std::size_t index) const { return stages[index].vertexView != nullptr ? *stages[index].vertexView : vertexInfos[index]; }
 };
 
 // The per-step times of a sampled direct draw (every StepSampleEvery-th draw on a thread).

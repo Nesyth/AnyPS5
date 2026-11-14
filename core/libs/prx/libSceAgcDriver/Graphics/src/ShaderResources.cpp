@@ -9041,7 +9041,228 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
 void ShaderResources::WriteFragmentSets(DrawBindings& result, std::span<const std::size_t> selected, std::int32_t pushedSet) const {
     Require(context.descriptorCache != nullptr && !heapStage, "a fragment's sets need a descriptor cache and no heap stage");
     result.lent = {};
+    if (RuntimeSwitches::Set(RuntimeSwitch::FragmentPlans)) {
+        writePlannedFragmentSets(result, selected, pushedSet);
+        return;
+    }
     writeFreshDrawSets(result, selected, nullptr, pushedSet);
+}
+
+namespace {
+
+struct FragmentSetPlan {
+    struct Write {
+        std::size_t index = 0;
+        std::size_t binding = 0;
+        std::size_t offset = 0;
+        std::uint8_t set = 0;
+        bool patched = false;
+    };
+    std::uint64_t serial = 0;
+    std::int32_t pushedSet = -2;
+    std::size_t writeCount = 0;
+    std::size_t bufferCount = 0;
+    std::vector<std::pair<std::size_t, std::size_t>> variable;
+    std::array<std::vector<VkDescriptorPoolSize>, 2> sizes;
+    std::array<bool, 2> described{};
+    std::array<std::optional<std::uint32_t>, 2> variableCounts;
+    std::vector<Write> writes;
+};
+
+struct FragmentSetPlans {
+    static constexpr std::size_t Slots = 1024;
+    std::vector<FragmentSetPlan> slots;
+    ShaderResources::FragmentPlanNote note;
+    std::uint64_t verifyOrdinal = 0;
+};
+
+struct FragmentSetPlansStorage {};
+
+std::atomic<std::uint64_t> planSerials{0};
+
+const char* plannedWritesDifference(std::span<const VkWriteDescriptorSet> mine, std::span<const VkWriteDescriptorSet> today) {
+    if (mine.size() != today.size()) return "the write count";
+    for (std::size_t at = 0; at < mine.size(); ++at) {
+        const auto& a = mine[at];
+        const auto& b = today[at];
+        if (a.dstSet != b.dstSet) return "a write's set";
+        if (a.dstBinding != b.dstBinding || a.dstArrayElement != b.dstArrayElement || a.descriptorCount != b.descriptorCount || a.descriptorType != b.descriptorType) return "a write's slot";
+        if (a.pNext != b.pNext || a.pImageInfo != b.pImageInfo || a.pTexelBufferView != b.pTexelBufferView || (a.pBufferInfo == nullptr) != (b.pBufferInfo == nullptr)) return "a write's infos";
+        if (a.pBufferInfo == nullptr) continue;
+        for (std::uint32_t element = 0; element < a.descriptorCount; ++element) {
+            const auto& x = a.pBufferInfo[element];
+            const auto& y = b.pBufferInfo[element];
+            if (x.buffer != y.buffer || x.offset != y.offset || x.range != y.range) return "a buffer info";
+        }
+    }
+    return nullptr;
+}
+
+void notePlanDifference(const char* what, std::size_t planned, std::size_t today, std::int32_t pushedSet) {
+    static std::atomic<std::uint32_t> printed{0};
+    if (printed.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[fragment-plans-verify] %s differs from today's: %zu writes planned, %zu today, pushed set %d\n", what, planned, today, static_cast<int>(pushedSet));
+}
+
+}
+
+std::uint64_t ShaderResources::NextPlanSerial() {
+    return planSerials.fetch_add(1, std::memory_order_relaxed) + 1u;
+}
+
+ShaderResources::FragmentPlanNote ShaderResources::TakeFragmentPlanNote() {
+    auto& plans = HostThreadLocal<FragmentSetPlans, FragmentSetPlansStorage>();
+    return std::exchange(plans.note, {});
+}
+
+void ShaderResources::writePlannedFragmentSets(DrawBindings& result, std::span<const std::size_t> selected, std::int32_t pushedSet) const {
+    auto& plans = HostThreadLocal<FragmentSetPlans, FragmentSetPlansStorage>();
+    if (plans.slots.empty()) plans.slots.resize(FragmentSetPlans::Slots);
+    auto mixed = planSerial * 0x9e3779b97f4a7c15ull ^ static_cast<std::uint64_t>(pushedSet + 2);
+    mixed ^= mixed >> 29u;
+    auto& plan = plans.slots[static_cast<std::size_t>(mixed % FragmentSetPlans::Slots)];
+    bool valid = plan.serial == planSerial && plan.pushedSet == pushedSet && plan.writeCount == descriptorWrites.size() && plan.bufferCount == descriptorBuffers.size();
+    for (std::size_t at = 0; valid && at < plan.variable.size(); ++at) valid = plan.variable[at].first < bindings.size() && bindings[plan.variable[at].first].imageAllocations.size() == plan.variable[at].second;
+    if (valid) {
+        ++plans.note.hit;
+    } else {
+        ++plans.note.built;
+        plan = {};
+        plan.serial = planSerial;
+        plan.pushedSet = pushedSet;
+        plan.writeCount = descriptorWrites.size();
+        plan.bufferCount = descriptorBuffers.size();
+        for (std::size_t index = 0; index < bindings.size(); ++index) {
+            const auto& binding = bindings[index];
+            if (binding.heap) continue;
+            const auto set = setOf(binding);
+            plan.described[set] = true;
+            const bool variable = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0;
+            if (variable) plan.variable.emplace_back(index, binding.imageAllocations.size());
+            const auto count = variable ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
+            if (count == 0) continue;
+            auto& sizes = plan.sizes[set];
+            const auto held = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
+            if (held != sizes.end()) held->descriptorCount += count;
+            else sizes.push_back({binding.layout.descriptorType, count});
+        }
+        for (auto& sizes : plan.sizes) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+        for (std::size_t set = 0; set < plan.variableCounts.size(); ++set) {
+            if (tableBindings[set] == std::numeric_limits<std::size_t>::max()) continue;
+            plan.variableCounts[set] = std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()));
+            plan.variable.emplace_back(tableBindings[set], bindings[tableBindings[set]].imageAllocations.size());
+        }
+        std::size_t next = 0;
+        for (std::size_t index = 0; index < bindings.size(); ++index) {
+            const auto& binding = bindings[index];
+            if (binding.heap) continue;
+            const auto original = setOf(binding) == 0 ? _set : fragment.set;
+            while (next < descriptorWrites.size() && descriptorWrites[next].dstBinding == binding.layout.binding && descriptorWrites[next].dstSet == original) {
+                const bool patched = !binding.allocations.empty();
+                plan.writes.push_back({next, index, patched ? static_cast<std::size_t>(descriptorWrites[next].pBufferInfo - descriptorBuffers.data()) : 0u, static_cast<std::uint8_t>(setOf(binding)), patched});
+                ++next;
+            }
+        }
+        if (next != descriptorWrites.size()) {
+            plan = {};
+            Require(false, "draw snapshot writes disagree with their descriptor bindings");
+        }
+    }
+    result.cache = context.descriptorCache;
+    if ((plan.described[0] || splitSets) && pushedSet != 0) {
+        result.allocation = result.cache->AllocateRewritten(_layout, plan.sizes[0], updateAfterBind, plan.variableCounts[0]);
+        result.layout = _layout;
+        Require(result.allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+    }
+    if (!heapStage && (plan.described[1] || splitSets) && pushedSet != 1) {
+        result.fragmentAllocation = result.cache->AllocateRewritten(fragment.layout, plan.sizes[1], updateAfterBind, plan.variableCounts[1]);
+        result.fragmentLayout = fragment.layout;
+        Require(result.fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+    }
+    struct BuffersStorage {};
+    auto& buffers = HostThreadLocal<std::vector<VkDescriptorBufferInfo>, BuffersStorage>();
+    if (buffers.size() != descriptorBuffers.size()) buffers.resize(descriptorBuffers.size());
+    struct IndicesStorage {};
+    auto& snapshotIndices = HostThreadLocal<std::vector<std::size_t>, IndicesStorage>();
+    snapshotIndices.assign(allocations.size(), selected.size());
+    for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
+    for (const auto& planned : plan.writes) {
+        if (!planned.patched || planned.offset >= buffers.size()) continue;
+        const auto reach = std::max<std::size_t>(descriptorWrites[planned.index].descriptorCount, bindings[planned.binding].allocations.size());
+        const auto end = std::min(planned.offset + reach, buffers.size());
+        std::copy(descriptorBuffers.begin() + static_cast<std::ptrdiff_t>(planned.offset), descriptorBuffers.begin() + static_cast<std::ptrdiff_t>(end), buffers.begin() + static_cast<std::ptrdiff_t>(planned.offset));
+    }
+    for (const auto& planned : plan.writes) {
+        if (!planned.patched) continue;
+        const auto& binding = bindings[planned.binding];
+        for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+            const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
+            if (snapshotIndex == selected.size() || planned.offset + element >= buffers.size()) continue;
+            const auto& snapshot = result.snapshots[snapshotIndex];
+            buffers[planned.offset + element] = wholeDwordRange({snapshot.Handle(), snapshot.offset, snapshot.bytes});
+        }
+    }
+    struct WritesStorage {};
+    auto& writes = HostThreadLocal<std::vector<VkWriteDescriptorSet>, WritesStorage>();
+    writes.clear();
+    for (const auto& planned : plan.writes) {
+        const auto set = planned.set == 0 ? result.allocation.set : result.fragmentAllocation.set;
+        if (pushedSet >= 0 && set == VK_NULL_HANDLE) continue;
+        auto& write = writes.emplace_back(descriptorWrites[planned.index]);
+        write.dstSet = set;
+        if (planned.patched) write.pBufferInfo = buffers.data() + planned.offset;
+    }
+    if (const auto every = CommitFragmentsVerifyEvery(); every != 0 && ++plans.verifyOrdinal % every == 0) {
+        ++plans.note.checked;
+        std::array<bool, 2> described{};
+        std::array<std::vector<VkDescriptorPoolSize>, 2> sizes;
+        for (const auto& binding : bindings) {
+            if (binding.heap) continue;
+            const auto set = setOf(binding);
+            described[set] = true;
+            const auto count = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
+            if (count == 0) continue;
+            const auto held = std::find_if(sizes[set].begin(), sizes[set].end(), [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
+            if (held != sizes[set].end()) held->descriptorCount += count;
+            else sizes[set].push_back({binding.layout.descriptorType, count});
+        }
+        std::vector<VkDescriptorBufferInfo> todayBuffers = descriptorBuffers;
+        std::vector<VkWriteDescriptorSet> todayWrites = descriptorWrites;
+        auto nextWrite = todayWrites.begin();
+        for (const auto& binding : bindings) {
+            if (binding.heap) continue;
+            const auto original = setOf(binding) == 0 ? _set : fragment.set;
+            while (nextWrite != todayWrites.end() && nextWrite->dstBinding == binding.layout.binding && nextWrite->dstSet == original) {
+                auto& write = *nextWrite++;
+                write.dstSet = setOf(binding) == 0 ? result.allocation.set : result.fragmentAllocation.set;
+                if (binding.allocations.empty()) continue;
+                const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
+                write.pBufferInfo = todayBuffers.data() + offset;
+                for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+                    const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
+                    if (snapshotIndex == selected.size()) continue;
+                    const auto& snapshot = result.snapshots[snapshotIndex];
+                    todayBuffers[offset + element] = wholeDwordRange({snapshot.Handle(), snapshot.offset, snapshot.bytes});
+                }
+            }
+        }
+        const char* what = nextWrite != todayWrites.end() ? "the write shape" : nullptr;
+        if (pushedSet >= 0) std::erase_if(todayWrites, [](const VkWriteDescriptorSet& write) { return write.dstSet == VK_NULL_HANDLE; });
+        const auto samePool = [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type == b.type && a.descriptorCount == b.descriptorCount; };
+        for (std::size_t set = 0; what == nullptr && set < sizes.size(); ++set) {
+            std::sort(sizes[set].begin(), sizes[set].end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+            const auto variable = tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt;
+            if (described[set] != plan.described[set] || !std::ranges::equal(sizes[set], plan.sizes[set], samePool) || variable != plan.variableCounts[set]) what = "the pool sizes";
+        }
+        if (what == nullptr) what = plannedWritesDifference(writes, todayWrites);
+        if (what != nullptr) {
+            ++plans.note.differing;
+            notePlanDifference(what, writes.size(), todayWrites.size(), pushedSet);
+            plan = {};
+            Require(false, "a planned fragment set update differs from today's");
+        }
+    }
+    writeAddressedOverlay(result, selected);
+    context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 void ShaderResources::writeFreshDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet) const {
@@ -9944,7 +10165,7 @@ bool ShaderResources::PrepareDirectBuffers(const BufferPlan& plan, std::span<con
     out.moved.clear();
     out.selected.clear();
     out.blob.clear();
-    if (out.blob.capacity() == 0) out.blob.reserve(8192);
+    if (out.blob.capacity() == 0 && !RuntimeSwitches::Set(RuntimeSwitch::BufferBlobAppend)) out.blob.reserve(8192);
     out.refusal = Refusal::None;
     out.inPlace = false;
     out.imports = inPlace != nullptr ? HostImportSetGeneration() : 0;
@@ -10015,10 +10236,35 @@ bool ShaderResources::PrepareDirectBuffers(const BufferPlan& plan, std::span<con
     }
     if (next != plan.elements.size()) return refuse(Refusal::Classification);
     const bool movedUploads = RuntimeSwitches::Set(RuntimeSwitch::MovedLargeUploads);
+    struct Part {
+        std::size_t offset;
+        const std::byte* source;
+        std::size_t bytes;
+        std::size_t allocation;
+        bool words;
+    };
+    struct PartsStorage {};
+    auto* const parts = RuntimeSwitches::Set(RuntimeSwitch::BufferBlobAppend) ? &HostThreadLocal<std::vector<Part>, PartsStorage>() : nullptr;
+    if (parts != nullptr) parts->clear();
+    std::size_t total = 0;
     const auto place = [&](std::size_t bytes) {
-        const auto offset = (out.blob.size() + plan.alignment - 1) & ~(plan.alignment - 1);
-        out.blob.resize(offset + bytes);
+        const auto offset = ((parts != nullptr ? total : out.blob.size()) + plan.alignment - 1) & ~(plan.alignment - 1);
+        if (parts != nullptr) total = offset + bytes;
+        else out.blob.resize(offset + bytes);
         return offset;
+    };
+    const auto patchWords = [&](std::size_t index, std::size_t offset, std::size_t bytes) {
+        for (const auto& patch : plan.patches) {
+            if (patch.allocation == index && patch.byte < bytes) out.blob[offset + patch.byte] = static_cast<std::byte>(patch.adjustment);
+        }
+    };
+    const auto copy = [&](std::size_t index, std::size_t offset, const void* source, std::size_t bytes, bool words) {
+        if (parts != nullptr) {
+            parts->push_back({offset, static_cast<const std::byte*>(source), bytes, index, words});
+            return;
+        }
+        std::memcpy(out.blob.data() + offset, source, bytes);
+        if (words) patchWords(index, offset, bytes);
     };
     std::size_t totalSnapshotBytes = 0;
     for (std::size_t index = 0; index < plan.allocations.size(); ++index) {
@@ -10027,10 +10273,7 @@ bool ShaderResources::PrepareDirectBuffers(const BufferPlan& plan, std::span<con
         const bool moved = override != out.moved.end();
         if (moved && !override->words.empty()) {
             const auto offset = place(override->size);
-            std::memcpy(out.blob.data() + offset, override->words.data(), override->size);
-            for (const auto& patch : plan.patches) {
-                if (patch.allocation == index && patch.byte < override->size) out.blob[offset + patch.byte] = static_cast<std::byte>(patch.adjustment);
-            }
+            copy(index, offset, override->words.data(), override->size, true);
             out.selected.push_back({index, 0, override->size, offset, true});
             continue;
         }
@@ -10057,10 +10300,18 @@ bool ShaderResources::PrepareDirectBuffers(const BufferPlan& plan, std::span<con
         }
         if (!moved && !GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return refuse(Refusal::Inaccessible);
         const auto offset = place(bytes);
-        std::memcpy(out.blob.data() + offset, reinterpret_cast<const void*>(begin), bytes);
+        copy(index, offset, reinterpret_cast<const void*>(begin), bytes, false);
         out.selected.push_back({index, begin, bytes, offset, moved, false, handle, importOffset});
         totalSnapshotBytes += bytes;
     }
+    if (parts == nullptr) return true;
+    if (out.blob.capacity() < total) out.blob.reserve(total);
+    for (const auto& part : *parts) {
+        if (out.blob.size() < part.offset) out.blob.resize(part.offset);
+        out.blob.insert(out.blob.end(), part.source, part.source + part.bytes);
+        if (part.words) patchWords(part.allocation, part.offset, part.bytes);
+    }
+    parts->clear();
     return true;
 }
 
@@ -10170,7 +10421,64 @@ void ShaderResources::PushDrawBindings(VkCommandBuffer commands, VkPipelineLayou
 }
 
 void ShaderResources::PushFragmentBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const {
+    if (RuntimeSwitches::Set(RuntimeSwitch::FragmentPlans)) {
+        pushPlannedBindings(commands, layout, result, plan);
+        return;
+    }
     pushBindings(commands, layout, result, plan);
+}
+
+void ShaderResources::pushPlannedBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const {
+    const auto fragmentSet = ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet;
+    if (plan.set == 1u) {
+        const auto set = result.allocation.set != VK_NULL_HANDLE ? result.allocation.set : _set;
+        if (set != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, SetBindSite::Draw, result.DynamicCount(0), result.DynamicOffsets(0));
+    } else if (splitSets) {
+        const auto set = result.fragmentAllocation.set != VK_NULL_HANDLE ? result.fragmentAllocation.set : fragment.set;
+        if (set != VK_NULL_HANDLE) CmdBindDescriptorSets(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, fragmentSet, 1, &set, SetBindSite::Draw, result.DynamicCount(1), result.DynamicOffsets(1));
+    }
+    struct PushBuffersStorage {};
+    auto& buffers = HostThreadLocal<std::vector<VkDescriptorBufferInfo>, PushBuffersStorage>();
+    if (buffers.size() != descriptorBuffers.size()) buffers.resize(descriptorBuffers.size());
+    for (const auto index : plan.writes) {
+        const auto& write = descriptorWrites[index];
+        if (write.pBufferInfo == nullptr) continue;
+        const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
+        const auto end = std::min<std::size_t>(offset + write.descriptorCount, descriptorBuffers.size());
+        if (offset < end) std::copy(descriptorBuffers.begin() + static_cast<std::ptrdiff_t>(offset), descriptorBuffers.begin() + static_cast<std::ptrdiff_t>(end), buffers.begin() + static_cast<std::ptrdiff_t>(offset));
+    }
+    overlayPushedBuffers(result, plan, buffers);
+    struct PushWritesStorage {};
+    auto& writes = HostThreadLocal<std::vector<VkWriteDescriptorSet>, PushWritesStorage>();
+    writes.clear();
+    for (const auto index : plan.writes) {
+        auto& write = writes.emplace_back(descriptorWrites[index]);
+        write.dstSet = VK_NULL_HANDLE;
+        if (write.pBufferInfo != nullptr) write.pBufferInfo = buffers.data() + (descriptorWrites[index].pBufferInfo - descriptorBuffers.data());
+    }
+    auto& plans = HostThreadLocal<FragmentSetPlans, FragmentSetPlansStorage>();
+    ++plans.note.pushed;
+    if (const auto every = CommitFragmentsVerifyEvery(); every != 0 && ++plans.verifyOrdinal % every == 0) {
+        ++plans.note.checked;
+        std::vector<VkDescriptorBufferInfo> today = descriptorBuffers;
+        overlayPushedBuffers(result, plan, today);
+        bool same = true;
+        for (const auto& write : writes) {
+            if (write.pBufferInfo == nullptr) continue;
+            const auto offset = static_cast<std::size_t>(write.pBufferInfo - buffers.data());
+            for (std::uint32_t element = 0; same && element < write.descriptorCount && offset + element < today.size(); ++element) {
+                const auto& a = write.pBufferInfo[element];
+                const auto& b = today[offset + element];
+                same = a.buffer == b.buffer && a.offset == b.offset && a.range == b.range;
+            }
+        }
+        if (!same) {
+            ++plans.note.differing;
+            notePlanDifference("a pushed buffer info", writes.size(), writes.size(), static_cast<std::int32_t>(plan.set));
+            Require(false, "a planned push differs from today's");
+        }
+    }
+    CmdPushDescriptorSet(context.Resolved(&DeviceFunctions::cmdPushDescriptorSet, "vkCmdPushDescriptorSetKHR"), commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, plan.set == 0 ? 0u : fragmentSet, static_cast<std::uint32_t>(writes.size()), writes.data(), SetBindSite::Draw);
 }
 
 void ShaderResources::pushBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const {

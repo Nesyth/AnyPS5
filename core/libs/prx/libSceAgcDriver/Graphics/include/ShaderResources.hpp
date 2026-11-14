@@ -490,6 +490,14 @@ public:
     PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched = false) const;
     void PushFragmentBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
     void WriteFragmentSets(DrawBindings& result, std::span<const std::size_t> selected, std::int32_t pushedSet) const;
+    struct FragmentPlanNote {
+        std::uint32_t built = 0;
+        std::uint32_t hit = 0;
+        std::uint32_t pushed = 0;
+        std::uint32_t checked = 0;
+        std::uint32_t differing = 0;
+    };
+    static FragmentPlanNote TakeFragmentPlanNote();
     void RewriteFragmentFaults(const DrawBindings& placed) const;
     DescriptorCache* FragmentDescriptorCache() const { return context.descriptorCache; }
     struct RepeatPush {
@@ -1271,6 +1279,10 @@ private:
     mutable std::atomic<std::uint64_t> multisampleGuardsClear{std::numeric_limits<std::uint64_t>::max()};
     void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     void writeFreshDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet) const;
+    void writePlannedFragmentSets(DrawBindings& result, std::span<const std::size_t> selected, std::int32_t pushedSet) const;
+    void pushPlannedBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const;
+    static std::uint64_t NextPlanSerial();
+    std::uint64_t planSerial = NextPlanSerial();
     bool preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched = false) const;
     void pushBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const;
     void writeOwnDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;

@@ -17,6 +17,24 @@ using AddressRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
 
 inline std::atomic<std::uint64_t> PreciseSettles{0};
 
+inline bool RangesStamped(const AddressRanges& ranges, std::uint64_t generation) {
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle) && GuestMemory::TrackerGenerationNow() <= generation) return true;
+    const bool precise = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PreciseSettle);
+    for (const auto& [begin, end] : ranges) {
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        if (GuestMemory::NewestStamp(begin, bytes) <= generation) continue;
+        if (!precise || !GuestMemory::UnchangedSince(begin, bytes, generation)) return false;
+        PreciseSettles.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+inline bool RangesSettledSince(const AddressRanges& ranges, const Graphics::Recorder::WriteRanges* before, std::uint64_t generation, const Graphics::Recorder::WriteRanges* also, std::uint64_t serial) {
+    const bool queuedWrite = DrawPipeline::Active() && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().OverlapsAny(ranges);
+    if (queuedWrite || !Graphics::Recorder::ReadsSettledSince(ranges, before, also, serial, before)) return false;
+    return RangesStamped(ranges, generation);
+}
+
 inline bool RangesSettled(const AddressRanges& ranges, const Graphics::Recorder::WriteRanges* before, std::uint64_t generation, const Graphics::Recorder::WriteRanges* also = nullptr) {
     const bool queuedWrite = DrawPipeline::Active() && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().OverlapsAny(ranges);
     if (queuedWrite || !Graphics::Recorder::ReadsSettled(ranges, before, also)) return false;

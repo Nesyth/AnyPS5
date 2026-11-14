@@ -223,6 +223,13 @@ struct DrawRecordHit {
     Graphics::ShaderResources::PreparedBuffers spareBuffers;
     Graphics::PreparedInputs spareInputs;
     bool pooled = false;
+    std::shared_ptr<VulkanDevice> device;
+    std::shared_ptr<const DrawDecode> decode;
+    Graphics::DrawTraceContext trace{};
+    std::uint64_t epoch = 0;
+    std::uint64_t shape = 0;
+    std::uint32_t queue = 0;
+    std::uint32_t opcode = 0;
 };
 
 namespace DrawRecordFlags {
