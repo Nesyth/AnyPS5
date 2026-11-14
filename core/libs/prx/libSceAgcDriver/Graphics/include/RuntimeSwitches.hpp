@@ -140,6 +140,14 @@ enum class RuntimeSwitch : std::size_t {
     DrawRuns,
     LeanPrepare,
     PooledHits,
+    ExpressTargetUploads,
+    AliasesAtPrepare,
+    StageMemoAdmitFirst,
+    XpNoOcclusion,
+    LabelReadbackMemo,
+    StageMemoNoIndex,
+    PassBarriersMerged,
+    ExpressPassStamps,
     Count,
 };
 

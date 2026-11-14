@@ -1794,6 +1794,7 @@ public:
         for (std::size_t index = 0; index < erased; ++index) PendingZones::Remove(texture->Descriptor().baseAddress, texture->GuestBytes());
         if (erased != 0) changed();
     }
+    std::uint64_t Version() const { return version; }
     bool MayOverlap(std::uint64_t address, std::size_t bytes) {
         if (indexed != version) rebuild();
         return !textures.empty() && Overlaps(ranges, address, bytes);
@@ -1861,7 +1862,13 @@ struct PendingWrites {
     };
     std::vector<Drawn> drawn;
     std::atomic<std::size_t> drawnCount{0};
+    std::uint64_t labelScanVersion = ~std::uint64_t{0};
+    std::uint64_t labelScanMarks = 0;
+    VkDevice labelScanDevice = VK_NULL_HANDLE;
+    bool labelScanClean = false;
 };
+
+std::atomic<std::uint64_t> occasionalMarks{0};
 
 PendingWrites& Pending() {
     static PendingWrites pending;
@@ -4444,7 +4451,9 @@ bool StorageTexture::RenoteInPass(std::uint64_t recorder, std::uint64_t pass, st
     const auto& note = passNote;
     ++writes;
     if (const auto flip = flipSerial.load(std::memory_order_relaxed); flip != writtenFlip) {
-        writtenOccasionally = flip - writtenFlip > OccasionalWriteFlips;
+        const bool occasional = flip - writtenFlip > OccasionalWriteFlips;
+        writtenOccasionally = occasional;
+        if (occasional) occasionalMarks.fetch_add(1, std::memory_order_relaxed);
         writtenFlip = flip;
     }
     const auto pendingSince = GuestMemory::TrackerGeneration();
@@ -4485,7 +4494,9 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     ++writes;
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (const auto flip = flipSerial.load(std::memory_order_relaxed); writes == 1u || flip != writtenFlip) {
-        writtenOccasionally = writes == 1u || flip - writtenFlip > OccasionalWriteFlips;
+        const bool occasional = writes == 1u || flip - writtenFlip > OccasionalWriteFlips;
+        writtenOccasionally = occasional;
+        if (occasional) occasionalMarks.fetch_add(1, std::memory_order_relaxed);
         writtenFlip = flip;
     }
     std::optional<MapImportGate::PublishHold> publication;
@@ -5519,6 +5530,11 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
+        const auto scanVersion = pending.textures.Version();
+        const auto scanMarks = occasionalMarks.load(std::memory_order_relaxed);
+#if !defined(__APPLE__)
+        if (RuntimeSwitches::Set(RuntimeSwitch::LabelReadbackMemo) && pending.labelScanClean && pending.labelScanVersion == scanVersion && pending.labelScanMarks == scanMarks && pending.labelScanDevice == device) return;
+#endif
 #if defined(__APPLE__)
         const bool trap = LabelTrapsEnabled();
         if (trap) labelTrapsSet.store(true, std::memory_order_relaxed);
@@ -5548,6 +5564,10 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
             occasionalLabelStores.fetch_add(1, std::memory_order_relaxed);
             occasional.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
         }
+        pending.labelScanClean = ranges.empty() && occasional.empty();
+        pending.labelScanVersion = scanVersion;
+        pending.labelScanMarks = scanMarks;
+        pending.labelScanDevice = device;
     }
     for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
     for (const auto& [address, bytes] : occasional) static_cast<void>(FlushPending(address, bytes, nullptr, reason, PublishScope::Whole, nullptr, false, device));

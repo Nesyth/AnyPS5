@@ -360,6 +360,7 @@ public:
         std::uint64_t forget = 0;
         mutable std::shared_ptr<DrawBindings> placed;
         VkDevice placedDevice = VK_NULL_HANDLE;
+        bool aliasesClear = false;
     };
     enum class BindingTaken : std::uint8_t { None, Placed, Copied, OtherDevice, Count };
     enum class DynamicLeave : std::uint8_t { None, Refused, Prepared, Stages, HeapPipeline, Heap, Address, AfterBind, Addressed, Faults, Shape, Uniform, OtherType, Flags, NoStorage, Limit, PushHeld, OtherSet, First, Repeats, Pipeline, Rebound, Count };

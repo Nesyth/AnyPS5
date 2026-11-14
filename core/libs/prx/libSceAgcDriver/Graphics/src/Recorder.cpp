@@ -550,6 +550,8 @@ void ReleaseDeferredKeeps() {
 // and inside WAIT_REG_MEM polls (see the static readers in Recorder.hpp). Written under the mutex.
 constexpr std::int64_t NoPendingLabel = std::numeric_limits<std::int64_t>::min();
 constexpr BarrierMask PassEndBarrier{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+std::array<std::atomic<std::uint64_t>, PassBreakCount + 3> passCensus{};
+constexpr VkAccessFlags DrawLeadingAccess = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 constexpr BarrierMask LabelLeadingBarrier{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
 std::atomic<std::int64_t> pendingLabelSince{NoPendingLabel};
 std::atomic<std::uint64_t> writeGeneration{0};
@@ -1892,12 +1894,17 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     ensureOpen();
     flushDeferredDispatch();
     auto& pass = open->renderPass;
+    const auto led = [](VkAccessFlags covered) { return RuntimeSwitches::Set(RuntimeSwitch::PassBarriersMerged) && BarrierBatch() && (covered & DrawLeadingAccess) == DrawLeadingAccess; };
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
         const auto reason = !pass.open ? pass.closedBy : forced ? PassBreak::Forced : PassBreak::Segment;
-        const auto commands = Commands();
+        VkAccessFlags covered = 0;
+        const auto commands = Commands(&covered);
         open->passHazards.Clear();
         open->passHazards.BeginPass();
-        return {commands, false, true, reason};
+        const bool merged = led(covered);
+        if (merged) CountMerged(CommandClass::Draw);
+        passCensus[PassBreakCount + (merged ? 1u : 0u)].fetch_add(1, std::memory_order_relaxed);
+        return {commands, false, !merged, reason};
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
     if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false, PassBreak::Continued};
@@ -1905,10 +1912,14 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
     endOpenRenderPass(reason, !merge);
-    const auto commands = Commands();
+    VkAccessFlags covered = 0;
+    const auto commands = Commands(&covered);
     if (!elide) open->passHazards.Clear();
     open->passHazards.BeginPass();
-    return {commands, false, !elide, reason};
+    const bool merged = !elide && led(covered);
+    if (merged) CountMerged(CommandClass::Draw);
+    passCensus[PassBreakCount + (elide ? 2u : merged ? 1u : 0u)].fetch_add(1, std::memory_order_relaxed);
+    return {commands, false, !elide && !merged, reason};
 }
 
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
@@ -1938,20 +1949,28 @@ bool Recorder::RenderPassOpen() const {
     return open != nullptr && open->renderPass.open;
 }
 
+std::array<std::uint64_t, PassBreakCount + 3> Recorder::PassCensus() {
+    std::array<std::uint64_t, PassBreakCount + 3> counts{};
+    for (std::size_t index = 0; index < counts.size(); ++index) counts[index] = passCensus[index].load(std::memory_order_relaxed);
+    return counts;
+}
+
 void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
     ++passGeneration;
+    passCensus[static_cast<std::size_t>(by)].fetch_add(1, std::memory_order_relaxed);
     auto& pass = open->renderPass;
     if (open->segmentActive) endSegment(*open);
     EndRenderPass(context, open->commands);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
     // host sees them at the batch's fence).
+    const VkAccessFlags leading = barrier && !pass.afterPass && RuntimeSwitches::Set(RuntimeSwitch::PassBarriersMerged) ? DrawLeadingAccess : 0;
     if (barrier) {
-        recordBarrier(open->commands, PassEndBarrier.srcStage, PassEndBarrier.dstStage, PassEndBarrier.srcAccess, PassEndBarrier.dstAccess);
+        recordBarrier(open->commands, PassEndBarrier.srcStage, PassEndBarrier.dstStage, PassEndBarrier.srcAccess, PassEndBarrier.dstAccess | leading);
         CountBarriers(CommandClass::Draw);
     }
     if (pass.afterPass) pass.afterPass(open->commands);
     EndGpuTiming(pass.timing);
-    open->coveredAccess = barrier ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0;
+    open->coveredAccess = barrier ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | leading : 0;
     open->hostReadOwed = true;
     pass = {};
     pass.closedBy = by;
@@ -2633,8 +2652,10 @@ std::uint64_t Recorder::SamplesTotal() {
 }
 
 void Recorder::NoteSampledDraw(VkCommandBuffer commands) {
+    ++sampledDrawsSinceDump;
     if (open == nullptr) return;
     if (segmentMode()) {
+        if (RuntimeSwitches::Set(RuntimeSwitch::XpNoOcclusion)) return;
         if (countingSamples && commands == open->commands && !open->segmentActive) beginSegment(*open);
         return;
     }
@@ -3023,9 +3044,16 @@ void Recorder::foldSamples(Batch& batch, VkDeviceAddress target) {
 bool Recorder::DumpSamples(VkDeviceAddress target, std::uint64_t address) {
     GuestMemory::AssertGpuLockHeld("Recorder::DumpSamples");
     if (target == 0 || !gpuSampleCounter()) return false;
+    static const bool dumpDiag = std::getenv("APS5_SAMPLE_DUMP_DIAG") != nullptr;
+    if (dumpDiag) {
+        const auto ordinal = dumpOrdinal++;
+        if (ordinal >= 20000u && ordinal < 20400u) std::fprintf(stderr, "[sample-dump-diag] dump %llu at %llx (%+lld from the previous), %llu draws since the previous dump\n", static_cast<unsigned long long>(ordinal), static_cast<unsigned long long>(address), static_cast<long long>(address - lastDumpAddress), static_cast<unsigned long long>(sampledDrawsSinceDump));
+    }
+    lastDumpAddress = address;
+    sampledDrawsSinceDump = 0;
     countingSamples = true;
     flushDeferredDispatch();
-    const bool xpVisible = RuntimeSwitches::Set(RuntimeSwitch::XpKeepDraws);
+    const bool xpVisible = RuntimeSwitches::Set(RuntimeSwitch::XpKeepDraws) || RuntimeSwitches::Set(RuntimeSwitch::XpNoOcclusion);
     if (segmentMode()) {
         ensureOpen();
         if (address != 0 && LabelRunsPerBatch() && pendingSamples.size() + (xpVisible ? 1u : 0u) < SegmentFoldCapacity && open->queuedDumps < DumpFoldCapacity) {

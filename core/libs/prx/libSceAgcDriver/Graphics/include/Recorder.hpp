@@ -608,6 +608,7 @@ public:
     // Presentations so far (never reset): a frame clock for policies that count per frame, such as
     // StorageTexture's write-back hysteresis.
     static std::uint64_t Presents();
+    static std::array<std::uint64_t, PassBreakCount + 3> PassCensus();
     static void NoteFrameGpuBusy(double milliseconds);
     static std::pair<std::uint64_t, double> FrameGpuBusy();
     static void RequestBatchStamps();
@@ -838,6 +839,9 @@ private:
     };
     std::vector<SampleSegment> pendingSamples;
     bool countingSamples = false;
+    std::uint64_t sampledDrawsSinceDump = 0;
+    std::uint64_t lastDumpAddress = 0;
+    std::uint64_t dumpOrdinal = 0;
     int meshArgumentState = 0;
     VkPipelineLayout meshArgumentLayout = VK_NULL_HANDLE;
     VkPipeline meshArgumentPipeline = VK_NULL_HANDLE;

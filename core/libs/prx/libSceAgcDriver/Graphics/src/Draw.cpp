@@ -7239,12 +7239,21 @@ void noteLeanExpress(bool untouched) {
 
 namespace {
 
-std::array<std::atomic<std::uint64_t>, 7> expressTargetCauses{};
+std::array<std::atomic<std::uint64_t>, 8> expressTargetCauses{};
 
 }
 
-std::array<std::uint64_t, 7> ExpressTargetMissCauses() {
-    std::array<std::uint64_t, 7> causes{};
+bool DrawBufferAliasesClear(std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::uint64_t indexBytes) {
+    try {
+        CheckBufferAliases(shaders, target, indexAddress, indexBytes);
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+
+std::array<std::uint64_t, 8> ExpressTargetMissCauses() {
+    std::array<std::uint64_t, 8> causes{};
     for (std::size_t index = 0; index < causes.size(); ++index) causes[index] = expressTargetCauses[index].load(std::memory_order_relaxed);
     return causes;
 }
@@ -7397,6 +7406,8 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
             if (keep.targets[index] == nullptr) NoteMultisampleTargetDrawn_nid_no_patch(keep.multisample[index]);
         }
     }
+    bool depthStamped = false;
+    std::uint32_t multisampleStamped = 0;
     const bool sameTargets = appended || (atFloor && recorder->RenderPassOpen() && floorPass.recorder == recorder->Id() && floorPass.generation == recorder->RenderPassGeneration() && floorPass.framebuffer == keep.framebuffer.get());
     for (std::size_t index = 0; !sameTargets && index < keep.targets.size(); ++index) {
         const auto& target = keep.targets[index];
@@ -7416,6 +7427,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
                 if (view != recipe->targetViews[index] || current.get() != owner || image != express->multisampleImages[index]) return targetMiss(1);
                 auto& slot = found != checked.end() ? *found : checked[nextChecked++ % checked.size()];
                 slot = {owner, recorder->Id(), generation};
+                multisampleStamped |= 1u << static_cast<std::uint32_t>(&slot - checked.data());
                 ++out.refreshed;
             } else {
                 NoteMultisampleTargetDrawn_nid_no_patch(keep.multisample[index]);
@@ -7426,7 +7438,9 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         const auto& color = state.colors[index];
         const auto dcc = SurfaceForTarget(color).dccAddress;
         if (dcc != express->dccAddresses[index] || !StorageImageServesKeys(*target, dcc)) return targetMiss(3);
-        if (!recorder->RenderPassOpen() || !target->NotedInPass(recorder->Id(), recorder->RenderPassGeneration())) {
+        const bool follows = RuntimeSwitches::Set(RuntimeSwitch::ExpressTargetUploads);
+        const bool uploaded = follows && target->UploadVersion() != express->targetVersions[index];
+        if (uploaded || !recorder->RenderPassOpen() || !target->NotedInPass(recorder->Id(), recorder->RenderPassGeneration())) {
             if (!StorageImageCached(context, target.get())) return targetMiss(4);
             if (color.fmaskAddress != 0) GuardOneFragmentFmask(context, color);
             DrawOutcome refreshed;
@@ -7438,7 +7452,11 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
             if (resident.get() != target.get()) return targetMiss(5);
             ++out.refreshed;
         }
-        if (target->UploadVersion() != express->targetVersions[index]) return targetMiss(6);
+        if (target->UploadVersion() != express->targetVersions[index]) {
+            if (!follows) return targetMiss(6);
+            express->targetVersions[index] = target->UploadVersion();
+            expressTargetCauses[7].fetch_add(1, std::memory_order_relaxed);
+        }
     }
     if (express->hasDepth && (DepthSurfacesSerial() != express->depthSerial || DepthSurfacesReleased() != express->depthReleased)) return miss(DrawExpressMiss::Depth);
     if (!sameTargets && recipe->hasDepth && state.depth.has_value()) {
@@ -7449,6 +7467,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
             const auto view = DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state));
             if (view != expected) return miss(DrawExpressMiss::Depth);
             checked = {recorder->Id(), generation, state.depth->address, expected};
+            depthStamped = true;
             ++out.refreshed;
         }
     }
@@ -7531,7 +7550,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     } catch (const std::exception&) {
         return giveBack(DrawExpressMiss::Staging);
     }
-    if (!atFloor) CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
+    if (!atFloor && !(prepared->aliasesClear && RuntimeSwitches::Set(RuntimeSwitch::AliasesAtPrepare))) CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
     if (recipe->hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     if (const auto present = Recorder::Presents(); record.touchedPresent != present) {
         if ((!atFloor && !RuntimeSwitches::Set(RuntimeSwitch::TemplateTouch)) || resources.TouchedPresent() != present) {
@@ -7559,7 +7578,23 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     for (std::size_t index = 0; index < keep.targets.size(); ++index) passAttachments.emplace_back(keep.targets[index] != nullptr ? keep.targets[index]->Image() : express->multisampleImages[index], true);
     const PassAccess passAccess{passReads, express->writes, express->images, passAttachments, false, false, express->writeOnly};
     resources.RequireGuestBuffers();
+    const auto generationBeforeStart = recorder->RenderPassGeneration();
+    const bool passOpenBeforeStart = recorder->RenderPassOpen() && !recorder->RunOpen();
     const auto start = recorder->StartDrawPass(express->passKey, false, express->fenced, passAccess);
+    if ((depthStamped || multisampleStamped != 0) && passOpenBeforeStart && recorder->RenderPassGeneration() == generationBeforeStart + 1 && RuntimeSwitches::Set(RuntimeSwitch::ExpressPassStamps)) {
+        const auto opened = recorder->RenderPassGeneration();
+        if (depthStamped) {
+            auto& depthMemo = HostThreadLocal<ExpressDepthChecked, ExpressDepthStorage>();
+            if (depthMemo.recorder == recorder->Id() && depthMemo.generation == generationBeforeStart) depthMemo.generation = opened;
+        }
+        if (multisampleStamped != 0) {
+            auto& memo = HostThreadLocal<ExpressMultisampleMemo, ExpressMultisampleStorage>();
+            for (std::size_t slot = 0; slot < memo.checked.size(); ++slot) {
+                auto& entry = memo.checked[slot];
+                if (((multisampleStamped >> slot) & 1u) != 0 && entry.recorder == recorder->Id() && entry.generation == generationBeforeStart) entry.generation = opened;
+            }
+        }
+    }
     record.access.generation = recorder->RenderPassGeneration();
     if (atFloor) floorPass = {recorder->Id(), recorder->RenderPassGeneration(), keep.framebuffer.get()};
     const auto commands = start.commands;

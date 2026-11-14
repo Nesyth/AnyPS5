@@ -146,6 +146,14 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_DRAW_RUNS",
     "APS5_LEAN_PREPARE",
     "APS5_POOLED_HITS",
+    "APS5_EXPRESS_TARGET_UPLOADS",
+    "APS5_ALIASES_AT_PREPARE",
+    "APS5_STAGE_MEMO_ADMIT_FIRST",
+    "APS5_XP_NO_OCCLUSION",
+    "APS5_LABEL_READBACK_MEMO",
+    "APS5_STAGE_MEMO_NO_INDEX",
+    "APS5_PASS_BARRIERS_MERGED",
+    "APS5_EXPRESS_PASS_STAMPS",
 };
 static_assert(SwitchNames.back() != nullptr, "every runtime switch needs a name");
 
@@ -292,6 +300,14 @@ struct SwitchValues {
             std::getenv("APS5_DRAW_RUNS") != nullptr,
             std::getenv("APS5_LEAN_PREPARE") != nullptr,
             std::getenv("APS5_POOLED_HITS") != nullptr,
+            std::getenv("APS5_EXPRESS_TARGET_UPLOADS") != nullptr,
+            std::getenv("APS5_ALIASES_AT_PREPARE") != nullptr,
+            std::getenv("APS5_STAGE_MEMO_ADMIT_FIRST") != nullptr,
+            std::getenv("APS5_XP_NO_OCCLUSION") != nullptr,
+            std::getenv("APS5_LABEL_READBACK_MEMO") != nullptr,
+            std::getenv("APS5_STAGE_MEMO_NO_INDEX") != nullptr,
+            std::getenv("APS5_PASS_BARRIERS_MERGED") != nullptr,
+            std::getenv("APS5_EXPRESS_PASS_STAMPS") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

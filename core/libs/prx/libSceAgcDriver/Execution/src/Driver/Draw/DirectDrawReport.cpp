@@ -400,9 +400,33 @@ void Report(bool force) {
     if (sum(Counter::FragmentsBlockNotReusable, Counter::FragmentsBlockModes) != 0) {
         AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] fragment blocks not published: %llu commits%s\n", static_cast<unsigned long long>(sum(Counter::FragmentsBlockNotReusable, Counter::FragmentsBlockModes)), reasons(counts, Counter::FragmentsBlockNotReusable, Counter::FragmentsBlockModes).c_str());
     }
+    {
+        static std::array<std::uint64_t, Graphics::PassBreakCount + 3> lastPasses{};
+        static std::uint64_t lastPresents = 0;
+        const auto passes = Graphics::Recorder::PassCensus();
+        const auto presents = Graphics::Recorder::Presents();
+        std::uint64_t ends = 0;
+        std::string byReason;
+        for (std::size_t index = 0; index < Graphics::PassBreakCount; ++index) {
+            const auto delta = passes[index] - lastPasses[index];
+            ends += delta;
+            if (delta == 0) continue;
+            byReason += byReason.empty() ? "" : ", ";
+            byReason += Graphics::PassBreakNames[index];
+            byReason += ' ';
+            byReason += std::to_string(delta);
+        }
+        if (ends != 0) {
+            AgcDriver::ProfilePrint_nid_no_patch("[passes] %llu presents: %llu pass ends (%s); pass starts: %llu with a leading barrier, %llu merged into the previous pass-end barrier, %llu with the boundary elided\n",
+                static_cast<unsigned long long>(presents - lastPresents), static_cast<unsigned long long>(ends), byReason.c_str(),
+                static_cast<unsigned long long>(passes[Graphics::PassBreakCount] - lastPasses[Graphics::PassBreakCount]), static_cast<unsigned long long>(passes[Graphics::PassBreakCount + 1] - lastPasses[Graphics::PassBreakCount + 1]), static_cast<unsigned long long>(passes[Graphics::PassBreakCount + 2] - lastPasses[Graphics::PassBreakCount + 2]));
+        }
+        lastPasses = passes;
+        lastPresents = presents;
+    }
     if (const auto causes = Graphics::ExpressTargetMissCauses(); std::any_of(causes.begin(), causes.end(), [](std::uint64_t count) { return count != 0; })) {
-        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] express target misses in the run: multisample shape %llu, multisample view %llu, target not cached %llu, dcc or keys %llu, image not cached %llu, another resident %llu, upload version %llu\n",
-            static_cast<unsigned long long>(causes[0]), static_cast<unsigned long long>(causes[1]), static_cast<unsigned long long>(causes[2]), static_cast<unsigned long long>(causes[3]), static_cast<unsigned long long>(causes[4]), static_cast<unsigned long long>(causes[5]), static_cast<unsigned long long>(causes[6]));
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] express target misses in the run: multisample shape %llu, multisample view %llu, target not cached %llu, dcc or keys %llu, image not cached %llu, another resident %llu, upload version %llu; %llu commits followed a new upload version\n",
+            static_cast<unsigned long long>(causes[0]), static_cast<unsigned long long>(causes[1]), static_cast<unsigned long long>(causes[2]), static_cast<unsigned long long>(causes[3]), static_cast<unsigned long long>(causes[4]), static_cast<unsigned long long>(causes[5]), static_cast<unsigned long long>(causes[6]), static_cast<unsigned long long>(causes[7]));
     }
     if (sum(Counter::ExpressTaken, Counter::ExpressCaptureUnreached) != 0) {
         const auto perCommit = [&](Counter nanoseconds, Counter timed) { return at(timed) == 0 ? 0.0 : static_cast<double>(at(nanoseconds)) / static_cast<double>(at(timed)); };

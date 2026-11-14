@@ -340,6 +340,7 @@ void prepareBuffers(const LeanDrawJob& job, const LeanAnchor& anchor, const Dire
         return;
     }
     prepared.plan = std::move(plan);
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::AliasesAtPrepare)) prepared.aliasesClear = Graphics::DrawBufferAliasesClear(hit.stages, job.shape->decode->state.color, hit.parameters.indexAddress, static_cast<std::uint64_t>(hit.parameters.indexCount) * hit.parameters.indexSize);
     DirectDraws::Add(Counter::BuffersPrepared);
     DirectDraws::Add(Counter::BuffersBlobBytes, prepared.blob.size());
     if (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::CommitBindings)) return;
@@ -987,7 +988,10 @@ bool stageMemoRead(std::uint64_t address, std::uint32_t& value, std::uint64_t& p
 
 std::uint64_t stageMemoContentKey(std::uint64_t key, std::size_t way, const StageMemoPattern& pattern, std::span<const std::uint32_t> userData, std::span<const std::uint32_t> rootValues, const Pm4::DrawParameters& parameters, std::uint32_t cursor, const DirectStage* previous) {
     auto hash = (key ^ way) * StageMemoPrime;
-    for (const std::uint64_t value : {parameters.indexAddress, std::uint64_t{parameters.indexCount}, std::uint64_t{parameters.indexSize}, std::uint64_t{parameters.instanceCount}, std::uint64_t{cursor}, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(previous))}) hash = (hash ^ value) * StageMemoPrime;
+    if (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoNoIndex)) {
+        for (const std::uint64_t value : {parameters.indexAddress, std::uint64_t{parameters.indexCount}, std::uint64_t{parameters.indexSize}, std::uint64_t{parameters.instanceCount}}) hash = (hash ^ value) * StageMemoPrime;
+    }
+    for (const std::uint64_t value : {std::uint64_t{cursor}, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(previous))}) hash = (hash ^ value) * StageMemoPrime;
     for (std::size_t word = 0; word < userData.size(); ++word) {
         if (!stageMemoRelocates(pattern.relocatable, word)) hash = (hash ^ userData[word]) * StageMemoPrime;
     }
@@ -1057,6 +1061,39 @@ void stageMemoDiagnose(std::uint64_t key, std::size_t way, const StageMemoPatter
             std::fprintf(stderr, "[stage-memo-diag] same roots, key differs in a %s: word %zu of %zu, %08x -> %08x; movable %016llx, values %016llx, bases %016llx, %zu roots (%u decode)\n", names[cause], word, userData.size(), kept.userData[word], userData[word], static_cast<unsigned long long>(pattern.relocatable), static_cast<unsigned long long>(pattern.values), static_cast<unsigned long long>(pattern.bases), pattern.roots.size(), pattern.decodeRoots);
         }
     }
+    static std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> lastRoots;
+    static std::array<std::uint64_t, 7> rootBuckets{};
+    static std::uint32_t rootsPrinted = 0;
+    if (cause == First) {
+        if (lastRoots.size() > 100000u) lastRoots.clear();
+        auto& before = lastRoots[key ^ (way * StageMemoPrime)];
+        if (before.empty()) {
+            ++rootBuckets[0];
+        } else if (before.size() != gathered.size()) {
+            ++rootBuckets[6];
+        } else {
+            std::size_t differing = 0;
+            for (std::size_t at = 0; at < gathered.size(); ++at) differing += before[at] != gathered[at] ? 1u : 0u;
+            ++rootBuckets[differing <= 2 ? 1 : differing <= 4 ? 2 : differing <= 8 ? 3 : differing <= 16 ? 4 : 5];
+            if (differing != 0 && rootsPrinted < 40u) {
+                ++rootsPrinted;
+                std::string text;
+                std::size_t at = 0;
+                std::size_t listed = 0;
+                for (std::size_t root = 0; root < pattern.roots.size(); ++root) {
+                    for (std::uint32_t word = 0; word < pattern.roots[root].words && at < gathered.size(); ++word, ++at) {
+                        if (before[at] == gathered[at] || listed >= 6u) continue;
+                        ++listed;
+                        char line[128];
+                        std::snprintf(line, sizeof(line), " root %zu%s user %u +0x%llx word %u: %08x -> %08x;", root, root < pattern.decodeRoots ? " (decode)" : "", static_cast<unsigned>(pattern.roots[root].origin), static_cast<unsigned long long>(pattern.roots[root].offset), static_cast<unsigned>(word), before[at], gathered[at]);
+                        text += line;
+                    }
+                }
+                std::fprintf(stderr, "[stage-memo-diag] first sight of root values, %zu of %zu words differ from the pattern's last sighting:%s\n", differing, gathered.size(), text.c_str());
+            }
+        }
+        before.assign(gathered.begin(), gathered.end());
+    }
     ++causes[cause];
     kept.userData.assign(userData.begin(), userData.end());
     kept.indexAddress = parameters.indexAddress;
@@ -1074,7 +1111,7 @@ void stageMemoDiagnose(std::uint64_t key, std::size_t way, const StageMemoPatter
             text += ' ';
             text += std::to_string(causes[index]);
         }
-        std::fprintf(stderr, "[stage-memo-diag] %llu misses without an entry:%s\n", static_cast<unsigned long long>(total), text.c_str());
+        std::fprintf(stderr, "[stage-memo-diag] %llu misses without an entry:%s; first sights by root words that differ from the pattern's last sighting: no sighting before %llu, 1 to 2 words %llu, 3 to 4 %llu, 5 to 8 %llu, 9 to 16 %llu, more %llu, another word count %llu\n", static_cast<unsigned long long>(total), text.c_str(), static_cast<unsigned long long>(rootBuckets[0]), static_cast<unsigned long long>(rootBuckets[1]), static_cast<unsigned long long>(rootBuckets[2]), static_cast<unsigned long long>(rootBuckets[3]), static_cast<unsigned long long>(rootBuckets[4]), static_cast<unsigned long long>(rootBuckets[5]), static_cast<unsigned long long>(rootBuckets[6]));
     }
 }
 
@@ -1131,7 +1168,7 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, const DrawP
         }
         const auto& entry = *held;
         const auto& parameters = job.parameters;
-        bool same = entry.decode.get() == decode.get() && entry.stage == index && entry.way == way && entry.cursor == cursor && entry.tag == resolved.tag && entry.previous.get() == previous && entry.indexAddress == parameters.indexAddress && entry.indexCount == parameters.indexCount && entry.indexSize == parameters.indexSize && entry.instanceCount == parameters.instanceCount && entry.variant == slot.variant && entry.convertedSamples == slot.convertedSamples && entry.layerRowSamples == slot.layerRowSamples && entry.userData.size() == userData.size();
+        bool same = entry.decode.get() == decode.get() && entry.stage == index && entry.way == way && entry.cursor == cursor && entry.tag == resolved.tag && entry.previous.get() == previous && (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoNoIndex) || (entry.indexAddress == parameters.indexAddress && entry.indexCount == parameters.indexCount && entry.indexSize == parameters.indexSize && entry.instanceCount == parameters.instanceCount)) && entry.variant == slot.variant && entry.convertedSamples == slot.convertedSamples && entry.layerRowSamples == slot.layerRowSamples && entry.userData.size() == userData.size();
         for (std::size_t word = 0; same && word < userData.size(); ++word) {
             if (!stageMemoRelocates(pattern.relocatable, word)) same = entry.userData[word] == userData[word];
             else if (((pattern.addresses >> word) & 1u) != 0) same = userData[word] != 0u && ((userData[word] ^ entry.userData[word]) & 3u) == 0u;
@@ -1480,7 +1517,7 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
             if (memoStage && known.handle != nullptr && known.snapshot.get() == program.snapshot.get() && known.codeOffset == program.codeOffset) {
                 const auto outcome = adoptStage(*memo, job, program, i, cursor, known, resolved);
                 DirectDraws::Add(stageMemoCounter(outcome));
-                if (outcome == StageMemoOutcome::NoEntry) memoAdmitted = stageMemoStore().Admit(memo->missKey);
+                if (outcome == StageMemoOutcome::NoEntry) memoAdmitted = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoAdmitFirst) || stageMemoStore().Admit(memo->missKey);
                 if (outcome == StageMemoOutcome::Hit) {
                     const auto every = stageMemoVerifyEvery();
                     if (every == 0 || ++memo->verifyOrdinal % every != 0) {
