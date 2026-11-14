@@ -9120,7 +9120,13 @@ ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHo
     return selection;
 }
 
-bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched) const {
+ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHoldsBy(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, bool untouched, const GuardTests* guards) const {
+    auto selection = PreparedBuffers::Selection::Hazard;
+    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, nullptr, untouched, guards));
+    return selection;
+}
+
+bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched, const GuardTests* guards) const {
     using Selection = PreparedBuffers::Selection;
     selection = Selection::Hazard;
     const auto& plan = *prepared.plan;
@@ -9130,7 +9136,7 @@ bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const
     // memory it overlaps, after the finisher read that memory; a guard set up or dropped since the
     // read may have published them already.
     const bool guardsMoved = DepthGuardsGeneration_nid_no_patch() != prepared.depthGuards;
-    if ((guardsMoved || HasResidentDepthGuards_nid_no_patch()) && std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && !item.inPlace && (guardsMoved || MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes)); })) {
+    if ((guardsMoved || HasResidentDepthGuards_nid_no_patch()) && std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && !item.inPlace && (guardsMoved || (guards != nullptr ? guards->depth(guards->tests, item.begin, item.bytes) : MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes))); })) {
         selection = Selection::DepthGuards;
         return false;
     }
@@ -9140,7 +9146,7 @@ bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const
             ++route->refuted;
             requireGuestBuffers(moved);
         }
-    } else if (route == nullptr && RuntimeSwitches::Set(RuntimeSwitch::CommitStamps) && requireMovedGuestBuffers(moved)) {
+    } else if (route == nullptr && RuntimeSwitches::Set(RuntimeSwitch::CommitStamps) && requireMovedGuestBuffers(moved, guards)) {
     } else {
         requireGuestBuffers(moved);
     }
@@ -9790,7 +9796,7 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
     if (multisampleClear && !multisampleHeld) multisampleGuardsClear.store(multisampleGeneration, std::memory_order_relaxed);
 }
 
-bool ShaderResources::requireMovedGuestBuffers(std::span<const MovedBuffer> moved) const {
+bool ShaderResources::requireMovedGuestBuffers(std::span<const MovedBuffer> moved, const GuardTests* guards) const {
     if (moved.empty() || !completed || !RuntimeSwitches::Set(RuntimeSwitch::GuardRangeMemo) || RuntimeSwitches::Set(RuntimeSwitch::NoGuardSpans) || VerifyGuardSpans()) return false;
     if (depthGuardsClear.load(std::memory_order_relaxed) != DepthGuardsGeneration_nid_no_patch() || multisampleGuardsClear.load(std::memory_order_relaxed) != MultisampleGuardsGeneration()) return false;
     for (std::size_t index = 0; index < moved.size(); ++index) {
@@ -9798,7 +9804,7 @@ bool ShaderResources::requireMovedGuestBuffers(std::span<const MovedBuffer> move
     }
     for (const auto& entry : moved) {
         if (!allocations[entry.allocation].guest) continue;
-        if (MayOverlapMultisampleGuards(entry.address, entry.size)) RequireNoMultisampleColorTarget(entry.address, entry.size, "a shader buffer access");
+        if (guards != nullptr ? guards->multisample(guards->tests, entry.address, entry.size) : MayOverlapMultisampleGuards(entry.address, entry.size)) RequireNoMultisampleColorTarget(entry.address, entry.size, "a shader buffer access");
     }
     return true;
 }

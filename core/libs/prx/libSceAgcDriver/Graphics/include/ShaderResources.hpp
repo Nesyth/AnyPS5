@@ -489,6 +489,12 @@ public:
     ExpressMiss ExpressCurrentFollowing();
     void ExpressStage(Recorder& recorder);
     PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched = false) const;
+    struct GuardTests {
+        bool (*depth)(void* tests, std::uint64_t address, std::uint64_t bytes) = nullptr;
+        bool (*multisample)(void* tests, std::uint64_t address, std::uint64_t bytes) = nullptr;
+        void* tests = nullptr;
+    };
+    PreparedBuffers::Selection FragmentSelectionHoldsBy(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, bool untouched, const GuardTests* guards) const;
     void PushFragmentBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
     void WriteFragmentSets(DrawBindings& result, std::span<const std::size_t> selected, std::int32_t pushedSet) const;
     struct FragmentPlanNote {
@@ -940,7 +946,7 @@ private:
     static std::uint64_t ClampedBufferBytes(std::span<const std::uint32_t> words, std::uint64_t maxStorageBufferRange);
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
     void requireGuestBuffers(std::span<const MovedBuffer> moved = {}) const;
-    bool requireMovedGuestBuffers(std::span<const MovedBuffer> moved) const;
+    bool requireMovedGuestBuffers(std::span<const MovedBuffer> moved, const GuardTests* guards = nullptr) const;
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
     // locks itself); stage B looks the sampled textures and storage images up (resolveImageBinding).
     void addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, std::span<const std::uint32_t> guest, VkShaderStageFlags flags);
@@ -1292,7 +1298,7 @@ private:
     void pushPlannedBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const;
     static std::uint64_t NextPlanSerial();
     std::uint64_t planSerial = NextPlanSerial();
-    bool preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched = false) const;
+    bool preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched = false, const GuardTests* guards = nullptr) const;
     void pushBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const;
     void writeOwnDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     mutable std::unique_ptr<PushPlan> pushPlan;

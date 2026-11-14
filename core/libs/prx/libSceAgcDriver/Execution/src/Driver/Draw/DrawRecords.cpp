@@ -1919,6 +1919,7 @@ bool Driver::followRecord(VulkanDevice& localDevice, std::uint32_t queue, const 
     commit.verifyBuffers = false;
     commit.verifyInputs = false;
     const auto attempts = Graphics::ExpressFollowAttempts();
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FollowWider)) Graphics::NoteExpressFollowDue(expressDue);
     if (!localDevice.ExpressFollow(graphics, hit.parameters, hit.stages, commit, *hit.preparedBuffers, *hit.preparedInputs, *hit.fragment)) {
         if (Graphics::ExpressFollowAttempts() == attempts) return refuse(Refusal::Device);
         flushFollowTally(tally);

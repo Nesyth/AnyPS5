@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeviceImageTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuZones.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuardSpans.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StagedMerge.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -3890,6 +3891,25 @@ void keepFragmentBindings(Recorder& recorder, const std::shared_ptr<ShaderResour
     }
 }
 
+void keepFragmentBindingsMoved(Recorder& recorder, std::shared_ptr<ShaderResources::DrawBindings>& bindings) {
+    const auto* kept = bindings.get();
+    recorder.Keep(std::move(bindings));
+    if (RuntimeSwitches::Set(RuntimeSwitch::KeepBytesOnce)) {
+        for (const auto& snapshot : kept->snapshots) {
+            if (snapshot.buffer != nullptr) recorder.KeepSnapshotBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+        }
+        return;
+    }
+    for (const auto& snapshot : kept->snapshots) {
+        if (snapshot.buffer != nullptr) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    }
+}
+
+void keepExpressBindings(Recorder& recorder, std::shared_ptr<ShaderResources::DrawBindings>& bindings) {
+    if (RuntimeSwitches::Set(RuntimeSwitch::KeepBindingsMoved)) keepFragmentBindingsMoved(recorder, bindings);
+    else keepFragmentBindings(recorder, bindings);
+}
+
 namespace {
 
 bool samplesImage(const ShaderResources& resources, VkImage image) {
@@ -7691,8 +7711,33 @@ struct ExpressDepthChecked {
     std::uint64_t generation = 0;
     std::uint64_t address = 0;
     VkImageView view = VK_NULL_HANDLE;
+    std::uint8_t applied = 0;
 };
 struct ExpressDepthStorage {};
+
+std::uint8_t depthIntent(const State& state) {
+    return static_cast<std::uint8_t>((state.depthWrite ? 1u : 0u) | (state.stencilTest ? 2u : 0u) | (writesStencilTarget(state) ? 4u : 0u));
+}
+
+bool depthIntentHeld(std::uint8_t own, std::uint8_t applied) {
+    return (own & ~applied) == 0;
+}
+
+std::atomic<std::uint64_t> depthIntentChecked{0};
+std::atomic<std::uint64_t> depthIntentStronger{0};
+std::atomic<std::uint64_t> depthIntentFollowersStronger{0};
+std::atomic<std::uint64_t> depthIntentViews{0};
+
+void noteDepthIntent(std::uint8_t own, std::uint8_t applied, bool follower) {
+    const auto checked = depthIntentChecked.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (!depthIntentHeld(own, applied)) {
+        depthIntentStronger.fetch_add(1, std::memory_order_relaxed);
+        if (follower) depthIntentFollowersStronger.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (checked % 65536u != 0u) return;
+    const auto stronger = depthIntentStronger.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "[express-depth-intent] %llu checked, %llu stronger (%llu of them followers); %llu depth views called for a stronger intent in a stamped pass\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(stronger), static_cast<unsigned long long>(depthIntentFollowersStronger.load(std::memory_order_relaxed)), static_cast<unsigned long long>(depthIntentViews.load(std::memory_order_relaxed)));
+}
 struct ExpressMultisampleChecked {
     const void* owner = nullptr;
     std::uint64_t recorder = 0;
@@ -7842,6 +7887,49 @@ struct ExpressRunCensus {
     std::array<std::uint64_t, static_cast<std::size_t>(ExpressRunRefusal::Count)> refusals{};
     std::array<std::uint64_t, static_cast<std::size_t>(ExpressRunEnd::Count)> ends{};
     std::array<std::uint64_t, 6> lengths{};
+    std::array<std::uint64_t, 6> windowAnswers{};
+    std::uint64_t windowsClear = 0;
+    std::uint64_t windowsLive = 0;
+    std::uint64_t widerReproved = 0;
+    std::uint64_t widerUploads = 0;
+    std::uint64_t widerRefused = 0;
+    std::uint64_t resumedTargets = 0;
+    std::uint64_t resumedProofs = 0;
+    std::uint64_t resumedMisses = 0;
+    std::array<std::uint64_t, 4> ownTargets{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::ExpressMiss::Count)> templateMisses{};
+    std::uint64_t templateReprovable = 0;
+};
+
+enum class WindowFact : std::uint8_t { Pending, Writes, Labels, DepthReads, DepthSpans, MultisampleSpans, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(WindowFact::Count)> WindowFactNames{"pending", "writes", "labels", "depth reads", "depth spans", "multisample spans"};
+
+struct ExpressRunWindows {
+    static constexpr std::uint64_t Shift = 16;
+    static constexpr std::size_t Slots = 16;
+    struct Slot {
+        std::uint64_t window = ~std::uint64_t{0};
+        std::uint8_t clear = 0;
+        std::uint8_t live = 0;
+    };
+    bool valid = false;
+    std::array<std::uint64_t, 9> key{};
+    std::array<Slot, Slots> slots{};
+};
+
+struct ExpressResume {
+    const DrawRecordCommit* record = nullptr;
+    std::uint32_t ordinal = 0;
+    bool targets = false;
+    bool proved = false;
+    bool upload = false;
+    bool depthChecked = false;
+    std::uint64_t depthGeneration = 0;
+    DrawExpressMiss miss = DrawExpressMiss::None;
+    std::uint32_t refreshed = 0;
+    ShaderResources::ExpressMiss templateMiss = ShaderResources::ExpressMiss::None;
+    std::optional<ShaderResources::CleanProof> cleanProof;
+    DrawRecipeOutcome result;
 };
 
 struct ExpressRun {
@@ -7872,6 +7960,10 @@ struct ExpressRun {
     bool depthChecked = false;
     std::uint64_t depthAddress = 0;
     VkImageView depthView = VK_NULL_HANDLE;
+    std::uint8_t depthApplied = 0;
+    std::uint8_t expectKind = 0;
+    bool followDue = false;
+    bool intentNoted = false;
     std::size_t targets = 0;
     std::array<const void*, Targets> owners{};
     std::array<std::uint64_t, Targets> versions{};
@@ -7883,6 +7975,8 @@ struct ExpressRun {
     ExpressRunRanges passReads;
     ExpressRunRanges shadowClear;
     ExpressRunRanges shadowLive;
+    ExpressRunWindows windows;
+    ExpressResume resume;
     ExpressRunCensus census;
 };
 
@@ -7931,11 +8025,51 @@ bool runFollowVerifyDue() {
     return every != 0 && ++ordinal % every == 0;
 }
 
-void noteRunFollowVerify(bool same, const char* why, const char* context = "", const char* kind = "") {
+std::array<std::atomic<std::uint64_t>, 3> widerFollowChecked{};
+std::array<std::atomic<std::uint64_t>, 3> widerFollowDiffering{};
+
+const char* widerContext(std::uint8_t wider) {
+    return wider == 1u ? " (a reproved follower)" : wider == 2u ? " (a follower over a new target upload)" : wider == 3u ? " (a reproved follower over a new target upload)" : wider == 4u ? " (an express commit resumed after a wider follower's steps)" : "";
+}
+
+void noteRunFollowVerify(bool same, const char* why, const char* context = "", const char* kind = "", std::uint8_t wider = 0) {
     const auto checked = runFollowChecked.fetch_add(1, std::memory_order_relaxed) + 1u;
     const auto differing = same ? runFollowDiffering.load(std::memory_order_relaxed) : runFollowDiffering.fetch_add(1, std::memory_order_relaxed) + 1u;
-    if (!same && differing <= 16u) std::fprintf(stderr, "[run-follow-verify] a commit the follow conditions accepted is not appended by the express commit: %s%s%s\n", kind, why, context);
-    if (checked % 4096u == 0u) std::fprintf(stderr, "[run-follow-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing));
+    for (std::size_t bit = 0; bit < widerFollowChecked.size(); ++bit) {
+        if (((wider >> bit) & 1u) == 0) continue;
+        widerFollowChecked[bit].fetch_add(1, std::memory_order_relaxed);
+        if (!same) widerFollowDiffering[bit].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!same && differing <= 16u) std::fprintf(stderr, "[run-follow-verify] a commit the follow conditions accepted is not appended by the express commit: %s%s%s%s\n", kind, why, context, widerContext(wider));
+    if (checked % 4096u != 0u) return;
+    const auto reproved = widerFollowChecked[0].load(std::memory_order_relaxed);
+    const auto uploaded = widerFollowChecked[1].load(std::memory_order_relaxed);
+    const auto resumed = widerFollowChecked[2].load(std::memory_order_relaxed);
+    if (reproved == 0 && uploaded == 0 && resumed == 0) std::fprintf(stderr, "[run-follow-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing));
+    else std::fprintf(stderr, "[run-follow-verify] %llu checked, %llu differing (reproved followers %llu checked, %llu differing; followers over a new target upload %llu checked, %llu differing; resumed express commits %llu checked, %llu differing)\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing), static_cast<unsigned long long>(reproved), static_cast<unsigned long long>(widerFollowDiffering[0].load(std::memory_order_relaxed)), static_cast<unsigned long long>(uploaded), static_cast<unsigned long long>(widerFollowDiffering[1].load(std::memory_order_relaxed)), static_cast<unsigned long long>(resumed), static_cast<unsigned long long>(widerFollowDiffering[2].load(std::memory_order_relaxed)));
+}
+
+std::atomic<std::uint64_t> windowChecked{0};
+std::atomic<std::uint64_t> windowDifferingTotal{0};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(WindowFact::Count)> windowDiffering{};
+
+bool windowVerifyDue() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_APPEND_COMMITS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    static std::uint64_t ordinal = 0;
+    return every != 0 && ++ordinal % every == 0;
+}
+
+void noteWindowVerify(WindowFact fact, bool same) {
+    const auto checked = windowChecked.fetch_add(1, std::memory_order_relaxed) + 1u;
+    const auto differing = same ? windowDifferingTotal.load(std::memory_order_relaxed) : windowDifferingTotal.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (!same) windowDiffering[static_cast<std::size_t>(fact)].fetch_add(1, std::memory_order_relaxed);
+    if (!same && differing <= 16u) std::fprintf(stderr, "[run-follow-verify] a window answered %s clear for a range the exact test does not find clear\n", WindowFactNames[static_cast<std::size_t>(fact)]);
+    if (checked % 4096u != 0u) return;
+    const auto count = [](WindowFact counted) { return static_cast<unsigned long long>(windowDiffering[static_cast<std::size_t>(counted)].load(std::memory_order_relaxed)); };
+    std::fprintf(stderr, "[run-follow-verify] window answers %llu checked, %llu differing (pending %llu, writes %llu, labels %llu, depth reads %llu, depth spans %llu, multisample spans %llu)\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing), count(WindowFact::Pending), count(WindowFact::Writes), count(WindowFact::Labels), count(WindowFact::DepthReads), count(WindowFact::DepthSpans), count(WindowFact::MultisampleSpans));
 }
 
 const char* runFollowContext(const ExpressRun& run, const DrawExpress* express) {
@@ -7992,11 +8126,33 @@ void noteRunFollow(ExpressRun& run, bool followed) {
     for (std::size_t index = 0; index < stages.size(); ++index) stages[index] = census.staged == 0 ? 0.0 : static_cast<double>(std::exchange(census.stageNs[index], 0)) / static_cast<double>(census.staged);
     census.staged = 0;
     std::fprintf(stderr, "[run-follow] %llu express commits followed a leader, %llu led a run; not followed: %s; runs ended by: %s; run lengths 1: %llu, 2-3: %llu, 4-7: %llu, 8-15: %llu, 16-31: %llu, 32+: %llu; carried across a dropped hold %llu (across non-draw items %llu), not carried %llu; runs kept across a non-follower commit %llu; followers with sampled images %llu; input ranges taken by the run's clear ranges %llu, pending reads already noted in the batch %llu, moved ranges taken by the shadow windows %llu; ns per follower %.0f (%.0f with its wrapper), per refused follow attempt %.0f; non-follower express commits appended %llu at %.0f ns, not appended %llu at %.0f ns; ns per non-follower item after a refused follow attempt %.0f to refuse and %.0f to commit, without an attempt %.0f to commit; run holds %llu at %.0f ns to take; ns per follower stage (1 in 64): checks %.0f, template %.0f, pass and inputs %.0f, zones and stores %.0f, keep bound and selection %.0f, staging and guest buffers %.0f, notes and keeps %.0f, splice and target notes %.0f; 1 in 8 timed\n", follows, leads, refused.empty() ? "none" : refused.c_str(), ended.empty() ? "none" : ended.c_str(), lengths[0], lengths[1], lengths[2], lengths[3], lengths[4], lengths[5], carried, carriedItems, notCarried, kept, imageFollowers, rangesSkipped, readsSkipped, shadowSkipped, follower, item, refusedAttempt, appendedCount, appendedCommit, fullCount, fullCommit, refusing, fallback, unled, static_cast<unsigned long long>(holdCount), hold, stages[0], stages[1], stages[2], stages[3], stages[4], stages[5], stages[6], stages[7]);
+    std::array<unsigned long long, static_cast<std::size_t>(WindowFact::Count)> answers{};
+    for (std::size_t index = 0; index < answers.size(); ++index) answers[index] = wide(census.windowAnswers[index]);
+    const auto windowsClear = wide(census.windowsClear);
+    const auto windowsLive = wide(census.windowsLive);
+    if (windowsClear != 0 || windowsLive != 0) std::fprintf(stderr, "[run-follow] ranges answered by windows: pending %llu, writes %llu, labels %llu, depth reads %llu, depth spans %llu, multisample spans %llu; windows proved clear %llu, live %llu\n", answers[0], answers[1], answers[2], answers[3], answers[4], answers[5], windowsClear, windowsLive);
+    const auto widerReproved = wide(census.widerReproved);
+    const auto widerUploads = wide(census.widerUploads);
+    const auto widerRefused = wide(census.widerRefused);
+    const auto resumedTargets = wide(census.resumedTargets);
+    const auto resumedProofs = wide(census.resumedProofs);
+    const auto resumedMisses = wide(census.resumedMisses);
+    std::array<unsigned long long, 4> ownTargets{};
+    for (std::size_t index = 0; index < ownTargets.size(); ++index) ownTargets[index] = wide(census.ownTargets[index]);
+    std::string templateMisses;
+    for (std::size_t index = 0; index < census.templateMisses.size(); ++index) {
+        static constexpr std::array<const char*, static_cast<std::size_t>(ShaderResources::ExpressMiss::Count)> MissNames{"none", "not proved", "watch", "forget", "serials", "sources", "views", "pending CPU", "staging", "regions"};
+        const auto count = std::exchange(census.templateMisses[index], 0);
+        if (count != 0) templateMisses += std::string(templateMisses.empty() ? "" : ", ") + MissNames[index] + " " + std::to_string(count);
+    }
+    const auto reprovable = wide(census.templateReprovable);
+    if (RuntimeSwitches::Set(RuntimeSwitch::FollowWider) || widerReproved != 0 || widerUploads != 0 || resumedTargets != 0 || resumedProofs != 0) std::fprintf(stderr, "[run-follow] wider follows: followers after an inline reprove %llu, after an inline target refresh %llu, refused after their side effects %llu; express commits resumed after the target refresh %llu, after the reprove %llu, with the follower's miss %llu; own-targets refusals: count or owner %llu, stale express upload version %llu, stale express DCC address %llu, with multisample owners %llu; template-not-current refusals: %s (reprovable by the express commit's rule %llu)\n", widerReproved, widerUploads, widerRefused, resumedTargets, resumedProofs, resumedMisses, ownTargets[0], ownTargets[1], ownTargets[2], ownTargets[3], templateMisses.empty() ? "none" : templateMisses.c_str(), reprovable);
 }
 
 void finishRun(ExpressRun& run, ExpressRunEnd reason) {
     run.dropped = false;
     run.itemsBetween = false;
+    run.windows.valid = false;
     if (!run.led) return;
     run.led = false;
     run.overItems = false;
@@ -8035,7 +8191,7 @@ void refuseRun(ExpressRun& run, ExpressRunRefusal why) {
     noteRunFollow(run, false);
 }
 
-bool leadExpressRun(ExpressRun& run, Recorder& recorder, const DrawExpress& express, const DrawExpressKeep& keep, const State& state, const DrawRecipe& recipe, bool attachmentsHeld) {
+bool leadExpressRun(ExpressRun& run, Recorder& recorder, const DrawExpress& express, const DrawExpressKeep& keep, const State& state, const DrawRecipe& recipe, bool attachmentsHeld, std::uint8_t depthApplied) {
     const auto count = keep.targets.size();
     const bool depthChecked = recipe.hasDepth && state.depth.has_value();
     const auto depthAddress = depthChecked ? state.depth->address : 0u;
@@ -8067,6 +8223,7 @@ bool leadExpressRun(ExpressRun& run, Recorder& recorder, const DrawExpress& expr
     run.depthChecked = depthChecked;
     run.depthAddress = depthAddress;
     run.depthView = depthView;
+    run.depthApplied = keeps ? static_cast<std::uint8_t>(run.depthApplied | depthApplied) : depthApplied;
     run.targets = count;
     for (std::size_t index = 0; index < count; ++index) {
         const auto* target = keep.targets[index].get();
@@ -8087,16 +8244,102 @@ bool leadExpressRun(ExpressRun& run, Recorder& recorder, const DrawExpress& expr
     return true;
 }
 
+void keyRunWindows(ExpressRun& run, const Recorder& recorder) {
+    auto& windows = run.windows;
+    const std::array<std::uint64_t, 9> key{recorder.Id(), recorder.WriteNoteCount(), StorageTexture::PendingSerial(), Recorder::QueuedLabelSerial(), DepthGuardsGeneration_nid_no_patch(), MultisampleGuardsGeneration(), DepthSurfacesSerial(), DepthSurfacesReleased(), RuntimeSwitches::Generation()};
+    if (windows.valid && windows.key == key) return;
+    windows.valid = true;
+    windows.key = key;
+    windows.slots.fill({});
+}
+
+void keyRunGuardWindows(ExpressRun& run, const Recorder& recorder) {
+    const auto& key = run.windows.key;
+    if (!run.windows.valid || key[4] != DepthGuardsGeneration_nid_no_patch() || key[5] != MultisampleGuardsGeneration() || key[6] != DepthSurfacesSerial() || key[8] != RuntimeSwitches::Generation()) keyRunWindows(run, recorder);
+}
+
+bool proveRunWindow(const Recorder& recorder, WindowFact fact, std::uint64_t address) {
+    constexpr std::size_t bytes = std::size_t{1} << ExpressRunWindows::Shift;
+    switch (fact) {
+    case WindowFact::Pending: return PendingZones::Clear(address, bytes) || (!recorder.PendingWriteOverlaps(address, bytes) && !PendingStorageOverlaps(address, bytes, nullptr));
+    case WindowFact::Writes: return PendingZones::Clear(address, bytes) || !recorder.PendingWriteOverlaps(address, bytes);
+    case WindowFact::Labels: return !recorder.PendingLabelIn(address, bytes);
+    case WindowFact::DepthReads: return DepthReadGuardIdle_nid_no_patch(address, bytes);
+    case WindowFact::DepthSpans: return !MayOverlapDepthGuards_nid_no_patch(address, bytes);
+    case WindowFact::MultisampleSpans: return !MayOverlapMultisampleGuards(address, bytes);
+    default: return false;
+    }
+}
+
+bool runWindowsClear(ExpressRun& run, const Recorder& recorder, WindowFact fact, std::uint64_t begin, std::uint64_t bytes) {
+    constexpr auto top = std::numeric_limits<std::uint64_t>::max();
+    if (!run.windows.valid || bytes == 0 || begin > top - bytes) return false;
+    const auto first = begin >> ExpressRunWindows::Shift;
+    const auto last = (begin + bytes - 1u) >> ExpressRunWindows::Shift;
+    if (last - first > 1u || last >= (top >> ExpressRunWindows::Shift)) return false;
+    const auto bit = static_cast<std::uint8_t>(1u << static_cast<unsigned>(fact));
+    for (auto window = first; window <= last; ++window) {
+        auto& slot = run.windows.slots[window & (ExpressRunWindows::Slots - 1u)];
+        if (slot.window != window) slot = {window, 0, 0};
+        if ((slot.clear & bit) != 0) continue;
+        if ((slot.live & bit) != 0) return false;
+        if (!proveRunWindow(recorder, fact, window << ExpressRunWindows::Shift)) {
+            slot.live |= bit;
+            ++run.census.windowsLive;
+            return false;
+        }
+        slot.clear |= bit;
+        ++run.census.windowsClear;
+    }
+    ++run.census.windowAnswers[static_cast<std::size_t>(fact)];
+    return true;
+}
+
+struct FollowGuards {
+    ExpressRun& run;
+    const Recorder& recorder;
+};
+
+bool followDepthGuards(void* tests, std::uint64_t address, std::uint64_t bytes) {
+    auto& guards = *static_cast<FollowGuards*>(tests);
+    const auto size = static_cast<std::size_t>(bytes);
+    if (!runWindowsClear(guards.run, guards.recorder, WindowFact::DepthSpans, address, bytes)) return MayOverlapDepthGuards_nid_no_patch(address, size);
+    if (!windowVerifyDue()) return false;
+    const bool overlaps = MayOverlapDepthGuards_nid_no_patch(address, size);
+    noteWindowVerify(WindowFact::DepthSpans, !overlaps);
+    return overlaps;
+}
+
+bool followMultisampleGuards(void* tests, std::uint64_t address, std::uint64_t bytes) {
+    auto& guards = *static_cast<FollowGuards*>(tests);
+    const auto size = static_cast<std::size_t>(bytes);
+    if (!runWindowsClear(guards.run, guards.recorder, WindowFact::MultisampleSpans, address, bytes)) return MayOverlapMultisampleGuards(address, size);
+    if (!windowVerifyDue()) return false;
+    const bool overlaps = MayOverlapMultisampleGuards(address, size);
+    noteWindowVerify(WindowFact::MultisampleSpans, !overlaps);
+    return overlaps;
+}
+
 struct FollowZones {
     ExpressRun& run;
     const Recorder& recorder;
+    bool windows = false;
 };
 
 bool followZoneClear(void* tests, std::uint64_t begin, std::size_t bytes, bool moved) {
     auto& zones = *static_cast<FollowZones*>(tests);
     auto& run = zones.run;
     const auto end = begin + bytes;
-    if (!runRangesHold(run.clear, begin, end, true) && !PendingZones::Clear(begin, bytes) && (zones.recorder.PendingWriteOverlaps(begin, bytes) || (moved && PendingStorageOverlaps(begin, bytes, nullptr)))) return false;
+    const auto pendingOver = [&] { return !PendingZones::Clear(begin, bytes) && (zones.recorder.PendingWriteOverlaps(begin, bytes) || (moved && PendingStorageOverlaps(begin, bytes, nullptr))); };
+    bool clear = runRangesHold(run.clear, begin, end, true);
+    if (!clear && zones.windows && runWindowsClear(run, zones.recorder, moved ? WindowFact::Pending : WindowFact::Writes, begin, bytes)) {
+        clear = true;
+        if (windowVerifyDue()) {
+            clear = !pendingOver();
+            noteWindowVerify(moved ? WindowFact::Pending : WindowFact::Writes, clear);
+        }
+    }
+    if (!clear && pendingOver()) return false;
     if (!moved || bytes == 0) return true;
     constexpr std::uint64_t Window = std::uint64_t{1} << 20u;
     const auto first = begin & ~(Window - 1u);
@@ -8118,6 +8361,41 @@ bool followZoneClear(void* tests, std::uint64_t begin, std::size_t bytes, bool m
     return !AnyShadowedOverlaps(begin, bytes);
 }
 
+constexpr std::size_t ExpressTargetHeld = 8;
+
+std::size_t refreshExpressTarget(const Context& context, const State& state, DrawExpress& express, const std::shared_ptr<StorageTexture>& target, std::size_t index, Recorder& recorder, std::uint32_t& refreshed) {
+    if (index >= state.colors.size() || !target->Cached()) return 2;
+    const auto& color = state.colors[index];
+    const auto dcc = SurfaceForTarget(color).dccAddress;
+    if (dcc != express.dccAddresses[index] || !StorageImageServesKeys(*target, dcc)) return 3;
+    const bool follows = RuntimeSwitches::Set(RuntimeSwitch::ExpressTargetUploads);
+    const bool uploaded = follows && target->UploadVersion() != express.targetVersions[index];
+    if (uploaded || !recorder.RenderPassOpen() || !target->NotedInPass(recorder.Id(), recorder.RenderPassGeneration())) {
+        if (!StorageImageCached(context, target.get())) return 4;
+        if (color.fmaskAddress != 0) GuardOneFragmentFmask(context, color);
+        DrawOutcome outcome;
+        const auto resident = refreshResidentTarget(context, state, color, outcome, false, [&] {
+            if (color.arrayLastSlice != 0) target->RefreshLayers(color.arraySlice, 1);
+            else target->Refresh();
+            return target;
+        });
+        if (resident.get() != target.get()) return 5;
+        ++refreshed;
+    }
+    if (target->UploadVersion() != express.targetVersions[index]) {
+        if (!follows) return 6;
+        express.targetVersions[index] = target->UploadVersion();
+        expressTargetCauses[7].fetch_add(1, std::memory_order_relaxed);
+    }
+    return ExpressTargetHeld;
+}
+
+bool followWiderAllowed(const ExpressRun& run, const DrawExpressKeep& keep, const Pm4::DrawParameters& draw, const DrawFragment& fragment) {
+    if (run.followDue || !RuntimeSwitches::Set(RuntimeSwitch::AppendCommits) || RuntimeSwitches::Set(RuntimeSwitch::XpAppendCommits) || RuntimeSwitches::Set(RuntimeSwitch::XpExpressFloor) || RuntimeSwitches::Set(RuntimeSwitch::DirectRepeat) || !RuntimeSwitches::Set(RuntimeSwitch::CommitFragments) || !RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits)) return false;
+    if (!RecordDraws() || DumpTargetLimit() != 0 || repeatExcludedModes() || !fragmentModes() || fragment.indirect != draw.indirect.has_value()) return false;
+    return std::ranges::none_of(keep.targets, [](const std::shared_ptr<StorageTexture>& target) { return target == nullptr; }) && std::ranges::none_of(keep.multisample, [](const std::shared_ptr<void>& owner) { return owner != nullptr; });
+}
+
 }
 
 ExpressOutcome ExpressCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs, DrawFragment* fragment, bool verifyDue) {
@@ -8125,6 +8403,17 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     auto& run = expressRun();
     if (run.dropped) finishRun(run, run.dropReason);
     const bool expectAppend = std::exchange(run.expectAppend, false);
+    const std::uint8_t pendingKind = std::exchange(run.expectKind, std::uint8_t{0});
+    const std::uint8_t followKind = expectAppend ? pendingKind : std::uint8_t{0};
+    ExpressResume* resume = run.resume.record == &record && run.resume.ordinal == run.followOrdinal ? &run.resume : nullptr;
+    run.resume.record = nullptr;
+    bool sideEffectsBegun = false;
+    bool sideEffectsMoved = false;
+    const bool intentOn = RuntimeSwitches::Set(RuntimeSwitch::ExpressDepthIntent);
+    const std::uint8_t ownIntent = intentOn ? depthIntent(state) : 0u;
+    bool intentNoted = std::exchange(run.intentNoted, false);
+    std::uint8_t conditionsApplied = 0;
+    std::uint8_t depthApplied = 0;
     const bool following = run.open != 0 && RuntimeSwitches::Set(RuntimeSwitch::RunFollow);
     const bool leadTimed = following && !expectAppend && (++run.leadOrdinal & 7u) == 0;
     const auto leadBegan = leadTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -8142,7 +8431,10 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     AppendRefusal followSeen = AppendRefusal::Count;
     bool followVerifyOpen = expectAppend && !verifyDue;
     const auto miss = [&](DrawExpressMiss why) {
-        if (std::exchange(followVerifyOpen, false)) noteRunFollowVerify(false, DrawExpressMissNames[static_cast<std::size_t>(why)], runFollowContext(run, record.express.get()), "the express commit returned before its pass start on ");
+        if (std::exchange(followVerifyOpen, false)) {
+            if (followKind != 0 && sideEffectsBegun) noteRunFollowVerify(true, DrawExpressMissNames[static_cast<std::size_t>(why)], runFollowContext(run, record.express.get()), "the express commit returned after the follower's side effects on ", followKind);
+            else noteRunFollowVerify(false, DrawExpressMissNames[static_cast<std::size_t>(why)], runFollowContext(run, record.express.get()), "the express commit returned before its pass start on ", followKind);
+        }
         out.miss = why;
         return out;
     };
@@ -8160,8 +8452,8 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     auto& keep = *express->keep;
     if (fragment == nullptr || fragment->bindings == nullptr || fragment->device != context.device || fragment->resources.get() != keep.resources.get() || fragment->pipeline.get() != keep.pipeline.get() || fragment->indirect != draw.indirect.has_value()) return miss(DrawExpressMiss::Objects);
     auto& resources = *keep.resources;
-    const auto templateMiss = resources.ExpressCurrent();
-    const bool reprove = templateMiss != ShaderResources::ExpressMiss::None && templateMiss != ShaderResources::ExpressMiss::Regions && (templateMiss != ShaderResources::ExpressMiss::NotProved || (RuntimeSwitches::Set(RuntimeSwitch::ExpressKeepState) && resources.ExpressWatchable()));
+    const auto templateMiss = resume != nullptr ? resume->templateMiss : resources.ExpressCurrent();
+    const bool reprove = resume != nullptr ? templateMiss != ShaderResources::ExpressMiss::None : templateMiss != ShaderResources::ExpressMiss::None && templateMiss != ShaderResources::ExpressMiss::Regions && (templateMiss != ShaderResources::ExpressMiss::NotProved || (RuntimeSwitches::Set(RuntimeSwitch::ExpressKeepState) && resources.ExpressWatchable()));
     if (templateMiss != ShaderResources::ExpressMiss::None && !reprove) return miss(DrawExpressMiss::Template);
     const bool appendOn = RuntimeSwitches::Set(RuntimeSwitch::XpAppendCommits);
     if (appendOn && !verifyDue && !draw.indirect && templateMiss == ShaderResources::ExpressMiss::None && prepared != nullptr && !prepared->inPlace && preparedInputs != nullptr && !record.verifyBuffers && !record.verifyInputs && prepared->plan != nullptr && prepared->plan == resources.DirectBufferPlan(shaders) && !StorageTexture::DrawnLinearPending() && (!express->hasDepth || (DepthSurfacesSerial() == express->depthSerial && DepthSurfacesReleased() == express->depthReleased))) {
@@ -8184,7 +8476,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
                         }
                         record.touchedPresent = present;
                     }
-                    keepFragmentBindings(*recorder, fragment->bindings);
+                    keepExpressBindings(*recorder, fragment->bindings);
                     if (express->keptRecorder != recorder->Id() || express->keptBatch != recorder->OpenSerial()) {
                         recorder->Keep(express->keep);
                         for (const auto& owner : keep.multisample) {
@@ -8231,83 +8523,101 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     bool appended = false;
     bool inPlaceBehind = false;
     bool inPlaceRefused = false;
-    if (RuntimeSwitches::Set(RuntimeSwitch::AppendCommits) && !atFloor && !verifyDue && !reprove && templateMiss == ShaderResources::ExpressMiss::None) {
-        const auto recorderId = recorder->Id();
-        const auto generation = recorder->RenderPassGeneration();
-        const auto conditions = [&](bool byRun) {
-            AppendRefusal refusal = AppendRefusal::None;
-            if (prepared == nullptr || preparedInputs == nullptr || record.verifyBuffers || record.verifyInputs || !RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || prepared->plan == nullptr || prepared->plan != resources.DirectBufferPlan(shaders) || context.recorder == nullptr || !context.drawInputsInPlace) refusal = AppendRefusal::Prepared;
-            else if (StorageTexture::DrawnLinearPending()) refusal = AppendRefusal::Linear;
-            else if (recorder->AppendablePass(express->passKey) == VK_NULL_HANDLE || (draw.indirect && !recorder->PassIndirectReads())) refusal = AppendRefusal::Pass;
-            else if (express->hasDepth && (DepthSurfacesSerial() != express->depthSerial || DepthSurfacesReleased() != express->depthReleased)) refusal = AppendRefusal::Depth;
-            for (std::size_t index = 0; refusal == AppendRefusal::None && index < keep.targets.size(); ++index) {
-                const auto& target = keep.targets[index];
-                if (target == nullptr) {
-                    const auto* owner = index < keep.multisample.size() ? keep.multisample[index].get() : nullptr;
-                    bool known = owner != nullptr && index < state.colors.size() && index < express->multisampleImages.size() && index < recipe->targetViews.size();
-                    if (known && byRun) {
-                        known = run.recorder == recorderId && run.generation == generation && index < run.targets && run.owners[index] == owner && run.images[index] == express->multisampleImages[index];
-                    } else if (known) {
-                        const auto& memo = HostThreadLocal<ExpressMultisampleMemo, ExpressMultisampleStorage>();
-                        known = std::ranges::any_of(memo.checked, [&](const ExpressMultisampleChecked& entry) { return entry.owner == owner && entry.recorder == recorderId && entry.generation == generation; });
-                    }
-                    if (!known) {
-                        refusal = AppendRefusal::Multisample;
-                        break;
-                    }
-                    continue;
+    std::uint64_t conditionsRecorder = 0;
+    std::uint64_t conditionsGeneration = 0;
+    const auto conditions = [&](bool byRun, bool ignoreVersions) {
+        const auto recorderId = conditionsRecorder;
+        const auto generation = conditionsGeneration;
+        AppendRefusal refusal = AppendRefusal::None;
+        if (prepared == nullptr || preparedInputs == nullptr || record.verifyBuffers || record.verifyInputs || !RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || prepared->plan == nullptr || prepared->plan != resources.DirectBufferPlan(shaders) || context.recorder == nullptr || !context.drawInputsInPlace) refusal = AppendRefusal::Prepared;
+        else if (StorageTexture::DrawnLinearPending()) refusal = AppendRefusal::Linear;
+        else if (recorder->AppendablePass(express->passKey) == VK_NULL_HANDLE || (draw.indirect && !recorder->PassIndirectReads())) refusal = AppendRefusal::Pass;
+        else if (express->hasDepth && (DepthSurfacesSerial() != express->depthSerial || DepthSurfacesReleased() != express->depthReleased)) refusal = AppendRefusal::Depth;
+        for (std::size_t index = 0; refusal == AppendRefusal::None && index < keep.targets.size(); ++index) {
+            const auto& target = keep.targets[index];
+            if (target == nullptr) {
+                const auto* owner = index < keep.multisample.size() ? keep.multisample[index].get() : nullptr;
+                bool known = owner != nullptr && index < state.colors.size() && index < express->multisampleImages.size() && index < recipe->targetViews.size();
+                if (known && byRun) {
+                    known = run.recorder == recorderId && run.generation == generation && index < run.targets && run.owners[index] == owner && run.images[index] == express->multisampleImages[index];
+                } else if (known) {
+                    const auto& memo = HostThreadLocal<ExpressMultisampleMemo, ExpressMultisampleStorage>();
+                    known = std::ranges::any_of(memo.checked, [&](const ExpressMultisampleChecked& entry) { return entry.owner == owner && entry.recorder == recorderId && entry.generation == generation; });
                 }
-                if (index >= state.colors.size() || !target->Cached() || !target->NotedInPass(recorderId, generation) || target->UploadVersion() != express->targetVersions[index]) {
-                    refusal = AppendRefusal::Targets;
+                if (!known) {
+                    refusal = AppendRefusal::Multisample;
                     break;
                 }
-                const auto dcc = SurfaceForTarget(state.colors[index]).dccAddress;
-                if (dcc != express->dccAddresses[index] || !StorageImageServesKeys(*target, dcc)) refusal = AppendRefusal::Targets;
+                continue;
             }
-            if (refusal == AppendRefusal::None && recipe->hasDepth && state.depth.has_value()) {
-                const auto expected = recipe->targetViews.empty() ? VK_NULL_HANDLE : recipe->targetViews.back();
-                if (byRun) {
-                    if (!run.depthChecked || run.recorder != recorderId || run.generation != generation || run.depthAddress != state.depth->address || run.depthView != expected) refusal = AppendRefusal::Depth;
-                } else {
-                    const auto& checked = HostThreadLocal<ExpressDepthChecked, ExpressDepthStorage>();
-                    if (checked.recorder != recorderId || checked.generation != generation || checked.address != state.depth->address || checked.view != expected) refusal = AppendRefusal::Depth;
+            if (index >= state.colors.size() || !target->Cached() || !target->NotedInPass(recorderId, generation) || (!ignoreVersions && target->UploadVersion() != express->targetVersions[index])) {
+                refusal = AppendRefusal::Targets;
+                break;
+            }
+            const auto dcc = SurfaceForTarget(state.colors[index]).dccAddress;
+            if (dcc != express->dccAddresses[index] || !StorageImageServesKeys(*target, dcc)) refusal = AppendRefusal::Targets;
+        }
+        if (refusal == AppendRefusal::None && recipe->hasDepth && state.depth.has_value()) {
+            const auto expected = recipe->targetViews.empty() ? VK_NULL_HANDLE : recipe->targetViews.back();
+            if (byRun) {
+                if (!run.depthChecked || run.recorder != recorderId || run.generation != generation || run.depthAddress != state.depth->address || run.depthView != expected || (intentOn && !depthIntentHeld(ownIntent, run.depthApplied))) refusal = AppendRefusal::Depth;
+            } else {
+                const auto& checked = HostThreadLocal<ExpressDepthChecked, ExpressDepthStorage>();
+                if (checked.recorder != recorderId || checked.generation != generation || checked.address != state.depth->address || checked.view != expected) refusal = AppendRefusal::Depth;
+                else {
+                    if (intentOn && !ignoreVersions && !std::exchange(intentNoted, true)) noteDepthIntent(ownIntent, checked.applied, false);
+                    if (intentOn && !depthIntentHeld(ownIntent, checked.applied)) refusal = AppendRefusal::Depth;
+                    else conditionsApplied = checked.applied;
                 }
             }
-            if (refusal == AppendRefusal::None) {
-                const auto& taken = *preparedInputs;
-                const std::size_t indexRanges = draw.indexed ? 1u : 0u;
-                if (taken.recipe.get() != recipe || taken.device != context.device || taken.state != &state || taken.draw != &draw || taken.shaders != shaders.data() || taken.stages != shaders.size() || taken.ranges.size() < indexRanges) refusal = AppendRefusal::InputShape;
-                else if ((taken.forget & 1u) != 0 || GuestMemory::ForgetSerial() != taken.forget || HostImportSetGeneration() != taken.imports || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != taken.mapping) refusal = AppendRefusal::Imports;
-                else if ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty()) refusal = AppendRefusal::Writers;
-                for (std::size_t at = 0; refusal == AppendRefusal::None && at < taken.ranges.size(); ++at) {
-                    const auto& range = taken.ranges[at];
-                    const auto bytes = static_cast<std::size_t>(range.end - range.begin);
-                    if (range.import == nullptr) refusal = AppendRefusal::Imports;
-                    else if (!PendingZones::Clear(range.begin, bytes) && (recorder->PendingWriteOverlaps(range.begin, bytes) || PendingStorageOverlaps(range.begin, bytes, nullptr))) refusal = AppendRefusal::InputWrites;
-                    else if (recorder->PendingLabelIn(range.begin, bytes) || recorder->QueuedStoreOverlaps(range.begin, bytes)) refusal = AppendRefusal::InputStores;
-                }
+        }
+        if (refusal == AppendRefusal::None) {
+            const auto& taken = *preparedInputs;
+            const std::size_t indexRanges = draw.indexed ? 1u : 0u;
+            if (taken.recipe.get() != recipe || taken.device != context.device || taken.state != &state || taken.draw != &draw || taken.shaders != shaders.data() || taken.stages != shaders.size() || taken.ranges.size() < indexRanges) refusal = AppendRefusal::InputShape;
+            else if ((taken.forget & 1u) != 0 || GuestMemory::ForgetSerial() != taken.forget || HostImportSetGeneration() != taken.imports || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != taken.mapping) refusal = AppendRefusal::Imports;
+            else if ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty()) refusal = AppendRefusal::Writers;
+            for (std::size_t at = 0; refusal == AppendRefusal::None && at < taken.ranges.size(); ++at) {
+                const auto& range = taken.ranges[at];
+                const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+                if (range.import == nullptr) refusal = AppendRefusal::Imports;
+                else if (!PendingZones::Clear(range.begin, bytes) && (recorder->PendingWriteOverlaps(range.begin, bytes) || PendingStorageOverlaps(range.begin, bytes, nullptr))) refusal = AppendRefusal::InputWrites;
+                else if (recorder->PendingLabelIn(range.begin, bytes) || recorder->QueuedStoreOverlaps(range.begin, bytes)) refusal = AppendRefusal::InputStores;
             }
-            if (refusal == AppendRefusal::None && !resources.PreparedZonesClear(*prepared, *recorder)) refusal = AppendRefusal::Buffers;
-            return refusal;
-        };
-        auto refusal = conditions(false);
+        }
+        if (refusal == AppendRefusal::None && !resources.PreparedZonesClear(*prepared, *recorder)) refusal = AppendRefusal::Buffers;
+        return refusal;
+    };
+    if (resume == nullptr && RuntimeSwitches::Set(RuntimeSwitch::AppendCommits) && !atFloor && !verifyDue && !reprove && templateMiss == ShaderResources::ExpressMiss::None) {
+        conditionsRecorder = recorder->Id();
+        conditionsGeneration = recorder->RenderPassGeneration();
+        const auto generation = conditionsGeneration;
+        auto refusal = conditions(false, false);
         if (refusal == AppendRefusal::None && !resources.PreparedInPlaceHolds(*prepared, *recorder, inPlaceBehind)) {
             refusal = AppendRefusal::Buffers;
             inPlaceRefused = true;
         }
-        followSeen = expectAppend && (refusal == AppendRefusal::Depth || refusal == AppendRefusal::Multisample) ? conditions(true) : refusal;
+        followSeen = expectAppend && (refusal == AppendRefusal::Depth || refusal == AppendRefusal::Multisample) ? conditions(true, false) : refusal;
+        if (expectAppend && (followKind & 2u) != 0 && followSeen == AppendRefusal::Targets) {
+            auto seen = conditions(false, true);
+            if (seen == AppendRefusal::Depth || seen == AppendRefusal::Multisample) seen = conditions(true, true);
+            if (seen == AppendRefusal::None) followSeen = seen;
+        }
         if (refusal != AppendRefusal::None) noteAppendRefusal(refusal);
         else if (appendVerifyDue()) appendClaim.armed = true;
         else appended = true;
         if (appended) noteValidated(generation);
+        if (appended) depthApplied = conditionsApplied;
         for (std::size_t index = 0; appended && index < keep.targets.size(); ++index) {
             if (keep.targets[index] == nullptr) NoteMultisampleTargetDrawn_nid_no_patch(keep.multisample[index]);
         }
     }
+    if (resume != nullptr && resume->upload && RuntimeSwitches::Set(RuntimeSwitch::AppendCommits) && !atFloor && !verifyDue && !reprove && templateMiss == ShaderResources::ExpressMiss::None) noteAppendRefusal(AppendRefusal::Targets);
     bool followVerifyPending = false;
     const char* followContext = expectAppend ? runFollowContext(run, express) : "";
     if (expectAppend && !verifyDue) {
         if (followSeen == AppendRefusal::None) followVerifyPending = true;
+        else if ((followKind & 1u) != 0 && followSeen == AppendRefusal::Count && reprove) followVerifyPending = true;
         else {
             followVerifyOpen = false;
             const bool templateMoved = followSeen == AppendRefusal::Count && templateMiss != ShaderResources::ExpressMiss::None && resources.ExpressCurrentFollowing() != ShaderResources::ExpressMiss::None;
@@ -8315,13 +8625,54 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
                 static std::atomic<std::uint32_t> moved{0};
                 if (moved.fetch_add(1, std::memory_order_relaxed) < 16u) std::fprintf(stderr, "[run-follow-verify] the template stopped being current between the follower's test and the full commit; not counted as differing\n");
             }
-            noteRunFollowVerify(templateMoved, followSeen == AppendRefusal::Count ? "its append conditions were not reached" : AppendRefusalNames[static_cast<std::size_t>(followSeen)], followContext);
+            noteRunFollowVerify(templateMoved, followSeen == AppendRefusal::Count ? "its append conditions were not reached" : AppendRefusalNames[static_cast<std::size_t>(followSeen)], followContext, "", followKind);
         }
     }
+    const auto verifyAfterSteps = [&] {
+        if (!followVerifyOpen || sideEffectsMoved) return;
+        if (templateMiss == ShaderResources::ExpressMiss::None || resources.ExpressCurrentFollowing() == ShaderResources::ExpressMiss::None) {
+            conditionsRecorder = recorder->Id();
+            conditionsGeneration = recorder->RenderPassGeneration();
+            auto seen = conditions(false, false);
+            if (seen == AppendRefusal::Depth || seen == AppendRefusal::Multisample) seen = conditions(true, false);
+            if (seen == AppendRefusal::None) {
+                sideEffectsBegun = false;
+                return;
+            }
+            followVerifyOpen = false;
+            followVerifyPending = false;
+            noteRunFollowVerify(false, AppendRefusalNames[static_cast<std::size_t>(seen)], followContext, "the append conditions refused after the follower's steps on ", followKind);
+            return;
+        }
+        followVerifyOpen = false;
+        followVerifyPending = false;
+        noteRunFollowVerify(true, "the template is not current after the proof", followContext, "", followKind);
+    };
+    const auto resumeHolds = [&] {
+        const bool samePass = recorder->RenderPassOpen() && recorder->Id() == run.recorder && recorder->RenderPassGeneration() == run.generation;
+        for (std::size_t index = 0; index < keep.targets.size(); ++index) {
+            const auto& target = keep.targets[index];
+            if (target == nullptr || index >= state.colors.size() || index >= express->targetVersions.size() || index >= express->dccAddresses.size() || !target->Cached() || target->UploadVersion() != express->targetVersions[index]) return false;
+            const auto dcc = SurfaceForTarget(state.colors[index]).dccAddress;
+            if (dcc != express->dccAddresses[index] || !StorageImageServesKeys(*target, dcc) || (samePass && !target->NotedInPass(run.recorder, run.generation))) return false;
+        }
+        return resume->templateMiss != ShaderResources::ExpressMiss::None || resources.ExpressCurrent() == ShaderResources::ExpressMiss::None || resources.ExpressCurrentFollowing() != ShaderResources::ExpressMiss::None;
+    };
     bool depthStamped = false;
     std::uint32_t multisampleStamped = 0;
     const bool sameTargets = appended || (atFloor && recorder->RenderPassOpen() && floorPass.recorder == recorder->Id() && floorPass.generation == recorder->RenderPassGeneration() && floorPass.framebuffer == keep.framebuffer.get());
-    for (std::size_t index = 0; !sameTargets && index < keep.targets.size(); ++index) {
+    const bool targetsAhead = resume != nullptr && resume->targets;
+    if (targetsAhead) {
+        out.refreshed = resume->refreshed;
+        ++run.census.resumedTargets;
+        if (resume->miss == DrawExpressMiss::Targets) {
+            ++run.census.resumedMisses;
+            return miss(DrawExpressMiss::Targets);
+        }
+        if (runFollowVerifyDue()) noteRunFollowVerify(resumeHolds(), "a target or the template answer moved since the follower's steps", runFollowContext(run, express), "the express commit resumed, but ", std::uint8_t{4});
+    }
+    if (followKind != 0) sideEffectsBegun = true;
+    for (std::size_t index = 0; !sameTargets && !targetsAhead && index < keep.targets.size(); ++index) {
         const auto& target = keep.targets[index];
         if (target == nullptr) {
             if (index >= state.colors.size() || index >= keep.multisample.size() || keep.multisample[index] == nullptr || index >= express->multisampleImages.size() || index >= recipe->targetViews.size()) return targetMiss(0);
@@ -8348,67 +8699,76 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
             }
             continue;
         }
-        if (index >= state.colors.size() || !target->Cached()) return targetMiss(2);
-        const auto& color = state.colors[index];
-        const auto dcc = SurfaceForTarget(color).dccAddress;
-        if (dcc != express->dccAddresses[index] || !StorageImageServesKeys(*target, dcc)) return targetMiss(3);
-        const bool follows = RuntimeSwitches::Set(RuntimeSwitch::ExpressTargetUploads);
-        const bool uploaded = follows && target->UploadVersion() != express->targetVersions[index];
-        if (uploaded || !recorder->RenderPassOpen() || !target->NotedInPass(recorder->Id(), recorder->RenderPassGeneration())) {
-            if (!StorageImageCached(context, target.get())) return targetMiss(4);
-            if (color.fmaskAddress != 0) GuardOneFragmentFmask(context, color);
-            DrawOutcome refreshed;
-            const auto resident = refreshResidentTarget(context, state, color, refreshed, false, [&] {
-                if (color.arrayLastSlice != 0) target->RefreshLayers(color.arraySlice, 1);
-                else target->Refresh();
-                return target;
-            });
-            if (resident.get() != target.get()) return targetMiss(5);
-            ++out.refreshed;
-        }
-        if (target->UploadVersion() != express->targetVersions[index]) {
-            if (!follows) return targetMiss(6);
-            express->targetVersions[index] = target->UploadVersion();
-            expressTargetCauses[7].fetch_add(1, std::memory_order_relaxed);
-        }
+        if (const auto cause = refreshExpressTarget(context, state, *express, target, index, *recorder, out.refreshed); cause != ExpressTargetHeld) return targetMiss(cause);
     }
-    if (express->hasDepth && (DepthSurfacesSerial() != express->depthSerial || DepthSurfacesReleased() != express->depthReleased)) return miss(DrawExpressMiss::Depth);
-    if (!sameTargets && recipe->hasDepth && state.depth.has_value()) {
-        auto& checked = HostThreadLocal<ExpressDepthChecked, ExpressDepthStorage>();
-        const auto expected = recipe->targetViews.empty() ? VK_NULL_HANDLE : recipe->targetViews.back();
-        if (!recorder->RenderPassOpen() || checked.recorder != recorder->Id() || checked.generation != recorder->RenderPassGeneration() || checked.address != state.depth->address || checked.view != expected) {
-            const auto generation = recorder->RenderPassGeneration();
-            const auto view = DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state));
-            if (view != expected) return miss(DrawExpressMiss::Depth);
-            checked = {recorder->Id(), generation, state.depth->address, expected};
-            depthStamped = true;
-            ++out.refreshed;
-            noteValidated(generation);
-        } else {
-            noteValidated(recorder->RenderPassGeneration());
+    if (followKind != 0) sideEffectsMoved = !recorder->RenderPassOpen() || recorder->RenderPassGeneration() != run.generation;
+    if (followKind == 2u) verifyAfterSteps();
+    const bool provedAhead = resume != nullptr && resume->proved;
+    if (!provedAhead) {
+        if (express->hasDepth && (DepthSurfacesSerial() != express->depthSerial || DepthSurfacesReleased() != express->depthReleased)) return miss(DrawExpressMiss::Depth);
+        if (!sameTargets && recipe->hasDepth && state.depth.has_value()) {
+            auto& checked = HostThreadLocal<ExpressDepthChecked, ExpressDepthStorage>();
+            const auto expected = recipe->targetViews.empty() ? VK_NULL_HANDLE : recipe->targetViews.back();
+            const bool keyed = recorder->RenderPassOpen() && checked.recorder == recorder->Id() && checked.generation == recorder->RenderPassGeneration() && checked.address == state.depth->address && checked.view == expected;
+            if (keyed && intentOn && !std::exchange(intentNoted, true)) noteDepthIntent(ownIntent, checked.applied, false);
+            if (!keyed || (intentOn && !depthIntentHeld(ownIntent, checked.applied))) {
+                if (keyed) depthIntentViews.fetch_add(1, std::memory_order_relaxed);
+                const auto generation = recorder->RenderPassGeneration();
+                const auto view = DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state));
+                if (view != expected) return miss(DrawExpressMiss::Depth);
+                checked = {recorder->Id(), generation, state.depth->address, expected, static_cast<std::uint8_t>(keyed ? checked.applied | ownIntent : ownIntent)};
+                depthApplied = checked.applied;
+                depthStamped = true;
+                ++out.refreshed;
+                noteValidated(generation);
+            } else {
+                depthApplied = checked.applied;
+                noteValidated(recorder->RenderPassGeneration());
+            }
         }
-    }
-    if (StorageTexture::DrawnLinearPending()) return miss(DrawExpressMiss::Linear);
-    if (prepared == nullptr || !RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || record.verifyBuffers || prepared->plan == nullptr || prepared->plan != resources.DirectBufferPlan(shaders)) return miss(DrawExpressMiss::Buffers);
-    if (preparedInputs == nullptr || !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || record.verifyInputs) return miss(DrawExpressMiss::Inputs);
-    if (verifyDue) {
-        out.verify = true;
-        out.reproved = reprove;
-        return miss(DrawExpressMiss::Verify);
+        if (StorageTexture::DrawnLinearPending()) return miss(DrawExpressMiss::Linear);
+        if (prepared == nullptr || !RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || record.verifyBuffers || prepared->plan == nullptr || prepared->plan != resources.DirectBufferPlan(shaders)) return miss(DrawExpressMiss::Buffers);
+        if (preparedInputs == nullptr || !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || record.verifyInputs) return miss(DrawExpressMiss::Inputs);
+        if (verifyDue) {
+            out.verify = true;
+            out.reproved = reprove;
+            return miss(DrawExpressMiss::Verify);
+        }
+    } else if (resume->depthChecked) {
+        depthApplied = HostThreadLocal<ExpressDepthChecked, ExpressDepthStorage>().applied;
+        noteValidated(resume->depthGeneration);
     }
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     PerformanceTimer timing("Graphics.ExpressCommit");
     DrawTimer timer(false);
-    recorder->BoundKeptBytes();
-    record.effects = {};
-    if (reprove) {
-        if (!proveRecordTemplate(record, resources, shaders, out.result, false)) {
-            record.effects = {};
-            out.result = {};
+    if (provedAhead) {
+        ++run.census.resumedProofs;
+        record.effects = {};
+        if (resume->miss == DrawExpressMiss::Template) {
+            ++run.census.resumedMisses;
             return miss(DrawExpressMiss::Template);
         }
+        record.effects.proved = true;
+        record.effects.cleanProof = resume->cleanProof;
+        out.result = std::move(resume->result);
         out.reproved = true;
         out.reproveMiss = templateMiss;
+    } else {
+        recorder->BoundKeptBytes();
+        record.effects = {};
+        if (reprove) {
+            if (!proveRecordTemplate(record, resources, shaders, out.result, false)) {
+                record.effects = {};
+                out.result = {};
+                return miss(DrawExpressMiss::Template);
+            }
+            out.reproved = true;
+            out.reproveMiss = templateMiss;
+            if ((followKind & 1u) != 0) {
+                sideEffectsMoved = sideEffectsMoved || !recorder->RenderPassOpen() || recorder->RenderPassGeneration() != run.generation;
+                verifyAfterSteps();
+            }
+        }
     }
     DrawInputs inputs;
     const bool leanOn = RuntimeSwitches::Set(RuntimeSwitch::LeanExpress);
@@ -8484,7 +8844,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         record.touchedPresent = present;
     }
     countCache(&DrawProfile::cacheHits);
-    keepFragmentBindings(*recorder, fragment->bindings);
+    keepExpressBindings(*recorder, fragment->bindings);
     if (express->keptRecorder != recorder->Id() || express->keptBatch != recorder->OpenSerial()) {
         recorder->Keep(express->keep);
         for (const auto& owner : keep.multisample) {
@@ -8528,7 +8888,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         start = {recorder->AppendablePass(express->passKey), true, false, PassBreak::Continued};
     } else {
         start = recorder->StartDrawPass(express->passKey, indirectExpress && !recorder->PassIndirectReads(), express->fenced, passAccess, express->restartDepth);
-        if (followVerifyPending) noteRunFollowVerify(followPassHeld && start.continued, followPassHeld ? PassBreakNames[static_cast<std::size_t>(start.reason)] : "the pass ended inside the express commit", followContext);
+        if (followVerifyPending) noteRunFollowVerify((followKind != 0 && sideEffectsMoved) || (followPassHeld && start.continued), followPassHeld ? PassBreakNames[static_cast<std::size_t>(start.reason)] : "the pass ended inside the express commit", followContext, "", followKind);
         if (passSeenVerify) {
             const auto checked = passReadsChecked.fetch_add(1, std::memory_order_relaxed) + 1u;
             const auto differing = start.continued ? passReadsDiffering.load(std::memory_order_relaxed) : passReadsDiffering.fetch_add(1, std::memory_order_relaxed) + 1u;
@@ -8644,7 +9004,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         const auto opened = recorder->RenderPassGeneration();
         const bool needs = (recipe->hasDepth && state.depth.has_value()) || std::ranges::any_of(keep.targets, [](const std::shared_ptr<StorageTexture>& target) { return target == nullptr; });
         const bool held = !needs || (validated && !validatedSplit && (validatedAt == opened || (validatedAt == generationBeforeStart && passOpenBeforeStart && opened == generationBeforeStart + 1)));
-        static_cast<void>(leadExpressRun(run, *recorder, *express, keep, state, *recipe, held));
+        static_cast<void>(leadExpressRun(run, *recorder, *express, keep, state, *recipe, held, depthApplied));
     }
     if (following && !expectAppend && !appendClaim.armed && !passSeenVerify) {
         ++(appended ? run.census.appended : run.census.full);
@@ -8680,6 +9040,9 @@ void EndExpressRun(ExpressRunEnd reason) {
     auto& run = expressRun();
     if (run.open == 0 || --run.open != 0) return;
     run.expectAppend = false;
+    run.expectKind = 0;
+    run.resume.record = nullptr;
+    run.intentNoted = false;
     if (!run.led) return;
     const bool following = RuntimeSwitches::Set(RuntimeSwitch::RunFollow);
     if (!following || reason == ExpressRunEnd::Stop || reason == ExpressRunEnd::Switch || RuntimeSwitches::Set(RuntimeSwitch::RunFollowNoCarry) || !GuestMemory::GpuMutex().HeldByThisThread()) {
@@ -8745,7 +9108,14 @@ void NoteExpressNonFollower(bool attempted, std::uint64_t attemptNanoseconds, st
 void DropExpressFollowVerify() {
     auto& run = expressRun();
     run.expectAppend = false;
+    run.expectKind = 0;
+    run.resume.record = nullptr;
+    run.intentNoted = false;
     run.refused = ExpressRunRefusal::Count;
+}
+
+void NoteExpressFollowDue(bool due) {
+    expressRun().followDue = due;
 }
 
 bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers& prepared, PreparedInputs& preparedInputs, DrawFragment& fragment) {
@@ -8771,6 +9141,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
         refuseRun(run, why);
         return false;
     };
+    run.resume.record = nullptr;
     auto* express = record.express.get();
     const auto* recipe = record.recipe.get();
     if (express == nullptr || !express->valid || express->keep == nullptr || recipe == nullptr || express->recipe != recipe || express->state != &state || record.expressRefused || record.verifyBuffers || record.verifyInputs) return refuse(ExpressRunRefusal::State);
@@ -8778,101 +9149,231 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     if (prepared.inPlace) return refuse(ExpressRunRefusal::InPlace);
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || context.recorder != recorder || express->device != context.device) return refuse(ExpressRunRefusal::Device);
-    if (express->switches != run.switches || RuntimeSwitches::Generation() != run.switches || recordChecksQueued() || DescriptorHeapEnabled()) return refuse(ExpressRunRefusal::Switches);
     auto& keep = *express->keep;
-    if (fragment.bindings == nullptr || fragment.device != context.device || fragment.resources.get() != keep.resources.get() || fragment.pipeline.get() != keep.pipeline.get()) return refuse(ExpressRunRefusal::Objects);
     const auto recorderId = recorder->Id();
-    if (recorderId != run.recorder) return refuse(ExpressRunRefusal::Recorder);
-    const auto generation = recorder->RenderPassGeneration();
-    if (generation != run.generation) return refuse(ExpressRunRefusal::Generation);
-    if (express->passKey != run.passKey) return refuse(ExpressRunRefusal::Key);
-    if (!express->writes.empty() || !express->writeOnly.empty()) return refuse(ExpressRunRefusal::OwnWrites);
-    if (std::ranges::any_of(express->images, [](const std::pair<VkImage, bool>& image) { return image.second; })) return refuse(ExpressRunRefusal::OwnImages);
-    const auto commands = recorder->AppendablePass(express->passKey);
-    if (commands == VK_NULL_HANDLE) return refuse(ExpressRunRefusal::NotAppendable);
-    const auto forget = GuestMemory::ForgetSerial();
-    const auto imports = HostImportSetGeneration();
-    const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    const auto depthSerial = DepthSurfacesSerial();
-    const auto depthReleased = DepthSurfacesReleased();
-    if (forget != run.forget || imports != run.imports || mapping != run.mapping || depthSerial != run.depthSerial || depthReleased != run.depthReleased) return refuse(ExpressRunRefusal::Serials);
-    if (express->hasDepth && (express->depthSerial != depthSerial || express->depthReleased != depthReleased)) return refuse(ExpressRunRefusal::OwnSerials);
-    if (StorageTexture::DrawnLinearPending()) return refuse(ExpressRunRefusal::Linear);
-    if ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty()) return refuse(ExpressRunRefusal::Writers);
-    const auto targetCount = keep.targets.size();
-    if (targetCount != run.targets || express->targetVersions.size() < targetCount || express->dccAddresses.size() < targetCount) return refuse(ExpressRunRefusal::OwnTargets);
-    for (std::size_t index = 0; index < targetCount; ++index) {
-        const auto* target = keep.targets[index].get();
-        if (target == nullptr) {
-            if (index >= keep.multisample.size() || keep.multisample[index] == nullptr || static_cast<const void*>(keep.multisample[index].get()) != run.owners[index] || index >= express->multisampleImages.size() || express->multisampleImages[index] != run.images[index] || index >= state.colors.size() || index >= recipe->targetViews.size()) return refuse(ExpressRunRefusal::Multisample);
-            continue;
-        }
-        if (static_cast<const void*>(target) != run.owners[index] || index >= state.colors.size()) return refuse(ExpressRunRefusal::OwnTargets);
-        if (target->Image() != run.images[index] || target->UploadVersion() != run.versions[index] || !target->Cached() || !target->NotedInPass(recorderId, generation)) return refuse(ExpressRunRefusal::Targets);
-        if (express->targetVersions[index] != run.versions[index] || express->dccAddresses[index] != run.dcc[index]) return refuse(ExpressRunRefusal::OwnTargets);
-        if (!StorageImageServesKeys(*target, express->dccAddresses[index])) return refuse(ExpressRunRefusal::Targets);
-    }
-    if (recipe->hasDepth && state.depth.has_value()) {
+    const bool windows = RuntimeSwitches::Set(RuntimeSwitch::FollowWindows) && !VerifyGuardSpans();
+    const bool widerCensus = RuntimeSwitches::Set(RuntimeSwitch::FollowWider);
+    const bool intentOn = RuntimeSwitches::Set(RuntimeSwitch::ExpressDepthIntent);
+    const std::uint8_t ownIntent = intentOn ? depthIntent(state) : 0u;
+    const auto depthMemoHolds = [&] {
+        if (!recipe->hasDepth || !state.depth.has_value()) return true;
+        const auto& checked = HostThreadLocal<ExpressDepthChecked, ExpressDepthStorage>();
         const auto expected = recipe->targetViews.empty() ? VK_NULL_HANDLE : recipe->targetViews.back();
-        if (!run.depthChecked || state.depth->address != run.depthAddress || expected != run.depthView) return refuse(ExpressRunRefusal::Depth);
-    }
-    mark(1);
-    auto& resources = *keep.resources;
-    if (resources.ExpressCurrentFollowing() != ShaderResources::ExpressMiss::None) return refuse(ExpressRunRefusal::Template);
-    mark(2);
-    if (!RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || prepared.plan == nullptr || prepared.plan != resources.DirectBufferPlan(shaders) || !context.drawInputsInPlace) return refuse(ExpressRunRefusal::Prepared);
-    const std::size_t indexRanges = draw.indexed ? 1u : 0u;
-    if (preparedInputs.recipe.get() != recipe || preparedInputs.device != context.device || preparedInputs.state != &state || preparedInputs.draw != &draw || preparedInputs.shaders != shaders.data() || preparedInputs.stages != shaders.size() || preparedInputs.ranges.size() < indexRanges || (preparedInputs.forget & 1u) != 0 || forget != preparedInputs.forget || imports != preparedInputs.imports || mapping != preparedInputs.mapping) return refuse(ExpressRunRefusal::Inputs);
-    if (!recorder->PassReadsFollow(express->reads, preparedInputs.inPlaceReads)) return refuse(ExpressRunRefusal::PassWrites);
-    if (!recorder->PassImagesFollow(express->images, std::span<const std::pair<VkImage, bool>>(run.attachments.data(), run.targets))) return refuse(ExpressRunRefusal::ImageHazard);
-    if (express->fenced && !recorder->PassFenced()) return refuse(ExpressRunRefusal::Fenced);
-    keyRunRanges(run.clear, recorderId, recorder->WriteNoteCount(), StorageTexture::PendingSerial(), Recorder::QueuedLabelSerial());
-    const bool queuedStores = recorder->HasQueuedStores();
-    for (const auto& range : preparedInputs.ranges) {
-        const auto bytes = static_cast<std::size_t>(range.end - range.begin);
-        if (range.import == nullptr) return refuse(ExpressRunRefusal::Inputs);
-        if (queuedStores && recorder->QueuedStoreOverlaps(range.begin, bytes)) return refuse(ExpressRunRefusal::InputStores);
-        if (runRangesHold(run.clear, range.begin, range.end, true)) {
-            ++run.census.rangesSkipped;
-            continue;
-        }
-        if (!PendingZones::Clear(range.begin, bytes) && (recorder->PendingWriteOverlaps(range.begin, bytes) || PendingStorageOverlaps(range.begin, bytes, nullptr))) return refuse(ExpressRunRefusal::InputWrites);
-        if (recorder->PendingLabelIn(range.begin, bytes)) return refuse(ExpressRunRefusal::InputStores);
-        addRunRange(run.clear, range.begin, range.end);
-    }
-    mark(3);
-    FollowZones zones{run, *recorder};
-    if (!resources.PreparedZonesClearBy(prepared, &followZoneClear, &zones)) return refuse(ExpressRunRefusal::Buffers);
-    if (recorder->HasQueuedKeyStores() || queuedStores) {
-        const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
-            const auto bytes = static_cast<std::size_t>(end - begin);
-            return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes);
+        return recorder->RenderPassOpen() && checked.recorder == recorder->Id() && checked.generation == recorder->RenderPassGeneration() && checked.address == state.depth->address && checked.view == expected && (!intentOn || depthIntentHeld(ownIntent, checked.applied));
+    };
+    int widened = -1;
+    const auto widen = [&] {
+        if (widened < 0) widened = widerCensus && followWiderAllowed(run, keep, draw, fragment) && depthMemoHolds() ? 1 : 0;
+        return widened == 1;
+    };
+    std::uint64_t generation = 0;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    bool upload = false;
+    auto templateMiss = ShaderResources::ExpressMiss::None;
+    const auto holds = [&](bool first) {
+        const auto ownTargets = [&](std::size_t cause) {
+            if (first && widerCensus) {
+                ++run.census.ownTargets[cause];
+                if (std::ranges::any_of(keep.multisample, [](const std::shared_ptr<void>& owner) { return owner != nullptr; })) ++run.census.ownTargets[3];
+            }
+            return ExpressRunRefusal::OwnTargets;
         };
-        if ((recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) || (queuedStores && recorder->AnyQueuedStore(touches))) return refuse(ExpressRunRefusal::Stores);
-    }
+        if (express->switches != run.switches || RuntimeSwitches::Generation() != run.switches || recordChecksQueued() || DescriptorHeapEnabled()) return ExpressRunRefusal::Switches;
+        if (fragment.bindings == nullptr || fragment.device != context.device || fragment.resources.get() != keep.resources.get() || fragment.pipeline.get() != keep.pipeline.get()) return ExpressRunRefusal::Objects;
+        if (recorderId != run.recorder) return ExpressRunRefusal::Recorder;
+        generation = recorder->RenderPassGeneration();
+        if (generation != run.generation) return ExpressRunRefusal::Generation;
+        if (express->passKey != run.passKey) return ExpressRunRefusal::Key;
+        if (!express->writes.empty() || !express->writeOnly.empty()) return ExpressRunRefusal::OwnWrites;
+        if (std::ranges::any_of(express->images, [](const std::pair<VkImage, bool>& image) { return image.second; })) return ExpressRunRefusal::OwnImages;
+        commands = recorder->AppendablePass(express->passKey);
+        if (commands == VK_NULL_HANDLE) return ExpressRunRefusal::NotAppendable;
+        const auto forget = GuestMemory::ForgetSerial();
+        const auto imports = HostImportSetGeneration();
+        const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const auto depthSerial = DepthSurfacesSerial();
+        const auto depthReleased = DepthSurfacesReleased();
+        if (forget != run.forget || imports != run.imports || mapping != run.mapping || depthSerial != run.depthSerial || depthReleased != run.depthReleased) return ExpressRunRefusal::Serials;
+        if (express->hasDepth && (express->depthSerial != depthSerial || express->depthReleased != depthReleased)) return ExpressRunRefusal::OwnSerials;
+        if (StorageTexture::DrawnLinearPending()) return ExpressRunRefusal::Linear;
+        if ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty()) return ExpressRunRefusal::Writers;
+        const auto targetCount = keep.targets.size();
+        if (targetCount != run.targets || express->targetVersions.size() < targetCount || express->dccAddresses.size() < targetCount) return ownTargets(0);
+        for (std::size_t index = 0; index < targetCount; ++index) {
+            const auto* target = keep.targets[index].get();
+            if (target == nullptr) {
+                if (index >= keep.multisample.size() || keep.multisample[index] == nullptr || static_cast<const void*>(keep.multisample[index].get()) != run.owners[index] || index >= express->multisampleImages.size() || express->multisampleImages[index] != run.images[index] || index >= state.colors.size() || index >= recipe->targetViews.size()) return ExpressRunRefusal::Multisample;
+                continue;
+            }
+            if (static_cast<const void*>(target) != run.owners[index] || index >= state.colors.size()) return ownTargets(0);
+            if (target->Image() != run.images[index] || target->UploadVersion() != run.versions[index] || !target->Cached() || !target->NotedInPass(recorderId, generation)) return ExpressRunRefusal::Targets;
+            if (express->dccAddresses[index] != run.dcc[index]) return ownTargets(2);
+            if (express->targetVersions[index] != run.versions[index]) {
+                if (!first || !RuntimeSwitches::Set(RuntimeSwitch::ExpressTargetUploads) || !widen()) return ownTargets(1);
+                upload = true;
+            }
+            if (!StorageImageServesKeys(*target, express->dccAddresses[index])) return ExpressRunRefusal::Targets;
+        }
+        if (recipe->hasDepth && state.depth.has_value()) {
+            const auto expected = recipe->targetViews.empty() ? VK_NULL_HANDLE : recipe->targetViews.back();
+            if (!run.depthChecked || state.depth->address != run.depthAddress || expected != run.depthView) return ExpressRunRefusal::Depth;
+            if (intentOn && !depthIntentHeld(ownIntent, run.depthApplied)) {
+                if (first) {
+                    noteDepthIntent(ownIntent, run.depthApplied, true);
+                    run.intentNoted = true;
+                }
+                return ExpressRunRefusal::Depth;
+            }
+        }
+        if (first) mark(1);
+        auto& resources = *keep.resources;
+        if (const auto missed = resources.ExpressCurrentFollowing(); missed != ShaderResources::ExpressMiss::None) {
+            const bool reprovable = missed != ShaderResources::ExpressMiss::Regions && (missed != ShaderResources::ExpressMiss::NotProved || (RuntimeSwitches::Set(RuntimeSwitch::ExpressKeepState) && resources.ExpressWatchable()));
+            if (first && widerCensus) {
+                ++run.census.templateMisses[static_cast<std::size_t>(missed)];
+                if (reprovable) ++run.census.templateReprovable;
+            }
+            if (!first || !reprovable || !widen()) return ExpressRunRefusal::Template;
+            templateMiss = missed;
+        }
+        if (first) mark(2);
+        if (!RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || prepared.plan == nullptr || prepared.plan != resources.DirectBufferPlan(shaders) || !context.drawInputsInPlace) return ExpressRunRefusal::Prepared;
+        const std::size_t indexRanges = draw.indexed ? 1u : 0u;
+        if (preparedInputs.recipe.get() != recipe || preparedInputs.device != context.device || preparedInputs.state != &state || preparedInputs.draw != &draw || preparedInputs.shaders != shaders.data() || preparedInputs.stages != shaders.size() || preparedInputs.ranges.size() < indexRanges || (preparedInputs.forget & 1u) != 0 || forget != preparedInputs.forget || imports != preparedInputs.imports || mapping != preparedInputs.mapping) return ExpressRunRefusal::Inputs;
+        if (!recorder->PassReadsFollow(express->reads, preparedInputs.inPlaceReads)) return ExpressRunRefusal::PassWrites;
+        if (!recorder->PassImagesFollow(express->images, std::span<const std::pair<VkImage, bool>>(run.attachments.data(), run.targets))) return ExpressRunRefusal::ImageHazard;
+        if (express->fenced && !recorder->PassFenced()) return ExpressRunRefusal::Fenced;
+        keyRunRanges(run.clear, recorderId, recorder->WriteNoteCount(), StorageTexture::PendingSerial(), Recorder::QueuedLabelSerial());
+        if (windows) keyRunWindows(run, *recorder);
+        const bool queuedStores = recorder->HasQueuedStores();
+        for (const auto& range : preparedInputs.ranges) {
+            const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+            if (range.import == nullptr) return ExpressRunRefusal::Inputs;
+            if (queuedStores && recorder->QueuedStoreOverlaps(range.begin, bytes)) return ExpressRunRefusal::InputStores;
+            if (runRangesHold(run.clear, range.begin, range.end, true)) {
+                ++run.census.rangesSkipped;
+                continue;
+            }
+            const auto pendingOver = [&] { return !PendingZones::Clear(range.begin, bytes) && (recorder->PendingWriteOverlaps(range.begin, bytes) || PendingStorageOverlaps(range.begin, bytes, nullptr)); };
+            bool pendingClear = windows && runWindowsClear(run, *recorder, WindowFact::Pending, range.begin, bytes);
+            if (pendingClear && windowVerifyDue()) {
+                pendingClear = !pendingOver();
+                noteWindowVerify(WindowFact::Pending, pendingClear);
+            }
+            if (!pendingClear && pendingOver()) return ExpressRunRefusal::InputWrites;
+            bool labelsClear = windows && runWindowsClear(run, *recorder, WindowFact::Labels, range.begin, bytes);
+            if (labelsClear && windowVerifyDue()) {
+                labelsClear = !recorder->PendingLabelIn(range.begin, bytes);
+                noteWindowVerify(WindowFact::Labels, labelsClear);
+            }
+            if (!labelsClear && recorder->PendingLabelIn(range.begin, bytes)) return ExpressRunRefusal::InputStores;
+            addRunRange(run.clear, range.begin, range.end);
+        }
+        if (first) mark(3);
+        FollowZones zones{run, *recorder, windows};
+        if (!resources.PreparedZonesClearBy(prepared, &followZoneClear, &zones)) return ExpressRunRefusal::Buffers;
+        if (recorder->HasQueuedKeyStores() || queuedStores) {
+            const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
+                const auto bytes = static_cast<std::size_t>(end - begin);
+                return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes);
+            };
+            if ((recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) || (queuedStores && recorder->AnyQueuedStore(touches))) return ExpressRunRefusal::Stores;
+        }
+        return ExpressRunRefusal::Count;
+    };
+    if (const auto why = holds(true); why != ExpressRunRefusal::Count) return refuse(why);
+    auto& resources = *keep.resources;
+    const bool reproving = templateMiss != ShaderResources::ExpressMiss::None;
+    const auto kind = static_cast<std::uint8_t>((reproving ? 1u : 0u) | (upload ? 2u : 0u));
     if (runFollowVerifyDue()) {
         run.expectAppend = true;
+        run.expectKind = kind;
         return refuse(ExpressRunRefusal::Verify);
     }
     mark(4);
+    auto& resume = run.resume;
+    const auto late = [&](ExpressRunRefusal why) {
+        if (kind != 0 && (resume.targets || resume.proved)) {
+            resume.record = &record;
+            ++run.census.widerRefused;
+        }
+        return refuse(why);
+    };
+    if (kind != 0) {
+        resume.ordinal = run.followOrdinal;
+        resume.targets = true;
+        resume.proved = false;
+        resume.upload = upload;
+        resume.depthChecked = false;
+        resume.depthGeneration = 0;
+        resume.miss = DrawExpressMiss::None;
+        resume.refreshed = 0;
+        resume.templateMiss = templateMiss;
+        resume.cleanProof.reset();
+        resume.result = {};
+        for (std::size_t index = 0; index < keep.targets.size(); ++index) {
+            if (const auto cause = refreshExpressTarget(context, state, *express, keep.targets[index], index, *recorder, resume.refreshed); cause != ExpressTargetHeld) {
+                expressTargetCauses[cause].fetch_add(1, std::memory_order_relaxed);
+                resume.miss = DrawExpressMiss::Targets;
+                return late(ExpressRunRefusal::OwnTargets);
+            }
+        }
+    }
+    if (reproving) {
+        if (express->hasDepth && (DepthSurfacesSerial() != express->depthSerial || DepthSurfacesReleased() != express->depthReleased)) return late(ExpressRunRefusal::OwnSerials);
+        if (!depthMemoHolds()) return late(ExpressRunRefusal::Depth);
+        resume.depthChecked = recipe->hasDepth && state.depth.has_value();
+        resume.depthGeneration = recorder->RenderPassGeneration();
+        if (StorageTexture::DrawnLinearPending()) return late(ExpressRunRefusal::Linear);
+        if (!RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || record.verifyBuffers || prepared.plan == nullptr || prepared.plan != resources.DirectBufferPlan(shaders)) return late(ExpressRunRefusal::Prepared);
+        if (!RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || record.verifyInputs) return late(ExpressRunRefusal::Inputs);
+    } else if (kind != 0) {
+        if (const auto why = holds(false); why != ExpressRunRefusal::Count) return late(why);
+    }
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     recorder->BoundKeptBytes();
-    if (resources.FragmentSelectionHolds(*recorder, prepared.moved, prepared, nullptr, true) != ShaderResources::PreparedBuffers::Selection::Taken) return refuse(ExpressRunRefusal::Selection);
+    if (reproving) {
+        record.effects = {};
+        resume.proved = true;
+        if (!proveRecordTemplate(record, resources, shaders, resume.result, false)) {
+            record.effects = {};
+            resume.result = {};
+            resume.miss = DrawExpressMiss::Template;
+            return late(ExpressRunRefusal::Template);
+        }
+        resume.cleanProof = record.effects.cleanProof;
+        if (const auto why = holds(false); why != ExpressRunRefusal::Count) return late(why);
+    }
+    FollowGuards guards{run, *recorder};
+    const ShaderResources::GuardTests guardTests{&followDepthGuards, &followMultisampleGuards, &guards};
+    if (windows) keyRunGuardWindows(run, *recorder);
+    const auto selection = windows ? resources.FragmentSelectionHoldsBy(*recorder, prepared.moved, prepared, true, &guardTests) : resources.FragmentSelectionHolds(*recorder, prepared.moved, prepared, nullptr, true);
+    if (selection != ShaderResources::PreparedBuffers::Selection::Taken) return late(ExpressRunRefusal::Selection);
     mark(5);
     try {
-        resources.ExpressStage(*recorder);
+        if (!reproving) resources.ExpressStage(*recorder);
     } catch (const std::exception&) {
-        return refuse(ExpressRunRefusal::Staging);
+        return late(ExpressRunRefusal::Staging);
     }
+    if (windows) keyRunGuardWindows(run, *recorder);
     for (std::size_t at = 0; at < preparedInputs.ranges.size(); ++at) {
         const auto& range = preparedInputs.ranges[at];
-        RequireNoMultisampleTarget(range.begin, static_cast<std::size_t>(range.end - range.begin), at == 0 && draw.indexed ? "an index buffer read" : "a vertex buffer read");
+        const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+        if (windows && runWindowsClear(run, *recorder, WindowFact::DepthReads, range.begin, bytes) && runWindowsClear(run, *recorder, WindowFact::MultisampleSpans, range.begin, bytes)) {
+            if (!windowVerifyDue()) continue;
+            const bool depthIdle = DepthReadGuardIdle_nid_no_patch(range.begin, bytes);
+            const bool multisampleIdle = !MayOverlapMultisampleGuards(range.begin, bytes);
+            noteWindowVerify(WindowFact::DepthReads, depthIdle);
+            noteWindowVerify(WindowFact::MultisampleSpans, multisampleIdle);
+            if (depthIdle && multisampleIdle) continue;
+        }
+        RequireNoMultisampleTarget(range.begin, bytes, at == 0 && draw.indexed ? "an index buffer read" : "a vertex buffer read");
     }
     if (resources.ChecksFaults() && fragment.faultGeneration != resources.FaultGeneration()) resources.RewriteFragmentFaults(*fragment.bindings);
     if (!(prepared.aliasesClear && RuntimeSwitches::Set(RuntimeSwitch::AliasesAtPrepare))) CheckBufferAliases(shaders, state.color, draw.indexAddress, preparedInputs.indexBytes);
     if (recipe->hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     resources.RequireGuestBuffers();
-    if (recorder->AppendablePass(express->passKey) != commands || recorder->RenderPassGeneration() != generation) return refuse(ExpressRunRefusal::PassMoved);
+    if (recorder->AppendablePass(express->passKey) != commands || recorder->RenderPassGeneration() != generation) return late(ExpressRunRefusal::PassMoved);
     mark(6);
     const auto batch = recorder->OpenSerial();
     keyRunRanges(run.noted, recorderId, batch, recorder->OpenBatchGeneration(), 0);
@@ -8895,7 +9396,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
         record.touchedPresent = present;
     }
     countCache(&DrawProfile::cacheHits);
-    keepFragmentBindings(*recorder, fragment.bindings);
+    keepExpressBindings(*recorder, fragment.bindings);
     if (express->keptRecorder != recorderId || express->keptBatch != batch) {
         recorder->Keep(express->keep);
         for (const auto& owner : keep.multisample) {
@@ -8940,6 +9441,9 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     if (RuntimeSwitches::Set(RuntimeSwitch::AppendCommits)) noteAppendCommit(true);
     ++run.length;
     if (!express->images.empty()) ++run.census.imageFollowers;
+    if (reproving) ++run.census.widerReproved;
+    if (upload) ++run.census.widerUploads;
+    if (intentOn && recipe->hasDepth && state.depth.has_value()) noteDepthIntent(ownIntent, run.depthApplied, true);
     if (staged) {
         mark(8);
         for (std::size_t stage = 0; stage < run.census.stageNs.size(); ++stage) run.census.stageNs[stage] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(marks[stage + 1] - marks[stage]).count());

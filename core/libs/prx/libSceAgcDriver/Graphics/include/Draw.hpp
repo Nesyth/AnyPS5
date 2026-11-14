@@ -198,6 +198,7 @@ void NoteExpressRunHold(std::uint64_t nanoseconds);
 void NoteExpressRunItem();
 void NoteExpressNonFollower(bool attempted, std::uint64_t attemptNanoseconds, std::uint64_t commitNanoseconds);
 void DropExpressFollowVerify();
+void NoteExpressFollowDue(bool due);
 bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers& prepared, PreparedInputs& preparedInputs, DrawFragment& fragment);
 std::uint64_t ExpressVerifyEvery();
 enum class RepeatRefusal : std::uint8_t { NoBlock, NotSimple, VerifyDue, Shape, Objects, Batch, Pass, Epoch, ProofSerial, Pending, Depth, Target, Access, Stores, Linear, Buffers, Selection, DepthGuards, Inputs, Changed, MovedHazard, UnmovedHazard, Count };

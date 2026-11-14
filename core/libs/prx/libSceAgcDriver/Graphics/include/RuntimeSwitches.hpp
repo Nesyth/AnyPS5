@@ -205,6 +205,10 @@ enum class RuntimeSwitch : std::size_t {
     StageMemoAdmitWays,
     StageMemoInvocationWays,
     ImportSnapshots,
+    FollowWindows,
+    KeepBindingsMoved,
+    FollowWider,
+    ExpressDepthIntent,
     Count,
 };
 
