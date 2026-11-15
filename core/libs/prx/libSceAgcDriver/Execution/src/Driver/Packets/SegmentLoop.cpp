@@ -475,7 +475,7 @@ SegmentSlot& SegmentSlots::Take() {
     return slot;
 }
 
-void Driver::scanSegment(const Submission& submission, PacketTable& table, bool validating, const std::uint32_t* guest, bool byTable) {
+void Driver::scanSegment(const Submission& submission, PacketTable& table, bool validating, const std::uint32_t* guest, bool byTable, bool quiet) {
     table.Clear();
     const auto& commands = submission.commands;
     std::vector<std::size_t> guarded;
@@ -504,7 +504,7 @@ void Driver::scanSegment(const Submission& submission, PacketTable& table, bool 
                 }
             }
             if (!valid) {
-                validate(submission, guest);
+                if (!quiet) validate(submission, guest);
                 throw std::runtime_error("AGC driver: " + Pm4::Name(header) + " at DWORD " + std::to_string(cursor) + ": the lean packet scan refused a packet today's validation accepts");
             }
         }

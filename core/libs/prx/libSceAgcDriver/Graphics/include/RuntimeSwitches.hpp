@@ -239,6 +239,7 @@ enum class RuntimeSwitch : std::size_t {
     XpJobReplay,
     XpFlow,
     DeepFlow,
+    TailsAhead,
     Count,
 };
 

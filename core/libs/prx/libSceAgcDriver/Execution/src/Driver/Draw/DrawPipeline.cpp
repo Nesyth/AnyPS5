@@ -982,7 +982,7 @@ void noteRingDepth(std::uint64_t depth) {
 }
 
 namespace {
-constexpr std::array<const char*, static_cast<std::size_t>(DeepKept::Count)> DeepKeptNames{"flip", "rendering wait", "wait", "worker label", "packet verdict", "segment end", "submission", "settle", "deferred labels", "worker draw", "worker dispatch", "metadata pass", "worker note", "relocation", "indirect cpu", "dispatch not pipelined", "fallback", "shutdown", "other"};
+constexpr std::array<const char*, static_cast<std::size_t>(DeepKept::Count)> DeepKeptNames{"flip", "rendering wait", "wait", "worker label", "packet verdict", "segment end", "submission", "settle", "deferred labels", "worker draw", "worker dispatch", "metadata pass", "worker note", "relocation", "indirect cpu", "dispatch not pipelined", "fallback", "shutdown", "other", "note: dispatch not a candidate", "note: multisampled clear", "note: memory value fill", "note: HTILE depth clear", "note: HTILE mask clear", "note: HTILE zmask fix-up", "note: depth render control"};
 constexpr std::array<const char*, static_cast<std::size_t>(DeepSite::Count)> DeepSiteNames{"packet verdict", "predication", "indirect arguments", "fill inputs", "fill by turn", "dispatch reads", "late dispatch reads", "decode", "heap stages", "variant", "write evidence", "shader code", "same key", "earlier key", "items by turn", "items with reads by turn", "packet finisher"};
 static_assert(DeepKeptNames.back() != nullptr && DeepSiteNames.back() != nullptr, "every deep flow census entry needs a name");
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DeepKept::Count)> deepKept{};

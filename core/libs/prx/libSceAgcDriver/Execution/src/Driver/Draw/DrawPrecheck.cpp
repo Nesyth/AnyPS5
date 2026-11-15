@@ -123,7 +123,7 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
     }
     if (const auto control = Graphics::DecodeDepthRenderControl(queue); control && Graphics::DepthRenderControlDrains(*control)) {
         if (DrawPipeline::Active()) {
-            DrawFinisher::NoteDeepKept(DeepKept::WorkerNote);
+            DrawFinisher::NoteDeepKept(DeepKept::NoteDepthControl);
             DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
         }
         Graphics::NoteDepthRenderControl(*control);

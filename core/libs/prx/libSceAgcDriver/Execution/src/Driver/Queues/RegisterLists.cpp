@@ -167,11 +167,8 @@ private:
     std::size_t index = 0;
 };
 
-void planListHooks(LeanTails& tails, std::span<const std::uint32_t> commands, const PacketTable* table) {
-    auto& spans = tails.spans;
-    auto& idle = tails.spanIdle;
+void listSpans(GuestRanges& spans, std::span<const std::uint32_t> commands, const PacketTable* table) {
     spans.clear();
-    idle.clear();
     ListCursors walk(commands, table);
     for (std::size_t cursor = walk.First(); cursor < commands.size(); cursor = walk.Next(cursor)) {
         const auto header = commands[cursor];
@@ -189,6 +186,14 @@ void planListHooks(LeanTails& tails, std::span<const std::uint32_t> commands, co
         else spans[++last] = spans[index];
     }
     spans.resize(last + 1);
+}
+
+void planListHooks(LeanTails& tails, std::span<const std::uint32_t> commands, const PacketTable* table) {
+    auto& spans = tails.spans;
+    auto& idle = tails.spanIdle;
+    idle.clear();
+    listSpans(spans, commands, table);
+    if (spans.empty()) return;
     bool all = Graphics::Recorder::FlushHookIdle(spans);
     for (std::size_t index = 0; all && index < spans.size(); ++index) all = Graphics::ReadGuardIdle(spans[index].first, static_cast<std::size_t>(spans[index].second - spans[index].first));
     idle.assign(spans.size(), static_cast<std::uint8_t>(all ? 1 : 0));
@@ -845,6 +850,207 @@ void Driver::verifyLeanLists(const Submission& submission, bool cacheable, std::
         }
         checkAnswer(*shape, found->second, lean, cached, header, cursor, submission.serial, ownWrites);
     }
+}
+
+namespace {
+
+constexpr std::uint64_t AheadPageBytes = 4096;
+
+void mergeSpans(GuestRanges& spans, std::uint64_t gap) {
+    if (spans.empty()) return;
+    std::sort(spans.begin(), spans.end());
+    std::size_t last = 0;
+    for (std::size_t index = 1; index < spans.size(); ++index) {
+        if (spans[index].first <= spans[last].second || spans[index].first - spans[last].second <= gap) spans[last].second = std::max(spans[last].second, spans[index].second);
+        else spans[++last] = spans[index];
+    }
+    spans.resize(last + 1);
+}
+
+std::string aheadListWhere(std::span<const std::uint32_t> commands, std::size_t cursor) {
+    return Pm4::Name(commands[cursor]) + " at DWORD " + std::to_string(cursor);
+}
+
+}
+
+AheadTail::Lists ResolveListsAhead(AheadTail& job) {
+    using Lists = AheadTail::Lists;
+    auto& lists = job.resolved;
+    lists.Clear();
+    job.collectSpans.clear();
+    job.queries.clear();
+    job.listPackets = 0;
+    const std::span<const std::uint32_t> commands = job.copy.commands;
+    const PacketTable* table = job.byTable ? &job.table : nullptr;
+    listSpans(job.hookSpans, commands, table);
+    GuestRanges exact;
+    ListCursors walk(commands, table);
+    for (std::size_t cursor = walk.First(); cursor < commands.size(); cursor = walk.Next(cursor)) {
+        const auto header = commands[cursor];
+        if ((header >> 30u) != 3u || !Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) continue;
+        if (Pm4::PacketWords(header) > commands.size() - cursor) return Lists::Shape;
+        ++job.listPackets;
+        const auto shape = leanShape(commands.subspan(cursor, Pm4::PacketWords(header)));
+        if (!shape) return Lists::Shape;
+        if (shape->count == 0) continue;
+        if (shape->address > std::numeric_limits<std::uint64_t>::max() - AheadPageBytes || shape->Bytes() > std::numeric_limits<std::uint64_t>::max() - AheadPageBytes - shape->address) return Lists::Unreadable;
+        const auto end = shape->address + shape->Bytes();
+        exact.emplace_back(shape->address, end);
+        job.collectSpans.emplace_back(shape->address & ~(AheadPageBytes - 1), (end + AheadPageBytes - 1) & ~(AheadPageBytes - 1));
+    }
+    mergeSpans(exact, 0);
+    mergeSpans(job.collectSpans, 0);
+    const auto abandoned = [&] { return job.state.load(std::memory_order_acquire) == AheadTail::Abandoned; };
+    if (abandoned()) return Lists::Dropped;
+    job.listForgets = GuestMemory::ForgetSerial();
+    if ((job.listForgets & 1u) != 0) return Lists::Forgetting;
+    std::uint64_t generation = 0;
+    for (const auto& [begin, end] : job.collectSpans) {
+        const auto collected = GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin));
+        if (collected == 0) return Lists::Unwatched;
+        generation = std::max(generation, collected);
+    }
+    for (const auto& [begin, end] : exact) job.queries.push_back({begin, static_cast<std::size_t>(end - begin), generation});
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Registers);
+    for (std::size_t cursor = walk.First(); cursor < commands.size(); cursor = walk.Next(cursor)) {
+        const auto header = commands[cursor];
+        if ((header >> 30u) != 3u || !Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) continue;
+        const auto shape = leanShape(commands.subspan(cursor, Pm4::PacketWords(header)));
+        if (!shape) return Lists::Shape;
+        const auto first = lists.words.size();
+        if (shape->count == 0) {
+            lists.refs.push_back({static_cast<std::uint32_t>(cursor), static_cast<std::uint32_t>(first), 0u, RegisterLists::Valid});
+            continue;
+        }
+        if (abandoned()) return Lists::Dropped;
+        lists.words.resize(first + shape->Words());
+        auto* out = lists.words.data() + first;
+        try {
+            copyList(*shape, out);
+        } catch (const std::exception&) {
+            return Lists::Unreadable;
+        }
+        const bool valid = Pm4::IndirectRegistersValid(std::span<const std::uint32_t>(out, shape->Words()));
+        lists.refs.push_back({static_cast<std::uint32_t>(cursor), static_cast<std::uint32_t>(first), shape->count, valid ? RegisterLists::Valid : 0u});
+    }
+    return Lists::Built;
+}
+
+bool CheckAheadLists(const Submission& submission, const PacketTable* table, std::string& detail) {
+    const std::span<const std::uint32_t> commands = submission.commands;
+    const auto& lists = submission.lists;
+    std::vector<std::uint32_t> fresh;
+    std::size_t index = 0;
+    std::size_t first = 0;
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Registers);
+    ListCursors walk(commands, table);
+    for (std::size_t cursor = walk.First(); cursor < commands.size(); cursor = walk.Next(cursor)) {
+        const auto header = commands[cursor];
+        if ((header >> 30u) != 3u || !Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) continue;
+        if (Pm4::PacketWords(header) > commands.size() - cursor) {
+            detail = aheadListWhere(commands, cursor) + ": today's walk finds a truncated list packet";
+            return false;
+        }
+        const auto shape = leanShape(commands.subspan(cursor, Pm4::PacketWords(header)));
+        if (!shape) {
+            detail = aheadListWhere(commands, cursor) + ": today's walk finds a list the lean shape does not cover";
+            return false;
+        }
+        if (index >= lists.refs.size()) {
+            detail = aheadListWhere(commands, cursor) + ": the lists resolved ahead end before this list";
+            return false;
+        }
+        const auto& ref = lists.refs[index++];
+        if (ref.cursor != cursor || ref.first != first || ref.pairs != shape->count) {
+            detail = aheadListWhere(commands, cursor) + ": the list resolved ahead sits at DWORD " + std::to_string(ref.cursor) + " word " + std::to_string(ref.first) + " with " + std::to_string(ref.pairs) + " pairs, today's at word " + std::to_string(first) + " with " + std::to_string(shape->count);
+            return false;
+        }
+        fresh.assign(shape->Words(), 0);
+        try {
+            copyList(*shape, fresh.data());
+        } catch (const std::exception& error) {
+            detail = aheadListWhere(commands, cursor) + ", list " + hex(shape->address) + ": today's read failed: " + error.what();
+            return false;
+        }
+        const bool valid = shape->count == 0 || Pm4::IndirectRegistersValid(fresh);
+        if (((ref.flags & RegisterLists::Valid) != 0) != valid || (ref.flags & ~RegisterLists::Valid) != 0) {
+            detail = aheadListWhere(commands, cursor) + ", list " + hex(shape->address) + ": flags " + hex(ref.flags) + " ahead, today's read is " + (valid ? "valid" : "invalid");
+            return false;
+        }
+        if (ref.first + fresh.size() > lists.words.size()) {
+            detail = aheadListWhere(commands, cursor) + ", list " + hex(shape->address) + ": the words resolved ahead end at " + std::to_string(lists.words.size()) + ", the list needs " + std::to_string(ref.first + fresh.size());
+            return false;
+        }
+        const auto answer = std::span<const std::uint32_t>(lists.words).subspan(ref.first, fresh.size());
+        const auto differs = std::mismatch(answer.begin(), answer.end(), fresh.begin());
+        if (differs.first != answer.end()) {
+            const auto at = static_cast<std::size_t>(differs.first - answer.begin());
+            detail = aheadListWhere(commands, cursor) + ", list " + hex(shape->address) + " mode " + hex(shape->mode) + " count " + std::to_string(shape->count) + ": first difference at word " + std::to_string(at) + ": ahead " + hex(answer[at]) + ", today " + hex(fresh[at]);
+            return false;
+        }
+        first += fresh.size();
+    }
+    if (index != lists.refs.size()) {
+        detail = "the lists resolved ahead hold " + std::to_string(lists.refs.size()) + " lists, today's walk " + std::to_string(index);
+        return false;
+    }
+    if (first != lists.words.size()) {
+        detail = "the lists resolved ahead hold " + std::to_string(lists.words.size()) + " words, today's walk " + std::to_string(first);
+        return false;
+    }
+    return true;
+}
+
+bool Driver::listsAheadWanted() const {
+    if (countedReads() || listHooksVerifyEvery() != 0 || !frontLatch.switches.Set(Graphics::RuntimeSwitch::ListHooksOnce)) return false;
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::LeanListDirect) || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::LeanListBatch);
+}
+
+bool Driver::takeAheadLists(Submission& submission, bool cacheable, AheadTail& job) {
+    using TailsAhead::Count;
+    const bool direct = cacheable && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::LeanListDirect);
+    const bool batched = cacheable && !direct && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::LeanListBatch) && !countedReads();
+    if (batched || countedReads() || !LeanFront::SwitchSet(frontLatch, Graphics::RuntimeSwitch::ListHooksOnce)) {
+        TailsAhead::Add(Count::HooksWouldRun);
+        return false;
+    }
+    if (listHooksVerifyEvery() != 0) {
+        TailsAhead::Add(Count::Verify);
+        return false;
+    }
+    const auto& spans = job.hookSpans;
+    if (!spans.empty()) {
+        bool all = Graphics::Recorder::FlushHookIdle(spans);
+        for (std::size_t index = 0; all && index < spans.size(); ++index) all = Graphics::ReadGuardIdle(spans[index].first, static_cast<std::size_t>(spans[index].second - spans[index].first));
+        if (!all) {
+            TailsAhead::Add(Count::HooksWouldRun);
+            return false;
+        }
+    }
+    for (const auto& [begin, end] : job.collectSpans) {
+        if (GuestMemory::CollectWritesUncached(begin, static_cast<std::size_t>(end - begin)) == 0) {
+            TailsAhead::Add(Count::SourcesChanged);
+            return false;
+        }
+    }
+    if (!job.queries.empty() && !GuestMemory::UnchangedSinceAll(job.queries)) {
+        GuestRanges ranges;
+        ranges.reserve(job.queries.size());
+        for (const auto& query : job.queries) ranges.emplace_back(query.address, query.bytes);
+        TailsAhead::Add(GuestMemory::DriverStoredOver(ranges, job.queries.front().generation) ? Count::DriverStore : Count::SourcesChanged);
+        return false;
+    }
+    for (const auto& [begin, end] : job.collectSpans) {
+        if (GuestMemory::ForgetStamp(begin, static_cast<std::size_t>(end - begin)) > job.listForgets) {
+            TailsAhead::Add(Count::ForgetMoved);
+            return false;
+        }
+    }
+    std::swap(submission.lists, job.resolved);
+    submission.leanLists = true;
+    if (direct) LeanFront::AddOnWorker(LeanFront::Counter::DirectListTails);
+    LeanFront::AddOnWorker(LeanFront::Counter::LeanLists, job.listPackets);
+    return true;
 }
 
 }

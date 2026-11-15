@@ -216,6 +216,12 @@ private:
     void settleListHits(Submission& submission);
     void verifyLeanLists(const Submission& submission, bool cacheable, std::uint64_t ownWrites);
     bool keptTailCurrent(const KeptTail& kept, const Submission& stalled) const;
+    TailsAhead::Count keptRefusal(const KeptTail& kept, const Submission& stalled) const;
+    bool handTailAhead(KeptTail& kept, bool byTable, bool wantLists);
+    static void prepareTailAhead(AheadTail& job);
+    bool listsAheadWanted() const;
+    bool takeAheadLists(Submission& submission, bool cacheable, AheadTail& job);
+    static bool verifyAheadTable(const Submission& stalled, const Submission& tail, PacketTable& table, bool byTable);
     void recycleLeanTail(Submission& tail);
     void prepareLeanTail(const Submission& stalled, Submission& tail, bool popped, bool verify, PacketTable* table);
     void waitForFlipRoom(const Submission& submission);
@@ -241,7 +247,7 @@ private:
     void runLeanPackets(const Submission& submission, QueueState& queue, const PacketTable& table, FlipHold& flipHold, LeanRun& run);
     template <bool Lean>
     bool endSegment(const Submission& submission, FlipHold& flipHold, bool pipelined, FrontMode front);
-    static void scanSegment(const Submission& submission, PacketTable& table, bool validating = false, const std::uint32_t* guest = nullptr, bool byTable = false);
+    static void scanSegment(const Submission& submission, PacketTable& table, bool validating = false, const std::uint32_t* guest = nullptr, bool byTable = false, bool quiet = false);
     static void markOutputs(const Submission& submission, PacketTable& table);
     static void verifyOutputs(const Submission& submission, const PacketTable& table);
     static void verifySegmentTable(const Submission& submission, const PacketTable& table);

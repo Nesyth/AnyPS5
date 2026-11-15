@@ -190,6 +190,7 @@ void Driver::stop() {
     for (auto& [queue, worker] : workers) {
         if (worker.thread.joinable()) worker.thread.join();
     }
+    leanTails.ahead.Stop();
     try {
         DrawFinisher::NoteDeepKept(DeepKept::Shutdown);
         DrawFinisher::Get().Drain();

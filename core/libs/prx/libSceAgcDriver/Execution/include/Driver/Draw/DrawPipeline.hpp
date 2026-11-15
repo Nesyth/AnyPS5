@@ -82,7 +82,7 @@ struct LabelRun {
 };
 
 enum class DeepSite : std::uint32_t { PacketVerdict, Predication, IndirectArguments, FillInputs, FillByTurn, DispatchReads, LateDispatchReads, Decode, HeapStages, Variant, WriteEvidence, ShaderCode, SameKey, EarlierKey, ItemsByTurn, ItemsWithReadsByTurn, PacketFinisher, Count };
-enum class DeepKept : std::uint32_t { Flip, RenderingWait, Wait, WorkerLabel, PacketVerdict, SegmentEnd, Submission, Settle, DeferredLabels, WorkerDraw, WorkerDispatch, MetadataPass, WorkerNote, Relocation, IndirectCpu, DispatchNotPipelined, Fallback, Shutdown, Other, Count };
+enum class DeepKept : std::uint32_t { Flip, RenderingWait, Wait, WorkerLabel, PacketVerdict, SegmentEnd, Submission, Settle, DeferredLabels, WorkerDraw, WorkerDispatch, MetadataPass, WorkerNote, Relocation, IndirectCpu, DispatchNotPipelined, Fallback, Shutdown, Other, NoteNotCandidate, NoteMultisampleClear, NoteMemoryValueFill, NoteHtileDepthClear, NoteHtileMaskClear, NoteHtileZmaskFixup, NoteDepthControl, Count };
 
 class DrawPipeline {
 public:

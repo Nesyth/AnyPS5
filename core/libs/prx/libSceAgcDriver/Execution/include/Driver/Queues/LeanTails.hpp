@@ -2,17 +2,26 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_QUEUES_LEANTAILS_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/RegisterLists.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SegmentLoop.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
 
 using GuestRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+
+struct AheadTail;
 
 struct KeptTail {
     const std::uint32_t* control = nullptr;
@@ -22,7 +31,122 @@ struct KeptTail {
     std::uint64_t stamp = 0;
     Submission copy{};
     GuestRanges sources;
+    AheadTail* job = nullptr;
 };
+
+struct AheadTail {
+    static constexpr std::uint32_t Free = 0;
+    static constexpr std::uint32_t Queued = 1;
+    static constexpr std::uint32_t Running = 2;
+    static constexpr std::uint32_t Done = 3;
+    static constexpr std::uint32_t Abandoned = 4;
+
+    enum class Lists : std::uint8_t { NotWanted, NoTable, Shape, Unreadable, Unwatched, Forgetting, Dropped, Built };
+
+    std::atomic<std::uint32_t> state{Free};
+    Submission copy{};
+    std::uint64_t stamp = 0;
+    bool byTable = false;
+    bool wantLists = false;
+    bool tableBuilt = false;
+    bool refreshed = false;
+    std::uint32_t lastWord = 0;
+    PacketTable table;
+    Lists lists = Lists::NotWanted;
+    RegisterLists resolved;
+    std::uint64_t listPackets = 0;
+    std::uint64_t listForgets = 0;
+    GuestRanges hookSpans;
+    GuestRanges collectSpans;
+    std::vector<GuestMemory::UnchangedQuery> queries;
+    std::uint64_t tableNs = 0;
+    std::uint64_t listsNs = 0;
+};
+
+class AheadTails {
+public:
+    using Work = void (*)(AheadTail& job);
+    static constexpr std::size_t Jobs = 512;
+    static constexpr std::size_t RingSlots = 1024;
+
+    AheadTails() = default;
+    AheadTails(const AheadTails&) = delete;
+    AheadTails& operator=(const AheadTails&) = delete;
+    ~AheadTails();
+
+    AheadTail* Acquire();
+    bool Publish(AheadTail& job, Work prepare);
+    void Wake();
+    void Stop();
+
+private:
+    void run();
+
+    std::unique_ptr<AheadTail[]> jobs;
+    std::unique_ptr<AheadTail*[]> ring;
+    std::size_t cursor = 0;
+    Work work = nullptr;
+    alignas(64) std::atomic<std::uint64_t> head{0};
+    alignas(64) std::atomic<std::uint64_t> tail{0};
+    alignas(64) std::atomic<bool> sleeping{false};
+    std::atomic<bool> stopping{false};
+    bool started = false;
+    bool failed = false;
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::thread thread;
+};
+
+namespace TailsAhead {
+
+enum class Count : std::uint8_t {
+    Handed,
+    NoJob,
+    Prepared,
+    TablesBuilt,
+    TableFailed,
+    ListsBuilt,
+    ListsShape,
+    ListsUnreadable,
+    ListsUnwatched,
+    ListsForgetting,
+    HelperNs,
+    TablesUsed,
+    ListsUsed,
+    NotStarted,
+    StillRunning,
+    SourcesChanged,
+    ForgetMoved,
+    DriverStore,
+    FrontChanged,
+    ControlWordMoved,
+    Verify,
+    HooksWouldRun,
+    ListsNotBuilt,
+    Other,
+    Dropped,
+    MovedNs,
+    AheadTails,
+    AheadNs,
+    PartialTails,
+    PartialNs,
+    TodayTails,
+    TodayNs,
+    VerifyChecked,
+    VerifyDiffering,
+    Kinds,
+};
+
+bool Stats();
+std::uint64_t VerifyEvery();
+void Add(Count count, std::uint64_t value = 1);
+void NoteDifference(const std::string& detail);
+void Report();
+
+}
+
+AheadTail::Lists ResolveListsAhead(AheadTail& job);
+bool CheckAheadLists(const Submission& submission, const PacketTable* table, std::string& detail);
 
 class RegisterListCache {
 public:
@@ -119,7 +243,11 @@ public:
     void GiveCommands(std::vector<std::uint32_t>&& commands);
     RegisterLists TakeLists();
     void GiveLists(RegisterLists&& lists);
+    void Attach(KeptTail& slot, AheadTail& job);
+    AheadTail* Reclaim(KeptTail& slot);
+    void Release(AheadTail& job);
 
+    AheadTails ahead;
     RegisterListCache cache;
     std::vector<PendingListHit> hits;
     std::vector<GuestMemory::UnchangedQuery> queries;
@@ -132,11 +260,15 @@ public:
     GuestRanges spans;
     std::vector<std::uint8_t> spanIdle;
     std::uint64_t hookVerifyOrdinal = 0;
+    std::uint64_t aheadVerifyOrdinal = 0;
 
 private:
+    void detach(KeptTail& slot);
+
     std::vector<KeptTail> kept;
     std::size_t keptFront = 0;
     std::size_t keptEnd = 0;
+    std::size_t attached = 0;
     std::vector<std::vector<std::uint32_t>> spareCommands;
     std::vector<RegisterLists> spareLists;
     std::size_t spareBytes = 0;

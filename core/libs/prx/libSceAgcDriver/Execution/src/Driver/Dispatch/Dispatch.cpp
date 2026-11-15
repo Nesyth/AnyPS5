@@ -721,6 +721,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     || Graphics::MatchHtileBufferMaskClear(code, userData, compute, packet, indirectArguments).has_value()
                     || Graphics::MatchHtileZmaskFixup(code, userData, compute, packet, indirectArguments).has_value();
             };
+            const auto noteKind = [&] {
+                if (!pipelineCandidate) return DeepKept::NoteNotCandidate;
+                if (indirectArguments == 0 && Graphics::MatchMultisampledSingleClear(code, userData, compute.numThreads)) return DeepKept::NoteMultisampleClear;
+                if (indirectArguments == 0 && (packet[4] & 0x20u) == 0 && Graphics::MatchMemoryValueFill(code, userData, compute.numThreads, {packet[1], packet[2], packet[3]}).has_value()) return DeepKept::NoteMemoryValueFill;
+                if (Graphics::HtileDepthClearAddress(code, userData, compute.numThreads) != 0) return DeepKept::NoteHtileDepthClear;
+                if (Graphics::MatchHtileBufferMaskClear(code, userData, compute, packet, indirectArguments).has_value()) return DeepKept::NoteHtileMaskClear;
+                return DeepKept::NoteHtileZmaskFixup;
+            };
             const bool noted = deep && notes();
             const bool filledOnly = deep && !noted && fills();
             const bool sideEffects = deep ? noted || filledOnly : !pipelineCandidate
@@ -735,7 +743,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 if (filledOnly) {
                     DrawFinisher::NoteDeepSite(DeepSite::FillByTurn);
                 } else {
-                    DrawFinisher::NoteDeepKept(DeepKept::WorkerNote);
+                    DrawFinisher::NoteDeepKept(noted ? noteKind() : DeepKept::WorkerNote);
                     DrawFinisher::Get().Drain();
                 }
             }
