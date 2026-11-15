@@ -190,9 +190,11 @@ std::atomic<std::uint64_t> bindingsPrinted{0};
 std::atomic<std::uint64_t> classesKnown{0};
 std::atomic<std::uint64_t> classBytes{0};
 std::atomic<std::uint64_t> stagesKnown{0};
+std::atomic<std::uint64_t> trusted{0};
 std::mutex reportMutex;
 std::int64_t reportedAt = 0;
 Window reported;
+std::uint64_t trustedReported = 0;
 
 bool Printed() {
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
@@ -263,6 +265,10 @@ void AddStep(Step step, std::uint64_t nanoseconds) {
     bump(block.stepDraws[static_cast<std::size_t>(step)], 1);
 }
 
+void AddTrusted(std::uint64_t count) {
+    trusted.fetch_add(count, std::memory_order_relaxed);
+}
+
 void NoteClasses(std::size_t known, std::size_t bytes) {
     classesKnown.store(known, std::memory_order_relaxed);
     classBytes.store(bytes, std::memory_order_relaxed);
@@ -308,6 +314,9 @@ void Report(bool force) {
         since.stepDraws[index] = current.stepDraws[index] - reported.stepDraws[index];
     }
     reported = current;
+    const auto trustedNow = trusted.load(std::memory_order_relaxed);
+    const auto trustedSince = trustedNow - trustedReported;
+    trustedReported = trustedNow;
     printed.store(0, std::memory_order_relaxed);
     bufferPrinted.store(0, std::memory_order_relaxed);
     repeatPrinted.store(0, std::memory_order_relaxed);
@@ -325,14 +334,14 @@ void Report(bool force) {
         return since.stepDraws[index] == 0 ? 0.0 : static_cast<double>(since.stepNanoseconds[index]) / static_cast<double>(since.stepDraws[index]) / 1000.0;
     };
     const auto direct = at(Counter::Direct);
-    AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] %llu draws: %llu direct (%.1f%%), %llu fallback%s; classes %llu known, %llu built, %llu refused%s, %llu evicted, %.1f KiB; stages %llu known, %llu built; invocations %llu rebuilt; verify %llu checked, %llu differing; us per direct draw: request %.2f, invocation %.2f, walk %.2f, key %.2f, side %.2f, class %.2f, checks %.2f, buffers %.2f, inputs %.2f, hand-off %.2f\n",
+    AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] %llu draws: %llu direct (%.1f%%), %llu fallback%s; classes %llu known, %llu built, %llu refused%s, %llu evicted, %.1f KiB; stages %llu known, %llu built; invocations %llu rebuilt; verify %llu checked, %llu differing; us per direct draw: request %.2f, invocation %.2f, walk %.2f, key %.2f, side %.2f, class %.2f, checks %.2f, buffers %.2f, inputs %.2f, hand-off %.2f; trusted %llu\n",
         static_cast<unsigned long long>(draws), static_cast<unsigned long long>(direct), draws != 0 ? 100.0 * static_cast<double>(direct) / static_cast<double>(draws) : 0.0,
         static_cast<unsigned long long>(fallbacks), reasons(counts, Counter::FallbackShape, Counter::FallbackVerify).c_str(),
         static_cast<unsigned long long>(classesKnown.load(std::memory_order_relaxed)), static_cast<unsigned long long>(at(Counter::ClassesBuilt)), static_cast<unsigned long long>(refused), reasons(counts, Counter::RefusedNotQueued, Counter::RefusedDiffers).c_str(),
         static_cast<unsigned long long>(at(Counter::ClassesEvicted)), static_cast<double>(classBytes.load(std::memory_order_relaxed)) / 1024.0,
         static_cast<unsigned long long>(stagesKnown.load(std::memory_order_relaxed)), static_cast<unsigned long long>(at(Counter::StagesBuilt)),
         static_cast<unsigned long long>(at(Counter::InvocationsRebuilt)), static_cast<unsigned long long>(at(Counter::VerifyChecked)), static_cast<unsigned long long>(at(Counter::VerifyDiffering)),
-        perDraw(Step::Request), perDraw(Step::Invocation), perDraw(Step::Walk), perDraw(Step::Key), perDraw(Step::Side), perDraw(Step::Class), perDraw(Step::Checks), perDraw(Step::Buffers), perDraw(Step::Inputs), perDraw(Step::HandOff));
+        perDraw(Step::Request), perDraw(Step::Invocation), perDraw(Step::Walk), perDraw(Step::Key), perDraw(Step::Side), perDraw(Step::Class), perDraw(Step::Checks), perDraw(Step::Buffers), perDraw(Step::Inputs), perDraw(Step::HandOff), static_cast<unsigned long long>(trustedSince));
     std::uint64_t splitDraws = 0;
     for (auto index = static_cast<std::size_t>(Step::BuffersPrepare); index < StepCount; ++index) splitDraws += since.stepDraws[index];
     if (splitDraws != 0) AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] split us per direct draw: buffers prepare %.2f, settle %.2f, place %.2f; hand-off fragment %.2f, commit %.2f\n", perDraw(Step::BuffersPrepare), perDraw(Step::BuffersSettle), perDraw(Step::BuffersPlace), perDraw(Step::Fragment), perDraw(Step::Commit));

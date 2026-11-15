@@ -518,6 +518,7 @@ inline bool Due(LeanFront::Latch& latch) {
 
 void Add(Counter counter, std::uint64_t count = 1);
 void AddStep(Step step, std::uint64_t nanoseconds);
+void AddTrusted(std::uint64_t count);
 void NoteClasses(std::size_t known, std::size_t bytes);
 void NoteStages(std::size_t known);
 void NoteDifference(DrawRecords::Field field, std::string_view detail);

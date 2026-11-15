@@ -497,6 +497,7 @@ public:
     bool ExpressWatchable() const;
     ExpressMiss ExpressCurrent();
     ExpressMiss ExpressCurrentFollowing();
+    ExpressMiss ExpressCurrentTrusted() const;
     void ExpressStage(Recorder& recorder);
     PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched = false) const;
     struct GuardTests {
@@ -1327,7 +1328,7 @@ private:
     void pushPlannedBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const;
     static std::uint64_t NextPlanSerial();
     std::uint64_t planSerial = NextPlanSerial();
-    bool preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched = false, const GuardTests* guards = nullptr) const;
+    bool preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched = false, const GuardTests* guards = nullptr, bool trusted = false) const;
     void pushBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const;
     void writeOwnDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     mutable std::unique_ptr<PushPlan> pushPlan;

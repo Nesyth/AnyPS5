@@ -5256,6 +5256,14 @@ ShaderResources::ExpressMiss ShaderResources::ExpressCurrentFollowing() {
     return expressCurrent(true);
 }
 
+ShaderResources::ExpressMiss ShaderResources::ExpressCurrentTrusted() const {
+    if (!expressValid || !cleanProved || expressWatch == nullptr) return ExpressMiss::NotProved;
+    if (GuestMemory::CleanForgetSerial() != expressAt.forget) return ExpressMiss::Forget;
+    if (HostImportSetGeneration() != expressAt.imports || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != expressAt.allocations || GuestMemory::UnwatchSerial() != expressAt.unwatched || DepthSurfacesSerial() != expressAt.depthSurfaces) return ExpressMiss::Serials;
+    NoteCommitterTrusted();
+    return ExpressMiss::None;
+}
+
 ShaderResources::ExpressMiss ShaderResources::expressCurrent(bool memo) {
     if (!expressValid || !cleanProved || expressWatch == nullptr) return ExpressMiss::NotProved;
     if (GuestMemory::SubscriptionGeneration(*expressWatch) != expressGeneration) return ExpressMiss::Watch;
@@ -8338,8 +8346,15 @@ bool ShaderResources::PreparedInPlaceHolds(const PreparedBuffers& prepared, cons
     };
     if (!RuntimeSwitches::Set(RuntimeSwitch::DirectBuffersInPlace)) return refuse(MovedCount::PreparedInPlaceSwitch);
     if ((prepared.forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared.forget || HostImportSetGeneration() != prepared.imports || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != prepared.mapping) return refuse(MovedCount::PreparedInPlaceSerials);
+    const bool trusted = RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter);
+    if (trusted) NoteCommitterTrusted();
     for (const auto& entry : prepared.moved) {
         if (entry.inPlace == VK_NULL_HANDLE) continue;
+        if (trusted) {
+            if (heapStage || addressedBuffers || usesBda || rebound) return refuse(MovedCount::NotEligible);
+            if (entry.bytes > context.limits.maxStorageBufferRange) return refuse(MovedCount::OverRange);
+            continue;
+        }
         if (guestMemory.WritesOverlap(entry.begin, entry.bytes)) return refuse(MovedCount::PreparedInPlaceWrites);
         if (const auto why = InPlaceRefusal(recorder, entry.begin, entry.bytes); why != MovedCount::Count) return refuse(why);
     }
@@ -9164,17 +9179,17 @@ bool ShaderResources::PlaceDirectBuffers(const Context& context, PreparedBuffers
 
 ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched) const {
     auto selection = PreparedBuffers::Selection::Hazard;
-    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, route, untouched));
+    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, route, untouched, nullptr, RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter)));
     return selection;
 }
 
 ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHoldsBy(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, bool untouched, const GuardTests* guards) const {
     auto selection = PreparedBuffers::Selection::Hazard;
-    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, nullptr, untouched, guards));
+    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, nullptr, untouched, guards, RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter)));
     return selection;
 }
 
-bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched, const GuardTests* guards) const {
+bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched, const GuardTests* guards, bool trusted) const {
     using Selection = PreparedBuffers::Selection;
     selection = Selection::Hazard;
     const auto& plan = *prepared.plan;
@@ -9183,12 +9198,14 @@ bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const
     // requireGuestBuffers publishes the host-written samples of a resident depth surface into the
     // memory it overlaps, after the finisher read that memory; a guard set up or dropped since the
     // read may have published them already.
-    const bool guardsMoved = DepthGuardsGeneration_nid_no_patch() != prepared.depthGuards;
-    if ((guardsMoved || HasResidentDepthGuards_nid_no_patch()) && std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && !item.inPlace && (guardsMoved || (guards != nullptr ? guards->depth(guards->tests, item.begin, item.bytes) : MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes))); })) {
+    if (trusted) NoteCommitterTrusted(3);
+    const bool guardsMoved = !trusted && DepthGuardsGeneration_nid_no_patch() != prepared.depthGuards;
+    if (!trusted && (guardsMoved || HasResidentDepthGuards_nid_no_patch()) && std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && !item.inPlace && (guardsMoved || (guards != nullptr ? guards->depth(guards->tests, item.begin, item.bytes) : MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes))); })) {
         selection = Selection::DepthGuards;
         return false;
     }
-    if (route != nullptr && route->stamps && requireMovedGuestBuffers(moved)) {
+    if (trusted) {
+    } else if (route != nullptr && route->stamps && requireMovedGuestBuffers(moved)) {
         ++route->guards;
         if (route->verifyStamps && std::ranges::any_of(moved, [&](const MovedBuffer& entry) { return allocations[entry.allocation].guest && MayOverlapDepthGuards_nid_no_patch(entry.address, entry.size); })) {
             ++route->refuted;
@@ -9200,7 +9217,8 @@ bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const
     }
     prepareFaultSlot();
     bindingsChecked = heapStage && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind);
-    if (route != nullptr) {
+    if (trusted) {
+    } else if (route != nullptr) {
         if (!unmovedClear(recorder, prepared, route)) return false;
     } else {
         for (const auto& item : prepared.selected) {

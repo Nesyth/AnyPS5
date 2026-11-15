@@ -201,6 +201,8 @@ void NoteExpressNonFollower(bool attempted, std::uint64_t attemptNanoseconds, st
 void DropExpressFollowVerify();
 void NoteExpressFollowDue(bool due);
 bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers& prepared, PreparedInputs& preparedInputs, DrawFragment& fragment);
+void NoteCommitterTrusted(std::uint64_t count = 1);
+std::uint64_t TakeCommitterTrusted();
 std::uint64_t ExpressVerifyEvery();
 enum class RepeatRefusal : std::uint8_t { NoBlock, NotSimple, VerifyDue, Shape, Objects, Batch, Pass, Epoch, ProofSerial, Pending, Depth, Target, Access, Stores, Linear, Buffers, Selection, DepthGuards, Inputs, Changed, MovedHazard, UnmovedHazard, Count };
 inline constexpr std::array<const char*, static_cast<std::size_t>(RepeatRefusal::Count)> RepeatRefusalNames{"no block", "not simple", "verify due", "shape", "objects", "another batch", "pass", "collect epoch", "proof serial", "pending stores", "depth surfaces", "target changed", "pass access", "queued stores", "drawn linear targets", "no prepared buffers", "selection", "depth guards", "inputs", "changed by the inputs", "moved-range hazard", "unmoved-range hazard"};
