@@ -724,6 +724,7 @@ public:
     static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false, bool movableWrites = false);
     static void AppendContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key, bool movableWrites = false);
     static bool DiffContentKeys(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> key, bool draw, ContentKeyDiff& diff);
+    static bool ContentKeyMatches(const CompiledShader& shader, std::span<const std::uint32_t> key, bool dataWords, bool movableBuffers, bool movableWrites);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
     // buffer already holding the words is left alone). Returns whether anything was recorded. With
@@ -754,11 +755,18 @@ public:
     // and, on a refusal, what failed.
     enum class ProofPath : std::size_t { Fast, OwnRefreshed, Full, Count };
     enum class ProofFailure : std::size_t { None, Imports, Evicted, Pending, Changed, Keys, Other, Count };
+    enum class ProofRefusal : std::uint8_t { None, Other, Views, NotReusable, WalkProgram, WalkSnapshot, WalkView, WalkDepth, WalkStorage, WalkTable, WalkCount, Imports, Staging, StagingCopies, AsIs, Injected, Count };
     struct ProofReport {
         ProofPath path = ProofPath::Fast;
         ProofFailure failure = ProofFailure::None;
         bool audited = false;
+        ProofRefusal refusal = ProofRefusal::None;
+        std::uint8_t fastFail = 0xffu;
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
     };
+    static const char* ProofRefusalName(ProofRefusal refusal);
+    static const char* FastFailName(std::size_t reason);
     enum class CleanProof : std::uint8_t { Skipped, Requeried, Verified, Differs, FirstProof, Failed, NotReusable, StorageImages, DepthCopies, OwnWrites, NotClean, Views, Serials, Forgotten, Rewritten, PendingWrites, Unsettled, Count };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr, CleanProof* clean = nullptr);
     struct CleanStamp {
@@ -1521,6 +1529,15 @@ public:
     // Find and Touch calls so far (the [rescache] line: a recipe hit touches instead of finding).
     static std::uint64_t Finds();
     static std::uint64_t Touches();
+    enum class Fate : std::uint8_t { None, Built, NotRecorded, NotReusable, InsertRefused, Inserted, LookupProof, LookupSpace, RecordProof, Capacity, Tables, Image, ReleasedTexture, Count };
+    struct FateNote {
+        Fate fate = Fate::None;
+        std::uint8_t detail = 0;
+        std::uint64_t present = 0;
+    };
+    static bool FateCensus();
+    static void NoteFate(const Key& key, Fate fate, std::uint8_t detail = 0);
+    static FateNote FateOf(const Key& key);
     void Clear();
     std::size_t Size() const;
     std::size_t Capacity() const;

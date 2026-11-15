@@ -398,6 +398,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             counters.retriesEqual += retriesEqual;
             counters.retriesMoved += retriesMoved;
             counters.variantsCompared += compared;
+            NoteDispatchLookup(outcome, compared);
             switch (outcome) {
                 case EntryOutcome::Equal: ++counters.equal; break;
                 case EntryOutcome::EqualData: ++counters.equal; break;

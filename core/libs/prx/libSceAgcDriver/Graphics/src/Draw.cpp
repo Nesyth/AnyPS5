@@ -1400,6 +1400,136 @@ std::array<std::atomic<std::uint64_t>, FullDrawLookupNames.size()> fullDrawLooku
 std::array<std::atomic<std::uint64_t>, FullDrawLookupNames.size()> fullDrawLookupNs{};
 }
 
+namespace {
+enum class TemplateBuildCause : std::uint8_t { NotKeyed, NoEntry, InUse, SpaceNotServed, Proof, NoRecorder, PatchedData, UnmovableBuffer, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(TemplateBuildCause::Count)> TemplateBuildCauseNames{"not keyed", "no entry under the key", "entry refused: address space in use", "entry refused: address space or snapshots not served", "entry refused: proof failed", "entry refused: no recorder", "entry refused: patched data", "entry refused: buffer not movable"};
+enum class ProofSite : std::uint8_t { Lookup, Recipe, Record, Repeat, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(ProofSite::Count)> ProofSiteNames{"full lookup", "recipe", "record", "repeat"};
+enum class ProofWriter : std::uint8_t { NoRange, Dispatch, HtileClear, Untagged, OtherWork, Recorded, Image, Depth, Unknown, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(ProofWriter::Count)> ProofWriterNames{"no range", "dispatch", "HTILE clear", "untagged recorded write", "copy/fill/clear", "recorded write (writer not kept)", "GPU image results pending", "depth surface", "no pending GPU write"};
+constexpr std::array<const char*, static_cast<std::size_t>(ResourceCache::Fate::Count)> TemplateFateNames{"never noted", "built but not offered for insertion", "built but not recorded", "built but not reusable", "insert refused", "inserted then removed without a noted cause", "removed after a failed full-lookup proof", "removed: address space not served", "removed after a failed record proof", "capacity eviction", "table budget eviction", "dropped with a storage image", "dropped with a released texture"};
+constexpr std::array<const char*, static_cast<std::size_t>(ShaderResources::NotReusable::Count)> TemplateNotReusableNames{"none", "HTILE clear", "copied writes", "lease or table", "multisample sources", "per-use textures", "data buffers", "no import serial"};
+constexpr std::array<const char*, static_cast<std::size_t>(ContentKeyComponent::Count)> KeyPartNames{"layout", "V# word 0", "V# word 1", "V# word 2", "V# word 3", "image", "sampler", "shader-data", "other", "draw target/index"};
+constexpr std::array<const char*, 4> RemovalAgeNames{"same present", "1 present back", "2-7 back", "8+ back"};
+constexpr std::size_t ProofRefusals = static_cast<std::size_t>(ShaderResources::ProofRefusal::Count);
+constexpr std::size_t FastFailSlots = static_cast<std::size_t>(ShaderResources::FastFail::Count) + 1u;
+
+struct TemplateBuildCensus {
+    using Counter = std::atomic<std::uint64_t>;
+    std::array<Counter, TemplateBuildCauseNames.size()> builds{};
+    std::array<Counter, TemplateFateNames.size()> fates{};
+    std::array<Counter, TemplateNotReusableNames.size()> notReusable{};
+    std::array<std::array<Counter, RemovalAgeNames.size()>, 2> removalAges{};
+    std::array<std::array<Counter, ProofRefusals>, 2> removalRefusals{};
+    Counter firstSeen{0};
+    Counter sameKey{0};
+    Counter otherKey{0};
+    Counter otherKeyCached{0};
+    std::array<Counter, KeyPartNames.size()> keyParts{};
+    std::array<Counter, ProofSiteNames.size()> failedSites{};
+    std::array<Counter, ProofSiteNames.size()> removedSites{};
+    std::array<Counter, ProofRefusals> failed{};
+    std::array<Counter, ProofRefusals> removed{};
+    std::array<std::array<Counter, FastFailSlots>, ProofRefusals> fastFails{};
+    std::array<std::array<Counter, ProofWriterNames.size()>, ProofRefusals> writers{};
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, ResourceCache::Key> lastKeys;
+    std::uint64_t reportedPresent = 0;
+};
+
+TemplateBuildCensus& templateBuildCensus() {
+    static auto* census = new TemplateBuildCensus();
+    return *census;
+}
+
+std::uint64_t drawKeyShaders(const ResourceCache::Key& key) {
+    std::uint64_t variants = 0;
+    std::size_t at = 4;
+    for (std::uint32_t stage = 0; stage < key[3] && at + 4 < key.size(); ++stage) {
+        variants = variants * 1000003ull ^ (key[at + 3] | (static_cast<std::uint64_t>(key[at + 4]) << 32u));
+        at += 1 + key[at];
+    }
+    return variants;
+}
+
+void noteTemplateLookup(const ResourceCache::Key& key, TemplateBuildCause cause, bool built) {
+    auto& census = templateBuildCensus();
+    ResourceCache::FateNote fate;
+    if (built) {
+        census.builds[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
+        if (cause == TemplateBuildCause::NotKeyed) return;
+        if (cause == TemplateBuildCause::NoEntry) {
+            fate = ResourceCache::FateOf(key);
+            census.fates[static_cast<std::size_t>(fate.fate)].fetch_add(1, std::memory_order_relaxed);
+            if (fate.fate == ResourceCache::Fate::LookupProof || fate.fate == ResourceCache::Fate::RecordProof) {
+                const auto row = fate.fate == ResourceCache::Fate::LookupProof ? 0u : 1u;
+                const auto present = Recorder::Presents();
+                const auto age = present - std::min(present, fate.present);
+                census.removalAges[row][age == 0 ? 0u : age == 1 ? 1u : age < 8 ? 2u : 3u].fetch_add(1, std::memory_order_relaxed);
+                census.removalRefusals[row][std::min<std::size_t>(fate.detail, ProofRefusals - 1u)].fetch_add(1, std::memory_order_relaxed);
+            } else if (fate.fate == ResourceCache::Fate::NotReusable) {
+                census.notReusable[std::min<std::size_t>(fate.detail, census.notReusable.size() - 1u)].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        ResourceCache::NoteFate(key, ResourceCache::Fate::Built);
+    }
+    if (key.size() < 5 || key[0] != 0xffffffffu) return;
+    const auto shaders = drawKeyShaders(key);
+    std::lock_guard lock(census.mutex);
+    if (census.lastKeys.size() >= 16384u) census.lastKeys.clear();
+    auto& last = census.lastKeys[shaders];
+    if (built && cause == TemplateBuildCause::NoEntry && fate.fate == ResourceCache::Fate::None) {
+        if (last.empty()) {
+            census.firstSeen.fetch_add(1, std::memory_order_relaxed);
+        } else if (last == key) {
+            census.sameKey.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            census.otherKey.fetch_add(1, std::memory_order_relaxed);
+            if (ResourceCache::FateOf(last).fate == ResourceCache::Fate::Inserted) census.otherKeyCached.fetch_add(1, std::memory_order_relaxed);
+            ContentKeyDiff parts{};
+            static_cast<void>(ShaderResources::DiffContentKeys(last, key, true, parts));
+            for (std::size_t part = 0; part < parts.size(); ++part) {
+                if (parts[part]) census.keyParts[part].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    last = key;
+}
+
+ProofWriter proofWriter(const Context& context, const ShaderResources::ProofReport& proof) {
+    if (proof.address == 0) return ProofWriter::NoRange;
+    const auto bytes = static_cast<std::size_t>(std::max<std::uint64_t>(proof.bytes, 1u));
+    if (const auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(proof.address, bytes)) {
+        if (!Recorder::KeyWriterCensus()) return ProofWriter::Recorded;
+        const auto note = recorder->NewestWriteNote(proof.address, bytes);
+        const auto tag = note != 0 ? Recorder::WriterOfNote(note) : ~std::uint64_t{0};
+        if (tag == ~std::uint64_t{0}) return ProofWriter::Recorded;
+        const auto site = tag >> 56u;
+        return site == 1u ? ProofWriter::Dispatch : site == 8u ? ProofWriter::HtileClear : site == 0u ? ProofWriter::Untagged : ProofWriter::OtherWork;
+    }
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{proof.address, proof.address + bytes}}};
+    if (StorageTexture::AnyPendingOverlaps(range)) return ProofWriter::Image;
+    if (DepthSurfaceOverlaps(context.device, proof.address, bytes)) return ProofWriter::Depth;
+    return ProofWriter::Unknown;
+}
+
+void noteFailedProof(const Context& context, ProofSite site, const ShaderResources::ProofReport& proof, const ResourceCache::Key* removedKey) {
+    if (!ResourceCache::FateCensus()) return;
+    auto refusal = proof.refusal;
+    if (refusal == ShaderResources::ProofRefusal::None) refusal = RuntimeSwitches::Set(RuntimeSwitch::XpProofAsIs) ? ShaderResources::ProofRefusal::AsIs : ShaderResources::ProofRefusal::Injected;
+    const auto index = static_cast<std::size_t>(refusal);
+    auto& census = templateBuildCensus();
+    census.failedSites[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+    census.failed[index].fetch_add(1, std::memory_order_relaxed);
+    census.fastFails[index][std::min<std::size_t>(proof.fastFail, FastFailSlots - 1u)].fetch_add(1, std::memory_order_relaxed);
+    census.writers[index][static_cast<std::size_t>(proofWriter(context, proof))].fetch_add(1, std::memory_order_relaxed);
+    if (removedKey == nullptr) return;
+    census.removedSites[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+    census.removed[index].fetch_add(1, std::memory_order_relaxed);
+    ResourceCache::NoteFate(*removedKey, site == ProofSite::Lookup ? ResourceCache::Fate::LookupProof : ResourceCache::Fate::RecordProof, static_cast<std::uint8_t>(refusal));
+}
+}
+
 void NoteCopiedWriter(bool draw) {
     copiedWritersListed[draw ? 1u : 0u].fetch_add(1, std::memory_order_relaxed);
 }
@@ -1431,6 +1561,108 @@ std::string TakeFullDrawLookupText() {
         std::snprintf(item, sizeof(item), " %s %llu (%.1f us)", FullDrawLookupNames[index], static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e3 / static_cast<double>(count));
         text += item;
     }
+    return text;
+}
+
+std::string TakeTemplateBuildText() {
+    auto& census = templateBuildCensus();
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+    const auto list = [&](auto& counters, auto name) {
+        std::string text;
+        for (std::size_t index = 0; index < counters.size(); ++index) {
+            const auto count = take(counters[index]);
+            if (count == 0) continue;
+            if (!text.empty()) text += ", ";
+            text += name(index);
+            text += ' ';
+            text += std::to_string(count);
+        }
+        return text;
+    };
+    const auto refusalName = [](std::size_t index) { return ShaderResources::ProofRefusalName(static_cast<ShaderResources::ProofRefusal>(index)); };
+    const auto fateDetail = [&](std::size_t index) {
+        const auto fate = static_cast<ResourceCache::Fate>(index);
+        std::string detail;
+        if (fate == ResourceCache::Fate::None) {
+            const auto first = take(census.firstSeen);
+            const auto same = take(census.sameKey);
+            const auto other = take(census.otherKey);
+            const auto cached = take(census.otherKeyCached);
+            const auto parts = list(census.keyParts, [](std::size_t part) { return KeyPartNames[part]; });
+            detail = "shaders first seen " + std::to_string(first) + ", same key as the shaders' last lookup " + std::to_string(same) + ", same shaders under another key " + std::to_string(other) + " (that key still cached " + std::to_string(cached) + (parts.empty() ? std::string() : "; differing parts: " + parts) + ")";
+        } else if (fate == ResourceCache::Fate::LookupProof || fate == ResourceCache::Fate::RecordProof) {
+            const auto row = fate == ResourceCache::Fate::LookupProof ? 0u : 1u;
+            detail = list(census.removalAges[row], [](std::size_t age) { return RemovalAgeNames[age]; });
+            const auto refusals = list(census.removalRefusals[row], refusalName);
+            if (!refusals.empty()) detail += "; refusals: " + refusals;
+        } else if (fate == ResourceCache::Fate::NotReusable) {
+            detail = list(census.notReusable, [](std::size_t reason) { return TemplateNotReusableNames[reason]; });
+        }
+        return detail;
+    };
+    std::string fates;
+    for (std::size_t index = 0; index < census.fates.size(); ++index) {
+        const auto count = take(census.fates[index]);
+        const auto detail = fateDetail(index);
+        if (count == 0) continue;
+        if (!fates.empty()) fates += ", ";
+        fates += TemplateFateNames[index];
+        fates += ' ';
+        fates += std::to_string(count);
+        if (!detail.empty()) fates += " {" + detail + "}";
+    }
+    std::uint64_t built = 0;
+    std::string causes;
+    for (std::size_t index = 0; index < census.builds.size(); ++index) {
+        const auto count = take(census.builds[index]);
+        if (count == 0) continue;
+        built += count;
+        if (!causes.empty()) causes += ", ";
+        causes += TemplateBuildCauseNames[index];
+        causes += ' ';
+        causes += std::to_string(count);
+        if (static_cast<TemplateBuildCause>(index) == TemplateBuildCause::NoEntry && !fates.empty()) causes += " [" + fates + "]";
+    }
+    const auto refusalText = [&](auto& totals, bool details, std::uint64_t& sum) {
+        std::string text;
+        for (std::size_t index = 0; index < ProofRefusals; ++index) {
+            const auto count = take(totals[index]);
+            const auto fasts = details ? list(census.fastFails[index], [](std::size_t reason) { return ShaderResources::FastFailName(reason); }) : std::string();
+            const auto writers = details ? list(census.writers[index], [](std::size_t writer) { return ProofWriterNames[writer]; }) : std::string();
+            if (count == 0) continue;
+            sum += count;
+            if (!text.empty()) text += ", ";
+            text += refusalName(index);
+            text += ' ';
+            text += std::to_string(count);
+            if (details) text += " {fast fail: " + (fasts.empty() ? std::string("none") : fasts) + "; writer: " + (writers.empty() ? std::string("none") : writers) + "}";
+        }
+        return text;
+    };
+    std::uint64_t failed = 0;
+    std::uint64_t removed = 0;
+    const auto failedText = refusalText(census.failed, true, failed);
+    const auto removedText = refusalText(census.removed, false, removed);
+    const auto failedSites = list(census.failedSites, [](std::size_t site) { return ProofSiteNames[site]; });
+    const auto removedSites = list(census.removedSites, [](std::size_t site) { return ProofSiteNames[site]; });
+    const auto depth = TakeDepthCheckText();
+    std::uint64_t presents = 0;
+    {
+        std::lock_guard lock(census.mutex);
+        const auto present = Recorder::Presents();
+        presents = present - std::min(present, census.reportedPresent);
+        census.reportedPresent = present;
+    }
+    if (built == 0 && failed == 0 && removed == 0 && depth.empty()) return {};
+    std::string text = std::to_string(presents) + " presents: built " + std::to_string(built);
+    if (!causes.empty()) text += " (" + causes + ")";
+    text += "; failed proofs " + std::to_string(failed);
+    if (!failedSites.empty()) text += " (" + failedSites + ")";
+    if (!failedText.empty()) text += ": " + failedText;
+    text += "; removed after a failed proof " + std::to_string(removed);
+    if (!removedSites.empty()) text += " (" + removedSites + ")";
+    if (!removedText.empty()) text += ": " + removedText;
+    if (!depth.empty()) text += "; multisample depth CheckCurrent: " + depth;
     return text;
 }
 
@@ -3079,7 +3311,9 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     std::optional<AddressDrawReuse> reuse;
     if (address == AddressStages::Storing) reuse = AddressDrawReuse::NotReadOnly;
     else if (address == AddressStages::ReadOnly && !resolved.cacheable) reuse = AddressDrawReuse::NotSpaceOnly;
+    auto buildCause = TemplateBuildCause::NotKeyed;
     if (resolved.cacheable) {
+        buildCause = TemplateBuildCause::NoEntry;
         resolved.contentKey = plan.contentKey;
         if (view != nullptr) view->lookup = DrawCommitLookup::Absent;
         if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
@@ -3115,7 +3349,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                     }
                 }
             }
-            const bool valid = spaceHeld && (RuntimeSwitches::Set(RuntimeSwitch::XpProofAsIs) ? cached->AsIsCurrent() : cached->Revalidate(shaders));
+            ShaderResources::ProofReport proof;
+            const bool valid = spaceHeld && (RuntimeSwitches::Set(RuntimeSwitch::XpProofAsIs) ? cached->AsIsCurrent() : cached->Revalidate(shaders, &proof));
             if (counted && spaceHeld && !valid) reuse = AddressDrawReuse::Revalidation;
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
@@ -3141,8 +3376,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
                 if (counted) reuse = AddressDrawReuse::Reused;
+                if (ResourceCache::FateCensus()) noteTemplateLookup(resolved.contentKey, buildCause, false);
                 if (view != nullptr) view->lookup = DrawCommitLookup::Hit;
             } else if (valid || inUse) {
+                buildCause = !valid ? TemplateBuildCause::InUse : recorder == nullptr ? TemplateBuildCause::NoRecorder : patched ? TemplateBuildCause::PatchedData : TemplateBuildCause::UnmovableBuffer;
                 if (view != nullptr) view->lookup = valid ? DrawCommitLookup::Unmoved : DrawCommitLookup::Invalid;
                 if (valid && cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 if (valid && counted) reuse = patched ? AddressDrawReuse::PatchedData : AddressDrawReuse::MovedBuffer;
@@ -3152,6 +3389,9 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
+                buildCause = spaceHeld ? TemplateBuildCause::Proof : TemplateBuildCause::SpaceNotServed;
+                if (!spaceHeld) ResourceCache::NoteFate(resolved.contentKey, ResourceCache::Fate::LookupSpace);
+                else noteFailedProof(context, ProofSite::Lookup, proof, &resolved.contentKey);
             }
         }
     } else {
@@ -3161,6 +3401,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     findCost.Stop();
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
+        if (ResourceCache::FateCensus()) noteTemplateLookup(resolved.contentKey, buildCause, true);
         HeapCostScope buildCost(HeapCost::TemplateBuild);
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, recordable && drawStagingEnabled());
         buildCost.Stop();
@@ -5284,6 +5525,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
     if (cacheable && built != nullptr && recorded && resources->Reusable() && SharedResourceCache().Insert(contentKey, resources)) templatesReplaced.fetch_add(1, std::memory_order_relaxed);
+    if (cacheable && built != nullptr && (!recorded || !resources->Reusable()) && ResourceCache::FateCensus()) ResourceCache::NoteFate(contentKey, recorded ? ResourceCache::Fate::NotReusable : ResourceCache::Fate::NotRecorded, static_cast<std::uint8_t>(resources->NotReusableReason()));
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
     // transitions of every target and one pass per draw, as before.
@@ -6181,6 +6423,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     if (profile) result.proofUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - proofStart).count();
     if (!proved) {
         SharedResourceCache().Remove(recipe.key, resources.get());
+        noteFailedProof(context, ProofSite::Recipe, result.proof, &recipe.key);
         countCache(&DrawProfile::cacheInvalidated);
         resources->KeepStorageImageBytes(*recorder);
         recorder->Keep(std::move(resources));
@@ -6955,6 +7198,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         return proveRecordTemplate(record, *resources, shaders, result, injected);
     };
     if (!proved()) {
+        noteFailedProof(context, ProofSite::Record, result.proof, recording ? &recipe.key : nullptr);
         if (recording) {
             SharedResourceCache().Remove(recipe.key, resources.get());
             countCache(&DrawProfile::cacheInvalidated);
@@ -7566,6 +7810,7 @@ RepeatOutcome RepeatCommit(const Context& context, const State& state, const Pm4
     } else if (!proveRecordTemplate(record, resources, shaders, out.result, false)) {
         auto owner = recipe->templateRef.lock();
         SharedResourceCache().Remove(recipe->key, &resources);
+        noteFailedProof(context, ProofSite::Repeat, out.result.proof, &recipe->key);
         countCache(&DrawProfile::cacheInvalidated);
         resources.KeepStorageImageBytes(*recorder);
         if (owner != nullptr) recorder->Keep(std::move(owner));

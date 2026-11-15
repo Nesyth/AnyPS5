@@ -179,6 +179,8 @@ struct DataMask {
 
 enum class EntryOutcome { Equal, EqualData, Differing, QueuedStores, Inaccessible, QueuedLabel, FlushingImage, PublishMoved, PendingMoved, ForgetMoved, DeviceImageFallback };
 
+void NoteDispatchLookup(EntryOutcome outcome, std::size_t compared);
+
 bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled);
 
 }

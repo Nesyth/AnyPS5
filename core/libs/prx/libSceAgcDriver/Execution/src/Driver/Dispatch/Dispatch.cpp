@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <atomic>
@@ -23,6 +24,8 @@
 #include <cstring>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace AgcDriver::DriverDetail {
@@ -59,12 +62,501 @@ std::atomic<std::uint64_t> itemFixups{0};
 enum class NotPlain : std::size_t { NoResult, HtileClear, KeysFill, DepthClear, Count };
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(NotPlain::Count)> itemNotPlainKinds{};
 
+bool CensusOn() {
+    static const bool on = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return on;
+}
+
+template<typename TEnum>
+constexpr std::size_t CensusIndex(TEnum value) {
+    return static_cast<std::size_t>(value);
+}
+
+enum class CensusOutcome : std::size_t { Other, Clear, Fill, Copy, Adopted, Exact, Data, Patched, Relocated, Miss, Count };
+constexpr std::array<const char*, CensusIndex(CensusOutcome::Count)> CensusOutcomeNames{"other", "multisample clear", "fill", "copy", "adopted ahead", "exact hit", "data hit", "patched address hit", "relocated hit", "miss"};
+enum class CensusMiss : std::size_t { Other, CacheOff, NotCacheable, Evicted, NewProgram, NotKept, NoEntry, Differing, ViewsChanged, QueuedStores, PendingWrites, QueuedLabel, Unmapped, Forgotten, DeviceImages, Count };
+constexpr std::array<const char*, CensusIndex(CensusMiss::Count)> CensusMissNames{"other", "cache off", "not cacheable", "evicted", "new program", "key seen but never kept", "no entry", "memory differs", "image views changed", "queued stores", "pending GPU writes", "queued label", "unmapped", "forgotten", "device image fallback"};
+enum class CensusUser : std::size_t { KeyField, TablePointer, WalkedValue, Forwarded, RegisterRead, Unused, Untracked, Count };
+constexpr std::array<const char*, CensusIndex(CensusUser::Count)> CensusUserNames{"no user word", "table pointer", "walked value", "forwarded data", "register read", "unused", "untracked"};
+enum class CensusWord : std::size_t { Equal, ReadAddress, WrittenAddress, BufferShape, Texture, Sampler, Data, Program, OtherBinding, Gone, Count };
+constexpr std::array<const char*, CensusIndex(CensusWord::Count)> CensusWordNames{"result equal", "read-only address", "written address", "buffer size or format", "texture", "sampler", "data", "program", "other binding", "reference gone"};
+enum class CensusRecipe : std::size_t { Verify, Htile, Transient, Refused, NeverAttached, Count };
+constexpr std::array<const char*, CensusIndex(CensusRecipe::Count)> CensusRecipeNames{"stamp validation", "HTILE clear", "relocated or patched copy", "pre-check refused", "never attached"};
+enum class CensusRoute : std::size_t { QueuedRecipe, QueuedRecipeLess, QueuedMiss, QueuedRelocated, InlineRecipe, InlineRecipeLess, InlineMiss, Count };
+constexpr std::size_t CensusWords = CensusIndex(CensusWord::Count);
+constexpr std::size_t CensusRecipes = CensusIndex(CensusRecipe::Count);
+constexpr std::size_t CensusNotPlain = CensusIndex(ItemFallback::Count);
+constexpr std::size_t CensusDrainOther = CensusNotPlain + 1;
+constexpr std::size_t CensusDrains = CensusDrainOther + 1;
+
+struct CensusCounts {
+    std::array<std::atomic<std::uint64_t>, CensusIndex(CensusOutcome::Count)> outcomes{};
+    std::array<std::atomic<std::uint64_t>, CensusIndex(CensusMiss::Count)> misses{};
+    std::array<std::atomic<std::uint64_t>, CensusIndex(CensusUser::Count) * CensusWords> noEntry{};
+    std::array<std::atomic<std::uint64_t>, CensusWords> differing{};
+    std::array<std::atomic<std::uint64_t>, CensusWords> present{};
+    std::array<std::atomic<std::uint64_t>, CensusIndex(CensusRoute::Count)> routes{};
+    std::array<std::atomic<std::uint64_t>, 2 * CensusRecipes> recipeLess{};
+    std::array<std::atomic<std::uint64_t>, CensusDrains> drained{};
+    std::array<std::atomic<std::uint64_t>, 3> redispatched{};
+    std::atomic<std::uint64_t> packets{0}, indirect{0}, resolved{0}, walkChanged{0}, notCandidate{0}, captures{0}, captureNs{0}, missPaths{0}, missNs{0};
+};
+
+std::array<CensusCounts, 2>& CensusQueues() {
+    static std::array<CensusCounts, 2> queues;
+    return queues;
+}
+
+struct CensusReference {
+    bool used = false;
+    std::uint64_t key = 0;
+    std::uint64_t serial = 0;
+    std::vector<std::uint32_t> userData;
+    std::weak_ptr<const DispatchVariant> variant;
+};
+
+struct CensusProgram {
+    std::array<CensusReference, 4> ring;
+    std::size_t next = 0;
+    std::uint64_t serial = 0;
+};
+
+struct CensusMemory {
+    AgcDriver::Mutex mutex;
+    std::unordered_map<std::uint64_t, CensusProgram> programs;
+    std::unordered_set<std::uint64_t> inserted;
+};
+
+CensusMemory& CensusState() {
+    static CensusMemory state;
+    return state;
+}
+
+struct CensusNearest {
+    bool found = false;
+    bool evicted = false;
+    std::uint64_t key = 0;
+    std::vector<std::uint32_t> userData;
+    std::shared_ptr<const DispatchVariant> variant;
+};
+
+CensusNearest CensusFind(std::uint64_t program, std::uint64_t key, std::span<const std::uint32_t> userData) {
+    CensusNearest nearest;
+    auto& state = CensusState();
+    std::lock_guard lock(state.mutex);
+    nearest.evicted = state.inserted.contains(key);
+    const auto found = state.programs.find(program);
+    if (nearest.evicted || found == state.programs.end()) return nearest;
+    const CensusReference* best = nullptr;
+    std::size_t bestDistance = 0;
+    for (const auto& held : found->second.ring) {
+        if (!held.used) continue;
+        std::size_t distance = 0;
+        if (held.userData.size() != userData.size()) {
+            distance = std::max(held.userData.size(), userData.size()) + 1u;
+        } else {
+            for (std::size_t index = 0; index < userData.size(); ++index) distance += held.userData[index] != userData[index] ? 1u : 0u;
+        }
+        if (best == nullptr || distance < bestDistance || (distance == bestDistance && held.serial > best->serial)) {
+            best = &held;
+            bestDistance = distance;
+        }
+    }
+    if (best == nullptr) return nearest;
+    nearest.found = true;
+    nearest.key = best->key;
+    nearest.userData = best->userData;
+    nearest.variant = best->variant.lock();
+    return nearest;
+}
+
+void CensusRemember(std::uint64_t program, std::uint64_t key, std::span<const std::uint32_t> userData, const std::shared_ptr<DispatchVariant>& variant, bool inserted) {
+    auto& state = CensusState();
+    std::unordered_map<std::uint64_t, CensusProgram> dropped;
+    std::unordered_set<std::uint64_t> forgotten;
+    std::lock_guard lock(state.mutex);
+    if (inserted) {
+        if (state.inserted.size() >= (std::size_t{1} << 17u)) forgotten.swap(state.inserted);
+        state.inserted.insert(key);
+    }
+    if (state.programs.size() >= 4096 && !state.programs.contains(program)) dropped.swap(state.programs);
+    auto& entry = state.programs[program];
+    auto at = entry.ring.size();
+    for (std::size_t index = 0; index < entry.ring.size(); ++index) {
+        if (entry.ring[index].used && entry.ring[index].key == key) at = index;
+    }
+    if (at == entry.ring.size()) {
+        at = entry.next;
+        entry.next = (entry.next + 1u) % entry.ring.size();
+    }
+    auto& slot = entry.ring[at];
+    slot.used = true;
+    slot.key = key;
+    slot.serial = ++entry.serial;
+    slot.userData.assign(userData.begin(), userData.end());
+    slot.variant = variant;
+}
+
+CensusWord CensusWordKind(const ShaderRecompiler::DescriptorBinding& binding, std::size_t word, std::uint32_t changed) {
+    using Role = ShaderRecompiler::DescriptorRole;
+    switch (binding.role) {
+        case Role::GuestBuffers: {
+            const auto element = word / 4u;
+            const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+            if (word % 4u == 0u || (word % 4u == 1u && (changed & 0xffffu) != 0u)) return written ? CensusWord::WrittenAddress : CensusWord::ReadAddress;
+            return CensusWord::BufferShape;
+        }
+        case Role::GuestImages:
+        case Role::ImageTable:
+        case Role::ImageTableMap:
+        case Role::ImageStorageTable:
+            return CensusWord::Texture;
+        case Role::GuestSamplers:
+        case Role::SamplerTable:
+            return CensusWord::Sampler;
+        case Role::FlattenedSrt:
+        case Role::ShaderData:
+            return CensusWord::Data;
+        default:
+            return CensusWord::OtherBinding;
+    }
+}
+
+CensusWord CensusCompare(const ShaderRecompiler::RecompileResult& before, const ShaderRecompiler::RecompileResult& now, const DispatchVariant* masks, std::uint32_t& present) {
+    auto first = CensusWord::Count;
+    const auto note = [&](CensusWord kind) {
+        present |= std::uint32_t{1} << CensusIndex(kind);
+        if (first == CensusWord::Count) first = kind;
+    };
+    if (before.PipelineVariantId() != now.PipelineVariantId() || before.bindings.size() != now.bindings.size()) {
+        note(CensusWord::Program);
+        return first;
+    }
+    for (std::size_t index = 0; index < now.bindings.size(); ++index) {
+        const auto& old = before.bindings[index];
+        const auto& live = now.bindings[index];
+        if (old.role != live.role || old.count != live.count || old.guestDescriptor.size() != live.guestDescriptor.size()) {
+            note(CensusWord::Program);
+            continue;
+        }
+        const bool masked = masks != nullptr && masks->flatBinding == index;
+        for (std::size_t word = 0; word < live.guestDescriptor.size(); ++word) {
+            const auto changed = old.guestDescriptor[word] ^ live.guestDescriptor[word];
+            if (changed == 0u) continue;
+            if (masked && std::find(masks->dataSlots.begin(), masks->dataSlots.end(), static_cast<std::uint32_t>(word)) != masks->dataSlots.end()) continue;
+            note(CensusWordKind(live, word, changed));
+        }
+    }
+    if (before.pushConstants != now.pushConstants) note(CensusWord::Data);
+    return first == CensusWord::Count ? CensusWord::Equal : first;
+}
+
+CensusUser CensusUserKind(std::span<const std::uint32_t> before, std::span<const std::uint32_t> now, const ShaderRecompiler::ResourceCapture* capture, const ShaderRecompiler::RecompileResult& compiled, const ShaderSnapshot& shader) {
+    if (before.size() != now.size()) return CensusUser::KeyField;
+    std::size_t index = 0;
+    while (index < now.size() && before[index] == now[index]) ++index;
+    if (index == now.size()) return CensusUser::KeyField;
+    if (index >= 64 || capture == nullptr) return CensusUser::Untracked;
+    const auto bit = std::uint64_t{1} << index;
+    if ((capture->userDataUse.asBase & bit) != 0) return CensusUser::TablePointer;
+    if ((capture->userDataUse.asValue & bit) != 0) return CensusUser::WalkedValue;
+    if (std::find(compiled.shaderDataUserWords.begin(), compiled.shaderDataUserWords.end(), static_cast<std::uint32_t>(index)) != compiled.shaderDataUserWords.end()) return CensusUser::Forwarded;
+    const bool tail = shader.userDataTailRegister.has_value() && (index == *shader.userDataTailRegister || index == *shader.userDataTailRegister + 1u);
+    if ((compiled.userDataRegisterReads & bit) != 0 || tail) return CensusUser::RegisterRead;
+    return CensusUser::Unused;
+}
+
+bool CensusSameWalk(const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> captured, std::span<const ShaderRecompiler::MemoryRegion> memory) {
+    std::size_t at = 0;
+    for (const auto& region : captured) {
+        if (std::any_of(memory.begin(), memory.end(), [&](const ShaderRecompiler::MemoryRegion& known) { return region.guestAddress >= known.guestAddress && region.guestAddress < known.guestAddress + known.bytes.size(); })) continue;
+        if (at >= variant.runs.size() || variant.runs[at].first != region.guestAddress || variant.runs[at].second != region.guestAddress + region.bytes.size()) return false;
+        ++at;
+    }
+    return at == variant.runs.size();
+}
+
+bool CensusLiveRecipe(const DispatchVariant& variant) {
+    const auto recipe = variant.recipe.load(std::memory_order_acquire);
+    return recipe != nullptr && (!recipe->moves || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchMovedRecipes));
+}
+
+struct OutcomeCensus {
+    OutcomeCensus(std::uint32_t queueId, bool resolvingAhead, bool indirect);
+    ~OutcomeCensus();
+    OutcomeCensus(const OutcomeCensus&) = delete;
+    OutcomeCensus& operator=(const OutcomeCensus&) = delete;
+
+    std::chrono::steady_clock::time_point Clock() const { return on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; }
+    void Captured(std::chrono::steady_clock::time_point start) const;
+    void MissPath(std::chrono::steady_clock::time_point start) const;
+    void Served(bool fromAhead, bool cached, const std::shared_ptr<DispatchVariant>& variant, bool dataHit, std::uint64_t address, const ShaderSnapshot* shader, std::uint64_t dispatchKey, std::span<const std::uint32_t> userData);
+    void ClassifyMiss(bool cacheOff, const DispatchEntry* entry, const ShaderRecompiler::ResourceCapture* capture, const ShaderRecompiler::RecompileResult& compiled, const ShaderSnapshot& shader, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> captured, std::span<const ShaderRecompiler::MemoryRegion> memory);
+    void Inserted(const std::shared_ptr<DispatchVariant>& variant, std::span<const std::uint32_t> userData) const;
+    void Queued(bool recipe, bool late, bool relocated, const DispatchVariant* variant) const;
+    void Inline(bool candidate, bool cached, const DispatchVariant* variant, bool recipeHit, bool htile, bool stamp) const;
+
+    bool on = false;
+    bool resolving = false;
+    std::size_t queue = 0;
+    bool notPlain = false;
+    bool lookupFound = false;
+    bool walkChanged = false;
+    std::size_t compared = 0;
+    std::size_t drain = CensusDrainOther;
+    std::uint32_t present = 0;
+    std::uint64_t program = 0;
+    std::uint64_t key = 0;
+    EntryOutcome lookup = EntryOutcome::Differing;
+    CensusOutcome outcome = CensusOutcome::Other;
+    CensusMiss miss = CensusMiss::Other;
+    CensusUser user = CensusUser::KeyField;
+    CensusWord word = CensusWord::Equal;
+    OutcomeCensus* parent = nullptr;
+};
+
+OutcomeCensus*& CurrentCensus() {
+    struct CurrentCensusStorage {};
+    return HostThreadLocal<OutcomeCensus*, CurrentCensusStorage>();
+}
+
+OutcomeCensus::OutcomeCensus(std::uint32_t queueId, bool resolvingAhead, bool indirect) : on(CensusOn()), resolving(resolvingAhead), queue(queueId == 0 ? 0u : 1u) {
+    if (!on) return;
+    auto& current = CurrentCensus();
+    parent = current;
+    current = this;
+    auto& counts = CensusQueues()[queue];
+    if (resolving) counts.resolved.fetch_add(1, std::memory_order_relaxed);
+    else if (parent == nullptr && indirect) counts.indirect.fetch_add(1, std::memory_order_relaxed);
+}
+
+OutcomeCensus::~OutcomeCensus() {
+    if (!on) return;
+    CurrentCensus() = parent;
+    if (resolving) return;
+    auto& counts = CensusQueues()[queue];
+    if (parent != nullptr) {
+        const bool hit = outcome == CensusOutcome::Adopted || outcome == CensusOutcome::Exact || outcome == CensusOutcome::Data || outcome == CensusOutcome::Patched || outcome == CensusOutcome::Relocated;
+        counts.redispatched[hit ? 0u : outcome == CensusOutcome::Miss ? 1u : 2u].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    counts.packets.fetch_add(1, std::memory_order_relaxed);
+    counts.outcomes[CensusIndex(outcome)].fetch_add(1, std::memory_order_relaxed);
+    if (outcome != CensusOutcome::Miss) return;
+    counts.misses[CensusIndex(miss)].fetch_add(1, std::memory_order_relaxed);
+    if (miss == CensusMiss::NoEntry) counts.noEntry[CensusIndex(user) * CensusWords + CensusIndex(word)].fetch_add(1, std::memory_order_relaxed);
+    if (miss == CensusMiss::Differing) {
+        counts.differing[CensusIndex(word)].fetch_add(1, std::memory_order_relaxed);
+        if (walkChanged) counts.walkChanged.fetch_add(1, std::memory_order_relaxed);
+    }
+    for (std::size_t kind = 0; kind < CensusWords; ++kind) {
+        if (((present >> kind) & 1u) != 0) counts.present[kind].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void OutcomeCensus::Captured(std::chrono::steady_clock::time_point start) const {
+    if (!on) return;
+    auto& counts = CensusQueues()[queue];
+    counts.captures.fetch_add(1, std::memory_order_relaxed);
+    counts.captureNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+}
+
+void OutcomeCensus::MissPath(std::chrono::steady_clock::time_point start) const {
+    if (!on) return;
+    auto& counts = CensusQueues()[queue];
+    counts.missPaths.fetch_add(1, std::memory_order_relaxed);
+    counts.missNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+}
+
+void OutcomeCensus::Served(bool fromAhead, bool cached, const std::shared_ptr<DispatchVariant>& variant, bool dataHit, std::uint64_t address, const ShaderSnapshot* shader, std::uint64_t dispatchKey, std::span<const std::uint32_t> userData) {
+    if (!on || resolving) return;
+    program = (address * 0x9e3779b97f4a7c15ull) ^ static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(shader));
+    key = dispatchKey;
+    const bool lookupHit = lookupFound && (lookup == EntryOutcome::Equal || lookup == EntryOutcome::EqualData);
+    if (fromAhead) outcome = CensusOutcome::Adopted;
+    else if (!cached) outcome = CensusOutcome::Miss;
+    else if (!lookupHit) outcome = CensusOutcome::Relocated;
+    else if (variant != nullptr && variant->relocated) outcome = CensusOutcome::Patched;
+    else outcome = dataHit ? CensusOutcome::Data : CensusOutcome::Exact;
+    if ((outcome == CensusOutcome::Exact || outcome == CensusOutcome::Data) && variant != nullptr) CensusRemember(program, key, userData, variant, true);
+}
+
+void OutcomeCensus::ClassifyMiss(bool cacheOff, const DispatchEntry* entry, const ShaderRecompiler::ResourceCapture* capture, const ShaderRecompiler::RecompileResult& compiled, const ShaderSnapshot& shader, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> captured, std::span<const ShaderRecompiler::MemoryRegion> memory) {
+    if (!on || resolving || outcome != CensusOutcome::Miss) return;
+    if (cacheOff) {
+        miss = CensusMiss::CacheOff;
+        return;
+    }
+    if (lookupFound) {
+        switch (lookup) {
+            case EntryOutcome::Differing: break;
+            case EntryOutcome::QueuedStores: miss = CensusMiss::QueuedStores; return;
+            case EntryOutcome::FlushingImage:
+            case EntryOutcome::PublishMoved:
+            case EntryOutcome::PendingMoved: miss = CensusMiss::PendingWrites; return;
+            case EntryOutcome::QueuedLabel: miss = CensusMiss::QueuedLabel; return;
+            case EntryOutcome::Inaccessible: miss = CensusMiss::Unmapped; return;
+            case EntryOutcome::ForgetMoved: miss = CensusMiss::Forgotten; return;
+            case EntryOutcome::DeviceImageFallback: miss = CensusMiss::DeviceImages; return;
+            default: miss = CensusMiss::Other; return;
+        }
+        if (entry == nullptr || entry->variants.empty() || entry->variants.front()->compiled == nullptr) {
+            miss = CensusMiss::Other;
+            return;
+        }
+        if (compared == 0) {
+            miss = CensusMiss::ViewsChanged;
+            return;
+        }
+        const auto& reference = *entry->variants.front();
+        miss = CensusMiss::Differing;
+        word = CensusCompare(*reference.compiled, compiled, &reference, present);
+        walkChanged = !CensusSameWalk(reference, captured, memory);
+        return;
+    }
+    if (!CacheableResult(compiled)) {
+        miss = CensusMiss::NotCacheable;
+        return;
+    }
+    const auto nearest = CensusFind(program, key, userData);
+    if (nearest.evicted) {
+        miss = CensusMiss::Evicted;
+        return;
+    }
+    if (!nearest.found) {
+        miss = CensusMiss::NewProgram;
+        return;
+    }
+    if (nearest.key == key) {
+        miss = CensusMiss::NotKept;
+        return;
+    }
+    miss = CensusMiss::NoEntry;
+    user = CensusUserKind(nearest.userData, userData, capture, compiled, shader);
+    word = nearest.variant != nullptr && nearest.variant->compiled != nullptr ? CensusCompare(*nearest.variant->compiled, compiled, nearest.variant.get(), present) : CensusWord::Gone;
+}
+
+void OutcomeCensus::Inserted(const std::shared_ptr<DispatchVariant>& variant, std::span<const std::uint32_t> userData) const {
+    if (!on || resolving || variant == nullptr || outcome != CensusOutcome::Miss) return;
+    CensusRemember(program, key, userData, variant, true);
+}
+
+void OutcomeCensus::Queued(bool recipe, bool late, bool relocated, const DispatchVariant* variant) const {
+    if (!on) return;
+    auto& counts = CensusQueues()[queue];
+    const auto route = late ? (relocated ? CensusRoute::QueuedRelocated : CensusRoute::QueuedMiss) : recipe ? CensusRoute::QueuedRecipe : CensusRoute::QueuedRecipeLess;
+    counts.routes[CensusIndex(route)].fetch_add(1, std::memory_order_relaxed);
+    if (route != CensusRoute::QueuedRecipeLess) return;
+    const auto why = variant != nullptr && variant->relocated ? CensusRecipe::Transient : CensusRecipe::NeverAttached;
+    counts.recipeLess[CensusIndex(why)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void OutcomeCensus::Inline(bool candidate, bool cached, const DispatchVariant* variant, bool recipeHit, bool htile, bool stamp) const {
+    if (!on) return;
+    auto& counts = CensusQueues()[queue];
+    if (!candidate) counts.notCandidate.fetch_add(1, std::memory_order_relaxed);
+    else counts.drained[notPlain ? CensusNotPlain : drain].fetch_add(1, std::memory_order_relaxed);
+    const auto route = !cached ? CensusRoute::InlineMiss : recipeHit ? CensusRoute::InlineRecipe : CensusRoute::InlineRecipeLess;
+    counts.routes[CensusIndex(route)].fetch_add(1, std::memory_order_relaxed);
+    if (route != CensusRoute::InlineRecipeLess) return;
+    const auto why = stamp ? CensusRecipe::Verify : htile ? CensusRecipe::Htile : variant != nullptr && CensusLiveRecipe(*variant) ? CensusRecipe::Refused : variant != nullptr && variant->relocated ? CensusRecipe::Transient : CensusRecipe::NeverAttached;
+    counts.recipeLess[CensusRecipes + CensusIndex(why)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteCensusFallback(ItemFallback reason) {
+    if (!CensusOn()) return;
+    if (auto* census = CurrentCensus(); census != nullptr) census->drain = CensusIndex(reason);
+}
+
+void ReportDispatchCensus() {
+    if (!CensusOn()) return;
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    for (std::size_t queue = 0; queue < 2; ++queue) {
+        auto& counts = CensusQueues()[queue];
+        const auto packets = take(counts.packets);
+        const auto indirect = take(counts.indirect);
+        const auto resolved = take(counts.resolved);
+        std::array<unsigned long long, 3> again{};
+        for (std::size_t index = 0; index < again.size(); ++index) again[index] = take(counts.redispatched[index]);
+        char item[256];
+        std::string text;
+        std::snprintf(item, sizeof(item), "[dispatch-census] (10 s) %s: %llu packets (%llu indirect, %llu ahead resolves; re-dispatched: hit %llu, miss %llu, other %llu):", queue == 0 ? "queue 0" : "other queues", packets, indirect, resolved, again[0], again[1], again[2]);
+        text += item;
+        for (std::size_t index = 0; index < CensusOutcomeNames.size(); ++index) {
+            std::snprintf(item, sizeof(item), "%s %s %llu", index == 0 ? "" : ",", CensusOutcomeNames[index], take(counts.outcomes[index]));
+            text += item;
+        }
+        text += "; misses:";
+        for (std::size_t index = 0; index < CensusMissNames.size(); ++index) {
+            std::snprintf(item, sizeof(item), "%s %s %llu", index == 0 ? "" : ",", CensusMissNames[index], take(counts.misses[index]));
+            text += item;
+        }
+        text += "; no entry by first differing user word / first differing result word:";
+        bool any = false;
+        for (std::size_t user = 0; user < CensusUserNames.size(); ++user) {
+            for (std::size_t word = 0; word < CensusWords; ++word) {
+                const auto count = take(counts.noEntry[user * CensusWords + word]);
+                if (count == 0) continue;
+                std::snprintf(item, sizeof(item), "%s %s/%s %llu", any ? "," : "", CensusUserNames[user], CensusWordNames[word], count);
+                text += item;
+                any = true;
+            }
+        }
+        if (!any) text += " none";
+        text += "; memory differs by first differing result word:";
+        any = false;
+        for (std::size_t word = 0; word < CensusWords; ++word) {
+            const auto count = take(counts.differing[word]);
+            if (count == 0) continue;
+            std::snprintf(item, sizeof(item), "%s %s %llu", any ? "," : "", CensusWordNames[word], count);
+            text += item;
+            any = true;
+        }
+        std::snprintf(item, sizeof(item), "%s (walk changed %llu); result words differing in classified misses:", any ? "" : " none", take(counts.walkChanged));
+        text += item;
+        for (std::size_t word = CensusIndex(CensusWord::ReadAddress); word < CensusIndex(CensusWord::Gone); ++word) {
+            std::snprintf(item, sizeof(item), "%s %s %llu", word == CensusIndex(CensusWord::ReadAddress) ? "" : ",", CensusWordNames[word], take(counts.present[word]));
+            text += item;
+        }
+        take(counts.present[CensusIndex(CensusWord::Equal)]);
+        take(counts.present[CensusIndex(CensusWord::Gone)]);
+        const auto captures = take(counts.captures);
+        const auto captureMs = static_cast<double>(take(counts.captureNs)) / 1e6;
+        const auto missPaths = take(counts.missPaths);
+        const auto missMs = static_cast<double>(take(counts.missNs)) / 1e6;
+        std::snprintf(item, sizeof(item), "; captures %llu in %.1f ms (%.1f us each), miss paths %llu in %.1f ms (%.1f us each)", captures, captureMs, captures != 0 ? captureMs * 1000.0 / static_cast<double>(captures) : 0.0, missPaths, missMs, missPaths != 0 ? missMs * 1000.0 / static_cast<double>(missPaths) : 0.0);
+        text += item;
+        std::array<unsigned long long, CensusIndex(CensusRoute::Count)> routes{};
+        for (std::size_t index = 0; index < routes.size(); ++index) routes[index] = take(counts.routes[index]);
+        std::snprintf(item, sizeof(item), "; queued: recipe %llu, after a miss %llu, relocated %llu, without a recipe %llu (", routes[CensusIndex(CensusRoute::QueuedRecipe)], routes[CensusIndex(CensusRoute::QueuedMiss)], routes[CensusIndex(CensusRoute::QueuedRelocated)], routes[CensusIndex(CensusRoute::QueuedRecipeLess)]);
+        text += item;
+        for (std::size_t index = 0; index < CensusRecipes; ++index) {
+            std::snprintf(item, sizeof(item), "%s%s %llu", index == 0 ? "" : ", ", CensusRecipeNames[index], take(counts.recipeLess[index]));
+            text += item;
+        }
+        std::snprintf(item, sizeof(item), "); inline: recipe %llu, miss %llu, without a recipe %llu (", routes[CensusIndex(CensusRoute::InlineRecipe)], routes[CensusIndex(CensusRoute::InlineMiss)], routes[CensusIndex(CensusRoute::InlineRecipeLess)]);
+        text += item;
+        for (std::size_t index = 0; index < CensusRecipes; ++index) {
+            std::snprintf(item, sizeof(item), "%s%s %llu", index == 0 ? "" : ", ", CensusRecipeNames[index], take(counts.recipeLess[CensusRecipes + index]));
+            text += item;
+        }
+        std::snprintf(item, sizeof(item), "), not a pipeline candidate %llu, drained candidates:", take(counts.notCandidate));
+        text += item;
+        for (std::size_t index = 0; index < CensusDrains; ++index) {
+            std::snprintf(item, sizeof(item), "%s %s %llu", index == 0 ? "" : ",", index < ItemFallbackNames.size() ? ItemFallbackNames[index] : index == CensusNotPlain ? "not plain" : "other", take(counts.drained[index]));
+            text += item;
+        }
+        if (queue == 0 || packets != 0 || resolved != 0 || captures != 0) std::fprintf(stderr, "%s\n", text.c_str());
+    }
+}
+
 bool DispatchMissItemsEnabled() {
     return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelineDispatchMisses);
 }
 
 void NoteItemFallback(ItemFallback reason) {
     itemFallbacks[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    NoteCensusFallback(reason);
 }
 
 void ReportDispatchItems(bool profile) {
@@ -82,6 +574,7 @@ void ReportDispatchItems(bool profile) {
     }
     std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer, %llu queued after a cache miss, %llu queued without a recipe, %llu cached ones kept off the queue as not plain; not plain by kind: no result %llu, HTILE clear %llu, key fill %llu, depth plane clear %llu; ZMASK fix-ups queued %llu); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemMisses.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRecipeLess.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemNotPlain.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemNotPlainKinds[0].load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemNotPlainKinds[1].load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemNotPlainKinds[2].load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemNotPlainKinds[3].load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemFixups.load(std::memory_order_relaxed)), drained.c_str());
     if (const auto relocated = itemRelocated.load(std::memory_order_relaxed); relocated != 0) std::fprintf(stderr, "[dispatch-item] %llu more commit items queued after an exact cache miss that a relocated entry served (not among the misses above), cumulative\n", static_cast<unsigned long long>(relocated));
+    ReportDispatchCensus();
 }
 
 bool SameDispatchResult(const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b) {
@@ -123,6 +616,15 @@ bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, c
 
 }
 
+void NoteDispatchLookup(EntryOutcome outcome, std::size_t compared) {
+    if (!CensusOn()) return;
+    auto* census = CurrentCensus();
+    if (census == nullptr) return;
+    census->lookupFound = true;
+    census->lookup = outcome;
+    census->compared = compared;
+}
+
 bool Driver::pipelineDispatch() {
     return DispatchItemsEnabled();
 }
@@ -131,6 +633,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (SkippedShader(address)) return;
+    OutcomeCensus census(submission.queue, resolvingAhead(), indirectArguments != 0);
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
     if (!registeredShader) registeredShader = ReadRawShader(address);
     const auto& snapshot = *registeredShader;
@@ -207,6 +710,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (sideEffects) DrawFinisher::Get().Drain();
         }
         if (indirectArguments == 0 && Graphics::TakeMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) {
+            census.outcome = CensusOutcome::Clear;
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             if (resolvedAhead().empty()) gateOpened() = true;
             return;
@@ -215,6 +719,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (const auto fill = Graphics::MatchMemoryValueFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]})) Graphics::NoteMemoryValueFill(*fill);
         }
         if (!partialLastGroup && fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
+            census.outcome = CensusOutcome::Fill;
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             if (resolvedAhead().empty()) gateOpened() = true;
             return;
@@ -254,6 +759,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             htileFixup = Graphics::MatchHtileZmaskFixup(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
         }
         if (!partialLastGroup && indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
+            census.outcome = CensusOutcome::Copy;
             pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
             if (resolvedAhead().empty()) gateOpened() = true;
             return;
@@ -507,6 +1013,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             dataHit = true;
         }
     }
+    census.Served(fromAhead, cached, keepVariant, dataHit, address, registeredShader.get(), key, userData);
     timing.Mark("lookup_cache");
     std::vector<DrawPipeline::Range> itemWrites;
     bool pipelined = false;
@@ -530,6 +1037,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
         if (profile) captureMs.fetch_add(phaseTiming.Elapsed(), std::memory_order_relaxed);
     } else if (!fromAhead) {
+        const auto missStart = census.Clock();
         shaderMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
         if (relocate && !resolving) shaderMemory->RecordReadNodes(&provenance.readNodes);
 
@@ -540,10 +1048,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
             const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             forgetAtCapture = GuestMemory::ForgetSerial();
+            const auto captureStart = census.Clock();
             capture = [&] {
                 const SampledReadScope sampling(evidenceReads);
                 return CaptureInvocation(*shaderMemory, snapshot, codeOffset, request, invocation);
             }();
+            census.Captured(captureStart);
             captured = shaderMemory->Regions();
             request.context.memory = captured;
             if (traceCapSync()) traceCapture("dispatch-capture", address, submission.queue, captured, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
@@ -560,7 +1070,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 NoteHeapFragment(&snapshot, computeHeapKey, false);
                 request.target.gpuResolvedImages = false;
                 invocation = InvocationFor(snapshot, codeOffset, request);
+                const auto recaptureStart = census.Clock();
                 capture = shaderMemory->Capture(invocation);
+                census.Captured(recaptureStart);
                 captured = shaderMemory->Regions();
                 request.context.memory = captured;
                 compiledResult = invocation.Materialize(*capture);
@@ -603,7 +1115,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         if (profile) recompileMs.fetch_add(phaseTiming.Elapsed(), std::memory_order_relaxed);
         phaseTiming.Phase(PhaseRecompile);
+        census.ClassifyMiss(noDispatchCache, missedEntry.get(), capture.get(), *compiledResult, snapshot, userData, captured, memory);
         if (!resolving) insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming, relocate ? &provenance : nullptr);
+        census.Inserted(attachVariant, userData);
+        census.MissPath(missStart);
     }
     const auto* registeredViews = capture != nullptr ? &capture->snapshot.registeredImages : keepVariant != nullptr && keepVariant->registeredViews != nullptr ? keepVariant->registeredViews.get() : nullptr;
     if (resolving) {
@@ -712,6 +1227,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         plain = why == NotPlain::Count;
         if (!plain) itemNotPlainKinds[static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed);
         else if (htileFixup.has_value()) itemFixups.fetch_add(1, std::memory_order_relaxed);
+        if (!plain) census.notPlain = true;
     }
     if (pipelined && DispatchMissItemsEnabled() && !plain) {
         pipelined = false;
@@ -749,6 +1265,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
+        census.Queued(recipe != nullptr, lateItem, relocatedHit, keepVariant.get());
         DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dispatch, [this, localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, attach, prepareThreads, dataHit, epoch, htileClearCompletion, htileMask, itemFixup = DispatchMissItemsEnabled() ? htileFixup : std::nullopt] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
@@ -816,6 +1333,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(LiveRecipe(*keepVariant), indirectArguments != 0);
         phaseTiming.Phase(PhaseRecipePrecheck);
     }
+    census.Inline(pipelineCandidate, cached, keepVariant.get(), recipeHit != nullptr, htileClearCompletion.has_value(), stampValidate());
 
     std::shared_ptr<const Recipe> builtRecipe;
     auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? (relocatedHit ? relocatedAttach.get() : keepVariant.get()) : attachVariant.get();

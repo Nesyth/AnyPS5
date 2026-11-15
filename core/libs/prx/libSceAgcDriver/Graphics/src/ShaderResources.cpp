@@ -3416,6 +3416,16 @@ bool MatchesContentKey(const CompiledShader& shader, std::span<const std::uint32
     return equal && cursor == key.size();
 }
 
+bool ShaderResources::ContentKeyMatches(const CompiledShader& shader, std::span<const std::uint32_t> key, bool dataWords, bool movableBuffers, bool movableWrites) {
+    std::size_t cursor = 0;
+    bool equal = true;
+    VisitContentKey(shader, dataWords, movableBuffers, [&](std::uint32_t word) {
+        equal &= cursor < key.size() && key[cursor] == word;
+        ++cursor;
+    }, movableBuffers && movableWrites);
+    return equal && cursor == key.size();
+}
+
 namespace {
 
 // APS5_PROFILE_DRAW: Revalidate outcomes and time, printed as [rescache] every 10 s next to the
@@ -5297,6 +5307,16 @@ void ShaderResources::ExpressStage(Recorder& recorder) {
     guestMemory.RecordStagingCopies(recorder);
 }
 
+const char* ShaderResources::ProofRefusalName(ProofRefusal refusal) {
+    constexpr std::array<const char*, static_cast<std::size_t>(ProofRefusal::Count)> names{"none", "other", "registered views", "not reusable", "walk: no program", "walk: snapshot texture", "walk: view of a GPU image", "walk: depth surface", "walk: storage image", "walk: image table", "walk: element count", "imports", "staging decisions", "staging copies", "as-is check", "injected"};
+    const auto index = static_cast<std::size_t>(refusal);
+    return index < names.size() ? names[index] : "unnamed";
+}
+
+const char* ShaderResources::FastFailName(std::size_t reason) {
+    return reason < FastFailNames.size() ? FastFailNames[reason] : "none";
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report, CleanProof* clean) {
     if (!RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits)) {
         if (expressValid || expressWatch != nullptr) {
@@ -5373,7 +5393,7 @@ bool ShaderResources::revalidateClean(std::span<const CompiledShader> shaders, P
 
 bool ShaderResources::revalidateProof(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (!registeredImageViewsCurrent(registeredImageViews)) {
-        if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
+        if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other, false, ProofRefusal::Views};
         provedEpoch = 0;
         return false;
     }
@@ -5446,7 +5466,7 @@ bool ShaderResources::AsIsCurrent() {
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
-    if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
+    if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other, false, ProofRefusal::NotReusable};
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -5468,9 +5488,28 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     }
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
-    const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
+    auto refusal = ProofRefusal::Other;
+    std::uint64_t refusedAddress = 0;
+    std::uint64_t refusedBytes = 0;
+    const auto refuse = [&](ProofRefusal why, std::uint64_t address = 0, std::uint64_t bytes = 0) {
+        refusal = why;
+        refusedAddress = address;
+        refusedBytes = bytes;
+        return false;
+    };
+    const auto refuseTexture = [&](std::size_t index, std::uint64_t address) {
+        if (index >= validatedTextures.size()) return refuse(ProofRefusal::WalkCount, address);
+        const auto& surface = validatedTextures[index];
+        return refuse(surface.depth ? ProofRefusal::WalkDepth : surface.source != nullptr ? ProofRefusal::WalkView : ProofRefusal::WalkSnapshot, address, surface.bytes);
+    };
+    const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other, ProofRefusal why = ProofRefusal::Count) {
         if (profile) countRevalidate(fast, ok, start);
-        if (report != nullptr) report->failure = ok ? ProofFailure::None : failure;
+        if (report != nullptr) {
+            report->failure = ok ? ProofFailure::None : failure;
+            report->refusal = ok ? ProofRefusal::None : why != ProofRefusal::Count ? why : refusal;
+            report->address = ok || why != ProofRefusal::Count ? 0 : refusedAddress;
+            report->bytes = ok || why != ProofRefusal::Count ? 0 : refusedBytes;
+        }
         return ok;
     };
     // Loaded before any check (the memo rule of fastRevalidate): kept as the memo only when the
@@ -5488,7 +5527,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         std::size_t textureIndex = 0;
         std::size_t storageIndex = 0;
         for (const auto& shader : shaders) {
-            if (shader.program == nullptr) return false;
+            if (shader.program == nullptr) return refuse(ProofRefusal::WalkProgram);
             for (const auto& binding : shader.program->bindings) {
                 if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages) continue;
                 if (binding.kind == ShaderRecompiler::DescriptorKind::SampledImage) {
@@ -5502,18 +5541,18 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                         const VkComponentMapping components = ViewComponents(resource);
                         const VkImageViewType multisampleViewType = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
                         const bool depthCompare = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
-                        if (textureIndex >= textures.size() || cachedTexture(context, words, resource, components, 0, depthCompare, multisampleViewType, layerRowsBinding(binding.imageShape, resource, depthCompare)) != textures[textureIndex]) return false;
+                        if (textureIndex >= textures.size() || cachedTexture(context, words, resource, components, 0, depthCompare, multisampleViewType, layerRowsBinding(binding.imageShape, resource, depthCompare)) != textures[textureIndex]) return refuseTexture(textureIndex, resource.baseAddress);
                         ++textureIndex;
                     }
                 } else if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) {
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
                         const auto words = std::span<const std::uint32_t>(DrawGuestWords(shader, binding)).subspan(static_cast<std::size_t>(element) * 8u, 8u);
                         if (IsNullTextureResource(words)) continue;
-                        if (storageIndex >= storageTextures.size()) return false;
+                        if (storageIndex >= storageTextures.size()) return refuse(ProofRefusal::WalkCount);
                         std::shared_ptr<StorageTexture> expected;
                         if (SameAsPreviousStorageElement(DrawGuestWords(shader, binding), element) && StorageDedupeEnabled()) expected = storageTextures[storageIndex - 1];
                         else expected = cachedStorageTexture(context, words, DecodeTextureResource(words), storageMips[storageIndex], 0, storageWritten[storageIndex]);
-                        if (expected != storageTextures[storageIndex]) return false;
+                        if (expected != storageTextures[storageIndex]) return refuse(ProofRefusal::WalkStorage, storageTextures[storageIndex] != nullptr ? storageTextures[storageIndex]->Descriptor().baseAddress : 0, storageTextures[storageIndex] != nullptr ? storageTextures[storageIndex]->GuestBytes() : 0);
                         ++storageIndex;
                     }
                 }
@@ -5532,7 +5571,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             if (table.elementTextures.empty()) continue;
             std::span<const std::uint32_t> imageWords;
             const auto* images = tableImages(shaders, table.stage, imageWords);
-            if (images == nullptr || images->count != table.elementTextures.size() || imageWords.size() != static_cast<std::size_t>(images->count) * 8u) return false;
+            if (images == nullptr || images->count != table.elementTextures.size() || imageWords.size() != static_cast<std::size_t>(images->count) * 8u) return refuse(ProofRefusal::WalkTable);
             std::vector<std::shared_ptr<Texture>> cached;
             if (auto* reused = FindReusedTable(context.device, *images, imageWords, CurrentTableState()); reused != nullptr && TableCurrent(*reused) && CachedTableTextures(*reused, cached)) {
                 auto next = cached.begin();
@@ -5555,19 +5594,19 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                     same = index == textureIndex && textureIndex < textures.size() && textures[textureIndex] == texture;
                     ++textureIndex;
                 }
-                if (!same) return false;
+                if (!same) return refuse(ProofRefusal::WalkTable);
                 TextureCounts().tablesReused.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
-            if (!table.representatives.empty() && table.representatives != variantRepresentatives(context.device, *images, imageWords, table.elementBase, context.imageTableCapacity)) return false;
+            if (!table.representatives.empty() && table.representatives != variantRepresentatives(context.device, *images, imageWords, table.elementBase, context.imageTableCapacity)) return refuse(ProofRefusal::WalkTable);
             for (std::uint32_t element = 0; element < images->count; ++element) {
                 if (table.elementTextures[element] == std::numeric_limits<std::size_t>::max()) continue;
                 if (!table.representatives.empty() && table.representatives[element] != NoRepresentative) continue;
-                if (table.elementTextures[element] != textureIndex || !currentTableEntry(*images, imageWords, element)) return false;
+                if (table.elementTextures[element] != textureIndex || !currentTableEntry(*images, imageWords, element)) return refuse(ProofRefusal::WalkTable);
                 ++textureIndex;
             }
         }
-        if (textureIndex != textures.size() || storageIndex != storageTextures.size()) return false;
+        if (textureIndex != textures.size() || storageIndex != storageTextures.size()) return refuse(ProofRefusal::WalkCount);
         // The walk proved every object current again: the records move to what it proved, or one
         // spurious stamp (a label sharing a 64 KiB block with a surface's edge) would keep this
         // object on the full walk for good.
@@ -5632,6 +5671,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (report != nullptr) {
         report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
         report->audited = !fast && reason == FastFail::Audit;
+        report->fastFail = static_cast<std::uint8_t>(fast ? FastFail::Count : reason);
     }
     if (!fast) {
         countFullWalk(reason);
@@ -5684,10 +5724,10 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         for (const auto& region : directRegions) {
             auto serial = HostImportSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin), true);
             if (serial == 0) serial = ImageMirrorSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
-            if (serial != region.serial) return false;
+            if (serial != region.serial) return refuse(ProofRefusal::Imports, region.begin, region.end - region.begin);
             if (region.regionEnd != 0) {
                 const auto committed = GuestMemory::DescribeCommitted(region.begin, static_cast<std::size_t>(region.regionEnd - region.begin));
-                if (committed.ranges.size() != 1 || committed.ranges.front().first != region.begin || committed.ranges.front().second != region.committedEnd) return false;
+                if (committed.ranges.size() != 1 || committed.ranges.front().first != region.begin || committed.ranges.front().second != region.committedEnd) return refuse(ProofRefusal::Imports, region.begin, region.regionEnd - region.begin);
             }
         }
         return true;
@@ -5720,13 +5760,13 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
     // from their imports anew for this use, after the flushes above and before the work is
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
-    if (!guestMemory.StagingDecisionsCurrent()) return finish(fast, false, ProofFailure::Changed);
+    if (!guestMemory.StagingDecisionsCurrent()) return finish(fast, false, ProofFailure::Changed, ProofRefusal::Staging);
     if (auto* recorder = Recorder::Active(); recorder != nullptr) {
         try {
             guestMemory.RecordStagingCopies(*recorder);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[resources] staging copies of a reused build failed: %s\n", error.what());
-            return finish(fast, false);
+            return finish(fast, false, ProofFailure::Other, ProofRefusal::StagingCopies);
         }
     }
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
@@ -6049,7 +6089,10 @@ void ResourceCache::noteMiss(const Key& key) {
 bool ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     std::lock_guard lock(mutex);
     dropReleasedTextures(evicted);
-    if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) return false;
+    if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) {
+        NoteFate(key, Fate::InsertRefused);
+        return false;
+    }
     bool replaced = false;
     if (const auto found = index.find(key); found != index.end()) {
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
@@ -6059,6 +6102,7 @@ bool ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     }
     entries.emplace_front(key, std::move(resources));
     index.emplace(key, entries.begin());
+    NoteFate(key, Fate::Inserted);
     if (capacity == 0) {
         const char* value = std::getenv("APS5_RESOURCE_CACHE_ENTRIES");
         const auto parsed = value ? std::strtoull(value, nullptr, 10) : 0ull;
@@ -6074,6 +6118,7 @@ bool ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
             ++spared;
             continue;
         }
+        NoteFate(entries.back().first, Fate::Capacity);
         noteEvicted(entries.back().first);
         if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
         index.erase(entries.back().first);
@@ -6090,6 +6135,7 @@ bool ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         }
         tables -= elements;
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
+        NoteFate(it->first, Fate::Tables);
         index.erase(it->first);
         it = std::prev(entries.erase(it));
     }
@@ -6124,6 +6170,7 @@ void ResourceCache::removeImage(const StorageTexture* image, std::vector<std::sh
             continue;
         }
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
+        NoteFate(it->first, Fate::Image);
         index.erase(it->first);
         it = entries.erase(it);
     }
@@ -6137,6 +6184,7 @@ void ResourceCache::dropReleasedTextures(std::vector<std::shared_ptr<ShaderResou
             continue;
         }
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
+        NoteFate(it->first, Fate::ReleasedTexture);
         index.erase(it->first);
         it = entries.erase(it);
     }
@@ -6224,6 +6272,43 @@ void ResourceCache::erase(const Key& key) {
 ResourceCache& SharedResourceCache() {
     static auto* cache = new ResourceCache();
     return *cache;
+}
+
+namespace {
+struct FateTable {
+    AgcDriver::Mutex mutex;
+    std::unordered_map<std::size_t, ResourceCache::FateNote> notes;
+};
+
+FateTable& fateTable() {
+    static auto* table = new FateTable();
+    return *table;
+}
+}
+
+bool ResourceCache::FateCensus() {
+    static const bool census = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return census;
+}
+
+void ResourceCache::NoteFate(const Key& key, Fate fate, std::uint8_t detail) {
+    if (!FateCensus() || key.empty() || key[0] != 0xffffffffu) return;
+    const auto hash = KeyHash{}(key);
+    const auto present = Recorder::Presents();
+    auto& table = fateTable();
+    std::lock_guard lock(table.mutex);
+    if (table.notes.size() >= 65536u) std::erase_if(table.notes, [&](const auto& item) { return item.second.present + 600u < present; });
+    if (table.notes.size() >= 65536u) table.notes.clear();
+    table.notes[hash] = {fate, detail, present};
+}
+
+ResourceCache::FateNote ResourceCache::FateOf(const Key& key) {
+    if (!FateCensus() || key.empty()) return {};
+    const auto hash = KeyHash{}(key);
+    auto& table = fateTable();
+    std::lock_guard lock(table.mutex);
+    const auto found = table.notes.find(hash);
+    return found != table.notes.end() ? found->second : FateNote{};
 }
 
 namespace {

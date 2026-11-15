@@ -379,6 +379,94 @@ bool htileProvesClear(std::uint32_t word, bool depthOnly, float clearDepth) {
     return false;
 }
 
+enum class DepthCheck : std::size_t { Calls, Worked, FillNotes, PublicationSync, PendingSync, PendingDepth, PendingHtile, PendingStencil, Alias, StencilClear, DepthClear, HtileStore, Count };
+enum class DepthWriter : std::size_t { Dispatch, HtileClear, Untagged, Other, Untold, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(DepthWriter::Count)> DepthWriterNames{"dispatch", "HTILE clear", "untagged", "copy/fill/clear", "untold"};
+
+struct DepthCheckCounts {
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DepthCheck::Count)> events{};
+    std::array<std::array<std::atomic<std::uint64_t>, DepthWriterNames.size()>, 2> writers{};
+    std::atomic<std::uint64_t> collects{0};
+    std::atomic<std::uint64_t> nanoseconds{0};
+    std::atomic<std::uint64_t> syncNanoseconds{0};
+    std::atomic<std::uint64_t> collectNanoseconds{0};
+};
+
+DepthCheckCounts& depthCheckCounts() {
+    static auto* counts = new DepthCheckCounts();
+    return *counts;
+}
+
+bool depthCheckCensus() {
+    static const bool census = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return census;
+}
+
+DepthWriter depthWriter(const Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint64_t note) {
+    if (!Recorder::KeyWriterCensus()) return DepthWriter::Untold;
+    if (note == 0u) note = recorder.NewestWriteNote(address, bytes);
+    const auto tag = note != 0u ? Recorder::WriterOfNote(note) : ~std::uint64_t{0};
+    if (tag == ~std::uint64_t{0}) return DepthWriter::Untold;
+    const auto site = tag >> 56u;
+    return site == 1u ? DepthWriter::Dispatch : site == 8u ? DepthWriter::HtileClear : site == 0u ? DepthWriter::Untagged : DepthWriter::Other;
+}
+
+class DepthCheckScope {
+public:
+    DepthCheckScope() = default;
+    DepthCheckScope(const DepthCheckScope&) = delete;
+    DepthCheckScope& operator=(const DepthCheckScope&) = delete;
+    ~DepthCheckScope() {
+        if (!on) return;
+        auto& counts = depthCheckCounts();
+        const auto at = [&](DepthCheck event) { return noted[static_cast<std::size_t>(event)]; };
+        for (std::size_t index = 0; index < noted.size(); ++index) {
+            if (noted[index]) counts.events[index].fetch_add(1, std::memory_order_relaxed);
+        }
+        counts.events[static_cast<std::size_t>(DepthCheck::Calls)].fetch_add(1, std::memory_order_relaxed);
+        if (at(DepthCheck::FillNotes) || at(DepthCheck::PublicationSync) || at(DepthCheck::PendingSync) || at(DepthCheck::Alias) || at(DepthCheck::StencilClear) || at(DepthCheck::DepthClear)) counts.events[static_cast<std::size_t>(DepthCheck::Worked)].fetch_add(1, std::memory_order_relaxed);
+        for (std::size_t row = 0; row < writers.size(); ++row) {
+            if (writers[row].has_value()) counts.writers[row][static_cast<std::size_t>(*writers[row])].fetch_add(1, std::memory_order_relaxed);
+        }
+        counts.collects.fetch_add(collects, std::memory_order_relaxed);
+        counts.syncNanoseconds.fetch_add(syncNs, std::memory_order_relaxed);
+        counts.collectNanoseconds.fetch_add(collectNs, std::memory_order_relaxed);
+        counts.nanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count()), std::memory_order_relaxed);
+    }
+    std::chrono::steady_clock::time_point Now() const { return on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; }
+    void Note(DepthCheck event) {
+        if (on) noted[static_cast<std::size_t>(event)] = true;
+    }
+    void Synced(std::chrono::steady_clock::time_point since) {
+        if (on) syncNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
+    }
+    void Collected(std::chrono::steady_clock::time_point since) {
+        if (!on) return;
+        ++collects;
+        collectNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
+    }
+    void Pending(const Recorder& recorder, std::size_t plane, std::uint64_t address, std::size_t bytes) {
+        if (!on) return;
+        noted[static_cast<std::size_t>(DepthCheck::PendingSync)] = true;
+        noted[static_cast<std::size_t>(plane == 0u ? DepthCheck::PendingDepth : plane == 1u ? DepthCheck::PendingHtile : DepthCheck::PendingStencil)] = true;
+        if (!writers[0].has_value()) writers[0] = depthWriter(recorder, address, bytes, 0u);
+    }
+    void HtileStore(const Recorder& recorder, std::uint64_t note) {
+        if (!on) return;
+        noted[static_cast<std::size_t>(DepthCheck::HtileStore)] = true;
+        writers[1] = depthWriter(recorder, 0u, 0u, note);
+    }
+
+private:
+    bool on = depthCheckCensus();
+    std::chrono::steady_clock::time_point began = Now();
+    std::array<bool, static_cast<std::size_t>(DepthCheck::Count)> noted{};
+    std::array<std::optional<DepthWriter>, 2> writers{};
+    std::uint64_t collects = 0;
+    std::uint64_t syncNs = 0;
+    std::uint64_t collectNs = 0;
+};
+
 std::uint64_t fillNoteAfter(const Recorder& recorder, const GuestMemory::UnchangedQuery& range, std::uint64_t floor, std::uint32_t word) {
     std::uint64_t found = 0u;
     for (const auto& write : recorder.PendingWritesOver(range.address, range.bytes)) {
@@ -776,22 +864,28 @@ public:
 
     void CheckCurrent() {
         if (target.samples == 1u) return;
+        DepthCheckScope check;
         ProveOverwrite();
         const auto clearLease = clearGeneration == 0u && stencilClearGeneration == 0u ? GuestAllocations::Lease{} : GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
         Require(active->load(std::memory_order_acquire), "the native multisample depth owner was released");
         Require(sampling.refusal.empty(), sampling.refusal);
         Require(!clearPending, "native multisample depth clear has not been recorded");
         const auto* recorder = RecorderFor(context);
+        if (recorder != nullptr && ((clearGeneration != 0u && clearPattern.has_value() && clearFillNote == 0u) || (stencilClearGeneration != 0u && stencilFillNote == 0u))) check.Note(DepthCheck::FillNotes);
         if (recorder != nullptr && clearGeneration != 0u && clearPattern.has_value() && clearFillNote == 0u) clearFillNote = fillNoteAfter(*recorder, sampling.initial[1], clearFillFloor, *clearPattern);
         if (recorder != nullptr && stencilClearGeneration != 0u && stencilFillNote == 0u) stencilFillNote = fillNoteAfter(*recorder, sampling.initial[2], stencilFillFloor, *stencilClearValue * 0x01010101u);
         if (!publication.empty()) {
             if (auto* pending = RecorderFor(context)) {
+                const auto syncStart = check.Now();
+                if (clearFillNote != 0u || stencilFillNote != 0u) check.Note(DepthCheck::PublicationSync);
                 if (clearFillNote != 0u) pending->SyncThrough(sampling.initial[1].address, sampling.initial[1].bytes);
                 if (stencilFillNote != 0u) pending->SyncThrough(sampling.initial[2].address, sampling.initial[2].bytes);
+                check.Synced(syncStart);
             }
         }
         const auto newestHtileNote = recorder != nullptr ? recorder->NewestStoreNote(sampling.initial[1].address, sampling.initial[1].bytes) : 0u;
         const bool queuedFill = clearPattern.has_value() && clearFillNote != 0u && newestHtileNote == clearFillNote;
+        if (recorder != nullptr && newestHtileNote != 0u && !queuedFill) check.HtileStore(*recorder, newestHtileNote);
         const auto newestStencilNote = recorder != nullptr && sampling.initial.size() > 2u ? recorder->NewestStoreNote(sampling.initial[2].address, sampling.initial[2].bytes) : 0u;
         const bool queuedStencilFill = stencilClearValue.has_value() && stencilFillNote != 0u && newestStencilNote == stencilFillNote;
         const bool separatePlane = target.stencilAddress != 0u && !target.htileStencil && target.htileDepthOnly && sampling.initial.size() > 2u;
@@ -800,15 +894,21 @@ public:
             const auto& range = sampling.initial[index];
             Require(GuestMemory::Accessible(reinterpret_cast<const void*>(range.address), range.bytes) && GuestMemory::Watched(range.address, range.bytes), "native multisample depth requires watched accessible guest memory");
             if (recorder != nullptr && !(index == 1u && queuedFill) && !(index == 2u && queuedStencilFill) && recorder->PendingWriteOverlaps(range.address, range.bytes)) {
+                check.Pending(*recorder, index, range.address, range.bytes);
                 Require(!recorder->PendingStoreOverlaps(range.address, range.bytes), "external GPU writes over native multisample depth are not implemented");
                 const auto settled = GuestMemory::TrackerGeneration();
+                const auto syncStart = check.Now();
                 RecorderFor(context)->SyncThrough(range.address, range.bytes);
+                check.Synced(syncStart);
                 Require(!GuestMemory::WrittenSince(range.address, range.bytes, settled), "external GPU writes over native multisample depth are not implemented");
             }
+            const auto collectStart = check.Now();
             GuestMemory::CollectWritesUncached(range.address, range.bytes);
+            check.Collected(collectStart);
             const auto alias = MultisampleColorTargetOver(range.address, range.bytes);
             if (!alias || (index == 2u && sampling.unprovenStencil && stencilClearGeneration == 0u)) continue;
             if (index == 0u && sampling.depthAlias && sameDepthAlias(*sampling.depthAlias, range)) continue;
+            check.Note(DepthCheck::Alias);
             const bool uniform = uniformPlaneTarget(target);
             std::optional<float> depthValue;
             std::optional<std::uint8_t> stencilValue;
@@ -823,6 +923,7 @@ public:
             if (stencilValue) stencilPlaneAliased = true;
         }
         if (stencilClearGeneration != 0u) {
+            check.Note(DepthCheck::StencilClear);
             auto& plane = sampling.initial[2];
             const bool gpuFill = stencilFillNote != 0u && (queuedStencilFill || newestStencilNote == 0u);
             Require(GuestMemory::UnchangedSinceCollected(plane.address, plane.bytes, stencilClearGeneration), "CPU writes raced native multisample stencil plane fill");
@@ -842,6 +943,7 @@ public:
             sampling.unprovenStencil.reset();
         }
         if (clearGeneration != 0u) {
+            check.Note(DepthCheck::DepthClear);
             const auto& metadata = sampling.initial[1];
             const bool gpuFill = clearPattern.has_value() && clearFillNote != 0u && (queuedFill || newestHtileNote == 0u);
             for (std::size_t index = 0u; index < sampling.initial.size(); ++index) {
@@ -3397,6 +3499,36 @@ std::uint64_t DepthHtileOverlapping_nid_no_patch(std::uint64_t address, std::uin
         if (address < htile + HtileMetadataBytes(surface->target.extent) && htile < address + bytes) return htile;
     }
     return 0;
+}
+
+std::string TakeDepthCheckText() {
+    auto& counts = depthCheckCounts();
+    std::array<unsigned long long, static_cast<std::size_t>(DepthCheck::Count)> events{};
+    for (std::size_t index = 0; index < events.size(); ++index) events[index] = counts.events[index].exchange(0, std::memory_order_relaxed);
+    const auto writers = [&](std::size_t row) {
+        std::string text;
+        for (std::size_t index = 0; index < DepthWriterNames.size(); ++index) {
+            const auto count = counts.writers[row][index].exchange(0, std::memory_order_relaxed);
+            if (count == 0) continue;
+            if (!text.empty()) text += ", ";
+            text += DepthWriterNames[index];
+            text += ' ';
+            text += std::to_string(count);
+        }
+        return text.empty() ? std::string("none") : text;
+    };
+    const auto pendingWriters = writers(0);
+    const auto htileWriters = writers(1);
+    const auto collects = counts.collects.exchange(0, std::memory_order_relaxed);
+    const auto nanoseconds = counts.nanoseconds.exchange(0, std::memory_order_relaxed);
+    const auto syncNanoseconds = counts.syncNanoseconds.exchange(0, std::memory_order_relaxed);
+    const auto collectNanoseconds = counts.collectNanoseconds.exchange(0, std::memory_order_relaxed);
+    const auto at = [&](DepthCheck event) { return events[static_cast<std::size_t>(event)]; };
+    const auto calls = at(DepthCheck::Calls);
+    if (calls == 0) return {};
+    char text[1024];
+    std::snprintf(text, sizeof(text), "%llu calls (%.1f us each), %llu with work: fill-note searches %llu, publication syncs %llu, pending-write syncs %llu (over depth %llu, HTILE %llu, stencil %llu; newest writer: %s), alias checks %llu, stencil clear completions %llu, depth clear completions %llu; HTILE store pending that is not the clear fill %llu (writer: %s); %llu range collects (%.1f us); syncs %.1f us", calls, static_cast<double>(nanoseconds) / 1e3 / static_cast<double>(calls), at(DepthCheck::Worked), at(DepthCheck::FillNotes), at(DepthCheck::PublicationSync), at(DepthCheck::PendingSync), at(DepthCheck::PendingDepth), at(DepthCheck::PendingHtile), at(DepthCheck::PendingStencil), pendingWriters.c_str(), at(DepthCheck::Alias), at(DepthCheck::StencilClear), at(DepthCheck::DepthClear), at(DepthCheck::HtileStore), htileWriters.c_str(), static_cast<unsigned long long>(collects), static_cast<double>(collectNanoseconds) / 1e3, static_cast<double>(syncNanoseconds) / 1e3);
+    return text;
 }
 
 void NoteHtileWriter_nid_no_patch(const char* kind, std::uint64_t program, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes) {

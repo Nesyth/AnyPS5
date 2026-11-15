@@ -5350,6 +5350,28 @@ bool MovedWritesKey(std::span<const std::uint32_t> key) {
     return key.size() >= 4 && key[key.size() - 4] == MovedWritesKeyMarker && key[key.size() - 3] == key.size() - 4;
 }
 
+bool RecipeKeyMatches(const Graphics::CompiledShader& shader, std::span<const std::uint32_t> key, VkDevice device) {
+    const bool writes = MovedWritesKey(key);
+    const std::size_t trailing = writes ? 4u : 2u;
+    const auto deviceHandle = reinterpret_cast<std::uint64_t>(device);
+    if (!DispatchMove() || key.size() < trailing || key[key.size() - 2] != static_cast<std::uint32_t>(deviceHandle) || key[key.size() - 1] != static_cast<std::uint32_t>(deviceHandle >> 32u)) return false;
+    return Graphics::ShaderResources::ContentKeyMatches(shader, key.first(key.size() - trailing), !TemplateDataRefresh(), true, writes);
+}
+
+void FlushBufferDepthPlanes(const ShaderRecompiler::RecompileResult& shader) {
+    for (const auto& binding : shader.bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+        for (std::size_t at = 0; at + 4u <= binding.guestDescriptor.size(); at += 4u) {
+            const auto* words = binding.guestDescriptor.data() + at;
+            const auto base = static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xffffu) << 32u);
+            const auto stride = (words[1] >> 16u) & 0x3fffu;
+            const auto records = static_cast<std::uint64_t>(words[2]);
+            const auto bytes = stride != 0 ? records * stride : records;
+            if (base != 0 && bytes != 0) static_cast<void>(Graphics::FlushDepthPlanes(base, static_cast<std::size_t>(bytes)));
+        }
+    }
+}
+
 // The phases of VulkanDevice::dispatch (APS5_PROFILE_DRAW), followed by one row per image lookup
 // outcome (Graphics::LookupOutcomes) on the [indirect] line.
 enum DispatchPhase : std::size_t { PhaseReap, PhaseResources, PhaseResourcesInsert, PhaseResourcesComplete, PhaseResourcesImages, PhaseResourcesUpload, PhaseResourcesDescriptors, PhaseResourcesOther, PhaseResourcesALocked, PhaseResourcesAddress, PhaseResourcesAUnlocked, PhaseResourcesRevalidate, PhaseResourcesFullBuild, PhaseResourcesHookWaits, PhaseProof, PhasePipeline, PhaseDecide, PhaseArgumentRead, PhaseRecordCommands, PhaseRecordKeeps, PhaseRecordDataRefresh, PhaseRecordBind, PhaseRecordMarks, PhaseRecordCompletion, PhaseRecord, PhaseSync, DispatchPhaseCount };
@@ -5578,6 +5600,35 @@ RecipeCounters& Recipes() {
     return counters;
 }
 
+constexpr std::array<const char*, 7> RecipeRefusalNames{"recipes off", "not cacheable", "moves without moved recipes", "not reusable", "needs completion", "no pipeline objects", "no content key"};
+
+struct RecipeAttachCensus {
+    std::atomic<std::uint64_t> built{0};
+    std::array<std::atomic<std::uint64_t>, RecipeRefusalNames.size()> refused{};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+void NoteRecipeAttach(bool recipes, bool cacheable, bool unmovedOverlay, bool reusable, bool completion, bool objects, bool keyed) {
+    static RecipeAttachCensus census;
+    const std::size_t why = !recipes ? 0u : !cacheable ? 1u : unmovedOverlay ? 2u : !reusable ? 3u : completion ? 4u : !objects ? 5u : !keyed ? 6u : RecipeRefusalNames.size();
+    if (why < RecipeRefusalNames.size()) census.refused[why].fetch_add(1, std::memory_order_relaxed);
+    else census.built.fetch_add(1, std::memory_order_relaxed);
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = census.lastReport.load();
+    if (last == 0) {
+        census.lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !census.lastReport.compare_exchange_strong(last, nowMs)) return;
+    std::string text;
+    char item[64];
+    for (std::size_t index = 0; index < RecipeRefusalNames.size(); ++index) {
+        std::snprintf(item, sizeof(item), "%s %s %llu", index == 0 ? "" : ",", RecipeRefusalNames[index], static_cast<unsigned long long>(census.refused[index].exchange(0, std::memory_order_relaxed)));
+        text += item;
+    }
+    std::fprintf(stderr, "[dispatch-recipes] (10 s) template-path dispatch commits with a dispatch-cache variant to attach a recipe to: %llu built one; not built:%s\n", static_cast<unsigned long long>(census.built.exchange(0, std::memory_order_relaxed)), text.c_str());
+}
+
 constexpr std::size_t MoveRefusals = static_cast<std::size_t>(Graphics::ShaderResources::MoveRefusal::Count);
 
 struct DispatchMoveCounters {
@@ -5655,7 +5706,7 @@ std::uint64_t VerifyEvery(const char* name) {
 
 enum class TemplateBuild : std::size_t { Layout, WrittenWord, BufferWord, Image, Sampler, Data, Other, FirstSeen, Count };
 constexpr std::array<const char*, static_cast<std::size_t>(TemplateBuild::Count)> TemplateBuildNames{"layout", "written buffer word", "buffer stride or format word", "image", "sampler", "data", "other", "first seen"};
-enum class RecipeRebuild : std::size_t { Proof, MoveRefused, Device, Other, Count };
+enum class RecipeRebuild : std::size_t { Proof, MoveRefused, Device, Other, Key, Count };
 constexpr std::size_t NotReusableReasons = static_cast<std::size_t>(Graphics::ShaderResources::NotReusable::Count);
 constexpr std::array<const char*, NotReusableReasons> NotReusableNames{"other", "HTILE clear", "copied writes", "lease or address table", "multisample sources", "per-use textures", "data buffers", "no import serial"};
 
@@ -5756,7 +5807,7 @@ void ReportTemplateCensus() {
         notKept += item;
     }
     const auto built = noTemplates + stageA + record + proof + notCacheable;
-    std::fprintf(stderr, "[dispatch-templates] (10 s) %llu dispatch commits: %llu recipe hits (%llu with moves; rebuilt: proof %llu, move refused %llu, device %llu, other %llu); %llu templates reused (exact %llu, read-only moves %llu, written moves %llu); %llu templates built (no template %llu: %s; move refused at stage A %llu (%s), at the record %llu (%s); proof failed %llu; not cacheable %llu); built templates kept %llu, not kept %llu: %s\n", commits, recipes, recipeMoves, rebuilds[0], rebuilds[1], rebuilds[2], rebuilds[3], reusedExact + reusedReadOnly + reusedWritten, reusedExact, reusedReadOnly, reusedWritten, built, noTemplates, noTemplate.c_str(), stageA, stageAText.c_str(), record, recordText.c_str(), proof, notCacheable, kept, notKeptTotal, notKept.c_str());
+    std::fprintf(stderr, "[dispatch-templates] (10 s) %llu dispatch commits: %llu recipe hits (%llu with moves; rebuilt: proof %llu, move refused %llu, device %llu, other %llu, live key or buffer ranges differ from the recipe's %llu);%llu templates reused (exact %llu, read-only moves %llu, written moves %llu); %llu templates built (no template %llu: %s; move refused at stage A %llu (%s), at the record %llu (%s); proof failed %llu; not cacheable %llu); built templates kept %llu, not kept %llu: %s\n", commits, recipes, recipeMoves, rebuilds[0], rebuilds[1], rebuilds[2], rebuilds[3], rebuilds[4], reusedExact + reusedReadOnly + reusedWritten, reusedExact, reusedReadOnly, reusedWritten, built, noTemplates, noTemplate.c_str(), stageA, stageAText.c_str(), record, recordText.c_str(), proof, notCacheable, kept, notKeptTotal, notKept.c_str());
 }
 
 struct MovedWritesVerify {
@@ -5925,6 +5976,7 @@ struct RecordedDispatch {
     std::array<std::uint32_t, 3> threadGroup{};
     std::array<std::uint32_t, 3> threadLimit{};
     std::vector<Graphics::ShaderResources::MovedBuffer> moved{};
+    const ResourceCache::Key* key = nullptr;
 };
 
 struct DispatchCompletion {
@@ -5949,12 +6001,43 @@ struct DispatchCompletion {
 
 namespace {
 
+const char* FirstKeyDifference(std::span<const std::uint32_t> held, std::span<const std::uint32_t> fresh, bool writes) {
+    static constexpr std::array<const char*, static_cast<std::size_t>(Graphics::ContentKeyComponent::Count)> names{"layout", "buffer word 0", "buffer word 1", "buffer word 2", "buffer word 3", "image", "sampler", "shader data", "other", "draw target"};
+    const std::size_t trailing = writes ? 4u : 2u;
+    Graphics::ContentKeyDiff diff{};
+    const bool labelled = held.size() >= trailing && fresh.size() >= trailing && Graphics::ShaderResources::DiffContentKeys(held.first(held.size() - trailing), fresh.first(fresh.size() - trailing), false, diff);
+    const char* first = labelled ? "the trailing words" : "the layout";
+    for (std::size_t component = 0; labelled && component < diff.size(); ++component) {
+        if (!diff[component]) continue;
+        first = names[component];
+        break;
+    }
+    return first;
+}
+
 void verifyMovedWrites(const RecordedDispatch& record) {
     static const std::uint64_t every = VerifyEvery("APS5_VERIFY_DISPATCH_MOVED_WRITES");
-    if (every == 0 || record.resources == nullptr || !std::ranges::any_of(record.moved, [](const Graphics::ShaderResources::MovedBuffer& entry) { return entry.written; })) return;
+    if (every == 0 || record.resources == nullptr) return;
+    const bool writesKey = record.key != nullptr && MovedWritesKey(*record.key);
+    if (!writesKey && !std::ranges::any_of(record.moved, [](const Graphics::ShaderResources::MovedBuffer& entry) { return entry.written; })) return;
     auto& verify = MovedWritesChecks();
     if (verify.seen.fetch_add(1, std::memory_order_relaxed) % every != 0) return;
-    const auto differences = record.resources->VerifyMovedWrites(*record.shader, record.moved);
+    std::vector<std::string> differences;
+    try {
+        if (record.bindings == nullptr || !record.moved.empty()) differences = record.resources->VerifyMovedWrites(*record.shader, record.moved);
+        if (!writesKey) {
+            differences.emplace_back("written buffers moved under a template key that keeps their addresses");
+        } else {
+            const auto live = DispatchContentKey(*record.shader, record.context->device, true, true);
+            if (live != *record.key) {
+                char text[192];
+                std::snprintf(text, sizeof(text), "the live movable-writes key differs from the template's, first in %s (%zu words against %zu)", FirstKeyDifference(*record.key, live, true), live.size(), record.key->size());
+                differences.emplace_back(text);
+            }
+        }
+    } catch (const std::exception& error) {
+        differences.emplace_back(std::string("the check could not be made: ") + error.what());
+    }
     const auto checked = verify.checked.fetch_add(1, std::memory_order_relaxed) + 1;
     if (!differences.empty()) verify.differing.fetch_add(1, std::memory_order_relaxed);
     for (const auto& difference : differences) {
@@ -5969,24 +6052,19 @@ void verifyMovedRecipe(const Recipe& recipe, const Graphics::CompiledShader& sha
     static std::atomic<std::uint64_t> seen{0}, checked{0}, differing{0}, printed{0};
     if (seen.fetch_add(1, std::memory_order_relaxed) % every != 0) return;
     const bool writes = MovedWritesKey(recipe.key);
-    const auto live = DispatchContentKey(shader, recipe.device, true, writes);
+    ResourceCache::Key live;
+    bool made = true;
+    try {
+        live = DispatchContentKey(shader, recipe.device, true, writes);
+    } catch (const std::exception&) {
+        made = false;
+    }
     const auto count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (live != recipe.key) {
+    if (!made || live != recipe.key) {
         differing.fetch_add(1, std::memory_order_relaxed);
         if (printed.fetch_add(1, std::memory_order_relaxed) < 16) {
-            static constexpr std::array<const char*, static_cast<std::size_t>(Graphics::ContentKeyComponent::Count)> names{"layout", "buffer word 0", "buffer word 1", "buffer word 2", "buffer word 3", "image", "sampler", "shader data", "other", "draw target"};
-            const std::size_t trailing = writes ? 4u : 2u;
-            const std::span<const std::uint32_t> held(recipe.key);
-            const std::span<const std::uint32_t> fresh(live);
-            Graphics::ContentKeyDiff diff{};
-            const bool labelled = held.size() >= trailing && fresh.size() >= trailing && Graphics::ShaderResources::DiffContentKeys(held.first(held.size() - trailing), fresh.first(fresh.size() - trailing), false, diff);
-            const char* first = labelled ? "the trailing words" : "the layout";
-            for (std::size_t component = 0; labelled && component < diff.size(); ++component) {
-                if (!diff[component]) continue;
-                first = names[component];
-                break;
-            }
-            std::fprintf(stderr, "[dispatch-moved-recipes-verify] program 0x%llx: the live key differs from the recipe's, first in %s (%zu words against %zu)\n", static_cast<unsigned long long>(program), first, fresh.size(), held.size());
+            if (!made) std::fprintf(stderr, "[dispatch-moved-recipes-verify] program 0x%llx: the live key could not be made\n", static_cast<unsigned long long>(program));
+            else std::fprintf(stderr, "[dispatch-moved-recipes-verify] program 0x%llx: the live key differs from the recipe's, first in %s (%zu words against %zu)\n", static_cast<unsigned long long>(program), FirstKeyDifference(recipe.key, live, writes), live.size(), recipe.key.size());
         }
     }
     if (count % 4096 == 0) std::fprintf(stderr, "[dispatch-moved-recipes-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differing.load(std::memory_order_relaxed)));
@@ -6497,7 +6575,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
     static_cast<void>(Graphics::StorageTexture::StoreDrawnLinearTouching("dispatch access", touches, resources.HoldsLease()));
-    resources.RequireGuestBuffers();
+    if (movedInPlace) resources.requireGuestBuffers(record.moved);
+    else resources.RequireGuestBuffers();
     std::shared_ptr<ScratchPool> pool;
     if (const auto slotDwords = record.shader->program->scratchPoolSlotDwords; slotDwords != 0) {
         const std::uint64_t groups = argumentImport != nullptr ? std::numeric_limits<std::uint64_t>::max() : static_cast<std::uint64_t>(record.x) * record.y * record.z;
@@ -6773,11 +6852,11 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (movedInPlace) {
         resources.MarkGpuWrites(recorder, record.moved);
         Graphics::NoteHtileWriter_nid_no_patch(record.htileClear.has_value() ? "recognised HTILE clear dispatch" : "dispatch", record.programAddress, resources.MovedGpuWrites(record.moved));
-        verifyMovedWrites(record);
     } else {
         resources.MarkGpuWrites(recorder);
         Graphics::NoteHtileWriter_nid_no_patch(record.htileClear.has_value() ? "recognised HTILE clear dispatch" : "dispatch", record.programAddress, resources.GpuWrites());
     }
+    verifyMovedWrites(record);
     if (record.htileClear.has_value()) {
         Graphics::QueueHtileDepthClear(record.htileClear->first, record.htileClear->second);
         const Graphics::Recorder::WriterScope writerScope{Graphics::Recorder::WriterTag(8)};
@@ -6950,17 +7029,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, const std::vector<ShaderRecompiler::RegisteredImageView>* registeredImageViews) {
     const Graphics::Recorder::WriterScope writerScope{Graphics::Recorder::WriterTag(1, programAddress)};
     startJournalReplay();
-    for (const auto& binding : shader.bindings) {
-        if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
-        for (std::size_t at = 0; at + 4u <= binding.guestDescriptor.size(); at += 4u) {
-            const auto* words = binding.guestDescriptor.data() + at;
-            const auto base = static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xffffu) << 32u);
-            const auto stride = (words[1] >> 16u) & 0x3fffu;
-            const auto records = static_cast<std::uint64_t>(words[2]);
-            const auto bytes = stride != 0 ? records * stride : records;
-            if (base != 0 && bytes != 0) static_cast<void>(Graphics::FlushDepthPlanes(base, static_cast<std::size_t>(bytes)));
-        }
-    }
+    FlushBufferDepthPlanes(shader);
     state->recorder->BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     PerformanceTimer timing("Vulkan.Dispatch");
@@ -7267,6 +7336,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     record.resourceKeyMatched = fromCache;
     record.bindings = overlay;
     record.threadGroup = threadGroup;
+    record.key = &contentKey;
     record.moved = std::move(completion.moved);
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
@@ -7317,6 +7387,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     }
     if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, resources->Describe().c_str());
     WatchMemory(programAddress);
+    if (recipeOut != nullptr && DispatchCensus()) NoteRecipeAttach(DispatchRecipes(), cacheable, overlay != nullptr && !completion.movesRecipe, resources->Reusable(), resources->NeedsCompletion(), objects != nullptr, !contentKey.empty());
     // The recipe for the caller's dispatch-cache variant (design_cpu_final M4, rule R3): only an
     // object the resource cache serves under this content key (reusable: no lease, no copied
     // writes, every direct region import- or mirror-served), so a hit's proof is the template's
@@ -7375,6 +7446,10 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     if (recipe.device != state->device) {
         counters.rebuildDevice.fetch_add(1, std::memory_order_relaxed);
         return rebuild(RecipeRebuild::Device);
+    }
+    if (recipe.moves) {
+        if (!RecipeKeyMatches(shaders[0], recipe.key, state->device)) return rebuild(RecipeRebuild::Key);
+        FlushBufferDepthPlanes(shader);
     }
     if (hit->presyncSerial != 0) {
         timer.restart();
@@ -7456,6 +7531,14 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         hit->resources->PatchPushConstants(livePush);
         verifyMovedRecipe(recipe, shaders[0], programAddress);
     }
+    const bool writesKey = MovedWritesKey(recipe.key);
+    bool keyProved = recipe.moves && writesKey;
+    if (writesKey && !recipe.moves && verify == nullptr && TemplateDataRefresh() && (refreshByWords || hit->resources->DataWordsHash() != recipe.dataWordsHash)) {
+        Graphics::ShaderResources::MoveProof proof;
+        const auto unmoved = hit->resources->MovedDispatchBuffers(shaders[0], nullptr, 0, proof, false);
+        if (!unmoved.has_value() || !unmoved->empty() || !RecipeKeyMatches(shaders[0], recipe.key, state->device)) return rebuild(RecipeRebuild::Key);
+        keyProved = true;
+    }
     counters.proofPaths[static_cast<std::size_t>(report.path)].fetch_add(1, std::memory_order_relaxed);
     ++d.cacheHits;
     state->resourceCache.Touch(recipe.key);
@@ -7465,10 +7548,11 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     const auto dataRefresh = !TemplateDataRefresh() ? RecordedDispatch::DataRefresh::None : refreshByWords ? RecordedDispatch::DataRefresh::Words : RecordedDispatch::DataRefresh::Hash;
     if (dataRefresh == RecordedDispatch::DataRefresh::Words) counters.refreshByWords.fetch_add(1, std::memory_order_relaxed);
     RecordedDispatch record{&context, &shaders[0], hit->resources, hit->objects, recipe.pushes ? VkShaderStageFlags{VK_SHADER_STAGE_COMPUTE_BIT} : VkShaderStageFlags{0}, recipe.moves ? &livePush : &recipe.pushBytes, x, y, z, arguments, nullptr, programAddress, dataRefresh, recipe.dataWordsHash, 0, &timer};
-    record.resourceKeyMatched = verify != nullptr;
+    record.resourceKeyMatched = verify != nullptr || keyProved;
     record.threadGroup = threadGroup;
     record.bindings = overlay;
     record.moved = std::move(moved);
+    record.key = &recipe.key;
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
