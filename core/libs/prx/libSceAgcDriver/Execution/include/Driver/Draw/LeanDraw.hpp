@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StagePlans.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanFront.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <array>
 #include <cstddef>
@@ -20,6 +21,8 @@
 namespace AgcDriver::DriverDetail {
 
 enum class LeanVerdict : std::uint8_t { Unknown, Normal, Nothing, Live, Fallback };
+
+enum class LeanFallbackCause : std::uint8_t { None, ColorMetadata, DepthCopy, RenderControl, Maintenance, Rejection, Threw };
 
 struct LeanShape : std::enable_shared_from_this<LeanShape> {
     std::shared_ptr<const DrawDecode> decode;
@@ -41,6 +44,8 @@ struct ShapeRecord {
     std::uint64_t lastUse = 0;
     std::uint64_t lastSeq = 0;
     std::array<LeanVerdict, 3> verdicts{};
+    std::array<LeanVerdict, 3> afterControl{};
+    std::array<LeanFallbackCause, 3> fallbackCauses{};
     bool used = false;
     bool refused = false;
     bool plansRefused = false;
@@ -49,6 +54,12 @@ struct ShapeRecord {
     std::uint64_t plansSeq = 0;
     std::uint64_t plansPresent = 0;
     std::uint64_t plansBuildSeq = 0;
+};
+
+struct LeanFallbackProbe {
+    bool force = false;
+    bool differed = false;
+    LeanFallbacks::Route route = LeanFallbacks::Route::Count;
 };
 
 struct LeanDrawJob {

@@ -336,16 +336,20 @@ private:
     void cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<StageDataHit>& stageData, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, bool shapeNeedsEntry = false, const DrawRelocationPending* relocationPending = nullptr);
     static bool drawPrecheck();
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::size_t packetOffset, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect);
-    static LeanVerdict precheckVerdict(const QueueState& queue, bool indexed, std::uint32_t indexSize);
+    static LeanVerdict precheckVerdict(const QueueState& queue, bool indexed, std::uint32_t indexSize, LeanFallbackCause* cause = nullptr, bool afterControl = false);
+    DrawPipeline::Commit colorMetadataCommit(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queueId, std::uint32_t opcode, Graphics::ColorMetadataPass pass);
+    std::shared_ptr<VulkanDevice> pipelinedColorMetadataDevice(const Graphics::ColorMetadataPass& pass, std::vector<DrawPipeline::Range>& writes);
+    void queueLeanColorMetadataPass(const Graphics::ColorMetadataPass& pass, std::vector<DrawPipeline::Range> writes, std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queueId, std::uint32_t opcode);
+    DrawVerdict drawLeanDepthCopy(const QueueState& queue, const Graphics::DepthCopyPass& copy, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected);
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected);
     DrawVerdict finishDraw(DrawTail& tail, PerformanceTimer& timing);
     DrawVerdict drawLean(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected);
-    DrawVerdict verifyLeanDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected, ShapeRecord& record, LeanVerdict verdict, const Pm4::DrawParameters& parameters, const LeanDrawJob* job);
+    DrawVerdict verifyLeanDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected, ShapeRecord& record, LeanVerdict verdict, const Pm4::DrawParameters& parameters, const LeanDrawJob* job, bool afterControl = false, bool* differed = nullptr);
     void prepareLeanDraws();
     bool leanDrawDevice();
     ShapeRecord* leanShapeRecord(const QueueState& queue, const Submission& submission);
-    LeanVerdict leanVerdict(const QueueState& queue, ShapeRecord& record, const Pm4::DrawParameters& parameters);
+    LeanVerdict leanVerdict(const QueueState& queue, ShapeRecord& record, const Pm4::DrawParameters& parameters, bool afterControl = false);
     bool buildLeanShape(const QueueState& queue, const Submission& submission, ShapeRecord& record);
     static bool leanShapeCurrent(const LeanShape& shape, const QueueState& queue, const ShaderRegistry& registry);
     void finishLeanDraw(const LeanDrawJob& job, const LeanAnchor& anchor);
@@ -602,6 +606,7 @@ private:
     std::atomic<bool> unorderedDrawKeys{false};
     LeanTails leanTails;
     LeanDraws leanDraws;
+    LeanFallbackProbe leanFallbackProbe;
     struct OpenLeanRun {
         std::byte* payload = nullptr;
         LeanDrawJob* jobs = nullptr;

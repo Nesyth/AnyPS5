@@ -161,6 +161,60 @@ bool leanQualified(const DrawDecode& decode) {
     return true;
 }
 
+std::uint64_t elapsedNs(std::chrono::steady_clock::time_point start) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+class WorkerClock {
+public:
+    explicit WorkerClock(std::optional<LeanFallbacks::Reason> reason) : reason(reason), start(LeanFallbacks::Stats() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~WorkerClock() {
+        if (start == std::chrono::steady_clock::time_point{}) return;
+        const auto spent = elapsedNs(start);
+        if (reason) LeanFallbacks::AddToday(*reason, spent);
+        else LeanFallbacks::AddLivePrecheck(spent);
+    }
+    WorkerClock(const WorkerClock&) = delete;
+    WorkerClock& operator=(const WorkerClock&) = delete;
+
+private:
+    std::optional<LeanFallbacks::Reason> reason;
+    std::chrono::steady_clock::time_point start;
+};
+
+class FallbackScope {
+public:
+    explicit FallbackScope(LeanFallbackProbe& probe) : probe(probe), start(LeanFallbacks::Stats() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~FallbackScope() {
+        probe.force = false;
+        if (route != LeanFallbacks::Route::Count) LeanFallbacks::AddMoved(route, start == std::chrono::steady_clock::time_point{} ? 0 : elapsedNs(start));
+    }
+    FallbackScope(const FallbackScope&) = delete;
+    FallbackScope& operator=(const FallbackScope&) = delete;
+    void Moved(LeanFallbacks::Route taken) { route = taken; }
+
+private:
+    LeanFallbackProbe& probe;
+    std::chrono::steady_clock::time_point start;
+    LeanFallbacks::Route route = LeanFallbacks::Route::Count;
+};
+
+LeanFallbacks::Reason fallbackReason(LeanFallbackCause cause) {
+    switch (cause) {
+        case LeanFallbackCause::ColorMetadata: return LeanFallbacks::Reason::ColorMetadata;
+        case LeanFallbackCause::DepthCopy: return LeanFallbacks::Reason::DepthCopy;
+        case LeanFallbackCause::RenderControl: return LeanFallbacks::Reason::RenderControl;
+        case LeanFallbackCause::Maintenance: return LeanFallbacks::Reason::Maintenance;
+        case LeanFallbackCause::Rejection: return LeanFallbacks::Reason::Rejection;
+        default: return LeanFallbacks::Reason::Other;
+    }
+}
+
+void noteFallbackVerify(LeanFallbackProbe& probe, const Submission& submission, std::size_t packetOffset) {
+    const bool differed = std::exchange(probe.differed, false);
+    LeanFallbacks::AddVerify(probe.route, differed, differed ? where(submission, packetOffset) + ": the lean answer differs from today's draw (the [lean-front-verify] lines name the field)" : std::string());
+}
+
 }
 
 std::shared_ptr<DrawDecode> LeanRefreshedDecode(const DrawDecode& from, const DrawUserWords& words) {
@@ -443,15 +497,15 @@ ShapeRecord* Driver::leanShapeRecord(const QueueState& queue, const Submission& 
     return &record;
 }
 
-LeanVerdict Driver::leanVerdict(const QueueState& queue, ShapeRecord& record, const Pm4::DrawParameters& parameters) {
+LeanVerdict Driver::leanVerdict(const QueueState& queue, ShapeRecord& record, const Pm4::DrawParameters& parameters, bool afterControl) {
     const auto index = verdictIndex(parameters);
     if (index >= record.verdicts.size()) return LeanVerdict::Live;
-    auto& verdict = record.verdicts[index];
+    auto& verdict = (afterControl ? record.afterControl : record.verdicts)[index];
     if (verdict != LeanVerdict::Unknown) return verdict;
     std::vector<Graphics::RegisterRead> reads;
     {
         const Graphics::RegisterReadLogScope log(&reads);
-        verdict = precheckVerdict(queue, parameters.indexed, parameters.indexSize);
+        verdict = precheckVerdict(queue, parameters.indexed, parameters.indexSize, afterControl ? nullptr : &record.fallbackCauses[index], afterControl);
     }
     if (verdict == LeanVerdict::Normal || verdict == LeanVerdict::Nothing) {
         const bool keyed = std::all_of(reads.begin(), reads.end(), [](const Graphics::RegisterRead& read) { return Graphics::DrawKeyCovers(read) && !(read.bank == Graphics::RegisterBank::Shader && runtimeRegister(read.offset)); });
@@ -541,38 +595,121 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
         DrawRecords::AddOnWorker(DrawRecords::Counter::Draws);
         DrawRecords::AddOnWorker(reason);
     };
-    const auto today = [&](Counter counter) {
+    bool afterControl = false;
+    bool movedControl = false;
+    const auto today = [&](Counter counter, LeanFallbacks::Reason reason) {
         LeanFront::AddOnWorker(counter);
         recordsOff(counter == Counter::IndirectDrawsOnTodaysPath ? DrawRecords::Counter::OffIndirect : DrawRecords::Counter::OffTodaysDraw);
+        if (movedControl) LeanFallbacks::AddLater(LeanFallbacks::Route::RenderControl);
+        const WorkerClock clock(reason);
         return draw(queue, packet, submission, packetOffset, rejected);
     };
     auto& finisher = DrawFinisher::Get();
-    if (!allowed || !finisher.RingStore() || !DrawPipeline::Active() || ShaderRecompiler::DebugProbeActive()) return today(Counter::DrawsOnTodaysPath);
+    if (!allowed || !finisher.RingStore() || !DrawPipeline::Active() || ShaderRecompiler::DebugProbeActive()) return today(Counter::DrawsOnTodaysPath, LeanFallbacks::Reason::Other);
     Pm4::DrawParameters parameters{};
     try {
         parameters = Pm4::ResolveDraw(packet, queue);
     } catch (const std::exception&) {
-        return today(Counter::DrawsOnTodaysPath);
+        return today(Counter::DrawsOnTodaysPath, LeanFallbacks::Reason::Other);
     }
     static const bool pipelinedIndirect = std::getenv("APS5_NO_PIPELINED_INDIRECT") == nullptr;
-    if (parameters.indirect && !(direct && pipelinedIndirect && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectGpuIndirect) && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelinedGpuIndirect))) return today(Counter::IndirectDrawsOnTodaysPath);
+    if (parameters.indirect && !(direct && pipelinedIndirect && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectGpuIndirect) && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelinedGpuIndirect))) return today(Counter::IndirectDrawsOnTodaysPath, LeanFallbacks::Reason::GpuIndirect);
     const auto todayCounter = parameters.indirect ? Counter::IndirectDrawsOnTodaysPath : Counter::DrawsOnTodaysPath;
     if (!parameters.indirect && !parameters.indexed && (parameters.indexCount == 0 || parameters.instanceCount == 0)) return DrawVerdict::Nothing;
-    if (!deferredLabels().labels.empty() || !leanDrawDevice()) return today(todayCounter);
+    if (!deferredLabels().labels.empty()) return today(todayCounter, LeanFallbacks::Reason::DeferredLabels);
+    if (!leanDrawDevice()) return today(todayCounter, LeanFallbacks::Reason::Other);
+    const auto verify = [&](ShapeRecord& checked, LeanVerdict shown, const LeanDrawJob* job, bool forced) {
+        const WorkerClock clock(LeanFallbacks::Reason::Verify);
+        const auto result = verifyLeanDraw(queue, packet, submission, packetOffset, rejected, checked, shown, parameters, job, afterControl, forced ? &leanFallbackProbe.differed : nullptr);
+        if (forced) noteFallbackVerify(leanFallbackProbe, submission, packetOffset);
+        return result;
+    };
     auto& record = *leanShapeRecord(queue, submission);
-    const auto verdict = leanVerdict(queue, record, parameters);
-    if (verdict == LeanVerdict::Fallback) return today(todayCounter);
+    auto verdict = leanVerdict(queue, record, parameters);
+    std::optional<FallbackScope> fallbackScope;
+    if (verdict == LeanVerdict::Fallback) {
+        const auto slot = verdictIndex(parameters);
+        const auto cause = slot < record.fallbackCauses.size() ? record.fallbackCauses[slot] : LeanFallbackCause::None;
+        const auto reason = fallbackReason(cause);
+        const bool head = cause == LeanFallbackCause::ColorMetadata || cause == LeanFallbackCause::DepthCopy || cause == LeanFallbackCause::RenderControl;
+        if (!head || !LeanFront::SwitchSet(frontLatch, Graphics::RuntimeSwitch::LeanFallbackDraws)) return today(todayCounter, reason);
+        if (parameters.indirect) {
+            LeanFallbacks::AddKept(LeanFallbacks::Kept::Indirect);
+            return today(todayCounter, reason);
+        }
+        fallbackScope.emplace(leanFallbackProbe);
+        std::optional<Graphics::ColorMetadataPass> pass;
+        std::optional<Graphics::DepthCopyPass> copy;
+        std::optional<Graphics::DepthRenderControl> control;
+        try {
+            pass = Graphics::DecodeColorMetadataPass(queue);
+            if (!pass) copy = Graphics::DecodeDepthCopyPass(queue);
+            if (!pass && !copy) control = Graphics::DecodeDepthRenderControl(queue);
+        } catch (const std::exception&) {
+            LeanFallbacks::AddKept(LeanFallbacks::Kept::HeadThrew);
+            return today(todayCounter, reason);
+        }
+        if (pass) {
+            std::vector<DrawPipeline::Range> writes;
+            auto localDevice = pipelinedColorMetadataDevice(*pass, writes);
+            if (localDevice == nullptr) {
+                LeanFallbacks::AddKept(LeanFallbacks::Kept::MetadataNotPipelined);
+                return today(todayCounter, LeanFallbacks::Reason::ColorMetadata);
+            }
+            if (LeanFallbacks::VerifyDue()) {
+                const auto queued = DrawPipeline::PipelinedMetadataPasses();
+                const auto result = today(todayCounter, LeanFallbacks::Reason::Verify);
+                const bool differed = result != DrawVerdict::Drawn || DrawPipeline::PipelinedMetadataPasses() != queued + 1;
+                LeanFallbacks::AddVerify(LeanFallbacks::Route::ColorMetadata, differed, differed ? where(submission, packetOffset) + ": the switch queues the pass through the finisher ring, today's precheck did not queue it as a pipelined pass" : std::string());
+                return result;
+            }
+            fallbackScope->Moved(LeanFallbacks::Route::ColorMetadata);
+            recordsOff(DrawRecords::Counter::OffTodaysDraw);
+            queueLeanColorMetadataPass(*pass, std::move(writes), std::move(localDevice), submission.queue, (packet[0] >> 8u) & 0xffu);
+            return DrawVerdict::Drawn;
+        }
+        if (copy) {
+            const bool checking = LeanFallbacks::VerifyDue();
+            if (checking) leanFallbackProbe = {true, false, LeanFallbacks::Route::DepthCopy};
+            else fallbackScope->Moved(LeanFallbacks::Route::DepthCopy);
+            const auto todays = LeanFront::Total(Counter::DrawsOnTodaysPath);
+            const auto result = drawLeanDepthCopy(queue, *copy, packet, submission, packetOffset, rejected);
+            if (!checking && LeanFront::Total(Counter::DrawsOnTodaysPath) != todays) LeanFallbacks::AddLater(LeanFallbacks::Route::DepthCopy);
+            return result;
+        }
+        if (!control) {
+            LeanFallbacks::AddKept(LeanFallbacks::Kept::HeadChanged);
+            return today(todayCounter, reason);
+        }
+        if (control->samples != 1u) {
+            LeanFallbacks::AddKept(LeanFallbacks::Kept::MultisampleControl);
+            return today(todayCounter, LeanFallbacks::Reason::RenderControl);
+        }
+        verdict = leanVerdict(queue, record, parameters, true);
+        if (verdict == LeanVerdict::Fallback) {
+            LeanFallbacks::AddKept(LeanFallbacks::Kept::AfterControlFallback);
+            return today(todayCounter, LeanFallbacks::Reason::RenderControl);
+        }
+        afterControl = true;
+        if (LeanFallbacks::VerifyDue()) {
+            leanFallbackProbe = {true, false, LeanFallbacks::Route::RenderControl};
+        } else {
+            fallbackScope->Moved(LeanFallbacks::Route::RenderControl);
+            movedControl = true;
+        }
+    }
     if (verdict == LeanVerdict::Nothing) {
-        if (LeanFront::Due(frontLatch, LeanFront::Item::Draw)) return verifyLeanDraw(queue, packet, submission, packetOffset, rejected, record, verdict, parameters, nullptr);
+        const bool forced = std::exchange(leanFallbackProbe.force, false);
+        if (LeanFront::Due(frontLatch, LeanFront::Item::Draw) || forced) return verify(record, verdict, nullptr, forced);
         LeanFront::AddOnWorker(Counter::LeanDraws);
         return DrawVerdict::Nothing;
     }
-    if (!buildLeanShape(queue, submission, record)) return today(todayCounter);
+    if (!buildLeanShape(queue, submission, record)) return today(todayCounter, LeanFallbacks::Reason::RefusedShape);
     const auto& shape = *record.built;
     if (parameters.indirect) {
         const auto& decode = *shape.decode;
         const auto& graphics = decode.state;
-        if (decode.programs.empty() || decode.roles.size() != decode.programs.size() || !KnownGpuIndirectProgram(decode.programs.front().binary.codeAddress) || graphics.quadList || graphics.rectList || graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.stages.mesh || graphics.stages.tessellation || graphics.stages.tessellationGeometry || graphics.tessellationCapture != nullptr) return today(Counter::IndirectDrawsOnTodaysPath);
+        if (decode.programs.empty() || decode.roles.size() != decode.programs.size() || !KnownGpuIndirectProgram(decode.programs.front().binary.codeAddress) || graphics.quadList || graphics.rectList || graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.stages.mesh || graphics.stages.tessellation || graphics.stages.tessellationGeometry || graphics.tessellationCapture != nullptr) return today(Counter::IndirectDrawsOnTodaysPath, LeanFallbacks::Reason::GpuIndirect);
         auto& indirect = *parameters.indirect;
         const auto sgprOf = [&](std::uint32_t location) -> std::int32_t {
             const auto words = UserDataWords(decode.programs, decode.roles, location);
@@ -583,7 +720,8 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
         indirect.startInstanceSgpr = sgprOf(indirect.startInstanceLocation);
         indirect.drawIndexSgpr = sgprOf(indirect.drawIndexLocation);
     }
-    if (LeanFront::Due(frontLatch, LeanFront::Item::Draw)) {
+    const bool forcedCheck = std::exchange(leanFallbackProbe.force, false);
+    if (LeanFront::Due(frontLatch, LeanFront::Item::Draw) || forcedCheck) {
         LeanDrawJob job{};
         job.shape = &shape;
         job.serial = submission.serial;
@@ -600,12 +738,16 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
         job.recordGeneration = 0;
         job.recordFlags = 0;
         recordsOff(DrawRecords::Counter::OffLeanVerify);
-        return verifyLeanDraw(queue, packet, submission, packetOffset, rejected, record, verdict, parameters, &job);
+        return verify(record, verdict, &job, forcedCheck);
     }
     if (verdict == LeanVerdict::Live) {
         LeanFront::AddOnWorker(Counter::PrecheckedLeanDraws);
         bool traceIndirect = false;
-        if (const auto prechecked = precheckDraw(queue, submission, packetOffset, packet, parameters, rejected, traceIndirect)) {
+        const auto prechecked = [&] {
+            const WorkerClock clock(std::nullopt);
+            return precheckDraw(queue, submission, packetOffset, packet, parameters, rejected, traceIndirect);
+        }();
+        if (prechecked) {
             if (*prechecked == DrawVerdict::Drawn) recordsOff(DrawRecords::Counter::OffTodaysDraw);
             return *prechecked;
         }
@@ -624,7 +766,7 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
         payload = finisher.ReserveLean();
         anchor = payload != nullptr ? leanDraws.AnchorFor(submission.shaders, leanDraws.device, finisher.Issued()) : std::nullopt;
     }
-    if (parameters.indirect && (payload == nullptr || !anchor)) return today(Counter::IndirectDrawsOnTodaysPath);
+    if (parameters.indirect && (payload == nullptr || !anchor)) return today(Counter::IndirectDrawsOnTodaysPath, LeanFallbacks::Reason::GpuIndirect);
     std::optional<LeanDrawJob> local;
     LeanDrawJob* job = nullptr;
     if (payload == nullptr || !anchor) {
@@ -712,7 +854,7 @@ void Driver::flushLeanRun() {
     Get().publishLeanRun();
 }
 
-DrawVerdict Driver::verifyLeanDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected, ShapeRecord& record, LeanVerdict verdict, const Pm4::DrawParameters& parameters, const LeanDrawJob* job) {
+DrawVerdict Driver::verifyLeanDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected, ShapeRecord& record, LeanVerdict verdict, const Pm4::DrawParameters& parameters, const LeanDrawJob* job, bool afterControl, bool* differed) {
     using LeanFront::Field;
     LeanDrawSink sink;
     struct SinkScope {
@@ -726,12 +868,17 @@ DrawVerdict Driver::verifyLeanDraw(QueueState& queue, std::span<const std::uint3
     const auto at = where(submission, packetOffset);
     const auto variant = verdictIndex(parameters);
     bool demote = false;
+    const auto demoteVerdict = [&] {
+        auto& verdicts = afterControl ? record.afterControl : record.verdicts;
+        if (variant < verdicts.size()) verdicts[variant] = LeanVerdict::Live;
+        if (differed != nullptr) *differed = true;
+    };
     if (verdict == LeanVerdict::Normal && (!sink.prechecked || !sink.passed)) {
         LeanFront::NoteDifference(Field::DrawVerdicts, at + ": the shape record says the precheck passes, today's precheck " + (sink.prechecked ? "returned verdict " + std::to_string(static_cast<int>(sink.verdict)) : std::string("did not run")));
-        if (variant < record.verdicts.size()) record.verdicts[variant] = LeanVerdict::Live;
+        demoteVerdict();
     } else if (verdict == LeanVerdict::Nothing && (!sink.prechecked || sink.passed || sink.verdict != DrawVerdict::Nothing)) {
         LeanFront::NoteDifference(Field::DrawVerdicts, at + ": the shape record says the draw draws nothing, today's precheck " + (!sink.prechecked ? std::string("did not run") : sink.passed ? std::string("passed") : "returned verdict " + std::to_string(static_cast<int>(sink.verdict))));
-        if (variant < record.verdicts.size()) record.verdicts[variant] = LeanVerdict::Live;
+        demoteVerdict();
     }
     if (job == nullptr || !sink.keyed) return result;
     const auto& shape = *job->shape;
@@ -804,7 +951,10 @@ DrawVerdict Driver::verifyLeanDraw(QueueState& queue, std::span<const std::uint3
             LeanFront::NoteDifference(Field::Jobs, at + ": the lean job's " + (!sameParameters ? "draw parameters" : sink.reg207 != shape.reg207 ? "PA_CL_VS_OUT_CNTL" : "held key") + " differ from today's hand-off");
             demote = true;
         }
-        if (sink.device != leanDraws.device.get()) LeanFront::NoteDifference(Field::Jobs, at + ": the lean job's device differs from the device today's draw used");
+        if (sink.device != leanDraws.device.get()) {
+            LeanFront::NoteDifference(Field::Jobs, at + ": the lean job's device differs from the device today's draw used");
+            if (differed != nullptr) *differed = true;
+        }
         if (sink.dataEntry != nullptr && sink.decode != nullptr) {
             try {
                 if (!sameDecode(*LeanRefreshedDecode(*sink.dataEntry->decode, job->words), *sink.decode)) {
@@ -818,6 +968,7 @@ DrawVerdict Driver::verifyLeanDraw(QueueState& queue, std::span<const std::uint3
         }
     }
     if (demote) {
+        if (differed != nullptr) *differed = true;
         leanDraws.Retire(record, DrawFinisher::Get().Front());
         record.refused = true;
     }

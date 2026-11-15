@@ -162,6 +162,24 @@ TextureKey MakeTextureKey(VkDevice device, std::span<const std::uint32_t> words,
     return key;
 }
 
+enum class KeepForm : std::uint8_t { None, View, Clear, KeyedClear, Snapshot, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(KeepForm::Count)> KeepFormNames{"other", "view of a storage image", "clear-colour texture", "keyed clear snapshot", "snapshot of guest memory"};
+
+struct ParkedTexture {
+    std::shared_ptr<Texture> texture;
+    KeepForm form = KeepForm::None;
+    GuestTextureResource made{};
+    VkClearColorValue clear{};
+    std::array<std::byte, 16> tail{};
+    bool layerRows = false;
+    DccKeys keys = DccKeys::Uncompressed;
+    std::uint64_t bytes = 0;
+    std::shared_ptr<StorageTexture> source;
+    std::uint64_t address = 0;
+    std::uint64_t present = 0;
+    std::uint64_t accounted = 0;
+};
+
 struct CachedTexture {
     TextureKey key;
     std::uint64_t address;
@@ -184,6 +202,11 @@ struct CachedTexture {
     std::array<std::uint64_t, 4> proved{};
     bool refuted = false;
     std::uint64_t surfaceBytes = 0;
+    KeepForm form = KeepForm::None;
+    GuestTextureResource made{};
+    VkClearColorValue madeClear{};
+    std::array<std::byte, 16> madeTail{};
+    bool madeLayerRows = false;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -217,6 +240,9 @@ struct TextureCache {
     std::uint64_t reportedStorage = 0;
     std::chrono::steady_clock::time_point reportedAt{};
     std::uint64_t erasures = 0;
+    std::unordered_map<TextureKey, ParkedTexture, TextureKeyHash> parked;
+    std::uint64_t parkedBytes = 0;
+    std::uint64_t parkedSweep = 0;
 };
 
 TextureCache& Textures() {
@@ -289,8 +315,8 @@ void noteRefilled(std::uint64_t address) {
     GuestMemory::NoteTextureReleased(address);
 }
 
-enum class ReleaseCause : std::uint8_t { Other, UncachedView, Evicted, StaleView, Rewritten, KeysChanged, NowPending, Shape, NotAdmitted, Cleared, Count };
-constexpr std::array<const char*, static_cast<std::size_t>(ReleaseCause::Count)> ReleaseCauseNames{"other", "view of an uncached image", "budget eviction", "stale view", "snapshot rewritten", "DCC keys changed", "now pending in a storage image", "surface size or refuted proof", "not admitted", "device cleared"};
+enum class ReleaseCause : std::uint8_t { Other, UncachedView, Evicted, StaleView, Rewritten, KeysChanged, NowPending, Shape, NotAdmitted, Cleared, Parked, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(ReleaseCause::Count)> ReleaseCauseNames{"other", "view of an uncached image", "budget eviction", "stale view", "snapshot rewritten", "DCC keys changed", "now pending in a storage image", "surface size or refuted proof", "not admitted", "device cleared", "parked, then taken back by a refill"};
 enum class ReleaseKind : std::uint8_t { Snapshot, Keyed, View, Copy, Count };
 constexpr std::array<const char*, static_cast<std::size_t>(ReleaseKind::Count)> ReleaseKindNames{"snapshot", "keyed snapshot or clear", "view", "per-use copy"};
 constexpr std::size_t RefillRefusals = static_cast<std::size_t>(Texture::RefillRefusal::Count) + 2u;
@@ -337,6 +363,57 @@ std::uint64_t TemplateKeepsVerifyEvery() {
     return every;
 }
 
+enum class NotParked : std::uint8_t { OtherForm, SameSide, Full, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(NotParked::Count)> NotParkedNames{"a per-use copy or made while no form was recorded", "replaced by the same side (a view by a view, a clear or snapshot by a clear or snapshot)", "park limit reached"};
+enum class ReviveRefusal : std::uint8_t { None, OtherForm, Descriptor, OtherImage, ClearValue, Keys, Levels, Tail, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(ReviveRefusal::Count)> ReviveRefusalNames{"none", "the other form parked", "descriptor, size or layer rows differ", "another storage image or a per-use copy", "clear value differs", "keys differ", "levels below the minimum LOD", "snapshot tail differs"};
+enum class ParkedDrop : std::uint8_t { Superseded, Aged, Uncached, SwitchUnset, Cleared, Unwound, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(ParkedDrop::Count)> ParkedDropNames{"superseded by a newer park of its key", "not taken back within 8 presents", "its storage image left the cache", "switch unset", "device cleared", "the lookup threw"};
+constexpr std::uint64_t ParkedPresents = 8;
+constexpr std::size_t ParkedLimit = 64;
+constexpr std::uint64_t ParkedByteLimit = 256ull << 20u;
+
+struct ViewKeepCensus {
+    using Counter = std::atomic<std::uint64_t>;
+    std::array<Counter, static_cast<std::size_t>(KeepForm::Count)> parked{};
+    std::array<Counter, static_cast<std::size_t>(KeepForm::Count)> parkable{};
+    std::array<Counter, static_cast<std::size_t>(KeepForm::Count)> revived{};
+    std::array<Counter, static_cast<std::size_t>(KeepForm::Count)> refilledBack{};
+    std::array<Counter, static_cast<std::size_t>(NotParked::Count)> notParked{};
+    std::array<Counter, static_cast<std::size_t>(ReviveRefusal::Count)> refused{};
+    std::array<Counter, static_cast<std::size_t>(ParkedDrop::Count)> dropped{};
+    Counter revivedNotAdmitted{0};
+    Counter revivedUnwound{0};
+    Counter verified{0};
+    Counter differing{0};
+    Counter parkedNow{0};
+    Counter parkedNowBytes{0};
+    std::atomic<std::uint32_t> namedParks{0};
+    std::atomic<std::uint32_t> namedRevivals{0};
+};
+
+ViewKeepCensus& viewKeepCensus() {
+    static auto* census = new ViewKeepCensus();
+    return *census;
+}
+
+void countViewKeep(std::atomic<std::uint64_t>& counter) {
+    if (ResourceCache::FateCensus()) counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::atomic<std::uint64_t>& textureRevivals() {
+    static std::atomic<std::uint64_t> revivals{0};
+    return revivals;
+}
+
+std::uint64_t ViewTemplateKeepsVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_VIEW_TEMPLATE_KEEPS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
 bool SamplerCacheDisabled() {
     static const bool disabled = std::getenv("APS5_NO_SAMPLER_CACHE") != nullptr;
     return disabled;
@@ -378,6 +455,32 @@ void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it, Re
     ++cache.erasures;
 }
 
+void noteParkedSize(const TextureCache& cache) {
+    auto& census = viewKeepCensus();
+    census.parkedNow.store(cache.parked.size(), std::memory_order_relaxed);
+    census.parkedNowBytes.store(cache.parkedBytes, std::memory_order_relaxed);
+}
+
+void dropParked(TextureCache& cache, std::unordered_map<TextureKey, ParkedTexture, TextureKeyHash>::iterator it, ParkedDrop why) {
+    auto parked = std::move(it->second);
+    cache.parked.erase(it);
+    cache.parkedBytes -= std::min(cache.parkedBytes, parked.accounted);
+    noteParkedSize(cache);
+    countViewKeep(viewKeepCensus().dropped[static_cast<std::size_t>(why)]);
+    if (parked.texture == nullptr) return;
+    if (parked.texture.use_count() > 1) noteReleased(parked.texture, parked.address);
+    parked.texture->MarkParked(false);
+}
+
+template<typename Drop>
+void dropParkedWhere(TextureCache& cache, ParkedDrop why, Drop&& drop) {
+    for (auto it = cache.parked.begin(); it != cache.parked.end();) {
+        const auto next = std::next(it);
+        if (drop(it->first, it->second)) dropParked(cache, it, why);
+        it = next;
+    }
+}
+
 void dropUncachedViews(TextureCache& cache) {
     auto& uncached = Uncached();
     if (!uncached.any.load(std::memory_order_acquire)) return;
@@ -391,7 +494,121 @@ void dropUncachedViews(TextureCache& cache) {
         const auto image = weak.lock();
         if (image == nullptr) continue;
         for (auto view = cache.views.find(image.get()); view != cache.views.end(); view = cache.views.find(image.get())) eraseTexture(cache, view->second, ReleaseCause::UncachedView);
+        if (!cache.parked.empty()) dropParkedWhere(cache, ParkedDrop::Uncached, [&](const TextureKey&, const ParkedTexture& parked) { return parked.source == image; });
     }
+}
+
+std::array<std::byte, 16> snapshotTail(std::span<const std::byte> bytes) {
+    std::array<std::byte, 16> tail{};
+    const auto count = std::min<std::size_t>(bytes.size(), tail.size());
+    std::copy(bytes.end() - static_cast<std::ptrdiff_t>(count), bytes.end(), tail.begin());
+    return tail;
+}
+
+bool noLevelsBelowMinLod(const GuestTextureResource& resource) {
+    return resource.baseLevel != 0u || std::min(resource.lastLevel, resource.mipCount - 1u) == 0u || (resource.dimension != TextureDimension::k2D && resource.dimension != TextureDimension::k2DArray);
+}
+
+std::uint64_t parkedAccount(const CachedTexture& entry) {
+    return entry.form == KeepForm::View ? 0u : entry.texture->AllocationBytes();
+}
+
+std::optional<NotParked> parkRefusal(const TextureCache& cache, const CachedTexture& entry, bool viewNext) {
+    if (entry.form == KeepForm::None || (entry.form == KeepForm::View && entry.texture->CopyKind() != Texture::PerUseCopy::None)) return NotParked::OtherForm;
+    if ((entry.form == KeepForm::View) == viewNext) return NotParked::SameSide;
+    const auto existing = cache.parked.find(entry.key);
+    const bool replaces = existing != cache.parked.end();
+    const std::uint64_t freed = replaces ? existing->second.accounted : 0u;
+    if (cache.parked.size() - (replaces ? 1u : 0u) >= ParkedLimit || cache.parkedBytes - std::min(cache.parkedBytes, freed) + parkedAccount(entry) > ParkedByteLimit) return NotParked::Full;
+    return std::nullopt;
+}
+
+ParkedTexture parkedFrom(const CachedTexture& entry) {
+    ParkedTexture parked;
+    parked.texture = entry.texture;
+    parked.form = entry.form;
+    parked.made = entry.made;
+    parked.clear = entry.madeClear;
+    parked.tail = entry.madeTail;
+    parked.layerRows = entry.madeLayerRows;
+    parked.keys = entry.keys;
+    parked.bytes = entry.surfaceBytes;
+    parked.source = entry.source;
+    parked.address = entry.address;
+    parked.present = Recorder::Presents();
+    parked.accounted = parkedAccount(entry);
+    return parked;
+}
+
+ReviveRefusal reviveRefusal(const ParkedTexture& parked, KeepForm form, const GuestTextureResource& resource, bool layerRows, std::uint64_t bytes, DccKeys keys, const StorageTexture* source, const VkClearColorValue* clear, std::span<const std::byte> snapshot) {
+    if (parked.texture == nullptr || parked.form != form) return ReviveRefusal::OtherForm;
+    if (!(parked.made == resource) || parked.layerRows != layerRows || parked.bytes != bytes) return ReviveRefusal::Descriptor;
+    if (form == KeepForm::View) return parked.source.get() == source && parked.texture->StorageSource() == source && parked.texture->CopyKind() == Texture::PerUseCopy::None ? ReviveRefusal::None : ReviveRefusal::OtherImage;
+    if (form == KeepForm::Clear) return clear != nullptr && std::memcmp(&parked.clear, clear, sizeof(VkClearColorValue)) == 0 ? ReviveRefusal::None : ReviveRefusal::ClearValue;
+    if (parked.keys != keys) return ReviveRefusal::Keys;
+    if (!noLevelsBelowMinLod(resource)) return ReviveRefusal::Levels;
+    return snapshotTail(snapshot) == parked.tail ? ReviveRefusal::None : ReviveRefusal::Tail;
+}
+
+struct ParkCommit {
+    TextureCache& cache;
+    const TextureKey& key;
+    std::optional<ParkedTexture> stash;
+    std::shared_ptr<Texture> revived;
+    std::uint64_t revivedAddress = 0;
+    int exceptions = -1;
+    ParkCommit(TextureCache& cache, const TextureKey& key) : cache(cache), key(key) {}
+    ParkCommit(const ParkCommit&) = delete;
+    ParkCommit& operator=(const ParkCommit&) = delete;
+    void Arm() {
+        if (exceptions < 0) exceptions = std::uncaught_exceptions();
+    }
+    ~ParkCommit() {
+        if (exceptions < 0) return;
+        if (std::uncaught_exceptions() > exceptions) {
+            if (revived != nullptr) {
+                noteReleased(revived, revivedAddress);
+                countViewKeep(viewKeepCensus().revivedUnwound);
+            }
+            if (stash.has_value() && stash->texture != nullptr) {
+                if (stash->texture.use_count() > 1) noteReleased(stash->texture, stash->address);
+                stash->texture->MarkParked(false);
+                countViewKeep(viewKeepCensus().dropped[static_cast<std::size_t>(ParkedDrop::Unwound)]);
+            }
+            return;
+        }
+        if (!stash.has_value()) return;
+        if (const auto found = cache.parked.find(key); found != cache.parked.end()) dropParked(cache, found, ParkedDrop::Superseded);
+        cache.parkedBytes += stash->accounted;
+        cache.parked.insert_or_assign(key, std::move(*stash));
+        noteParkedSize(cache);
+    }
+};
+
+void sweepParked(TextureCache& cache, bool on) {
+    if (cache.parked.empty()) return;
+    if (!on) {
+        dropParkedWhere(cache, ParkedDrop::SwitchUnset, [](const TextureKey&, const ParkedTexture&) { return true; });
+        return;
+    }
+    const auto present = Recorder::Presents();
+    if (cache.parkedSweep == present) return;
+    cache.parkedSweep = present;
+    dropParkedWhere(cache, ParkedDrop::Aged, [&](const TextureKey&, const ParkedTexture& parked) { return parked.present + ParkedPresents < present; });
+}
+
+void nameParking(const GuestTextureResource& resource, KeepForm form, ReleaseCause cause, DccKeys keys, const char* why) {
+    if (!ResourceCache::FateCensus()) return;
+    auto& census = viewKeepCensus();
+    if (census.namedParks.load(std::memory_order_relaxed) >= 8u || census.namedParks.fetch_add(1, std::memory_order_relaxed) >= 8u) return;
+    std::fprintf(stderr, "[view-template-keeps] parked the %s of 0x%llx (%ux%u format %u, dcc 0x%llx) at a lookup that found it %s: keys %s, %s\n", KeepFormNames[static_cast<std::size_t>(form)], static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<unsigned long long>(resource.dccAddress), ReleaseCauseNames[static_cast<std::size_t>(cause)], DccKeysName(keys), why);
+}
+
+void nameRevival(const GuestTextureResource& resource, KeepForm form, DccKeys keys, std::uint64_t age) {
+    if (!ResourceCache::FateCensus()) return;
+    auto& census = viewKeepCensus();
+    if (census.namedRevivals.load(std::memory_order_relaxed) >= 8u || census.namedRevivals.fetch_add(1, std::memory_order_relaxed) >= 8u) return;
+    std::fprintf(stderr, "[view-template-keeps] took back the %s of 0x%llx (%ux%u format %u, dcc 0x%llx, keys %s) parked %llu presents before\n", KeepFormNames[static_cast<std::size_t>(form)], static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<unsigned long long>(resource.dccAddress), DccKeysName(keys), static_cast<unsigned long long>(age));
 }
 
 // Moves an entry to the front (most recently used).
@@ -1190,6 +1407,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     std::lock_guard lock(cache.mutex);
     const CacheHold held(sampledCacheHeld);
     dropUncachedViews(cache);
+    const bool viewKeeps = RuntimeSwitches::Set(RuntimeSwitch::ViewTemplateKeeps) && !RuntimeSwitches::Set(RuntimeSwitch::TrustAudit) && !RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter) && !RuntimeSwitches::Set(RuntimeSwitch::XpTrustFinisher);
+    sweepParked(cache, viewKeeps);
+    ParkCommit parking{cache, key};
     std::vector<std::byte> recycled;
     std::shared_ptr<Texture> refill;
     auto refillCause = ReleaseCause::Other;
@@ -1252,13 +1472,27 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         if (it->bytes.size() == bytes) recycled = std::move(it->bytes);
         else parkSnapshot(cache, it->bytes);
-        const bool refillable = it->source == nullptr && it->texture.use_count() > 1 && RuntimeSwitches::Set(RuntimeSwitch::TemplateKeeps);
+        bool parks = false;
+        if ((viewKeeps || ResourceCache::FateCensus()) && it->texture.use_count() > 1) {
+            if (const auto refusal = parkRefusal(cache, *it, source != nullptr)) countViewKeep(viewKeepCensus().notParked[static_cast<std::size_t>(*refusal)]);
+            else if (viewKeeps) parks = true;
+            else countViewKeep(viewKeepCensus().parkable[static_cast<std::size_t>(it->form)]);
+        }
+        const bool refillable = !parks && it->source == nullptr && it->texture.use_count() > 1 && RuntimeSwitches::Set(RuntimeSwitch::TemplateKeeps);
+        if (parks) {
+            parking.Arm();
+            parking.stash = parkedFrom(*it);
+            it->texture->MarkParked(true);
+            noteRefilled(it->address);
+            countViewKeep(viewKeepCensus().parked[static_cast<std::size_t>(it->form)]);
+            nameParking(resource, it->form, staleCause, *keys, clearThroughKeys ? "the pending image holds the fill of these clear keys" : stagedFlushed ? "its pending results were flushed under clear keys" : source != nullptr ? "results now pending in a storage image" : "no pending image and no image that shows the keys");
+        }
         if (refillable) {
             refill = it->texture;
             refillCause = staleCause;
             refillKind = releaseKind(*it);
         }
-        eraseTexture(cache, it, staleCause, !refillable);
+        eraseTexture(cache, it, staleCause, !refillable && !parks);
         ++cache.counts.stale;
     }
     const auto releaseRefill = [&](std::size_t refusal) {
@@ -1320,6 +1554,58 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         return kept;
     };
+    const auto revive = [&](KeepForm form, const VkClearColorValue* reviveClear, std::span<const std::byte> snapshot) -> std::shared_ptr<Texture> {
+        if (!viewKeeps || cache.parked.empty()) return nullptr;
+        const auto found = cache.parked.find(key);
+        if (found == cache.parked.end()) return nullptr;
+        if (const auto refusal = reviveRefusal(found->second, form, resource, layerRows, bytes, *keys, source.get(), reviveClear, snapshot); refusal != ReviveRefusal::None) {
+            countViewKeep(viewKeepCensus().refused[static_cast<std::size_t>(refusal)]);
+            return nullptr;
+        }
+        auto parked = std::move(found->second);
+        cache.parked.erase(found);
+        cache.parkedBytes -= std::min(cache.parkedBytes, parked.accounted);
+        noteParkedSize(cache);
+        parked.texture->Revive(textureRevivals().fetch_add(1, std::memory_order_acq_rel) + 1u);
+        parking.Arm();
+        parking.revived = parked.texture;
+        parking.revivedAddress = address;
+        countViewKeep(viewKeepCensus().revived[static_cast<std::size_t>(form)]);
+        nameRevival(resource, form, *keys, Recorder::Presents() - parked.present);
+        static std::atomic<std::uint64_t> reviveOrdinal{0};
+        if (const auto every = ViewTemplateKeepsVerifyEvery(); every != 0 && reviveOrdinal.fetch_add(1, std::memory_order_relaxed) % every == 0) {
+            const char* what = nullptr;
+            try {
+                const auto fresh = form == KeepForm::View ? createTexture(source, resource, components) : form == KeepForm::Clear ? createTexture(*context.detiler, resource, components, std::span<const std::byte>{}, false, layerRows, reviveClear) : createTexture(*context.detiler, resource, components, snapshot, depthCompare, layerRows);
+                what = parked.texture->ReviveDifference(*fresh);
+            } catch (const std::exception&) {
+                what = "a fresh texture that threw";
+            }
+            auto& census = viewKeepCensus();
+            census.verified.fetch_add(1, std::memory_order_relaxed);
+            if (what != nullptr) census.differing.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<std::uint64_t> checks{0};
+            static std::atomic<std::uint64_t> differences{0};
+            const auto checked = checks.fetch_add(1, std::memory_order_relaxed) + 1u;
+            const auto differing = what != nullptr ? differences.fetch_add(1, std::memory_order_relaxed) + 1u : differences.load(std::memory_order_relaxed);
+            if (what != nullptr && (differing <= 16u || differing % 4096u == 0u)) std::fprintf(stderr, "[view-template-keeps-verify] a taken-back %s 0x%llx (%ux%u format %u) differs from a fresh one in its %s; %llu take-backs checked, %llu differing\n", KeepFormNames[static_cast<std::size_t>(form)], static_cast<unsigned long long>(address), resource.width, resource.height, resource.format, what, static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing));
+        }
+        return parked.texture;
+    };
+    const auto refillFromPark = [&] {
+        if (refill != nullptr || !viewKeeps || cache.parked.empty() || !RuntimeSwitches::Set(RuntimeSwitch::TemplateKeeps)) return;
+        const auto found = cache.parked.find(key);
+        if (found == cache.parked.end() || found->second.texture == nullptr || found->second.form == KeepForm::View || found->second.texture->ViewsStorageImage()) return;
+        auto parked = std::move(found->second);
+        cache.parked.erase(found);
+        cache.parkedBytes -= std::min(cache.parkedBytes, parked.accounted);
+        noteParkedSize(cache);
+        countViewKeep(viewKeepCensus().refilledBack[static_cast<std::size_t>(parked.form)]);
+        parked.texture->MarkParked(false);
+        refillCause = ReleaseCause::Parked;
+        refillKind = parked.keys != DccKeys::Uncompressed ? ReleaseKind::Keyed : ReleaseKind::Snapshot;
+        refill = std::move(parked.texture);
+    };
     if (source != nullptr) {
         releaseRefill(RefillRefusedByView);
         entry.source = source;
@@ -1337,13 +1623,26 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             entry.texture = createTexture(source, resource, components, Texture::SrgbExpandTag{});
             entry.texture->RefreshDepthCopy();
         } else {
-            entry.texture = createTexture(source, resource, components);
+            entry.texture = revive(KeepForm::View, nullptr, {});
+            if (entry.texture == nullptr) entry.texture = createTexture(source, resource, components);
+            entry.form = KeepForm::View;
+            entry.made = resource;
+            entry.madeLayerRows = layerRows;
         }
         entry.accounted = source->Cached() ? 0u : heldBytes(*source);
         counters.fromStorage.fetch_add(1, std::memory_order_relaxed);
     } else if (clear) {
         entry.texture = takeRefill(std::span<const std::byte>{}, false, &*clear);
+        if (entry.texture == nullptr) entry.texture = revive(KeepForm::Clear, &*clear, {});
+        if (entry.texture == nullptr) {
+            refillFromPark();
+            entry.texture = takeRefill(std::span<const std::byte>{}, false, &*clear);
+        }
         if (entry.texture == nullptr) entry.texture = createTexture(*context.detiler, resource, components, std::span<const std::byte>{}, false, layerRows, &*clear);
+        entry.form = KeepForm::Clear;
+        entry.made = resource;
+        entry.madeClear = *clear;
+        entry.madeLayerRows = layerRows;
         entry.accounted = entry.texture->AllocationBytes();
         counters.cleared.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -1361,7 +1660,17 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             for (std::size_t i = 0; i < entry.bytes.size(); i += 64) nonzero += entry.bytes[i] != std::byte{0};
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, entry.bytes.size() / 64);
         }
+        const bool keyedClear = IsDccClear(*keys);
+        entry.form = keyedClear ? KeepForm::KeyedClear : KeepForm::Snapshot;
+        entry.made = resource;
+        entry.madeTail = snapshotTail(entry.bytes);
+        entry.madeLayerRows = layerRows;
         entry.texture = takeRefill(entry.bytes, depthCompare, nullptr);
+        if (entry.texture == nullptr && keyedClear) entry.texture = revive(KeepForm::KeyedClear, nullptr, entry.bytes);
+        if (entry.texture == nullptr) {
+            refillFromPark();
+            entry.texture = takeRefill(entry.bytes, depthCompare, nullptr);
+        }
         if (entry.texture == nullptr) entry.texture = createTexture(*context.detiler, resource, components, entry.bytes, depthCompare, layerRows);
         entry.accounted = entry.texture->AllocationBytes();
         constexpr std::size_t SnapshotCompareBytes = 256u << 10u;
@@ -1371,6 +1680,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto budget = sampledBudget(context, cache);
     auto texture = entry.texture;
     if (!admitTexture(cache, key, entry.accounted, budget)) {
+        if (parking.revived != nullptr && parking.revived == texture) countViewKeep(viewKeepCensus().revivedNotAdmitted);
         noteReleaseCause(ReleaseCause::NotAdmitted, releaseKind(entry));
         noteReleased(texture, resource.baseAddress);
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
@@ -1791,6 +2101,7 @@ void ClearCachedTextures(VkDevice device) {
         }
         sampled.spare.clear();
         sampled.spareBytes = 0;
+        if (!sampled.parked.empty()) dropParkedWhere(sampled, ParkedDrop::Cleared, [&](const TextureKey& key, const ParkedTexture&) { return key.device == device; });
     }
     auto& storage = StorageTextures();
     std::vector<std::shared_ptr<StorageTexture>> cleared;
@@ -5346,6 +5657,7 @@ bool ShaderResources::ExpressWatchable() const {
 ShaderResources::ExpressBefore ShaderResources::expressBefore() {
     ExpressBefore before;
     expressSourcesBefore.clear();
+    expressProofEpochsBefore.clear();
     if (!expressEligible()) return before;
     if (expressWatch == nullptr) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
@@ -5359,7 +5671,9 @@ ShaderResources::ExpressBefore ShaderResources::expressBefore() {
     before.generation = GuestMemory::SubscriptionGeneration(*expressWatch);
     before.watched = true;
     for (const auto& surface : validatedTextures) {
-        if (surface.source != nullptr) expressSourcesBefore.emplace_back(surface.source, surface.source->StateEpoch());
+        if (surface.source == nullptr) continue;
+        expressProofEpochsBefore.push_back(surface.source->ProofEpoch());
+        expressSourcesBefore.emplace_back(surface.source, surface.source->StateEpoch());
     }
     return before;
 }
@@ -5375,6 +5689,7 @@ void ShaderResources::expressAfter(bool proved, const ExpressBefore& before) {
     }
     if (at != expressSourcesBefore.size()) return;
     expressSources.swap(expressSourcesBefore);
+    expressProofEpochs.swap(expressProofEpochsBefore);
     expressGeneration = before.generation;
     expressAt = cleanAt;
     expressValid = true;
@@ -5543,6 +5858,113 @@ void CommitterTrustFailed(CommitterTrustState& state, CommitterTrustSite site, C
     state.volatileUntil = static_cast<std::uint32_t>(Recorder::Presents()) + committerTrustHold();
 }
 
+namespace {
+
+constexpr std::size_t ProofKeepChanges = static_cast<std::size_t>(StorageTexture::StateChange::Count);
+
+struct ProofKeepCensus {
+    std::atomic<std::uint64_t> kept{0};
+    std::atomic<std::uint64_t> keptNew{0};
+    std::atomic<std::uint64_t> held{0};
+    std::atomic<std::uint64_t> contentOff{0};
+    std::atomic<std::uint64_t> contentLater{0};
+    std::array<std::atomic<std::uint64_t>, ProofKeepChanges> reproved{};
+    std::atomic<std::uint64_t> checked{0};
+    std::atomic<std::uint64_t> differing{0};
+    std::atomic<std::uint64_t> failed{0};
+    std::atomic<std::uint64_t> otherObjects{0};
+    std::atomic<std::uint64_t> otherKeys{0};
+    std::atomic<std::uint64_t> versionMoved{0};
+    std::atomic<std::uint64_t> notComparable{0};
+    std::atomic<std::uint64_t> noExpressState{0};
+    std::atomic<std::uint64_t> checkedPresent{0};
+    std::atomic<std::uint64_t> reportedPresent{0};
+    std::atomic<std::int64_t> reportedAt{0};
+};
+
+ProofKeepCensus proofKeepCensus;
+
+std::uint64_t proofKeepsVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_PROOF_KEEPS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+bool proofKeepsCensus() {
+    static const bool on = std::getenv("APS5_PIPELINE_STATS") != nullptr || proofKeepsVerifyEvery() != 0;
+    return on;
+}
+
+void countProofKeep(std::atomic<std::uint64_t>& counter) {
+    counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string proofKeepChangesText(const std::array<std::uint64_t, ProofKeepChanges>& counts, bool content, std::uint64_t& total) {
+    std::string text;
+    total = 0;
+    for (std::size_t at = 0; at < ProofKeepChanges; ++at) {
+        const auto change = static_cast<StorageTexture::StateChange>(at);
+        if (counts[at] == 0 || StorageTexture::ContentOnly(change) != content) continue;
+        total += counts[at];
+        char item[96];
+        std::snprintf(item, sizeof(item), "%s%s %llu", text.empty() ? "" : ", ", StorageTexture::StateChangeName(change), static_cast<unsigned long long>(counts[at]));
+        text += item;
+    }
+    return text.empty() ? std::string("none") : text;
+}
+
+void reportProofKeeps() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!stats) return;
+    auto& census = proofKeepCensus;
+    const auto presents = Recorder::Presents();
+    if (census.checkedPresent.load(std::memory_order_relaxed) == presents) return;
+    census.checkedPresent.store(presents, std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (census.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    const auto interval = presents - census.reportedPresent.exchange(presents, std::memory_order_relaxed);
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+    const auto kept = take(census.kept);
+    const auto keptNew = take(census.keptNew);
+    const auto held = take(census.held);
+    const auto contentOff = take(census.contentOff);
+    const auto contentLater = take(census.contentLater);
+    std::array<std::uint64_t, ProofKeepChanges> reproved{};
+    for (std::size_t at = 0; at < ProofKeepChanges; ++at) reproved[at] = take(census.reproved[at]);
+    const auto changes = StorageTexture::TakeStateChanges();
+    std::uint64_t reprovedTotal = 0;
+    std::uint64_t contentChanges = 0;
+    std::uint64_t proofChanges = 0;
+    const auto reprovedText = proofKeepChangesText(reproved, false, reprovedTotal);
+    const auto contentText = proofKeepChangesText(changes, true, contentChanges);
+    const auto proofText = proofKeepChangesText(changes, false, proofChanges);
+    const auto left = contentOff + contentLater + reprovedTotal;
+    if (kept == 0 && held == 0 && left == 0 && contentChanges == 0 && proofChanges == 0) return;
+    const auto load = [](const std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.load(std::memory_order_relaxed)); };
+    AgcDriver::ProfilePrint_nid_no_patch("[proof-keeps] %llu presents: express template tests that found a viewed storage image moved %llu; kept current %llu (reproofs not run %llu), held back for the verify %llu; left to today's reproof %llu: images changed by content alone with the switch off or a trust mode set %llu, by content alone with a later test missing %llu, by the last proof-relevant change of the first such image: %s; storage image changes: content alone %llu (%s), proof-relevant %llu (%s); verify since start %llu checked, %llu differing (reproof failed %llu, other objects %llu, other keys %llu, content version moved %llu), %llu not comparable, %llu reproofs that left no express state\n",
+        static_cast<unsigned long long>(interval), static_cast<unsigned long long>(kept + held + left), static_cast<unsigned long long>(kept), static_cast<unsigned long long>(keptNew), static_cast<unsigned long long>(held),
+        static_cast<unsigned long long>(left), static_cast<unsigned long long>(contentOff), static_cast<unsigned long long>(contentLater), reprovedText.c_str(),
+        static_cast<unsigned long long>(contentChanges), contentText.c_str(), static_cast<unsigned long long>(proofChanges), proofText.c_str(),
+        load(census.checked), load(census.differing), load(census.failed), load(census.otherObjects), load(census.otherKeys), load(census.versionMoved), load(census.notComparable), load(census.noExpressState));
+}
+
+void noteProofKeepVerify(bool proved, bool sameObjects, bool sameKeys, bool unmoved, bool expressLeft) {
+    auto& census = proofKeepCensus;
+    const auto checked = census.checked.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (proved && !expressLeft) countProofKeep(census.noExpressState);
+    const char* what = !proved ? "the reproof failed" : !sameObjects ? "the reproof holds other objects" : !sameKeys ? "the reproof read other keys" : !unmoved ? "a viewed image's content version moved during the reproof" : nullptr;
+    if (what != nullptr) {
+        countProofKeep(!proved ? census.failed : !sameObjects ? census.otherObjects : !sameKeys ? census.otherKeys : census.versionMoved);
+        const auto differing = census.differing.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (differing <= 16u || differing % 4096u == 0u) std::fprintf(stderr, "[proof-keeps-verify] a template kept current across content-only changes of its viewed storage images differs from its reproof: %s; %llu checked, %llu differing\n", what, static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing));
+    }
+    reportProofKeeps();
+}
+
+}
+
 ShaderResources::ExpressMiss ShaderResources::ExpressCurrentTrusted() const {
     const auto kept = ExpressCurrentKept();
     if (kept == ExpressMiss::None) NoteCommitterTrusted();
@@ -5565,13 +5987,87 @@ ShaderResources::ExpressMiss ShaderResources::ExpressCurrentAudited(CommitterTru
 }
 
 ShaderResources::ExpressMiss ShaderResources::expressCurrent(bool memo) {
+    const bool keeps = RuntimeSwitches::Set(RuntimeSwitch::ProofKeeps) && !RuntimeSwitches::Set(RuntimeSwitch::TrustAudit) && !RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter);
+    bool kept = false;
+    const auto missed = expressTest(memo, keeps, kept);
+    if (missed == ExpressMiss::Sources && proofKeepsCensus()) noteProofKeepMiss(keeps);
+    if (!kept) return missed;
+    if (proofKeepVerify) return ExpressMiss::Sources;
+    if (const auto every = proofKeepsVerifyEvery(); every != 0) {
+        thread_local std::uint64_t uses = 0;
+        if (++uses % every == 0) {
+            proofKeepVerify = true;
+            if (proofKeepsCensus()) {
+                countProofKeep(proofKeepCensus.held);
+                reportProofKeeps();
+            }
+            return ExpressMiss::Sources;
+        }
+    }
+    if (proofKeepsCensus()) noteProofKept();
+    return ExpressMiss::None;
+}
+
+ShaderResources::ExpressMiss ShaderResources::expressTest(bool memo, bool keeps, bool& kept) {
+    kept = false;
     if (!expressValid || !cleanProved || expressWatch == nullptr) return ExpressMiss::NotProved;
     if (GuestMemory::SubscriptionGeneration(*expressWatch) != expressGeneration) return ExpressMiss::Watch;
     if (GuestMemory::CleanForgetSerial() != expressAt.forget) return ExpressMiss::Forget;
     if (HostImportSetGeneration() != expressAt.imports || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != expressAt.allocations || GuestMemory::UnwatchSerial() != expressAt.unwatched || DepthSurfacesSerial() != expressAt.depthSurfaces) return ExpressMiss::Serials;
-    for (const auto& [source, epoch] : expressSources) {
-        if (source->StateEpoch() != epoch) return ExpressMiss::Sources;
+    bool moved = false;
+    for (std::size_t at = 0; at < expressSources.size(); ++at) {
+        const auto& [source, epoch] = expressSources[at];
+        if (source->StateEpoch() == epoch) continue;
+        if (!keeps || at >= expressProofEpochs.size() || source->ProofEpoch() != expressProofEpochs[at]) return ExpressMiss::Sources;
+        moved = true;
     }
+    const auto rest = expressRest(memo);
+    if (moved && rest != ExpressMiss::None) return ExpressMiss::Sources;
+    kept = moved;
+    return rest;
+}
+
+bool ShaderResources::proofKeepHeld() {
+    bool kept = false;
+    return expressTest(false, true, kept) == ExpressMiss::None && kept;
+}
+
+void ShaderResources::noteProofKeepMiss(bool keeps) const {
+    auto change = StorageTexture::StateChange::Count;
+    for (std::size_t at = 0; at < expressSources.size(); ++at) {
+        const auto& [source, epoch] = expressSources[at];
+        if (source->StateEpoch() == epoch) continue;
+        if (at >= expressProofEpochs.size()) {
+            change = StorageTexture::StateChange::Other;
+            break;
+        }
+        if (source->ProofEpoch() != expressProofEpochs[at]) {
+            change = source->LastProofChange();
+            break;
+        }
+    }
+    auto& census = proofKeepCensus;
+    if (change == StorageTexture::StateChange::Count) countProofKeep(keeps ? census.contentLater : census.contentOff);
+    else countProofKeep(census.reproved[std::min(static_cast<std::size_t>(change), ProofKeepChanges - 1u)]);
+    reportProofKeeps();
+}
+
+void ShaderResources::noteProofKept() {
+    thread_local std::uint64_t uses = 0;
+    std::uint64_t sum = 0;
+    for (const auto& entry : expressSources) sum += entry.first->StateEpoch();
+    const bool fresh = sum != proofKeptSum;
+    if (fresh) {
+        proofKeptSum = sum;
+        countProofKeep(proofKeepCensus.keptNew);
+    }
+    if (++uses < 256u && !fresh) return;
+    proofKeepCensus.kept.fetch_add(uses, std::memory_order_relaxed);
+    uses = 0;
+    reportProofKeeps();
+}
+
+ShaderResources::ExpressMiss ShaderResources::expressRest(bool memo) {
     if (!memo || expressViewsAt.load(std::memory_order_relaxed) != expressAt.allocations) {
         if (!registeredImageViewsCurrent(registeredImageViews)) return ExpressMiss::Views;
         if (memo) expressViewsAt.store(expressAt.allocations, std::memory_order_relaxed);
@@ -5615,6 +6111,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         return revalidateClean(shaders, report, clean);
     }
+    const bool keepFlagged = proofKeepVerify;
+    const bool keepCheck = keepFlagged && proofKeepHeld();
     if (clean != nullptr && expressValid && !verifyCleanCurrency() && ExpressCurrent() == ExpressMiss::None) {
         bool staged = true;
         if (auto* recorder = Recorder::Active(); recorder != nullptr) {
@@ -5625,15 +6123,33 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             }
         }
         if (staged) {
+            proofKeepVerify = false;
             noteClean(CleanEvent::Hit);
             if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::None};
             *clean = CleanProof::Skipped;
             return true;
         }
     }
+    proofKeepVerify = false;
+    if (keepFlagged && !keepCheck) countProofKeep(proofKeepCensus.notComparable);
+    std::vector<std::shared_ptr<Texture>> keptTextures;
+    std::vector<DccKeys> keptKeys;
+    std::vector<std::pair<const StorageTexture*, std::uint64_t>> keptVersions;
+    if (keepCheck) {
+        keptTextures = textures;
+        for (const auto& surface : validatedTextures) {
+            keptKeys.push_back(surface.keys);
+            if (surface.source != nullptr) keptVersions.emplace_back(surface.source, surface.source->Version());
+        }
+    }
     const auto before = expressBefore();
     const bool proved = revalidateClean(shaders, report, clean);
     expressAfter(proved, before);
+    if (keepCheck) {
+        const bool sameKeys = keptKeys.size() == validatedTextures.size() && std::equal(keptKeys.begin(), keptKeys.end(), validatedTextures.begin(), [](DccKeys keys, const ValidatedSurface& surface) { return keys == surface.keys; });
+        const bool unmoved = std::none_of(keptVersions.begin(), keptVersions.end(), [](const std::pair<const StorageTexture*, std::uint64_t>& entry) { return entry.first->Version() != entry.second; });
+        noteProofKeepVerify(proved, textures == keptTextures, sameKeys, unmoved, expressValid && cleanProved);
+    }
     return proved;
 }
 
@@ -6469,7 +6985,7 @@ void ResourceCache::removeImage(const StorageTexture* image, std::vector<std::sh
 void ResourceCache::dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     if (!TexturesReleased().exchange(false, std::memory_order_acq_rel)) return;
     for (auto it = entries.begin(); it != entries.end();) {
-        if (!it->second->HoldsReleasedTexture()) {
+        if (!it->second->HoldsDiscardedTexture()) {
             ++it;
             continue;
         }
@@ -13262,6 +13778,18 @@ bool ShaderResources::HoldsReleasedTexture() const {
     return std::any_of(textures.begin(), textures.end(), [](const auto& texture) { return texture != nullptr && texture->Released(); });
 }
 
+bool ShaderResources::HoldsDiscardedTexture() const {
+    return std::any_of(textures.begin(), textures.end(), [](const auto& texture) { return texture != nullptr && texture->Discarded(); });
+}
+
+bool ShaderResources::RevivedUse() const {
+    const auto revivals = textureRevivals().load(std::memory_order_acquire);
+    if (revivals == revivedSeen.load(std::memory_order_relaxed)) return false;
+    const auto seen = revivedSeen.exchange(revivals, std::memory_order_relaxed);
+    if (seen >= revivals) return false;
+    return std::any_of(textures.begin(), textures.end(), [&](const auto& texture) { return texture != nullptr && texture->RevivedAt() > seen; });
+}
+
 bool ShaderResources::KeptUse() const {
     const auto refills = Texture::Refills();
     if (refills == keptSeen.load(std::memory_order_relaxed)) return false;
@@ -13342,6 +13870,36 @@ std::string ShaderResources::TakeTemplateKeepText() {
     text += "; refilled in place: " + (refilled.empty() ? std::string("none") : refilled);
     text += "; refills refused: " + (refused.empty() ? std::string("none") : refused);
     if (verified != 0) text += "; refills verified " + std::to_string(verified) + ", differing " + std::to_string(differing);
+    return text;
+}
+
+std::string ShaderResources::TakeViewTemplateKeepText() {
+    auto& census = viewKeepCensus();
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+    const auto list = [&](auto& counters, const auto& names, std::size_t first) {
+        std::string text;
+        for (std::size_t index = first; index < counters.size(); ++index) {
+            const auto count = take(counters[index]);
+            if (count == 0) continue;
+            if (!text.empty()) text += ", ";
+            text += std::string(names[index]) + " " + std::to_string(count);
+        }
+        return text.empty() ? std::string("none") : text;
+    };
+    std::string text = "parked: " + list(census.parked, KeepFormNames, 1u);
+    text += "; taken back: " + list(census.revived, KeepFormNames, 1u);
+    text += "; taken back by a refill (APS5_TEMPLATE_KEEPS): " + list(census.refilledBack, KeepFormNames, 1u);
+    text += "; parkable while unset: " + list(census.parkable, KeepFormNames, 1u);
+    text += "; held stale entries released as today: " + list(census.notParked, NotParkedNames, 0u);
+    text += "; take-backs refused (left parked): " + list(census.refused, ReviveRefusalNames, 1u);
+    text += "; parked textures released: " + list(census.dropped, ParkedDropNames, 0u);
+    const auto notAdmitted = take(census.revivedNotAdmitted);
+    const auto unwound = take(census.revivedUnwound);
+    if (notAdmitted != 0 || unwound != 0) text += "; taken back then released: not admitted " + std::to_string(notAdmitted) + ", the lookup threw " + std::to_string(unwound);
+    text += "; parked now " + std::to_string(census.parkedNow.load(std::memory_order_relaxed)) + " (" + std::to_string(census.parkedNowBytes.load(std::memory_order_relaxed) >> 20u) + " MiB)";
+    const auto verified = take(census.verified);
+    const auto differing = take(census.differing);
+    if (verified != 0) text += "; take-backs verified " + std::to_string(verified) + ", differing " + std::to_string(differing);
     return text;
 }
 

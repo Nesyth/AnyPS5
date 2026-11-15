@@ -1283,6 +1283,26 @@ const char* Texture::RefillDifference(const Texture& fresh) const {
     return nullptr;
 }
 
+void Texture::Revive(std::uint64_t serial) {
+    keyProof = DccKeyProof{};
+    fastProof = FastProofStamp{};
+    revivedAt.store(serial, std::memory_order_release);
+    MarkParked(false);
+}
+
+const char* Texture::ReviveDifference(const Texture& fresh) const {
+    if (fresh.storageSource != storageSource || fresh.source != source || fresh.perUseCopy != perUseCopy || fresh.srgbExpand != srgbExpand || fresh.repackCopy != repackCopy) return "kind";
+    if ((fresh.image == VK_NULL_HANDLE) != (image == VK_NULL_HANDLE)) return "image";
+    if (fresh.viewFormat != viewFormat) return "view format";
+    if (fresh.viewRange.type != viewRange.type || fresh.viewRange.levels != viewRange.levels || fresh.viewRange.layers != viewRange.layers) return "view range";
+    if (fresh.firstLayerRange.type != firstLayerRange.type || fresh.firstLayerRange.levels != firstLayerRange.levels || fresh.firstLayerRange.layers != firstLayerRange.layers || (fresh.firstLayerView == VK_NULL_HANDLE) != (firstLayerView == VK_NULL_HANDLE)) return "first-layer view";
+    if (!sameViewInfo(fresh.baseLevelInfo, baseLevelInfo)) return "base-level view";
+    if (!sameViewInfo(fresh.srgbInfo, srgbInfo) || std::bit_cast<std::uint32_t>(fresh.srgbMinLod) != std::bit_cast<std::uint32_t>(srgbMinLod)) return "sRGB view";
+    if (fresh.layout != layout) return "layout";
+    if (fresh.allocationBytes != allocationBytes) return "allocation size";
+    return nullptr;
+}
+
 VkFormat Texture::DepthCopyFormat(VkFormat colorFormat) {
     switch (colorFormat) {
         case VK_FORMAT_R32_SFLOAT: return VK_FORMAT_D32_SFLOAT;
@@ -3285,7 +3305,10 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
     if (refreshProved()) {
-        layerBehind.clear(); NoteStateChange();
+        const bool behind = !layerBehind.empty();
+        layerBehind.clear();
+        if (behind) NoteStateChange(StateChange::Refresh);
+        else NoteContentChange(StateChange::RefreshProved);
         if (epoch != 0) {
             provedEpoch.store(epoch, std::memory_order_relaxed);
             provedProof.store(proofBefore, std::memory_order_relaxed);
@@ -3514,7 +3537,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     }
     const bool outsideChanged = std::any_of(outside.begin(), outside.end(), [](bool value) { return value; });
     if (scoped) noteLayersBehind(firstLayer, lastLayer, outside);
-    else layerBehind.clear(); NoteStateChange();
+    else layerBehind.clear(); NoteStateChange(StateChange::Refresh);
     if (unchanged) {
         ++Profile().storageReused;
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
@@ -3633,7 +3656,10 @@ DccKeys StorageTexture::ProvedKeys() const {
     if (descriptor.dccAddress != 0 && uploadedKeys == DccKeys::Uncompressed) keys = WaitForKeyWriters(descriptor, guestBytes);
     if (keys.has_value()) keyProof = PendingKeyProof(descriptor, guestBytes, *keys);
     else keys = ProvedClearKeys(descriptor, guestBytes, keyProof);
-    if (IsDccClear(filledKeys) && *keys != filledKeys && !anyLayerPending()) filledKeys = DccKeys::Uncompressed;
+    if (IsDccClear(filledKeys) && *keys != filledKeys && !anyLayerPending()) {
+        filledKeys = DccKeys::Uncompressed;
+        NoteProofChange(StateChange::KeysFill);
+    }
     return *keys;
 }
 
@@ -4021,7 +4047,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         refreshGeneration();
     };
     SetUploadedKeys(ProvedClearKeys(descriptor, guestBytes, keyProof));
-    filledKeys = DccKeys::Uncompressed;
+    if (std::exchange(filledKeys, DccKeys::Uncompressed) != DccKeys::Uncompressed) NoteProofChange(StateChange::KeysFill);
     const auto* singleImport = uploadedKeys == DccKeys::ClearSingle && RuntimeSwitches::Set(RuntimeSwitch::GpuSingleKeys) && singleBlocksDetilable() && GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr;
     const bool singleBlocks = singleImport != nullptr;
     if (singleBlocks) layers = nullptr;
@@ -4081,7 +4107,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         if (batch) batch->SubmitAndWait();
         else recorder->EndGpuTiming(timing, guestBytes);
         countStorageUpload(0, guestBytes);
-        ++version; NoteStateChange();
+        ++version; NoteStateChange(StateChange::Upload);
         ++uploads;
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadClear, start);
         return;
@@ -4116,7 +4142,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 partialUploadBytes.fetch_add(uploadedBytes, std::memory_order_relaxed);
             }
             ++Profile().storageDirectUploads;
-            ++version; NoteStateChange();
+            ++version; NoteStateChange(StateChange::Upload);
             ++uploads;
             if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
             return;
@@ -4174,7 +4200,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             else recorder->EndGpuTiming(timing, uploadedBytes);
             countStorageUpload(1, uploadedBytes);
             ++Profile().storageDirectUploads;
-            ++version; NoteStateChange();
+            ++version; NoteStateChange(StateChange::Upload);
             ++uploads;
             if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
             return;
@@ -4212,7 +4238,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         else recorder->EndGpuTiming(timing, uploadedBytes);
         countStorageUpload(1, uploadedBytes);
         ++Profile().storageDirectUploads;
-        ++version; NoteStateChange();
+        ++version; NoteStateChange(StateChange::Upload);
         ++uploads;
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
         return;
@@ -4294,7 +4320,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             APS5_LOG_CHARS_OUT_DEBUG("StorageTexture upload done");
     }
     countStorageUpload(2, uploadedBytes);
-    ++version; NoteStateChange();
+    ++version; NoteStateChange(StateChange::Upload);
     ++uploads;
     if (profile) LookupOutcomes::Add(LookupOutcomes::UploadCpu, start);
 }
@@ -5165,7 +5191,7 @@ bool StorageTexture::anyLayerPending() const {
 }
 
 void StorageTexture::refreshGeneration() {
-    NoteStateChange();
+    NoteStateChange(StateChange::Generation);
     generation = *std::min_element(layerGeneration.begin(), layerGeneration.end());
 }
 
@@ -5189,7 +5215,7 @@ std::uint64_t StorageTexture::collectedLayerGeneration(std::uint32_t layer, std:
 }
 
 void StorageTexture::noteLayersBehind(std::uint32_t firstLayer, std::uint32_t lastLayer, const std::vector<bool>& outside) {
-    NoteStateChange();
+    NoteStateChange(StateChange::LayersBehind);
     if (layerBehind.size() != trackedLayers) layerBehind.assign(trackedLayers, false);
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (layer >= firstLayer && layer < lastLayer) layerBehind[layer] = false;
@@ -5299,6 +5325,9 @@ void StorageTexture::RememberPassNote(std::uint64_t recorder, std::uint64_t pass
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     const bool newlyPending = count == 0 || first + count > trackedLayers || !layerPending.AllIn(first, count);
+    const bool borrowedMarked = borrowedUnits.size() == trackedLayers && borrowedUnits.AnyIn(first, count);
+    const bool handed = !handedOver.empty() || !handedUnits.empty();
+    bool layoutMoved = false;
     markedFirst = first;
     markedLayers = count;
     const bool lean = RuntimeSwitches::Set(RuntimeSwitch::LeanRemark);
@@ -5307,10 +5336,14 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         if (records.byAddress.size() >= 65536u) {
             records.byAddress.clear();
             records.layouts.fetch_add(1, std::memory_order_release);
+            layoutMoved = true;
         }
         const WriteRecord layout{descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format, ++records.serial};
         const auto [entry, inserted] = records.byAddress.try_emplace(descriptor.baseAddress, layout);
-        if (inserted || !sameLayout(entry->second, layout)) records.layouts.fetch_add(1, std::memory_order_release);
+        if (inserted || !sameLayout(entry->second, layout)) {
+            records.layouts.fetch_add(1, std::memory_order_release);
+            layoutMoved = true;
+        }
         entry->second = layout;
         layoutRecord = records.byAddress.size() >= 65536u ? 0u : records.layouts.load(std::memory_order_relaxed);
     }
@@ -5390,7 +5423,10 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
             unitsSuperseded.fetch_add(1, std::memory_order_relaxed);
             superseded = true;
         }
-        if (superseded) source->reconcilePending();
+        if (superseded) {
+            source->NoteProofChange(StateChange::Registry);
+            source->reconcilePending();
+        }
     }
     if (!handedOver.empty() || !handedUnits.empty()) supersedeHandedOver(first, count);
     if (eager) {
@@ -5413,8 +5449,13 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         }();
         static_cast<void>(hooked);
     }
-    ++version; NoteStateChange();
-    if (const auto format = ResolveTextureFormat(descriptor.format); format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_UNORM) eightBitWrites().fetch_add(1, std::memory_order_release);
+    ++version;
+    const auto format = ResolveTextureFormat(descriptor.format);
+    const bool eightBit = format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_UNORM;
+    const auto change = newlyPending ? StateChange::PendingNew : !dirty ? StateChange::PendingRegistry : lent ? StateChange::PendingLent : borrowedMarked ? StateChange::PendingBorrowed : handed ? StateChange::PendingHanded : layoutMoved ? StateChange::PendingLayout : eightBit ? StateChange::PendingEightBit : StateChange::Remark;
+    if (change == StateChange::Remark) NoteContentChange(change);
+    else NoteStateChange(change);
+    if (eightBit) eightBitWrites().fetch_add(1, std::memory_order_release);
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
         if (wasLent) BumpPendingSerial();
@@ -5434,6 +5475,7 @@ void StorageTexture::reconcilePending() {
     dirty = any;
     if (any) pending.textures.push_back(this);
     else pending.textures.remove(this);
+    NoteProofChange(StateChange::Registry);
     BumpPendingSerial();
 }
 
@@ -5668,7 +5710,7 @@ void StorageTexture::Flush(const char* reason) {
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
-        released = true; NoteStateChange();
+        released = true; NoteStateChange(StateChange::Released);
     }
     {
         auto& pending = Pending();
@@ -5825,6 +5867,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                     continue;
                 }
                 texture->dirty = false;
+                texture->NoteProofChange(StateChange::Registry);
                 if (const auto skips = texture->hookSkips.exchange(0, std::memory_order_relaxed); skips != 0 && texture->skippedResultsInside(address, bytes)) {
                     flushedAfterSkip.fetch_add(1, std::memory_order_relaxed);
                     if (PublishReasonFor(reason) == PublishReason::Hook && texture->hookSkipSite.load(std::memory_order_relaxed) == static_cast<std::uint8_t>(GuestMemory::CurrentReadSite())) flushedAfterSkipSameSite.fetch_add(1, std::memory_order_relaxed);
@@ -5846,6 +5889,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                     continue;
                 }
                 texture->dirty = false;
+                texture->NoteProofChange(StateChange::Registry);
                 if (auto alive = texture->weak_from_this().lock()) flush.push_back(std::move(alive));
                 it = pending.textures.erase(it);
             }
@@ -6694,6 +6738,38 @@ void StorageTexture::NoteProved() const {
     provedPresent.store(Recorder::Presents(), std::memory_order_relaxed);
 }
 
+namespace {
+
+using StateChangeCounts = std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(StorageTexture::StateChange::Count)>;
+
+StateChangeCounts& stateChangeCounts() {
+    static StateChangeCounts counts{};
+    return counts;
+}
+
+}
+
+void StorageTexture::CountStateChange(StateChange change) {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!stats) return;
+    const auto at = static_cast<std::size_t>(change);
+    auto& counts = stateChangeCounts();
+    if (at < counts.size()) counts[at].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(StorageTexture::StateChange::Count)> StorageTexture::TakeStateChanges() {
+    std::array<std::uint64_t, static_cast<std::size_t>(StateChange::Count)> taken{};
+    auto& counts = stateChangeCounts();
+    for (std::size_t at = 0; at < taken.size(); ++at) taken[at] = counts[at].exchange(0, std::memory_order_relaxed);
+    return taken;
+}
+
+const char* StorageTexture::StateChangeName(StateChange change) {
+    static constexpr std::array<const char*, static_cast<std::size_t>(StateChange::Count)> names{"other", "refresh", "upload", "write generation", "layers behind", "newly pending layers", "registry entry by a write", "lent", "alias units superseded", "handed-over results", "layout record", "8-bit image written", "released", "keys fill", "units borrowed", "cache membership", "upload keys", "pending registry change", "refresh proved unchanged", "pending layers written again", "same upload keys"};
+    const auto at = static_cast<std::size_t>(change);
+    return at < names.size() ? names[at] : "unnamed";
+}
+
 std::vector<std::shared_ptr<StorageTexture>> StorageTexture::overlappingPending(std::uint64_t address, std::size_t bytes) {
     // FlushPending's listing; the images stay alive across the caller's scan as there.
     std::vector<std::shared_ptr<StorageTexture>> overlapping;
@@ -6940,6 +7016,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
             texture->layerOriginal.assign(texture->trackedLayers, false);
             texture->cancelStoredSaves();
             texture->forgetDrawn();
+            texture->NoteProofChange(StateChange::Registry);
             it = pending.textures.erase(it);
             ++discarded;
         } else if (texture != exempt && texture->blockUnits && texture->overlaps(address, bytes)) {
@@ -6956,7 +7033,10 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
                 unitsDropped.fetch_add(1, std::memory_order_relaxed);
                 dropped = true;
             }
-            if (dropped) ++discarded;
+            if (dropped) {
+                ++discarded;
+                texture->NoteProofChange(StateChange::Registry);
+            }
             if (dropped && !texture->anyLayerPending()) {
                 texture->dirty = false;
                 it = pending.textures.erase(it);
@@ -7073,7 +7153,7 @@ std::size_t StorageTexture::NoteKeysFill(std::uint64_t address, std::size_t byte
     std::lock_guard lock(live.mutex);
     std::size_t covered = 0;
     const auto apply = [&](StorageTexture* texture) {
-        texture->filledKeys = keys;
+        if (std::exchange(texture->filledKeys, keys) != keys) texture->NoteProofChange(StateChange::KeysFill);
         ++covered;
         if (traceKeys && IsDccClear(keys)) std::fprintf(stderr, "[dcc-keys] %s key fill over 0x%llx+0x%llx (uploaded %s, dirty %d)\n", DccKeysName(keys), static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), DccKeysName(texture->uploadedKeys), texture->dirty ? 1 : 0);
         if (refillDisabled || !IsDccClear(keys) || texture->uploadedKeys != keys) return;
@@ -7185,7 +7265,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
     const auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) layerGeneration[layer] = collectedLayerGeneration(layer, now);
     refreshGeneration();
-    ++version; NoteStateChange();
+    ++version; NoteStateChange(StateChange::KeysFill);
     ++uploads;
     if (traceKeys) std::fprintf(stderr, "[dcc-keys] key fill %s clears 0x%llx+0x%llx at once (keys 0x%llx, %zu pending units dropped, dirty %d)\n", DccKeysName(keys), static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(descriptor.dccAddress), droppedUnits, wasDirty ? 1 : 0);
     return true;
@@ -7669,7 +7749,10 @@ void StorageTexture::supersedeHandedOver(std::uint32_t first, std::uint32_t coun
             handedOverSuperseded.fetch_add(1, std::memory_order_relaxed);
             superseded = true;
         }
-        if (superseded) source->reconcilePending();
+        if (superseded) {
+            source->NoteProofChange(StateChange::Registry);
+            source->reconcilePending();
+        }
         ++entry;
     }
     if (first == 0 && count >= trackedLayers) handedOver.clear();
@@ -7702,7 +7785,7 @@ void StorageTexture::Detach() {
     storeTrappedOverlaps("cache eviction");
     auto& live = Live();
     std::lock_guard lock(live.mutex);
-    released = true; NoteStateChange();
+    released = true; NoteStateChange(StateChange::Released);
 }
 
 StorageTexture::CreationHandOver::~CreationHandOver() {
@@ -7878,7 +7961,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
         if (units[unit]) borrowedUnits[unit] = true;
     }
-    ++version; NoteStateChange();
+    ++version; NoteStateChange(StateChange::Borrowed);
     ++uploads;
     return bytes;
 }

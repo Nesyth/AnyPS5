@@ -153,8 +153,16 @@ public:
     PerUseCopy CopyKind() const { return perUseCopy; }
     bool RefreshedPerUse() const { return perUseCopy == PerUseCopy::RemadePerUse; }
     void MarkRefreshedPerUse() { perUseCopy = PerUseCopy::RemadePerUse; }
-    bool Released() const { return released.load(std::memory_order_acquire); }
-    void MarkReleased() { released.store(true, std::memory_order_release); }
+    bool Released() const { return released.load(std::memory_order_acquire) != 0u; }
+    bool Discarded() const { return (released.load(std::memory_order_acquire) & 1u) != 0u; }
+    void MarkReleased() { released.fetch_or(std::uint8_t{1}, std::memory_order_acq_rel); }
+    void MarkParked(bool parked) {
+        if (parked) released.fetch_or(std::uint8_t{2}, std::memory_order_acq_rel);
+        else released.fetch_and(std::uint8_t{1}, std::memory_order_acq_rel);
+    }
+    void Revive(std::uint64_t serial);
+    std::uint64_t RevivedAt() const { return revivedAt.load(std::memory_order_acquire); }
+    const char* ReviveDifference(const Texture& fresh) const;
     FastProofStamp& FastProof() const { return fastProof; }
     enum class RefillRefusal : std::uint8_t { None, NoOrigin, Shape, Sparse, NoRecorder, Count };
     RefillRefusal Refill(TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, bool layerRows, const VkClearColorValue* clear);
@@ -204,7 +212,8 @@ private:
     std::shared_ptr<StorageTexture> storageSource;
     std::unique_ptr<CommandBatch> upload;
     PerUseCopy perUseCopy = PerUseCopy::None;
-    std::atomic<bool> released{false};
+    std::atomic<std::uint8_t> released{0};
+    std::atomic<std::uint64_t> revivedAt{0};
     bool copiedOnce = false;
     bool srgbExpand = false;
     GuestTextureResource sourceDescriptor{};
@@ -464,18 +473,41 @@ public:
     static bool OrderedFlushArmedForTest();
     // A consumer found the image current and used it (Refresh, the fast revalidation).
     void NoteProved() const;
+    enum class StateChange : std::uint8_t { Other, Refresh, Upload, Generation, LayersBehind, PendingNew, PendingRegistry, PendingLent, PendingBorrowed, PendingHanded, PendingLayout, PendingEightBit, Released, KeysFill, Borrowed, Cached, UploadedKeys, Registry, RefreshProved, Remark, SameKeys, Count };
+    static constexpr bool ContentOnly(StateChange change) { return change == StateChange::RefreshProved || change == StateChange::Remark || change == StateChange::SameKeys; }
+    static const char* StateChangeName(StateChange change);
+    static std::array<std::uint64_t, static_cast<std::size_t>(StateChange::Count)> TakeStateChanges();
+    static void CountStateChange(StateChange change);
     // Whether the storage cache holds this image (set and cleared by the cache under its mutex, the
     // clear before the eviction's flush): what a lookup of its surface would return.
     bool Cached() const { return cached.load(std::memory_order_acquire); }
     void SetCached(bool value) {
         cached.store(value, std::memory_order_release);
-        NoteStateChange();
+        NoteStateChange(StateChange::Cached);
     }
     std::uint64_t StateEpoch() const { return stateEpoch.load(std::memory_order_acquire); }
-    void NoteStateChange() const { stateEpoch.fetch_add(1, std::memory_order_acq_rel); }
+    std::uint64_t ProofEpoch() const { return proofEpoch.load(std::memory_order_acquire); }
+    StateChange LastProofChange() const { return static_cast<StateChange>(proofChange.load(std::memory_order_relaxed)); }
+    void NoteStateChange(StateChange change = StateChange::Other) const {
+        proofChange.store(static_cast<std::uint8_t>(change), std::memory_order_relaxed);
+        proofEpoch.fetch_add(1, std::memory_order_acq_rel);
+        stateEpoch.fetch_add(1, std::memory_order_acq_rel);
+        CountStateChange(change);
+    }
+    void NoteContentChange(StateChange change) const {
+        stateEpoch.fetch_add(1, std::memory_order_acq_rel);
+        CountStateChange(change);
+    }
+    void NoteProofChange(StateChange change) const {
+        proofChange.store(static_cast<std::uint8_t>(change), std::memory_order_relaxed);
+        proofEpoch.fetch_add(1, std::memory_order_acq_rel);
+        CountStateChange(change);
+    }
     void SetUploadedKeys(DccKeys keys) {
+        const bool same = uploadedKeys == keys;
         uploadedKeys = keys;
-        NoteStateChange();
+        if (same) NoteContentChange(StateChange::SameKeys);
+        else NoteStateChange(StateChange::UploadedKeys);
     }
     FastProofStamp& FastProof() const { return fastProof; }
     // The pending image whose surface starts at `address` and covers at least `bytes` (a mip chain
@@ -847,6 +879,8 @@ private:
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;
     mutable std::atomic<std::uint64_t> stateEpoch{0};
+    mutable std::atomic<std::uint64_t> proofEpoch{0};
+    mutable std::atomic<std::uint8_t> proofChange{0};
     mutable DccKeys filledKeys = DccKeys::Uncompressed;
     mutable DccKeyProof keyProof;
     mutable DccRangeProof targetKeyProof;

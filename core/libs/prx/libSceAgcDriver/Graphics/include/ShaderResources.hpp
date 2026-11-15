@@ -752,9 +752,12 @@ public:
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;
     bool HoldsReleasedTexture() const;
+    bool HoldsDiscardedTexture() const;
     bool KeptUse() const;
+    bool RevivedUse() const;
     const char* KeptDifference(const ShaderResources& fresh, std::span<const MovedBuffer> moved) const;
     static std::string TakeTemplateKeepText();
+    static std::string TakeViewTemplateKeepText();
     std::uint32_t TableElements() const { return tableElements[0] + tableElements[1]; }
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
     const std::vector<std::uint32_t>& FragmentLayoutKey() const { return fragmentLayoutKey; }
@@ -1170,6 +1173,7 @@ private:
     std::vector<ImagePosition> indexImagePositions;
     bool rebound = false;
     mutable std::atomic<std::uint64_t> keptSeen{0};
+    mutable std::atomic<std::uint64_t> revivedSeen{0};
     // T1 (design_cpu_final M3): brings the overlapping surfaces' own objects up to date exactly as
     // the full walk's lookups would, in the walk's binding order, without the lookups: a storage
     // image's Refresh (which stores the foreign images over its surface first), a view's source's
@@ -1477,6 +1481,11 @@ private:
     void expressAfter(bool proved, const ExpressBefore& before);
     bool expressEligible() const;
     ExpressMiss expressCurrent(bool memo);
+    ExpressMiss expressTest(bool memo, bool keeps, bool& kept);
+    ExpressMiss expressRest(bool memo);
+    bool proofKeepHeld();
+    void noteProofKeepMiss(bool keeps) const;
+    void noteProofKept();
     bool revalidateClean(std::span<const CompiledShader> shaders, ProofReport* report, CleanProof* clean);
     std::shared_ptr<GuestMemory::WriteSubscription> expressWatch;
     std::uint64_t expressGeneration = 0;
@@ -1487,6 +1496,10 @@ private:
     std::atomic<std::uint64_t> expressRegionsAt{0};
     std::vector<std::pair<const StorageTexture*, std::uint64_t>> expressSources;
     std::vector<std::pair<const StorageTexture*, std::uint64_t>> expressSourcesBefore;
+    std::vector<std::uint64_t> expressProofEpochs;
+    std::vector<std::uint64_t> expressProofEpochsBefore;
+    std::uint64_t proofKeptSum = 0;
+    bool proofKeepVerify = false;
     std::uint8_t cleanEligibility = 0;
     std::uint32_t cleanMisses = 0;
     CleanProof cleanRefusal = CleanProof::FirstProof;

@@ -1461,6 +1461,31 @@ bool templateKeepsCensus() {
     return ResourceCache::FateCensus() || templateKeepsVerifyEvery() != 0;
 }
 
+struct ViewKeepDrawCensus {
+    using Counter = std::atomic<std::uint64_t>;
+    Counter revivedHits{0};
+    Counter verified{0};
+    Counter differing{0};
+    Counter notRun{0};
+};
+
+ViewKeepDrawCensus& viewKeepDrawCensus() {
+    static auto* census = new ViewKeepDrawCensus();
+    return *census;
+}
+
+std::uint64_t viewTemplateKeepsVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_VIEW_TEMPLATE_KEEPS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+bool viewTemplateKeepsWatched() {
+    return RuntimeSwitches::Set(RuntimeSwitch::ViewTemplateKeeps) && (ResourceCache::FateCensus() || viewTemplateKeepsVerifyEvery() != 0);
+}
+
 struct TemplateBuildCensus {
     using Counter = std::atomic<std::uint64_t>;
     std::array<Counter, TemplateBuildCauseNames.size()> builds{};
@@ -1738,6 +1763,20 @@ std::string TakeTemplateKeepText() {
     text += "; " + textures;
     text += "; not keyed " + std::to_string(notKeyedTotal) + (notKeyed.empty() ? std::string() : " (" + notKeyed + ")");
     text += "; keyed by the generated-stage rule: hits " + std::to_string(generatedHits) + ", built " + std::to_string(generatedBuilt);
+    return text;
+}
+
+std::string TakeViewTemplateKeepText() {
+    auto& census = viewKeepDrawCensus();
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+    const auto hits = take(census.revivedHits);
+    const auto verified = take(census.verified);
+    const auto differing = take(census.differing);
+    const auto notRun = take(census.notRun);
+    const bool on = RuntimeSwitches::Set(RuntimeSwitch::ViewTemplateKeeps);
+    std::string text = std::string("APS5_VIEW_TEMPLATE_KEEPS ") + (on ? "set" : "unset") + "; template hits on a taken-back texture " + std::to_string(hits);
+    if (verified != 0 || notRun != 0) text += " (verified " + std::to_string(verified) + ", differing " + std::to_string(differing) + ", not run " + std::to_string(notRun) + ")";
+    text += "; " + ShaderResources::TakeViewTemplateKeepText();
     return text;
 }
 
@@ -3369,6 +3408,33 @@ void noteKeptHit(const Context& context, const State& state, const Pm4::DrawPara
     if (what != nullptr && (differing <= 16u || differing % 4096u == 0u)) std::fprintf(stderr, "[template-keeps-verify] %s differs from a fresh build in its %s; %llu kept uses checked, %llu differing\n", refilled ? "a template kept over a refilled texture" : "a rect-list template keyed by the generated-stage rule", what, static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing));
 }
 
+void noteRevivedHit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, const ShaderResources& served, std::span<const ShaderResources::MovedBuffer> moved) {
+    auto& census = viewKeepDrawCensus();
+    if (ResourceCache::FateCensus()) census.revivedHits.fetch_add(1, std::memory_order_relaxed);
+    const auto every = viewTemplateKeepsVerifyEvery();
+    static std::atomic<std::uint64_t> ordinal{0};
+    if (every == 0 || ordinal.fetch_add(1, std::memory_order_relaxed) % every != 0) return;
+    std::shared_ptr<ShaderResources> fresh;
+    try {
+        fresh = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->Keep(fresh);
+    } catch (const std::exception& error) {
+        census.notRun.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<std::uint64_t> notRun{0};
+        const auto skipped = notRun.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (skipped <= 16u || skipped % 4096u == 0u) std::fprintf(stderr, "[view-template-keeps-verify] %llu checks of templates kept over a taken-back texture not run: the fresh build threw: %s\n", static_cast<unsigned long long>(skipped), error.what());
+        return;
+    }
+    const char* what = served.KeptDifference(*fresh, moved);
+    static std::atomic<std::uint64_t> checks{0};
+    static std::atomic<std::uint64_t> differences{0};
+    census.verified.fetch_add(1, std::memory_order_relaxed);
+    if (what != nullptr) census.differing.fetch_add(1, std::memory_order_relaxed);
+    const auto checked = checks.fetch_add(1, std::memory_order_relaxed) + 1u;
+    const auto differing = what != nullptr ? differences.fetch_add(1, std::memory_order_relaxed) + 1u : differences.load(std::memory_order_relaxed);
+    if (what != nullptr && (differing <= 16u || differing % 4096u == 0u)) std::fprintf(stderr, "[view-template-keeps-verify] a template kept over a taken-back texture differs from a fresh build in its %s; %llu kept uses checked, %llu differing\n", what, static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing));
+}
+
 void noteLeanCoverage(const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, const Recorder* recorder) {
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (!stats) return;
@@ -3488,6 +3554,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 noteLeanCoverage(*resolved.resources, resolved.moved, recorder);
                 const bool keptUse = templateKeepsCensus() && resolved.resources->KeptUse();
                 if (keptUse || (plan.generatedKey && templateKeepsVerifyEvery() != 0)) noteKeptHit(context, state, draw, shaders, snapshots, indexBytes, *resolved.resources, resolved.moved, keptUse);
+                if (viewTemplateKeepsWatched() && resolved.resources->RevivedUse()) noteRevivedHit(context, state, draw, shaders, snapshots, indexBytes, *resolved.resources, resolved.moved);
                 if (plan.generatedKey && ResourceCache::FateCensus()) templateKeepDrawCensus().generatedHits.fetch_add(1, std::memory_order_relaxed);
                 if (resolved.resources->HeapStage()) {
                     const auto reason = replayDraw == ReplayReason::Eligible ? resolved.resources->HeapReplayRefusal(shaders) : replayDraw;

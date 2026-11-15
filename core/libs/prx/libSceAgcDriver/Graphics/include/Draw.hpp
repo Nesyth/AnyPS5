@@ -303,6 +303,7 @@ ResidentCensusTotals ResidentCensus();
 std::string TakeFullDrawLookupText();
 std::string TakeTemplateBuildText();
 std::string TakeTemplateKeepText();
+std::string TakeViewTemplateKeepText();
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> PipelinedColorMetadataPassWrites(const ColorMetadataPass& pass);

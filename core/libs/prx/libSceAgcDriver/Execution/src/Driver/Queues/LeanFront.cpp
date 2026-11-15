@@ -226,6 +226,7 @@ void AddOnWorker(Counter counter, std::uint64_t count) {
 }
 
 void Report(bool force) {
+    LeanFallbacks::Report(force);
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     std::lock_guard lock(reportMutex);
     const auto last = reportedAt;
@@ -296,6 +297,195 @@ std::uint64_t AllowedCount(Allowed kind) {
 
 std::uint64_t Total(Counter counter) {
     return counters[static_cast<std::size_t>(counter)].value.load(std::memory_order_relaxed);
+}
+
+}
+
+namespace LeanFallbacks {
+
+namespace {
+
+constexpr std::size_t ReasonCount = static_cast<std::size_t>(Reason::Count);
+constexpr std::size_t RouteCount = static_cast<std::size_t>(Route::Count);
+constexpr std::size_t KeptCount = static_cast<std::size_t>(Kept::Count);
+constexpr std::uint64_t VerifyPrintedPerWindow = 8;
+constexpr std::int64_t ReportWindowMs = 10000;
+
+constexpr std::array<const char*, ReasonCount> ReasonNames{"color metadata pass", "depth copy", "depth render control", "depth maintenance", "rejected by the precheck", "refused shape record", "GPU-indirect", "deferred labels", "verify", "other"};
+constexpr std::array<const char*, RouteCount> RouteNames{"color metadata passes", "depth copies", "depth render controls"};
+constexpr std::array<const char*, KeptCount> KeptNames{"color metadata pass not pipelined", "GPU-indirect", "multisample depth render control", "decode threw", "no metadata pass, depth copy or depth render control any more", "precheck after the depth render control falls back"};
+
+static_assert(ReasonNames.back() != nullptr && RouteNames.back() != nullptr && KeptNames.back() != nullptr, "every lean fallback reason, route and kept case needs a name");
+static_assert(static_cast<std::size_t>(Route::ColorMetadata) == static_cast<std::size_t>(Reason::ColorMetadata) && static_cast<std::size_t>(Route::DepthCopy) == static_cast<std::size_t>(Reason::DepthCopy) && static_cast<std::size_t>(Route::RenderControl) == static_cast<std::size_t>(Reason::RenderControl), "each route shares its index with the reason it moves");
+
+struct Tallied {
+    std::atomic<std::uint64_t> value{0};
+    std::uint64_t reported = 0;
+
+    void Add(std::uint64_t count) { value.store(value.load(std::memory_order_relaxed) + count, std::memory_order_relaxed); }
+    std::uint64_t Window() {
+        const auto now = value.load(std::memory_order_relaxed);
+        const auto since = now - reported;
+        reported = now;
+        return since;
+    }
+};
+
+std::array<Tallied, ReasonCount> todayDraws{};
+std::array<Tallied, ReasonCount> todayNs{};
+Tallied liveDraws{};
+Tallied liveNs{};
+std::array<Tallied, RouteCount> movedDraws{};
+std::array<Tallied, RouteCount> movedNs{};
+std::array<Tallied, RouteCount> laterDraws{};
+std::array<Tallied, RouteCount> checkedDraws{};
+std::array<Tallied, RouteCount> differingDraws{};
+std::array<Tallied, KeptCount> keptDraws{};
+std::atomic<std::uint64_t> verifyOrdinal{0};
+std::atomic<std::uint64_t> verifyPrinted{0};
+std::mutex fallbackReportMutex;
+std::int64_t fallbackReportedAt = 0;
+
+template <std::size_t Size>
+std::array<std::uint64_t, Size> window(std::array<Tallied, Size>& tallies) {
+    std::array<std::uint64_t, Size> counts{};
+    for (std::size_t index = 0; index < Size; ++index) counts[index] = tallies[index].Window();
+    return counts;
+}
+
+template <std::size_t Size>
+std::uint64_t total(const std::array<std::uint64_t, Size>& counts) {
+    std::uint64_t sum = 0;
+    for (const auto count : counts) sum += count;
+    return sum;
+}
+
+double microsEach(std::uint64_t ns, std::uint64_t draws) {
+    return draws == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(draws);
+}
+
+template <std::size_t Size>
+std::string timedParts(const std::array<std::uint64_t, Size>& draws, const std::array<std::uint64_t, Size>& ns, const std::array<const char*, Size>& names) {
+    std::string text;
+    for (std::size_t index = 0; index < Size; ++index) {
+        if (draws[index] == 0) continue;
+        char part[192];
+        std::snprintf(part, sizeof(part), "%s%s %llu in %.1f ms (%.1f us each)", text.empty() ? " (" : ", ", names[index], static_cast<unsigned long long>(draws[index]), static_cast<double>(ns[index]) / 1e6, microsEach(ns[index], draws[index]));
+        text += part;
+    }
+    return text.empty() ? text : text + ")";
+}
+
+template <std::size_t Size>
+std::string countParts(const char* lead, const std::array<std::uint64_t, Size>& counts, const std::array<const char*, Size>& names) {
+    std::string text;
+    for (std::size_t index = 0; index < Size; ++index) {
+        if (counts[index] == 0) continue;
+        text += text.empty() ? lead : ", ";
+        text += names[index];
+        text += ' ';
+        text += std::to_string(counts[index]);
+    }
+    return text;
+}
+
+}
+
+bool Stats() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return stats;
+}
+
+std::uint64_t VerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_LEAN_FALLBACK_DRAWS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+bool VerifyDue() {
+    const auto every = VerifyEvery();
+    return every != 0 && (verifyOrdinal.fetch_add(1, std::memory_order_relaxed) + 1) % every == 0;
+}
+
+void AddToday(Reason reason, std::uint64_t ns) {
+    const auto index = static_cast<std::size_t>(reason);
+    if (index >= ReasonCount) return;
+    todayDraws[index].Add(1);
+    todayNs[index].Add(ns);
+}
+
+void AddLivePrecheck(std::uint64_t ns) {
+    liveDraws.Add(1);
+    liveNs.Add(ns);
+}
+
+void AddMoved(Route route, std::uint64_t ns) {
+    const auto index = static_cast<std::size_t>(route);
+    if (index >= RouteCount) return;
+    movedDraws[index].Add(1);
+    movedNs[index].Add(ns);
+}
+
+void AddLater(Route route) {
+    const auto index = static_cast<std::size_t>(route);
+    if (index < RouteCount) laterDraws[index].Add(1);
+}
+
+void AddKept(Kept kept) {
+    const auto index = static_cast<std::size_t>(kept);
+    if (index < KeptCount) keptDraws[index].Add(1);
+}
+
+void AddVerify(Route route, bool differed, std::string_view detail) {
+    const auto index = static_cast<std::size_t>(route);
+    if (index >= RouteCount) return;
+    checkedDraws[index].Add(1);
+    if (!differed) return;
+    differingDraws[index].Add(1);
+    if (verifyPrinted.fetch_add(1, std::memory_order_relaxed) < VerifyPrintedPerWindow) std::fprintf(stderr, "[lean-fallback-verify] %s, %.*s\n", ReasonNames[index], static_cast<int>(detail.size()), detail.data());
+}
+
+void Report(bool force) {
+    if (!Stats()) return;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::lock_guard lock(fallbackReportMutex);
+    const auto last = fallbackReportedAt;
+    if (last == 0) {
+        fallbackReportedAt = now;
+        if (!force) return;
+    } else if (!force && now - last < ReportWindowMs) {
+        return;
+    }
+    fallbackReportedAt = now;
+    const double seconds = last == 0 ? 0.0 : static_cast<double>(now - last) / 1000.0;
+    const auto draws = window(todayDraws);
+    const auto ns = window(todayNs);
+    const auto live = liveDraws.Window();
+    const auto liveTime = liveNs.Window();
+    const auto moved = window(movedDraws);
+    const auto movedTime = window(movedNs);
+    const auto later = window(laterDraws);
+    const auto checked = window(checkedDraws);
+    const auto differing = window(differingDraws);
+    const auto kept = window(keptDraws);
+    verifyPrinted.store(0, std::memory_order_relaxed);
+    const auto todayAll = total(draws);
+    const auto todayTime = total(ns);
+    if (todayAll != 0 || live != 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[lean-fallback] %.1f s: draws the lean front sent to today's path on the worker %llu in %.1f ms (%.1f us each)%s; lean draws that ran the precheck %llu in %.1f ms\n", seconds,
+            static_cast<unsigned long long>(todayAll), static_cast<double>(todayTime) / 1e6, microsEach(todayTime, todayAll), timedParts(draws, ns, ReasonNames).c_str(),
+            static_cast<unsigned long long>(live), static_cast<double>(liveTime) / 1e6);
+    }
+    const auto movedAll = total(moved);
+    const auto checkedAll = total(checked);
+    if (movedAll == 0 && total(later) == 0 && total(kept) == 0 && checkedAll == 0) return;
+    const bool set = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::LeanFallbackDraws);
+    AgcDriver::ProfilePrint_nid_no_patch("[lean-fallback] %.1f s: APS5_LEAN_FALLBACK_DRAWS %s, moved off today's path %llu in %.1f ms%s%s%s; verify every %llu: checked %llu, differing %llu%s\n", seconds, set ? "set" : "unset",
+        static_cast<unsigned long long>(movedAll), static_cast<double>(total(movedTime)) / 1e6, timedParts(moved, movedTime, RouteNames).c_str(),
+        countParts("; on today's path later for another reason: ", later, RouteNames).c_str(), countParts("; kept on today's path: ", kept, KeptNames).c_str(),
+        static_cast<unsigned long long>(VerifyEvery()), static_cast<unsigned long long>(checkedAll), static_cast<unsigned long long>(total(differing)), countParts(" (", differing, RouteNames).append(total(differing) != 0 ? ")" : "").c_str());
 }
 
 }

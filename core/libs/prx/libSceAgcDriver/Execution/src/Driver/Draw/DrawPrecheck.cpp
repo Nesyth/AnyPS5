@@ -43,15 +43,21 @@ bool Driver::drawPrecheck() {
     return precheck;
 }
 
-LeanVerdict Driver::precheckVerdict(const QueueState& queue, bool indexed, std::uint32_t indexSize) {
+LeanVerdict Driver::precheckVerdict(const QueueState& queue, bool indexed, std::uint32_t indexSize, LeanFallbackCause* cause, bool afterControl) {
     using Graphics::RegisterBank;
     using Graphics::NoteRegisterRead;
+    const auto fallback = [&](LeanFallbackCause found) {
+        if (cause != nullptr) *cause = found;
+        return LeanVerdict::Fallback;
+    };
     try {
-        if (Graphics::DecodeColorMetadataPass(queue)) return LeanVerdict::Fallback;
-        if (Graphics::DecodeDepthCopyPass(queue)) return LeanVerdict::Fallback;
-        if (Graphics::DecodeDepthRenderControl(queue)) return LeanVerdict::Fallback;
+        if (!afterControl) {
+            if (Graphics::DecodeColorMetadataPass(queue)) return fallback(LeanFallbackCause::ColorMetadata);
+            if (Graphics::DecodeDepthCopyPass(queue)) return fallback(LeanFallbackCause::DepthCopy);
+            if (Graphics::DecodeDepthRenderControl(queue)) return fallback(LeanFallbackCause::RenderControl);
+        }
         if (Graphics::DepthResummarizeDrawsNothing(queue)) return LeanVerdict::Nothing;
-        if (!Graphics::DepthMaintenanceRejection(queue).empty()) return LeanVerdict::Fallback;
+        if (!Graphics::DepthMaintenanceRejection(queue).empty()) return fallback(LeanFallbackCause::Maintenance);
         NoteRegisterRead(RegisterBank::Context, 0x8e);
         NoteRegisterRead(RegisterBank::Context, 0x8f);
         const auto targetMask = queue.context.find(0x8e);
@@ -78,14 +84,14 @@ LeanVerdict Driver::precheckVerdict(const QueueState& queue, bool indexed, std::
                 const auto type = primitive == queue.userConfig.end() ? 0u : primitive->second & 0x3fu;
                 const bool strip = type == 3 || type == 5 || type == 6 || type == 21;
                 const bool list = type == 1 || type == 2 || type == 4;
-                if (!strip && !list) return LeanVerdict::Fallback;
-                if (resetIndex == queue.context.end() || (resetIndex->second & allOnes) != allOnes) return LeanVerdict::Fallback;
+                if (!strip && !list) return fallback(LeanFallbackCause::Rejection);
+                if (resetIndex == queue.context.end() || (resetIndex->second & allOnes) != allOnes) return fallback(LeanFallbackCause::Rejection);
             }
         }
-        if (drawPrecheck() && !Graphics::DrawRejection(queue, indexed).empty()) return LeanVerdict::Fallback;
+        if (drawPrecheck() && !Graphics::DrawRejection(queue, indexed).empty()) return fallback(LeanFallbackCause::Rejection);
         return LeanVerdict::Normal;
     } catch (const std::exception&) {
-        return LeanVerdict::Fallback;
+        return fallback(LeanFallbackCause::Threw);
     }
 }
 
@@ -93,24 +99,10 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
     if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
     if (const auto pass = Graphics::DecodeColorMetadataPass(queue)) {
         require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
-        if (DrawPipeline::Active() && DrawPipeline::MetadataPassesPipelined() && deferredLabels().labels.empty()) {
-            auto writes = Graphics::PipelinedColorMetadataPassWrites(*pass);
-            const auto localDevice = device.Load();
-            if (!writes.empty() && localDevice != nullptr) {
-                const auto queueId = submission.queue;
-                const auto opcode = (packet[0] >> 8u) & 0xffu;
-                DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::ColorMetadata, [this, localDevice, queueId, opcode, pass = *pass] {
-                    GuestMemory::SetCurrentPacket(opcode, queueId);
-                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
-                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
-                    auto current = device.Load();
-                    const auto& target = current != nullptr ? current : localDevice;
-                    recordLabelsForPacket(target.get(), queueId);
-                    target->ColorMetadataPass(pass);
-                }, std::move(writes));
-                DrawPipeline::CountPipelinedMetadataPass();
-                return DrawVerdict::Drawn;
-            }
+        if (std::vector<DrawPipeline::Range> writes; const auto localDevice = pipelinedColorMetadataDevice(*pass, writes)) {
+            DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::ColorMetadata, colorMetadataCommit(localDevice, submission.queue, (packet[0] >> 8u) & 0xffu, *pass), std::move(writes));
+            DrawPipeline::CountPipelinedMetadataPass();
+            return DrawVerdict::Drawn;
         }
         if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
@@ -169,6 +161,41 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
         if (!rejected.empty()) return DrawVerdict::Rejected;
     }
     return std::nullopt;
+}
+
+DrawPipeline::Commit Driver::colorMetadataCommit(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queueId, std::uint32_t opcode, Graphics::ColorMetadataPass pass) {
+    return [this, localDevice = std::move(localDevice), queueId, opcode, pass = std::move(pass)] {
+        GuestMemory::SetCurrentPacket(opcode, queueId);
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        auto current = device.Load();
+        const auto& target = current != nullptr ? current : localDevice;
+        recordLabelsForPacket(target.get(), queueId);
+        target->ColorMetadataPass(pass);
+    };
+}
+
+std::shared_ptr<VulkanDevice> Driver::pipelinedColorMetadataDevice(const Graphics::ColorMetadataPass& pass, std::vector<DrawPipeline::Range>& writes) {
+    if (!DrawPipeline::Active() || !DrawPipeline::MetadataPassesPipelined() || !deferredLabels().labels.empty()) return nullptr;
+    writes = Graphics::PipelinedColorMetadataPassWrites(pass);
+    auto localDevice = device.Load();
+    if (writes.empty()) return nullptr;
+    return localDevice;
+}
+
+void Driver::queueLeanColorMetadataPass(const Graphics::ColorMetadataPass& pass, std::vector<DrawPipeline::Range> writes, std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queueId, std::uint32_t opcode) {
+    DrawFinisher::Pending held;
+    held.unknown = false;
+    held.writes = writes;
+    DrawFinisher::Get().Enqueue([commit = colorMetadataCommit(std::move(localDevice), queueId, opcode, pass), writes = std::move(writes)]() mutable {
+        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::ColorMetadata, std::move(commit), std::move(writes));
+    }, std::move(held));
+    DrawPipeline::CountPipelinedMetadataPass();
+}
+
+DrawVerdict Driver::drawLeanDepthCopy(const QueueState& queue, const Graphics::DepthCopyPass& copy, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
+    auto copyDraw = DepthCopyDraw(queue, copy);
+    return drawLean(copyDraw, packet, submission, packetOffset, rejected);
 }
 
 }

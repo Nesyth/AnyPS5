@@ -184,6 +184,25 @@ std::uint64_t Total(Counter counter);
 
 }
 
+namespace LeanFallbacks {
+
+enum class Reason : std::uint8_t { ColorMetadata, DepthCopy, RenderControl, Maintenance, Rejection, RefusedShape, GpuIndirect, DeferredLabels, Verify, Other, Count };
+enum class Route : std::uint8_t { ColorMetadata, DepthCopy, RenderControl, Count };
+enum class Kept : std::uint8_t { MetadataNotPipelined, Indirect, MultisampleControl, HeadThrew, HeadChanged, AfterControlFallback, Count };
+
+bool Stats();
+std::uint64_t VerifyEvery();
+bool VerifyDue();
+void AddToday(Reason reason, std::uint64_t ns);
+void AddLivePrecheck(std::uint64_t ns);
+void AddMoved(Route route, std::uint64_t ns);
+void AddLater(Route route);
+void AddKept(Kept kept);
+void AddVerify(Route route, bool differed, std::string_view detail);
+void Report(bool force);
+
+}
+
 }
 
 #endif

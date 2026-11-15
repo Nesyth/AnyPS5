@@ -228,6 +228,9 @@ enum class RuntimeSwitch : std::size_t {
     DirectRectLists,
     DirectAddressed,
     TrustAudit,
+    ProofKeeps,
+    ViewTemplateKeeps,
+    LeanFallbackDraws,
     Count,
 };
 
