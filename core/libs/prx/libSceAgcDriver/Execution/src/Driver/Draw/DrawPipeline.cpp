@@ -1153,6 +1153,16 @@ bool DrawFinisher::Deep() {
     return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DeepFlow) && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpFlow) && deepQueues();
 }
 
+namespace {
+constexpr std::array<std::uint32_t, 6> PacketWaitOpcodes{0x50u, 0x63u, 0x64u, 0x9fu, 0x3cu, 0x93u};
+struct PacketWaitTally {
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PendingCause::Count)> counts{};
+    std::atomic<std::uint64_t> nanoseconds{0};
+    std::atomic<std::uint64_t> ahead{0};
+};
+std::array<PacketWaitTally, PacketWaitOpcodes.size() + 1> packetWaits{};
+}
+
 void DrawFinisher::NoteDeepKept(DeepKept kept, std::uint32_t opcode) {
     if (!pipelineStats() || !Deep()) return;
     if (!Busy() && DrawPipeline::Queue0().Outstanding() == 0) return;
@@ -1209,6 +1219,20 @@ std::string DrawFinisher::DeepText() {
     for (std::size_t index = 0; index < deepAnswered.size(); ++index) {
         char item[96];
         std::snprintf(item, sizeof(item), "%s %s %llu (%llu)", index == 0 ? "" : ",", DeepLookupNames[index], take(deepAnswered[index]), take(deepFellBack[index]));
+        text += item;
+    }
+    text += "; packet waits by opcode (named writer/unknown writes/fallback drain, ms, jobs ahead on average):";
+    for (std::size_t index = 0; index < packetWaits.size(); ++index) {
+        auto& tally = packetWaits[index];
+        const auto writer = take(tally.counts[static_cast<std::size_t>(PendingCause::Writer)]);
+        const auto unknown = take(tally.counts[static_cast<std::size_t>(PendingCause::Unknown)]);
+        const auto fallback = take(tally.counts[static_cast<std::size_t>(PendingCause::Fallback)]);
+        const auto nanoseconds = take(tally.nanoseconds);
+        const auto ahead = take(tally.ahead);
+        if (writer + unknown + fallback == 0) continue;
+        char item[128];
+        if (index < PacketWaitOpcodes.size()) std::snprintf(item, sizeof(item), " 0x%02x %llu/%llu/%llu (%.1f ms, %.1f)", PacketWaitOpcodes[index], writer, unknown, fallback, static_cast<double>(nanoseconds) / 1e6, static_cast<double>(ahead) / static_cast<double>(writer + unknown + fallback));
+        else std::snprintf(item, sizeof(item), " other %llu/%llu/%llu (%.1f ms, %.1f)", writer, unknown, fallback, static_cast<double>(nanoseconds) / 1e6, static_cast<double>(ahead) / static_cast<double>(writer + unknown + fallback));
         text += item;
     }
     text += "; targeted waits by site (finisher jobs/committer items):";
@@ -1272,13 +1296,15 @@ std::uint64_t DrawFinisher::KeyBlocker(std::uint64_t key, std::uint64_t shape, b
     return found.answer == DeepAnswer::Hit ? found.stamp : 0;
 }
 
-void DrawFinisher::AwaitPending(std::span<const Range> ranges, DeepSite site) {
+PendingWait DrawFinisher::AwaitPending(std::span<const Range> ranges, DeepSite site) {
     NoteDeepSite(site);
     FlushOpenRun();
-    if (!Busy() || OnFinisherThread()) return;
+    PendingWait waited;
+    if (!Busy() || OnFinisherThread()) return waited;
     if (!FinisherProducer::Get() || !ringMode.load(std::memory_order_acquire) || !deepRing.load(std::memory_order_relaxed)) {
         Drain();
-        return;
+        waited.cause = PendingCause::Fallback;
+        return waited;
     }
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
     for (;;) {
@@ -1289,19 +1315,34 @@ void DrawFinisher::AwaitPending(std::span<const Range> ranges, DeepSite site) {
             noteDeepTotal(DeepCount::WorkerFallbacks);
             NoteDeepKept(DeepKept::Fallback);
             Drain();
-            return;
+            if (waited.cause == PendingCause::None) waited.cause = PendingCause::Fallback;
+            return waited;
         }
-        auto blocker = found.answer == DeepAnswer::Hit ? found.stamp : std::uint64_t{0};
+        const auto writer = found.answer == DeepAnswer::Hit ? found.stamp : std::uint64_t{0};
+        auto blocker = writer;
         const auto unknown = lastUnknown.load(std::memory_order_relaxed);
         if (unknown >= front) blocker = std::max(blocker, unknown);
-        if (blocker == 0) return;
+        if (blocker == 0) return waited;
+        if (waited.cause == PendingCause::None) {
+            waited.cause = blocker == writer ? PendingCause::Writer : PendingCause::Unknown;
+            waited.ahead = blocker >= front ? blocker - front + 1 : 0;
+        }
         noteDeepSiteWait(site, true);
         if (blocker >= nextSeq || !awaitProducerFront(blocker)) {
             NoteDeepKept(DeepKept::Fallback);
             Drain();
-            return;
+            return waited;
         }
     }
+}
+
+void DrawFinisher::NotePacketWait(std::uint32_t opcode, const PendingWait& waited, std::uint64_t nanoseconds) {
+    if (!pipelineStats() || waited.cause == PendingCause::None) return;
+    const auto found = std::find(PacketWaitOpcodes.begin(), PacketWaitOpcodes.end(), opcode);
+    auto& tally = packetWaits[static_cast<std::size_t>(found - PacketWaitOpcodes.begin())];
+    tally.counts[static_cast<std::size_t>(waited.cause)].fetch_add(1, std::memory_order_relaxed);
+    tally.nanoseconds.fetch_add(nanoseconds, std::memory_order_relaxed);
+    tally.ahead.fetch_add(waited.ahead, std::memory_order_relaxed);
 }
 
 std::uint64_t DrawFinisher::DeepTotal(DeepCount count) {

@@ -209,7 +209,9 @@ bool awaitVerdictFinisherWriters(std::span<const std::uint32_t> packet, std::uin
     std::array<std::pair<std::uint64_t, std::uint64_t>, 3> ranges{};
     const auto count = verdictRanges(packet, header, opcode, ranges);
     if (count == 0) return keepsDrawPipeline(packet, header, opcode);
-    DrawFinisher::Get().AwaitPending(std::span<const DrawFinisher::Range>(ranges.data(), count), DeepSite::PacketFinisher);
+    const auto begin = std::chrono::steady_clock::now();
+    const auto waited = DrawFinisher::Get().AwaitPending(std::span<const DrawFinisher::Range>(ranges.data(), count), DeepSite::PacketFinisher);
+    if (waited.cause != PendingCause::None) DrawFinisher::NotePacketWait(opcode, waited, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count()));
     return true;
 }
 

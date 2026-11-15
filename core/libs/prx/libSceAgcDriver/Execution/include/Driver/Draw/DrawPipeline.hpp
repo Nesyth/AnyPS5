@@ -82,6 +82,11 @@ struct LabelRun {
 };
 
 enum class DeepSite : std::uint32_t { PacketVerdict, Predication, IndirectArguments, FillInputs, FillByTurn, DispatchReads, LateDispatchReads, Decode, HeapStages, Variant, WriteEvidence, ShaderCode, SameKey, EarlierKey, ItemsByTurn, ItemsWithReadsByTurn, PacketFinisher, Count };
+enum class PendingCause : std::uint32_t { None, Writer, Unknown, Fallback, Count };
+struct PendingWait {
+    PendingCause cause = PendingCause::None;
+    std::uint64_t ahead = 0;
+};
 enum class DeepKept : std::uint32_t { Flip, RenderingWait, Wait, WorkerLabel, PacketVerdict, SegmentEnd, Submission, Settle, DeferredLabels, WorkerDraw, WorkerDispatch, MetadataPass, WorkerNote, Relocation, IndirectCpu, DispatchNotPipelined, Fallback, Shutdown, Other, NoteNotCandidate, NoteMultisampleClear, NoteMemoryValueFill, NoteHtileDepthClear, NoteHtileMaskClear, NoteHtileZmaskFixup, NoteDepthControl, Count };
 
 class DrawPipeline {
@@ -290,7 +295,8 @@ public:
     static bool Deep();
     bool DeepRing() const { return deepRing.load(std::memory_order_acquire); }
     void AwaitKeyed(std::uint64_t key, std::uint64_t shape, bool insertsOnly);
-    void AwaitPending(std::span<const Range> ranges, DeepSite site);
+    PendingWait AwaitPending(std::span<const Range> ranges, DeepSite site);
+    static void NotePacketWait(std::uint32_t opcode, const PendingWait& waited, std::uint64_t nanoseconds);
     static void NoteDeepKept(DeepKept kept, std::uint32_t opcode = 0x100);
     static void NoteDeepSite(DeepSite site);
     static std::string DeepText();
