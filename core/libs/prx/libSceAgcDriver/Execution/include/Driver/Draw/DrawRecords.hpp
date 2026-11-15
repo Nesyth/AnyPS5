@@ -235,6 +235,7 @@ struct DrawRecordHit {
     std::uint64_t shape = 0;
     std::uint32_t queue = 0;
     std::uint32_t opcode = 0;
+    std::shared_ptr<const void> replayed;
 };
 
 namespace DrawRecordFlags {

@@ -382,6 +382,7 @@ private:
     void installStagePlans(const LeanDrawJob& job, const StagePlanAnswer& answer);
     static void retireStagePlans(const std::byte* payload, std::shared_ptr<const void>&& answer);
     void finishDirectDraw(const LeanDrawJob& job);
+    std::optional<DirectDraws::Counter> replayDirectJob(const LeanDrawJob& job, const LeanAnchor& anchor);
     std::optional<DirectDraws::Counter> resolveDirectStages(const LeanDrawJob& job, const LeanAnchor& anchor, DirectStages& resolved, DirectStepClock* clock);
     std::optional<DirectDraws::Counter> assembleDirectHit(const LeanDrawJob& job, DirectStages& resolved, DrawRecordHit& hit);
     const DrawRecordSink* finishDirectAnswer(const LeanDrawJob& job, const LeanAnchor& anchor, const DirectStages& resolved, const DrawRecordHit& hit, DrawRecordView& answer);

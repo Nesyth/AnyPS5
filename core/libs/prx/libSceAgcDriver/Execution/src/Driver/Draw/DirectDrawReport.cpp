@@ -85,7 +85,11 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "rect-list draws", "rect-list direct", "rect-list shape", "rect-list class new", "rect-list verify", "rect-list other reasons", "rect verify checked", "rect verify differing", "rect first commits", "rect commits with a recipe", "rect follows",
     "addressed draws served", "addressed commits", "addressed snapshot regions", "addressed snapshot bytes",
     "addressed: switch off", "addressed: stores through an address", "addressed: a read across a program region", "addressed: later reason",
-    "addressed classes built", "addressed classes refused", "addressed verify checked", "addressed verify differing"
+    "addressed classes built", "addressed classes refused", "addressed verify checked", "addressed verify differing",
+    "jobs replayed", "replayed without a fragment", "no earlier hit", "class new or refused", "not a direct draw",
+    "verify sampled", "no prepared buffers, inputs, bindings or fragments", "indirect", "another device", "forget, import or mapping serial moved", "buffer plan or inputs recipe moved", "class refused or evicted", "placement refused or thrown",
+    "replay sources kept", "no fragment or prepared buffers and inputs", "addressed, rect list or indirect", "class no longer in the class store", "template checks shader faults", "replay stores cleared",
+    "replay nanoseconds", "replay copy nanoseconds", "replay fragment nanoseconds", "replay hand-off nanoseconds", "replays timed"
 };
 static_assert(static_cast<std::size_t>(Counter::ExpressReprovedStaging) - static_cast<std::size_t>(Counter::ExpressReprovedNotProved) == static_cast<std::size_t>(Graphics::ShaderResources::ExpressMiss::Staging) - static_cast<std::size_t>(Graphics::ShaderResources::ExpressMiss::NotProved), "every reason an express commit reproves its template needs a counter");
 static_assert(static_cast<std::size_t>(Counter::BindingsLeftUnpushedRebound) - static_cast<std::size_t>(Counter::BindingsLeftUnpushedRefused) + 2 == static_cast<std::size_t>(Graphics::ShaderResources::DynamicLeave::Count), "every way an unpushed draw leaves the dynamic route needs a counter");
@@ -424,6 +428,25 @@ void Report(bool force) {
     std::uint64_t splitDraws = 0;
     for (auto index = static_cast<std::size_t>(Step::BuffersPrepare); index < StepCount; ++index) splitDraws += since.stepDraws[index];
     if (splitDraws != 0) AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] split us per direct draw: buffers prepare %.2f, settle %.2f, place %.2f; hand-off fragment %.2f, commit %.2f\n", perDraw(Step::BuffersPrepare), perDraw(Step::BuffersSettle), perDraw(Step::BuffersPlace), perDraw(Step::Fragment), perDraw(Step::Commit));
+    {
+        std::uint64_t replayKept = 0;
+        for (auto index = static_cast<std::size_t>(Counter::ReplayKeptVerify); index <= static_cast<std::size_t>(Counter::ReplayKeptPlace); ++index) replayKept += counts[index];
+        std::uint64_t replaySourcesRefused = 0;
+        for (auto index = static_cast<std::size_t>(Counter::ReplaySourceNoFragment); index <= static_cast<std::size_t>(Counter::ReplaySourceFaults); ++index) replaySourcesRefused += counts[index];
+        const auto replayed = at(Counter::ReplayJobs);
+        const auto replayToday = at(Counter::ReplayTodayNoEarlier) + at(Counter::ReplayTodayClassNew) + at(Counter::ReplayTodayNotDirect) + replayKept;
+        const auto replayTimed = at(Counter::ReplayTimed);
+        const auto perReplay = [&](Counter nanoseconds) { return replayTimed == 0 ? 0.0 : static_cast<double>(at(nanoseconds)) / static_cast<double>(replayTimed) / 1000.0; };
+        if (replayed != 0 || replayToday != 0 || at(Counter::ReplaySourcesKept) != 0 || replaySourcesRefused != 0 || at(Counter::ReplayCleared) != 0) {
+            AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] job replay, an experiment that draws wrong pictures: %llu jobs replayed (%.1f%% of draws), %llu of them without a fragment; %llu jobs on today's path: no earlier hit %llu, class new or refused %llu, not a direct draw %llu, kept for safety %llu%s; sources kept %llu, refused %llu%s; replay stores cleared %llu; us per replayed job %.2f (lookup, copies and placement %.2f, fragment %.2f, hand-off %.2f; %llu timed)\n",
+                static_cast<unsigned long long>(replayed), draws != 0 ? 100.0 * static_cast<double>(replayed) / static_cast<double>(draws) : 0.0, static_cast<unsigned long long>(at(Counter::ReplayNoFragment)),
+                static_cast<unsigned long long>(replayToday), static_cast<unsigned long long>(at(Counter::ReplayTodayNoEarlier)), static_cast<unsigned long long>(at(Counter::ReplayTodayClassNew)), static_cast<unsigned long long>(at(Counter::ReplayTodayNotDirect)),
+                static_cast<unsigned long long>(replayKept), reasons(counts, Counter::ReplayKeptVerify, Counter::ReplayKeptPlace).c_str(),
+                static_cast<unsigned long long>(at(Counter::ReplaySourcesKept)), static_cast<unsigned long long>(replaySourcesRefused), reasons(counts, Counter::ReplaySourceNoFragment, Counter::ReplaySourceFaults).c_str(),
+                static_cast<unsigned long long>(at(Counter::ReplayCleared)),
+                perReplay(Counter::ReplayNanoseconds), perReplay(Counter::ReplayCopyNanoseconds), perReplay(Counter::ReplayFragmentNanoseconds), perReplay(Counter::ReplayHandoffNanoseconds), static_cast<unsigned long long>(replayTimed));
+        }
+    }
     if (std::ranges::any_of(since.trust, [](std::uint64_t count) { return count != 0; })) {
         std::array<std::uint64_t, TrustEvents> all{};
         for (std::size_t index = 0; index < TrustCounts; ++index) all[index % TrustEvents] += since.trust[index];

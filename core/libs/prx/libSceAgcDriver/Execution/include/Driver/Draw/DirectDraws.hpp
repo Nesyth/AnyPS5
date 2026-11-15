@@ -120,6 +120,7 @@ public:
     void Evict();
     void Clear();
     std::size_t Size() const;
+    std::uint64_t Clears() const { return clears.load(std::memory_order_acquire); }
 
 private:
     struct KeyHash {
