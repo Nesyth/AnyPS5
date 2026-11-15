@@ -64,6 +64,7 @@ struct DirectStages;
 struct DirectClass;
 struct DirectClassKey;
 class DirectStepClock;
+struct LabelRun;
 
 struct DrawStageContext {
     const QueueState& queue;
@@ -475,6 +476,9 @@ private:
     bool enqueueConstantRamDump(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, const QueueState& state);
     void commitStore(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes);
     void commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, std::optional<std::uint32_t> interrupt);
+    void enqueueLabelRun(std::uint32_t queue, std::shared_ptr<const LabelRun> run, std::vector<std::pair<std::uint64_t, std::uint64_t>> writes);
+    void commitLabelRun(std::uint32_t queue, const LabelRun& run);
+    std::size_t verifyLabelRun(const Submission& submission, const QueueState& queue, const PacketTable& table, std::size_t first, std::size_t end, const LabelRun& run, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::optional<std::uint32_t> leaderInterrupt);
     void submitDueAfterCommit(VulkanDevice* localDevice);
     std::optional<WrittenBuffer> newestWriterLocked(std::uint64_t begin, std::uint64_t end) const;
     std::optional<WrittenBuffer> newestWriter(std::uint64_t begin, std::uint64_t end);

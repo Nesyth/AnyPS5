@@ -1786,6 +1786,12 @@ void noteRepeatDifference(DrawRecords::Field field, std::string_view detail) {
 
 void noteRepeatAllowed(DrawRecords::Allowed) {}
 
+void noteHeavyDifference(DrawRecords::Field field, std::string_view detail) {
+    Graphics::NoteRecordHeavyVerifyDifference(DrawRecords::FieldName(field), detail);
+}
+
+void noteHeavyAllowed(DrawRecords::Allowed) {}
+
 void noteBindingsDifference(DrawRecords::Field field, std::string_view detail) {
     DirectDraws::NoteBindingsDifference(DrawRecords::FieldName(field), detail);
 }
@@ -1938,6 +1944,7 @@ struct CommitOrdinals {
     std::uint64_t inputs = 0;
     std::uint64_t express = 0;
     std::uint64_t expressRefused = ~std::uint64_t{0};
+    std::uint64_t heavy = 0;
 };
 CommitOrdinals commitOrdinals;
 
@@ -2009,7 +2016,8 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(1);
         while (std::chrono::steady_clock::now() < until) {}
     }
-    if (hit.direct && hit.record->commit->recipe != nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpNoCommits)) {
+    const bool heavyOn = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RecordHeavyDraws);
+    if (hit.direct && hit.record->commit->recipe != nullptr && (heavyOn || !hit.record->commit->recipe->spaceReuse) && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpNoCommits)) {
         ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
         return;
     }
@@ -2037,14 +2045,30 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     if (commit.writers == 0) commit.writers = StagesMayWriteBuffers(hit.stages) ? 2 : 1;
     if (commit.writers == 2) noteDrawWriters(hit.stages, queue);
     commit.cleanProofs = hit.direct ? Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectCleanProofs) : hit.planned && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoPlanCleanProofs);
+    const auto& record = *hit.record;
+    const auto* keyWords = hit.addressed ? (hit.contentKey.empty() ? nullptr : &hit.contentKey) : record.contentKey.empty() ? nullptr : &record.contentKey;
+    using Cause = Graphics::FullDrawCause;
+    const bool spaceRecipe = commit.recipe != nullptr && commit.recipe->spaceReuse;
+    auto spaceUnused = Cause::Count;
+    if (spaceRecipe && !heavyOn) spaceUnused = Cause::SpaceSwitchOff;
+    else if (spaceRecipe && (keyWords == nullptr || *keyWords != commit.recipe->key)) spaceUnused = Cause::SpaceKeyMoved;
+    const bool recipeUsable = commit.recipe != nullptr && spaceUnused == Cause::Count;
+    const auto spaceSnapshots = spaceRecipe ? std::span<const Graphics::GuestMemorySnapshot>(hit.snapshots) : std::span<const Graphics::GuestMemorySnapshot>();
     auto& ordinal = commitOrdinals.record;
     const auto every = DrawRecords::VerifyEvery();
-    const bool verify = commit.recipe != nullptr && every != 0 && ++ordinal % every == 0;
-    if (hit.direct && graphics.rectList) DirectDraws::Add(commit.recipe == nullptr ? DirectDraws::Counter::RectListsCommitFirst : DirectDraws::Counter::RectListsCommitRecipe);
-    if (commit.recipe == nullptr) {
+    const bool verify = recipeUsable && every != 0 && ++ordinal % every == 0;
+    const auto heavyEvery = spaceRecipe && recipeUsable && !verify ? Graphics::RecordHeavyVerifyEvery() : std::uint64_t{0};
+    const bool heavyVerify = heavyEvery != 0 && ++commitOrdinals.heavy % heavyEvery == 0;
+    const bool compared = verify || heavyVerify;
+    if (hit.direct && graphics.rectList) DirectDraws::Add(!recipeUsable ? DirectDraws::Counter::RectListsCommitFirst : DirectDraws::Counter::RectListsCommitRecipe);
+    if (!recipeUsable) {
         DrawRecords::AddOnCommitter(Counter::CommitFirst);
         if (hit.direct) DirectDraws::Add(DirectDraws::Counter::CommitFirst);
-    } else if (!verify) {
+        if (spaceRecipe) Graphics::NoteRecordHeavy(spaceUnused == Cause::SpaceSwitchOff ? Graphics::RecordHeavyEvent::SwitchOff : Graphics::RecordHeavyEvent::KeyMoved);
+        else if (hit.addressed && heavyOn) Graphics::NoteRecordHeavy(commit.spaceRefused ? Graphics::RecordHeavyEvent::Refused : Graphics::RecordHeavyEvent::FirstCommit);
+    } else if (heavyVerify) {
+        Graphics::NoteRecordHeavy(Graphics::RecordHeavyEvent::VerifyDue);
+    } else if (!compared) {
         const auto* prepared = hit.preparedBuffers.has_value() ? &*hit.preparedBuffers : nullptr;
         auto& bufferOrdinal = commitOrdinals.buffers;
         const auto bufferEvery = DirectDraws::BufferVerifyEvery();
@@ -2142,7 +2166,8 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
                 }
             }
         }
-        const auto outcome = expressedOutcome.has_value() ? *expressedOutcome : repeatedOutcome.has_value() ? *repeatedOutcome : localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, nullptr, prepared, fullInputs, fragment);
+        const auto outcome = expressedOutcome.has_value() ? *expressedOutcome : repeatedOutcome.has_value() ? *repeatedOutcome : localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, nullptr, prepared, fullInputs, fragment, spaceSnapshots);
+        if (spaceRecipe && !outcome.recorded) Graphics::NoteRecordHeavyMiss(outcome.miss);
         if (verifyKeep != nullptr) NoteExpressVerify(*hit.record, commit, outcome, verifyKeep, verifyVersions, verifyReprove);
         const bool captureUnreached = fragment != nullptr && !expressedOutcome.has_value() && !repeatedOutcome.has_value() && tracePtr == nullptr && commit.effects.fragment.expressCapture == DrawExpressCapture::None && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ExpressCommits);
         if (captureUnreached) DirectDraws::Add(DirectDraws::Counter::ExpressCaptureUnreached);
@@ -2166,7 +2191,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
             NoteCommitBindings(*hit.record, commit, prepared);
         }
         if (outcome.recorded) {
-            if (hit.direct) {
+            if (hit.direct && !spaceRecipe) {
                 PublishBufferPlan(commit, hit.stages);
                 PublishInputsRecipe(commit);
             }
@@ -2183,12 +2208,12 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         }
         DrawRecords::AddOnCommitter(CommitMiss(outcome.miss));
     }
-    if ((commit.recipe == nullptr || verify) && hit.preparedBuffers.has_value()) DirectDraws::Add(DirectDraws::Counter::BuffersDropped);
-    if ((commit.recipe == nullptr || verify) && hit.preparedBuffers.has_value() && hit.preparedBuffers->placed != nullptr) DirectDraws::Add(DirectDraws::Counter::BindingsReturned);
-    if ((commit.recipe == nullptr || verify) && hit.preparedInputs.has_value()) DirectDraws::Add(DirectDraws::Counter::InputsDropped);
+    if ((!recipeUsable || compared) && hit.preparedBuffers.has_value()) DirectDraws::Add(DirectDraws::Counter::BuffersDropped);
+    if ((!recipeUsable || compared) && hit.preparedBuffers.has_value() && hit.preparedBuffers->placed != nullptr) DirectDraws::Add(DirectDraws::Counter::BindingsReturned);
+    if ((!recipeUsable || compared) && hit.preparedInputs.has_value()) DirectDraws::Add(DirectDraws::Counter::InputsDropped);
     if (hit.planned || hit.direct) ThreadReport::MarkItem(ThreadReport::ItemMark::PlanFallback);
     DrawCommitView answer;
-    if (verify) static_cast<void>(localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, &answer));
+    if (compared) static_cast<void>(localDevice->DrawFromRecord(graphics, hit.parameters, hit.stages, commit, tracePtr, &answer, nullptr, nullptr, nullptr, spaceSnapshots));
     if (verify && DrawRecords::CorruptingCommits() && !answer.bindings.empty()) {
         const auto snapshot = std::ranges::find_if(answer.bindings, [](const Graphics::ShaderResources::BoundBuffer& entry) { return entry.snapshot; });
         (snapshot != answer.bindings.end() ? *snapshot : answer.bindings.front()).info.range ^= 4u;
@@ -2197,20 +2222,30 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     struct ViewScope {
         ~ViewScope() { DrawCommitViewSlot::Set(nullptr); }
     } viewScope;
-    if (verify) {
+    if (compared) {
         today.wantPush = answer.pushed;
         DrawCommitViewSlot::Set(&today);
     }
     std::shared_ptr<const DrawRecipe> built;
-    const auto& record = *hit.record;
-    const auto* keyWords = hit.addressed ? (hit.contentKey.empty() ? nullptr : &hit.contentKey) : record.contentKey.empty() ? nullptr : &record.contentKey;
     if (hit.addressed) DirectDraws::Add(DirectDraws::Counter::AddressedCommits);
-    localDevice->Draw(graphics, hit.parameters, hit.stages, hit.snapshots, &built, tracePtr, shape, keyWords, fragmentOutputs ? &*fragmentOutputs : nullptr, true);
+    {
+        const Graphics::FullDrawCauseScope cause(verify ? Cause::RecordVerify : heavyVerify ? Cause::SpaceVerify : spaceUnused != Cause::Count ? spaceUnused : recipeUsable ? Cause::RecordMissed : hit.addressed && commit.spaceRefused ? Cause::SpaceRefused : hit.addressed ? Cause::RecordFirstAddressed : Cause::RecordFirst);
+        localDevice->Draw(graphics, hit.parameters, hit.stages, hit.snapshots, &built, tracePtr, shape, keyWords, fragmentOutputs ? &*fragmentOutputs : nullptr, true);
+    }
     DrawCommitViewSlot::Set(nullptr);
     bool differs = false;
     if (verify) {
         DrawRecords::AddOnCommitter(Counter::CommitVerified);
         differs = verifyRecordCommit(record, answer, today);
+    } else if (heavyVerify) {
+        Graphics::NoteRecordHeavy(Graphics::RecordHeavyEvent::VerifyChecked);
+        differs = compareCommitViews(record, answer, today, &noteHeavyDifference, &noteHeavyAllowed, false);
+    }
+    if (differs && heavyVerify) {
+        Graphics::NoteRecordHeavy(Graphics::RecordHeavyEvent::VerifyDiffering);
+        commit.Adopt(nullptr);
+        commit.spaceRefused = true;
+        return;
     }
     if (differs) {
         commit.Adopt(nullptr);
@@ -2220,10 +2255,14 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         if (hit.direct) RefuseDirectClass(hit.owner);
         return;
     }
-    if (built != nullptr && (!verify || !answer.filled || answer.resources != today.resources)) {
+    const bool spaceBuilt = built != nullptr && built->spaceReuse;
+    if (spaceBuilt && commit.spaceRefused) {
+        Graphics::NoteRecordHeavy(Graphics::RecordHeavyEvent::NotAdopted);
+    } else if (built != nullptr && (!compared || !answer.filled || answer.resources != today.resources)) {
         commit.Adopt(std::move(built));
         DrawRecords::AddOnCommitter(Counter::CommitBuilt);
-    } else if (!verify) {
+        if (spaceBuilt) Graphics::NoteRecordHeavy(Graphics::RecordHeavyEvent::Adopted);
+    } else if (!compared) {
         DrawRecords::AddOnCommitter(Counter::CommitUnbuilt);
     }
 }

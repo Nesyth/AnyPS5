@@ -62,6 +62,24 @@ private:
     std::array<std::atomic<std::uint64_t>, Capacity * 3> slots{};
 };
 
+struct LabelRun {
+    struct Label {
+        std::uint64_t address = 0;
+        std::uint32_t offset = 0;
+        std::uint32_t size = 0;
+        std::uint32_t opcode = 0;
+        std::uint32_t cursor = 0;
+        bool stores = false;
+        std::optional<std::uint32_t> interrupt;
+    };
+    enum class Lookup : std::uint8_t { NotHeld, Value, Unknown };
+    std::vector<Label> labels;
+    std::vector<std::byte> bytes;
+
+    std::span<const std::byte> BytesOf(const Label& label) const { return std::span<const std::byte>(bytes).subspan(label.offset, label.size); }
+    Lookup Find(std::uint64_t address, std::size_t size, std::uint64_t& value) const;
+};
+
 class DrawPipeline {
 public:
     using Commit = std::function<void()>;
@@ -89,6 +107,7 @@ public:
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
     void Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
     void EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes);
+    void EnqueueLabelRun(Commit commit, std::vector<Range> writes, std::shared_ptr<const LabelRun> run);
     void EnqueueQuiet(Commit commit);
     void EnqueueKept(Commit commit, std::vector<Range> writes, std::vector<Range> reads, std::shared_ptr<const void> keep);
     static void NoteDrawKey(std::uint64_t key, std::uint64_t shape);
@@ -130,6 +149,7 @@ private:
         std::uint64_t order = 0;
         std::uint32_t parts = 1;
         std::shared_ptr<const void> keep;
+        std::shared_ptr<const LabelRun> labelRun;
     };
     DrawPipeline() = default;
     void enqueue(Item item);
@@ -207,6 +227,7 @@ public:
         std::vector<Range> writes;
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
+        std::shared_ptr<const LabelRun> labelRun;
     };
     enum class LabelLookup : std::uint8_t { NotHeld, Value, Unknown };
     struct DepositCounts {
@@ -373,6 +394,20 @@ private:
     std::uint64_t nextParkedReads = 1;
     std::atomic<std::uint32_t> parkedReadCount{0};
 };
+
+namespace LabelRunCensus {
+
+enum class Gap : std::uint8_t { First, Adjacent, Registers, Waits, Draws, Dispatches, Other, Far, Count };
+enum class End : std::uint8_t { SegmentEnd, Draw, Dispatch, Wait, Registers, Other, Unqueued, Interrupt, Check, Cap, Count };
+
+bool Enabled();
+void NoteQueued(Gap gap, std::uint32_t otherOpcode, bool item);
+void NoteRun(std::size_t packets, std::size_t items, End end, std::uint32_t otherOpcode);
+void NoteVerify(std::size_t packets, std::size_t differing);
+void NoteCommitted(DrawPipeline::CommitKind previous, bool first, std::uint32_t labels);
+std::string Take();
+
+}
 
 }
 

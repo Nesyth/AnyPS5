@@ -346,15 +346,27 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
     static std::array<std::uint64_t, 8> holdByCover{};
     static std::uint64_t flushes = 0, flushed = 0, absorbedFills = 0, absorbedBytes = 0;
     static auto fillReport = std::chrono::steady_clock::now();
+    static const bool fillStats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    static std::array<std::uint64_t, FillPhaseCount> statsPhaseNs{};
+    static std::uint64_t statsFills = 0, statsHeldNs = 0, statsWaitNs = 0;
+    static auto statsReport = std::chrono::steady_clock::now();
     ++fills;
     filledBytes += bytes;
     if (bytes == 0) return;
     const auto store = [this, queueId, base, bytes, pattern, localDevice, memoryValueFill, noteMetadata] {
+        const auto waitStart = fillStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         const auto holdStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         auto phaseStart = holdStart;
+        const auto statsStart = fillStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        auto statsAt = statsStart;
         const auto phase = [&](FillPhase which) {
+            if (fillStats) {
+                const auto now = std::chrono::steady_clock::now();
+                statsPhaseNs[which] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - statsAt).count());
+                statsAt = now;
+            }
             if (!profile) return;
             const auto now = std::chrono::steady_clock::now();
             fillPhaseMs[which] += std::chrono::duration<double, std::milli>(now - phaseStart).count();
@@ -457,6 +469,29 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
                 line += text;
             }
             std::fprintf(stderr, "[fill] %llu buffer fills (%.0f MiB), %llu stored by the CPU; hold phases ms (cumulative):%s; pre-store flushes %llu (%llu stored an image); stored on the GPU: uniform %llu (%.0f MiB), pattern %llu (%.0f MiB), chain copies %llu\n", static_cast<unsigned long long>(fills.load()), filledBytes.load() / 1048576.0, static_cast<unsigned long long>(cpuFills.load()), line.c_str(), static_cast<unsigned long long>(flushes), static_cast<unsigned long long>(flushed), static_cast<unsigned long long>(uniformFills), uniformBytes / 1048576.0, static_cast<unsigned long long>(patternFills), patternBytes / 1048576.0, static_cast<unsigned long long>(chainCopies));
+        }
+    }
+    if (fillStats) {
+        const auto now = std::chrono::steady_clock::now();
+        ++statsFills;
+        statsHeldNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - statsStart).count());
+        statsWaitNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(statsStart - waitStart).count());
+        if (now - statsReport > std::chrono::seconds(10)) {
+            statsReport = now;
+            const auto per = [](std::uint64_t ns) { return statsFills != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(statsFills) : 0.0; };
+            std::string line;
+            char text[64];
+            std::uint64_t phased = 0;
+            for (std::size_t i = 0; i < FillPhaseCount; ++i) {
+                phased += statsPhaseNs[i];
+                std::snprintf(text, sizeof(text), " %s %.2f,", fillPhaseNames[i], per(statsPhaseNs[i]));
+                line += text;
+            }
+            std::fprintf(stderr, "[fill-census] (10 s) %llu buffer fills under the GPU lock at %.1f us held each, %.1f us waiting for the lock; us per fill:%s notes %.2f\n", static_cast<unsigned long long>(statsFills), per(statsHeldNs), per(statsWaitNs), line.c_str(), per(statsHeldNs > phased ? statsHeldNs - phased : 0));
+            statsPhaseNs = {};
+            statsFills = 0;
+            statsHeldNs = 0;
+            statsWaitNs = 0;
         }
     }
     };

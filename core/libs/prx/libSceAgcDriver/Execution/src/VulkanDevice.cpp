@@ -82,6 +82,7 @@
 #else
 #include <unistd.h>
 #endif
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <atomic>
 #include <chrono>
 #include <charconv>
@@ -5208,7 +5209,7 @@ std::vector<std::uint32_t> VulkanDevice::DrawContentKey(const Graphics::State& g
     return Graphics::DrawResourceContentKey(state->context, graphics, draw, shaders);
 }
 
-Graphics::DrawRecipeOutcome VulkanDevice::DrawFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer, const Graphics::ShaderResources::PreparedBuffers* prepared, Graphics::PreparedInputs* preparedInputs, DrawFragment* fragment) {
+Graphics::DrawRecipeOutcome VulkanDevice::DrawFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer, const Graphics::ShaderResources::PreparedBuffers* prepared, Graphics::PreparedInputs* preparedInputs, DrawFragment* fragment, std::span<const Graphics::GuestMemorySnapshot> snapshots) {
     PerformanceTimer timing("Vulkan.DrawFromRecord");
     if (record.recipe == nullptr || record.recipe->device != state->device) {
         Graphics::DrawRecipeOutcome outcome;
@@ -5217,7 +5218,7 @@ Graphics::DrawRecipeOutcome VulkanDevice::DrawFromRecord(const Graphics::State& 
     }
     startJournalReplay();
     const auto context = graphicsContext();
-    return Graphics::DrawWithRecord(context, graphics, draw, shaders, record, trace, answer, prepared, preparedInputs, fragment);
+    return Graphics::DrawWithRecord(context, graphics, draw, shaders, record, trace, answer, prepared, preparedInputs, fragment, snapshots);
 }
 
 Graphics::ExpressOutcome VulkanDevice::ExpressFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const Graphics::ShaderResources::PreparedBuffers* prepared, Graphics::PreparedInputs* preparedInputs, DrawFragment* fragment, bool verifyDue) {
@@ -5350,9 +5351,26 @@ bool MovedWritesKey(std::span<const std::uint32_t> key) {
     return key.size() >= 4 && key[key.size() - 4] == MovedWritesKeyMarker && key[key.size() - 3] == key.size() - 4;
 }
 
+constexpr std::uint32_t BesideKeyMarker = 0x42534445u;
+
+bool BesideKey(std::span<const std::uint32_t> key) {
+    return key.size() >= 4 && key[key.size() - 4] == BesideKeyMarker && key[key.size() - 3] == key.size() - 4;
+}
+
+ResourceCache::Key BesideContentKey(const ResourceCache::Key& movable) {
+    if (movable.size() < 2) return movable;
+    ResourceCache::Key key(movable.begin(), movable.end() - 2);
+    const auto words = static_cast<std::uint32_t>(key.size());
+    key.push_back(BesideKeyMarker);
+    key.push_back(words);
+    key.push_back(movable[movable.size() - 2]);
+    key.push_back(movable[movable.size() - 1]);
+    return key;
+}
+
 bool RecipeKeyMatches(const Graphics::CompiledShader& shader, std::span<const std::uint32_t> key, VkDevice device) {
     const bool writes = MovedWritesKey(key);
-    const std::size_t trailing = writes ? 4u : 2u;
+    const std::size_t trailing = writes || BesideKey(key) ? 4u : 2u;
     const auto deviceHandle = reinterpret_cast<std::uint64_t>(device);
     if (!DispatchMove() || key.size() < trailing || key[key.size() - 2] != static_cast<std::uint32_t>(deviceHandle) || key[key.size() - 1] != static_cast<std::uint32_t>(deviceHandle >> 32u)) return false;
     return Graphics::ShaderResources::ContentKeyMatches(shader, key.first(key.size() - trailing), !TemplateDataRefresh(), true, writes);
@@ -5399,6 +5417,11 @@ struct PreparedDispatch {
     bool exact = false;
     bool movedWrites = false;
     bool writesKey = false;
+    bool writesRefused = false;
+    bool beside = false;
+    Graphics::ShaderResources::MoveRefusal writesRefusal = Graphics::ShaderResources::MoveRefusal::None;
+    std::uint8_t writesOverlap = 0;
+    std::uint8_t exactOverlap = 0;
     Graphics::ShaderResources::MoveRefusal refusal = Graphics::ShaderResources::MoveRefusal::None;
     // APS5_PROFILE_DRAW: stage A's time, added to the [dispatch] phase totals by the dispatch, and
     // the prepare's parts for the driver's 'prepare:' rows (PreparePhase order).
@@ -5816,6 +5839,278 @@ void ReportTemplateCensus() {
     if (movedRuns != 0) std::fprintf(stderr, "[dispatch-moved-runs] (10 s) %llu dispatches recorded through moved buffers could run beside other unordered dispatches (%llu with in-place written buffers): %llu took the template's ranges with each moved buffer's old range replaced by its moved one, %llu kept the template's ranges and added the moved ones (the template's regions are not its buffers' ranges); %llu joined an open run\n", movedRuns, movedRunsInPlace, movedRuns - movedRunsKept, movedRunsKept, movedRunsJoined);
 }
 
+bool CommitCensusOn() {
+    static const bool on = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return on;
+}
+
+bool CommitLeanOn() {
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchCommitLean);
+}
+
+std::int64_t SteadyNs() {
+    return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+using CommitStep = VulkanDevice::CommitStep;
+constexpr std::size_t CommitSteps = static_cast<std::size_t>(CommitStep::Count);
+constexpr std::array<const char*, CommitSteps> CommitStepNames{"prepare", "lock wait", "labels", "recipe key proof", "depth planes", "reap", "template proof", "moved overlay", "setup", "template resources", "pipeline", "record commands", "record keeps", "record refresh", "record bind and dispatch", "record marks", "record completion", "after the record", "notes"};
+enum class CommitRoute : std::uint8_t { Other, Recipe, RecipeMoves, Reused, ReusedReads, ReusedWrites, Built, Count };
+constexpr std::size_t CommitRoutes = static_cast<std::size_t>(CommitRoute::Count);
+constexpr std::array<const char*, CommitRoutes> CommitRouteNames{"other", "recipe hit", "recipe hit with moves", "template reused", "template reused with read-only moves", "template reused with written moves", "template built"};
+constexpr std::size_t CommitRebuilds = static_cast<std::size_t>(RecipeRebuild::Count);
+constexpr std::array<const char*, CommitRebuilds> CommitRebuildNames{"proof", "move refused", "device", "other", "key or buffer ranges"};
+
+struct CommitTrace {
+    bool active = false;
+    bool lean = false;
+    CommitRoute route = CommitRoute::Other;
+    std::uint8_t rebuild = 0xffu;
+    std::array<std::uint64_t, CommitSteps> ns{};
+};
+
+CommitTrace& CommitTraceOfThread() {
+    struct CommitTraceStorage {};
+    return HostThreadLocal<CommitTrace, CommitTraceStorage>();
+}
+
+CommitTrace* ActiveCommitTrace() {
+    if (!CommitCensusOn()) return nullptr;
+    auto& trace = CommitTraceOfThread();
+    return trace.active ? &trace : nullptr;
+}
+
+struct CommitLap {
+    CommitTrace* trace;
+    std::int64_t at;
+    explicit CommitLap(CommitTrace* traced) : trace(traced), at(traced != nullptr ? SteadyNs() : 0) {}
+    void Step(CommitStep step) {
+        if (trace == nullptr) return;
+        const auto now = SteadyNs();
+        trace->ns[static_cast<std::size_t>(step)] += static_cast<std::uint64_t>(now - at);
+        at = now;
+    }
+    void Skip() {
+        if (trace != nullptr) at = SteadyNs();
+    }
+    void Route(CommitRoute route) {
+        if (trace != nullptr) trace->route = route;
+    }
+};
+
+enum class BuildReason : std::size_t { NotCacheable, NoPrepare, WritesOff, WritesRefused, ExactRefused, RecordRefused, Proof, FirstSeen, KeyDiffers, SameNotMovable, SameBeside, SameExact, SameNotKept, SameRefused, SameGone, Count };
+constexpr std::size_t BuildReasons = static_cast<std::size_t>(BuildReason::Count);
+constexpr std::array<const char*, BuildReasons> BuildReasonNames{"not cacheable", "not prepared", "moved writes off", "movable-writes template refused at stage A", "movable template refused at stage A", "move refused at the record", "proof failed", "no movable-writes template: program first seen", "no movable-writes template: key differs from the program's last build", "no movable-writes template: same key as the program's last build, kept under the movable key as not movable", "no movable-writes template: same key as the program's last build, kept beside a refused one", "no movable-writes template: same key as the program's last build, kept under the exact key", "no movable-writes template: same key as the program's last build, not kept", "no movable-writes template: same key as the program's last build, insert refused", "no movable-writes template: same key as the program's last build, kept under it and gone"};
+constexpr std::size_t BuildDetails = 16;
+enum class BuildFate : std::uint8_t { UnderWrites, UnderMovable, UnderBeside, UnderExact, NotKept, InsertRefused };
+constexpr std::size_t MovedCounts = static_cast<std::size_t>(Graphics::ShaderResources::MovedCount::Count);
+
+struct ProgramBuild {
+    ResourceCache::Key form;
+    BuildFate fate = BuildFate::UnderWrites;
+    std::uint8_t detail = 0;
+};
+
+struct CommitCensusCounts {
+    std::array<std::atomic<std::uint64_t>, CommitRoutes> items{};
+    std::array<std::atomic<std::uint64_t>, CommitRoutes> itemNs{};
+    std::array<std::array<std::atomic<std::uint64_t>, CommitSteps>, CommitRoutes> stepNs{};
+    std::array<std::atomic<std::uint64_t>, CommitRebuilds> rebuilds{};
+    std::atomic<std::uint64_t> leanItems{0};
+    std::array<std::array<std::atomic<std::uint64_t>, BuildDetails>, BuildReasons> builds{};
+    std::atomic<std::uint64_t> besideInserted{0}, servedBeside{0}, servedMovable{0}, readsPlacedTemplate{0}, readsPlacedRecipe{0}, readsProvisional{0};
+    std::array<std::atomic<std::uint64_t>, MovedCounts + 1> readsRefused{};
+    std::atomic<std::int64_t> lastReport{0};
+    AgcDriver::Mutex programsMutex;
+    std::unordered_map<std::uint64_t, ProgramBuild> programs;
+};
+
+CommitCensusCounts& CommitCounts() {
+    static CommitCensusCounts counts;
+    return counts;
+}
+
+std::size_t RefusalDetail(Graphics::ShaderResources::MoveRefusal refusal, std::uint8_t overlap) {
+    if (refusal == Graphics::ShaderResources::MoveRefusal::Overlap && overlap >= 1 && overlap <= 4) return 10u + overlap;
+    return static_cast<std::size_t>(refusal);
+}
+
+const char* BuildDetailName(BuildReason reason, std::size_t detail) {
+    switch (reason) {
+        case BuildReason::WritesRefused:
+        case BuildReason::ExactRefused:
+        case BuildReason::RecordRefused: {
+            static constexpr std::array<const char*, 4> overlaps{"pending write: the template's own writes", "pending write: a recorded GPU write", "pending write: a storage image result", "pending write: a shadowed unit"};
+            if (detail >= 11 && detail <= 14) return overlaps[detail - 11];
+            if (detail == 0) return "thread-group shader data moved";
+            return detail < MoveRefusals ? Graphics::ShaderResources::MoveRefusalName(static_cast<Graphics::ShaderResources::MoveRefusal>(detail)) : "?";
+        }
+        case BuildReason::KeyDiffers: {
+            static constexpr std::array<const char*, 10> names{"layout", "buffer word 0", "buffer word 1", "buffer word 2", "buffer word 3", "image", "sampler", "shader data", "other", "draw target"};
+            return detail < names.size() ? names[detail] : "unlabelled";
+        }
+        case BuildReason::SameNotMovable:
+            return detail == 0 ? "moved writes off" : Graphics::ShaderResources::MovableWritesRefusalName(detail);
+        case BuildReason::SameNotKept:
+            return detail < NotReusableReasons ? NotReusableNames[detail] : "?";
+        default:
+            return nullptr;
+    }
+}
+
+BuildFate FateOfBuild(const Graphics::ShaderResources& resources, bool underWrites, bool underBeside, bool insertRefused, bool exactKey, bool movedWrites, std::uint8_t& detail) {
+    detail = 0;
+    if (!resources.Reusable()) {
+        detail = static_cast<std::uint8_t>(resources.NotReusableReason());
+        return BuildFate::NotKept;
+    }
+    if (insertRefused) return BuildFate::InsertRefused;
+    if (underWrites) return BuildFate::UnderWrites;
+    if (underBeside) return BuildFate::UnderBeside;
+    if (exactKey) return BuildFate::UnderExact;
+    if (movedWrites) detail = static_cast<std::uint8_t>(resources.MovableWritesRefusal());
+    return BuildFate::UnderMovable;
+}
+
+void NoteCommitBuild(std::uint64_t program, const Graphics::CompiledShader& shader, BuildReason reason, std::size_t detail, bool classify, BuildFate fate, std::uint8_t fateDetail, bool remember) {
+    auto& census = CommitCounts();
+    if (classify || remember) {
+        try {
+            auto form = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh(), true, true);
+            std::lock_guard lock(census.programsMutex);
+            const auto found = census.programs.find(program);
+            if (classify) {
+                if (found == census.programs.end()) {
+                    reason = BuildReason::FirstSeen;
+                    detail = 0;
+                } else if (found->second.form != form) {
+                    reason = BuildReason::KeyDiffers;
+                    Graphics::ContentKeyDiff diff{};
+                    static_cast<void>(Graphics::ShaderResources::DiffContentKeys(found->second.form, form, false, diff));
+                    detail = BuildDetails - 1;
+                    for (std::size_t component = 0; component < diff.size(); ++component) {
+                        if (!diff[component]) continue;
+                        detail = component;
+                        break;
+                    }
+                } else {
+                    detail = found->second.detail;
+                    switch (found->second.fate) {
+                        case BuildFate::UnderWrites: reason = BuildReason::SameGone; break;
+                        case BuildFate::UnderMovable: reason = BuildReason::SameNotMovable; break;
+                        case BuildFate::UnderBeside: reason = BuildReason::SameBeside; break;
+                        case BuildFate::UnderExact: reason = BuildReason::SameExact; break;
+                        case BuildFate::NotKept: reason = BuildReason::SameNotKept; break;
+                        case BuildFate::InsertRefused: reason = BuildReason::SameRefused; break;
+                    }
+                }
+            }
+            if (remember) {
+                if (found == census.programs.end() && census.programs.size() >= 4096) census.programs.clear();
+                census.programs[program] = ProgramBuild{std::move(form), fate, fateDetail};
+            }
+        } catch (const std::exception&) {
+        }
+    }
+    census.builds[static_cast<std::size_t>(reason)][std::min(detail, BuildDetails - 1)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteReadsInPlace(const Graphics::ShaderResources::MoveProof& proof, bool placed, bool recipe) {
+    if (!CommitCensusOn()) return;
+    auto& census = CommitCounts();
+    if (placed) {
+        if (proof.readsInPlace != 0) (recipe ? census.readsPlacedRecipe : census.readsPlacedTemplate).fetch_add(proof.readsInPlace, std::memory_order_relaxed);
+        return;
+    }
+    if (proof.refusal != Graphics::ShaderResources::MoveRefusal::Overlap || proof.overlap != 2) return;
+    if (!proof.guarded && proof.inPlace == Graphics::ShaderResources::MovedCount::Count) return;
+    census.readsRefused[proof.guarded ? MovedCounts : static_cast<std::size_t>(proof.inPlace)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void ReportCommitCensus() {
+    auto& census = CommitCounts();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = census.lastReport.load();
+    if (last == 0) {
+        census.lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !census.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    char item[384];
+    std::string routes;
+    unsigned long long items = 0, itemNs = 0;
+    for (std::size_t route = 0; route < CommitRoutes; ++route) {
+        const auto count = take(census.items[route]);
+        const auto ns = take(census.itemNs[route]);
+        std::array<unsigned long long, CommitSteps> steps{};
+        unsigned long long stepSum = 0;
+        for (std::size_t step = 0; step < CommitSteps; ++step) {
+            steps[step] = take(census.stepNs[route][step]);
+            stepSum += steps[step];
+        }
+        if (count == 0) continue;
+        items += count;
+        itemNs += ns;
+        const auto per = [&](unsigned long long value) { return static_cast<double>(value) / 1000.0 / static_cast<double>(count); };
+        std::snprintf(item, sizeof(item), "%s %s %llu at %.1f us (", routes.empty() ? "" : ";", CommitRouteNames[route], count, per(ns));
+        routes += item;
+        for (std::size_t step = 0; step < CommitSteps; ++step) {
+            if (steps[step] == 0) continue;
+            std::snprintf(item, sizeof(item), "%s %.2f, ", CommitStepNames[step], per(steps[step]));
+            routes += item;
+        }
+        std::snprintf(item, sizeof(item), "unattributed %.2f)", per(ns > stepSum ? ns - stepSum : 0));
+        routes += item;
+    }
+    std::string rebuilt;
+    for (std::size_t index = 0; index < CommitRebuilds; ++index) {
+        std::snprintf(item, sizeof(item), "%s%s %llu", index == 0 ? "" : ", ", CommitRebuildNames[index], take(census.rebuilds[index]));
+        rebuilt += item;
+    }
+    std::fprintf(stderr, "[dispatch-commit] (10 s, dispatch commit items, APS5_DISPATCH_COMMIT_LEAN %s) %llu items at %.1f us, by route, us per item and step:%s; recipe rebuilds (counted in the route they ended on): %s; items the switch changed %llu\n", CommitLeanOn() ? "set" : "unset", items, items != 0 ? static_cast<double>(itemNs) / 1000.0 / static_cast<double>(items) : 0.0, routes.empty() ? " none" : routes.c_str(), rebuilt.c_str(), take(census.leanItems));
+    std::string builds;
+    unsigned long long built = 0;
+    for (std::size_t reason = 0; reason < BuildReasons; ++reason) {
+        for (std::size_t detail = 0; detail < BuildDetails; ++detail) {
+            const auto count = take(census.builds[reason][detail]);
+            if (count == 0) continue;
+            built += count;
+            const auto* name = BuildDetailName(static_cast<BuildReason>(reason), detail);
+            if (name != nullptr) std::snprintf(item, sizeof(item), "%s %s (%s) %llu", builds.empty() ? "" : ",", BuildReasonNames[reason], name, count);
+            else std::snprintf(item, sizeof(item), "%s %s %llu", builds.empty() ? "" : ",", BuildReasonNames[reason], count);
+            builds += item;
+        }
+    }
+    std::string refused;
+    for (std::size_t index = 0; index <= MovedCounts; ++index) {
+        const auto count = take(census.readsRefused[index]);
+        if (count == 0) continue;
+        std::snprintf(item, sizeof(item), "%s %s %llu", refused.empty() ? "" : ",", index == MovedCounts ? "depth or multisample guards" : Graphics::ShaderResources::MovedCountName(static_cast<Graphics::ShaderResources::MovedCount>(index)), count);
+        refused += item;
+    }
+    const auto placedTemplate = take(census.readsPlacedTemplate);
+    const auto placedRecipe = take(census.readsPlacedRecipe);
+    const auto provisional = take(census.readsProvisional);
+    const auto beside = take(census.besideInserted);
+    const auto servedBeside = take(census.servedBeside);
+    const auto servedMovable = take(census.servedMovable);
+    std::fprintf(stderr, "[dispatch-commit-builds] (10 s, any thread) %llu templates built:%s; moved read-only buffers bound in place: template hits %llu, recipe hits %llu, taken at stage A for the record %llu; refused in place at the record:%s; templates kept beside a refused movable-writes template %llu; template hits after the movable-writes template was refused at stage A: through the beside key %llu, through the movable key %llu\n", built, builds.empty() ? " none" : builds.c_str(), placedTemplate, placedRecipe, provisional, refused.empty() ? " none" : refused.c_str(), beside, servedBeside, servedMovable);
+}
+
+void NoteCommitItem(const CommitTrace& trace, std::uint64_t ns) {
+    auto& census = CommitCounts();
+    const auto route = static_cast<std::size_t>(trace.route);
+    census.items[route].fetch_add(1, std::memory_order_relaxed);
+    census.itemNs[route].fetch_add(ns, std::memory_order_relaxed);
+    for (std::size_t step = 0; step < CommitSteps; ++step) {
+        if (trace.ns[step] != 0) census.stepNs[route][step].fetch_add(trace.ns[step], std::memory_order_relaxed);
+    }
+    if (trace.rebuild < CommitRebuilds) census.rebuilds[trace.rebuild].fetch_add(1, std::memory_order_relaxed);
+    if (trace.lean) census.leanItems.fetch_add(1, std::memory_order_relaxed);
+    ReportCommitCensus();
+}
+
 struct MovedWritesVerify {
     std::atomic<std::uint64_t> seen{0}, checked{0}, differing{0}, printed{0};
 };
@@ -5951,6 +6246,41 @@ struct DispatchTimer {
 
 }
 
+VulkanDevice::CommitTraceScope::CommitTraceScope() {
+    if (!CommitCensusOn()) return;
+    try {
+        auto& trace = CommitTraceOfThread();
+        trace = CommitTrace{};
+        trace.active = true;
+        on = true;
+        start = SteadyNs();
+        at = start;
+    } catch (const std::exception&) {
+        on = false;
+    }
+}
+
+VulkanDevice::CommitTraceScope::~CommitTraceScope() {
+    if (!on) return;
+    try {
+        auto& trace = CommitTraceOfThread();
+        trace.active = false;
+        NoteCommitItem(trace, static_cast<std::uint64_t>(SteadyNs() - start));
+    } catch (...) {
+    }
+}
+
+void VulkanDevice::CommitTraceScope::Step(CommitStep step) {
+    if (!on) return;
+    const auto now = SteadyNs();
+    CommitTraceOfThread().ns[static_cast<std::size_t>(step)] += static_cast<std::uint64_t>(now - at);
+    at = now;
+}
+
+void VulkanDevice::CommitTraceScope::Skip() {
+    if (on) at = SteadyNs();
+}
+
 struct RecordedDispatch {
     const Graphics::Context* context;
     const Graphics::CompiledShader* shader;
@@ -5984,6 +6314,7 @@ struct RecordedDispatch {
     std::vector<Graphics::ShaderResources::MovedBuffer> moved{};
     const ResourceCache::Key* key = nullptr;
     std::vector<Graphics::ShaderResources::MovedBuffer> readMoves{};
+    bool lean = false;
 };
 
 struct DispatchCompletion {
@@ -6005,6 +6336,7 @@ struct DispatchCompletion {
     std::vector<Graphics::ShaderResources::MovedBuffer> moved{};
     bool movesRecipe = false;
     std::vector<Graphics::ShaderResources::MovedBuffer> readMoves{};
+    bool lean = false;
 };
 
 namespace {
@@ -6054,6 +6386,37 @@ void verifyMovedWrites(const RecordedDispatch& record) {
     if (checked % 4096 == 0) std::fprintf(stderr, "[dispatch-moved-writes-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(verify.differing.load(std::memory_order_relaxed)));
 }
 
+void verifyCommitLean(const RecordedDispatch& record) {
+    static const std::uint64_t every = VerifyEvery("APS5_VERIFY_DISPATCH_COMMIT_LEAN");
+    if (every == 0 || !record.lean || record.resources == nullptr || record.shader == nullptr) return;
+    static std::atomic<std::uint64_t> seen{0}, checked{0}, differing{0}, printed{0};
+    if (seen.fetch_add(1, std::memory_order_relaxed) % every != 0) return;
+    std::vector<std::string> differences;
+    try {
+        const auto& moves = record.moved.empty() ? record.readMoves : record.moved;
+        if (record.bindings == nullptr || !moves.empty()) differences = record.resources->VerifyMovedWrites(*record.shader, moves);
+        if (record.key != nullptr) {
+            const bool writes = MovedWritesKey(*record.key);
+            const bool beside = BesideKey(*record.key);
+            auto live = DispatchContentKey(*record.shader, record.context->device, true, writes);
+            if (beside) live = BesideContentKey(live);
+            if (live != *record.key && (writes || beside || DispatchContentKey(*record.shader, record.context->device, false) != *record.key)) {
+                char text[192];
+                std::snprintf(text, sizeof(text), "the live key differs from the template's, first in %s (%zu words against %zu)", FirstKeyDifference(*record.key, live, writes || beside), live.size(), record.key->size());
+                differences.emplace_back(text);
+            }
+        }
+    } catch (const std::exception& error) {
+        differences.emplace_back(std::string("the check could not be made: ") + error.what());
+    }
+    const auto count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!differences.empty()) differing.fetch_add(1, std::memory_order_relaxed);
+    for (const auto& difference : differences) {
+        if (printed.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[dispatch-commit-lean-verify] program 0x%llx: %s\n", static_cast<unsigned long long>(record.programAddress), difference.c_str());
+    }
+    if (count % 4096 == 0) std::fprintf(stderr, "[dispatch-commit-lean-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differing.load(std::memory_order_relaxed)));
+}
+
 void verifyMovedRuns(const RecordedDispatch& record, std::span<const std::array<std::uint64_t, 3>> accesses) {
     static const std::uint64_t every = VerifyEvery("APS5_VERIFY_DISPATCH_MOVED_RUNS");
     if (every == 0 || record.resources == nullptr || record.shader == nullptr) return;
@@ -6083,6 +6446,7 @@ void verifyMovedRecipe(const Recipe& recipe, const Graphics::CompiledShader& sha
     bool made = true;
     try {
         live = DispatchContentKey(shader, recipe.device, true, writes);
+        if (BesideKey(recipe.key)) live = BesideContentKey(live);
     } catch (const std::exception&) {
         made = false;
     }
@@ -6091,7 +6455,7 @@ void verifyMovedRecipe(const Recipe& recipe, const Graphics::CompiledShader& sha
         differing.fetch_add(1, std::memory_order_relaxed);
         if (printed.fetch_add(1, std::memory_order_relaxed) < 16) {
             if (!made) std::fprintf(stderr, "[dispatch-moved-recipes-verify] program 0x%llx: the live key could not be made\n", static_cast<unsigned long long>(program));
-            else std::fprintf(stderr, "[dispatch-moved-recipes-verify] program 0x%llx: the live key differs from the recipe's, first in %s (%zu words against %zu)\n", static_cast<unsigned long long>(program), FirstKeyDifference(recipe.key, live, writes), live.size(), recipe.key.size());
+            else std::fprintf(stderr, "[dispatch-moved-recipes-verify] program 0x%llx: the live key differs from the recipe's, first in %s (%zu words against %zu)\n", static_cast<unsigned long long>(program), FirstKeyDifference(recipe.key, live, writes || BesideKey(recipe.key)), live.size(), recipe.key.size());
         }
     }
     if (count % 4096 == 0) std::fprintf(stderr, "[dispatch-moved-recipes-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differing.load(std::memory_order_relaxed)));
@@ -6362,6 +6726,7 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         prepared->phaseMs[which] += std::chrono::duration<double, std::milli>(now - phaseStart).count();
         phaseStart = now;
     };
+    const bool lean = CommitLeanOn();
     if (!htileClear.has_value() && ResourceCacheEnabled() && shader.PipelineVariantId() != 0) {
         prepared->movedWrites = DispatchMovedWritesOn();
         if (prepared->movedWrites) {
@@ -6369,10 +6734,14 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
             cached = state->resourceCache.Find(prepared->key);
             if (cached != nullptr) {
                 Graphics::ShaderResources::MoveProof proof;
-                if (cached->MovedDispatchBuffers(compute, nullptr, DispatchMoveBytes(), proof, true).has_value()) {
+                if (cached->MovedDispatchBuffers(compute, nullptr, DispatchMoveBytes(), proof, true, lean).has_value()) {
                     prepared->writesKey = true;
+                    if (proof.readsInPlace != 0 && CommitCensusOn()) CommitCounts().readsProvisional.fetch_add(proof.readsInPlace, std::memory_order_relaxed);
                 } else {
                     DispatchMoves().filtered[static_cast<std::size_t>(proof.refusal)].fetch_add(1, std::memory_order_relaxed);
+                    prepared->writesRefused = true;
+                    prepared->writesRefusal = proof.refusal;
+                    prepared->writesOverlap = proof.overlap;
                     cached = nullptr;
                 }
             }
@@ -6380,15 +6749,27 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         if (!prepared->writesKey) {
             prepared->key = DispatchContentKey(compute, context.device);
             phase(PreparedDispatch::PrepareKey);
-            cached = state->resourceCache.Find(prepared->key);
+            if (prepared->writesRefused && lean) {
+                auto beside = BesideContentKey(prepared->key);
+                cached = state->resourceCache.Find(beside);
+                if (cached != nullptr) {
+                    prepared->key = std::move(beside);
+                    prepared->beside = true;
+                }
+            }
+            if (!prepared->beside) cached = state->resourceCache.Find(prepared->key);
             if (cached != nullptr && DispatchMove()) {
                 Graphics::ShaderResources::MoveProof proof;
-                if (!cached->MovedDispatchBuffers(compute, nullptr, DispatchMoveBytes(), proof).has_value()) {
+                if (!cached->MovedDispatchBuffers(compute, nullptr, DispatchMoveBytes(), proof, false, lean).has_value()) {
                     DispatchMoves().filtered[static_cast<std::size_t>(proof.refusal)].fetch_add(1, std::memory_order_relaxed);
                     prepared->refusal = proof.refusal;
+                    prepared->exactOverlap = proof.overlap;
                     prepared->key = DispatchContentKey(compute, context.device, false);
                     prepared->exact = true;
+                    prepared->beside = false;
                     cached = state->resourceCache.Find(prepared->key);
+                } else if (proof.readsInPlace != 0 && CommitCensusOn()) {
+                    CommitCounts().readsProvisional.fetch_add(proof.readsInPlace, std::memory_order_relaxed);
                 }
             }
         } else {
@@ -6450,7 +6831,7 @@ std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<con
         counters.precheckMisses[reason].fetch_add(1, std::memory_order_relaxed);
         return std::shared_ptr<RecipeHit>{};
     };
-    if (!DispatchRecipes() || recipe == nullptr || (recipe->moves && !DispatchMovedRecipesOn())) return miss(MissNoRecipe);
+    if (!DispatchRecipes() || recipe == nullptr || (recipe->moves && !DispatchMovedRecipesOn()) || (BesideKey(recipe->key) && !CommitLeanOn())) return miss(MissNoRecipe);
     if (recipe->device != state->device) return miss(MissDevice);
     auto hit = std::make_shared<RecipeHit>();
     hit->recipe = recipe;
@@ -6559,6 +6940,7 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
 }
 
 void VulkanDevice::recordDispatch(RecordedDispatch& record) {
+    CommitLap traceLap(ActiveCommitTrace());
     auto& d = Dispatches();
     auto& recorder = *state->recorder;
     auto& timer = *record.timer;
@@ -6637,6 +7019,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         if (overlapped) counts.movedRunsJoined.fetch_add(1, std::memory_order_relaxed);
     }
     recordStep(PhaseRecordCommands);
+    traceLap.Step(CommitStep::Commands);
     recorder.Keep(record.objects);
     if (record.resources != nullptr) record.resources->KeepStorageImageBytes(recorder);
     recorder.Keep(record.resources);
@@ -6648,6 +7031,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
     }
     recordStep(PhaseRecordKeeps);
+    traceLap.Step(CommitStep::Keeps);
     if (resources.HeapStage()) {
         if (record.threadGroup != std::array<std::uint32_t, 3>{}) resources.forgetShaderDataWords(*record.shader);
         resources.RefreshHeapStage(std::span<const Graphics::CompiledShader>(record.shader, 1));
@@ -6670,6 +7054,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
         recordStep(PhaseRecordDataRefresh);
     }
+    traceLap.Step(CommitStep::Refresh);
     std::shared_ptr<Graphics::Buffer> threadArguments;
     if (record.threadGroup != std::array<std::uint32_t, 3>{}) {
         const auto [data, dataOffset] = resources.shaderDataLocation(*record.shader, record.bindings.get());
@@ -6890,6 +7275,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.MarkCovered(dispatchedAccess);
     }
     recordStep(PhaseRecordBind);
+    traceLap.Step(CommitStep::Bind);
     if (record.htileClear.has_value()) Graphics::ArmHtileDepthClear(record.htileClear->first, record.htileClear->second);
     if (movedInPlace) {
         resources.MarkGpuWrites(recorder, record.moved);
@@ -6899,12 +7285,14 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         Graphics::NoteHtileWriter_nid_no_patch(record.htileClear.has_value() ? "recognised HTILE clear dispatch" : "dispatch", record.programAddress, resources.GpuWrites());
     }
     verifyMovedWrites(record);
+    verifyCommitLean(record);
     if (record.htileClear.has_value()) {
         Graphics::QueueHtileDepthClear(record.htileClear->first, record.htileClear->second);
         const Graphics::Recorder::WriterScope writerScope{Graphics::Recorder::WriterTag(8)};
         recorder.NotePendingWrite(record.htileClear->first, record.htileClear->second);
     }
     recordStep(PhaseRecordMarks);
+    traceLap.Step(CommitStep::Marks);
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
     // the batch can signal its labels from the GPU.
     const bool completionNeeded = resources.NeedsCompletion() || record.htileClear.has_value();
@@ -6931,6 +7319,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
     }
     recordStep(PhaseRecordCompletion);
+    traceLap.Step(CommitStep::Completion);
 }
 
 std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout, std::span<const std::uint32_t> layoutKey, VkShaderStageFlags pushStages, std::uint64_t programAddress) {
@@ -7069,9 +7458,11 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, const std::vector<ShaderRecompiler::RegisteredImageView>* registeredImageViews) {
+    CommitLap lap(ActiveCommitTrace());
     const Graphics::Recorder::WriterScope writerScope{Graphics::Recorder::WriterTag(1, programAddress)};
     startJournalReplay();
     FlushBufferDepthPlanes(shader);
+    lap.Step(CommitStep::Planes);
     state->recorder->BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     PerformanceTimer timing("Vulkan.Dispatch");
@@ -7118,6 +7509,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     enum class BuildWhy { NoTemplate, StageA, Record, Proof };
     auto buildWhy = BuildWhy::NoTemplate;
     auto recordRefusal = Graphics::ShaderResources::MoveRefusal::None;
+    std::uint8_t recordOverlap = 0;
+    bool leanRecord = false;
     int reusedMoves = 0;
     std::vector<Graphics::ShaderResources::MovedBuffer> movedList;
     std::vector<Graphics::ShaderResources::MovedBuffer> readMoveList;
@@ -7194,17 +7587,35 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             timer.callMs[PhaseResourcesAUnlocked] += prepared->prepareMs;
             d.phaseTotals[PhaseResourcesAUnlocked] += prepared->prepareMs;
         }
+        const bool besideRefused = prepared->writesRefused && CommitLeanOn();
+        bool insertRefused = false;
         if (cacheable) {
             ++d.cacheMisses;
             if (prepared->exact) noteRefusalBuild(resources->Reusable());
-            if (prepared->movedWrites && !prepared->exact && resources->MovableWrites()) contentKey = DispatchContentKey(shaders[0], context.device, true, true);
-            if (resources->Reusable()) insert();
+            if (prepared->movedWrites && !prepared->exact && !besideRefused && resources->MovableWrites()) contentKey = DispatchContentKey(shaders[0], context.device, true, true);
+            if (besideRefused && !prepared->exact && !BesideKey(contentKey)) contentKey = BesideContentKey(contentKey);
+            if (resources->Reusable()) {
+                if (CommitCensusOn()) insertRefused = !resources->HasCachedStorageImages() || resources->HoldsReleasedTexture();
+                insert();
+            }
         }
         if (census) {
             if (!cacheable) TemplateCensus().builtNotCacheable.fetch_add(1, std::memory_order_relaxed);
             else if (prepared->exact) TemplateCensus().refusedStageA[static_cast<std::size_t>(prepared->refusal)].fetch_add(1, std::memory_order_relaxed);
             else TemplateCensus().builtNoTemplate[static_cast<std::size_t>(ClassifyTemplateBuild(programAddress, shaders[0]))].fetch_add(1, std::memory_order_relaxed);
             NoteBuiltTemplate(*resources);
+        }
+        if (CommitCensusOn()) {
+            if (!cacheable) {
+                NoteCommitBuild(programAddress, shaders[0], BuildReason::NotCacheable, 0, false, BuildFate::NotKept, 0, false);
+            } else {
+                const auto reason = prepared->exact ? BuildReason::ExactRefused : prepared->writesRefused ? BuildReason::WritesRefused : !prepared->movedWrites ? BuildReason::WritesOff : BuildReason::FirstSeen;
+                const auto detail = prepared->exact ? RefusalDetail(prepared->refusal, prepared->exactOverlap) : prepared->writesRefused ? RefusalDetail(prepared->writesRefusal, prepared->writesOverlap) : std::size_t{0};
+                std::uint8_t fateDetail = 0;
+                const auto fate = FateOfBuild(*resources, MovedWritesKey(contentKey), BesideKey(contentKey), insertRefused, prepared->exact, prepared->movedWrites, fateDetail);
+                NoteCommitBuild(programAddress, shaders[0], reason, detail, reason == BuildReason::FirstSeen, fate, fateDetail, true);
+                if (BesideKey(contentKey) && resources->Reusable()) CommitCounts().besideInserted.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     } else if (cacheable) {
         // PrepareDispatch made the key already when it found the cached object, and carries the
@@ -7222,7 +7633,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                 if (DispatchMove() && !exactEntry) {
                     auto& moves = DispatchMoves();
                     Graphics::ShaderResources::MoveProof proof;
-                    auto moved = cached->MovedDispatchBuffers(shaders[0], state->recorder.get(), DispatchMoveBytes(), proof, writesEntry);
+                    auto moved = cached->MovedDispatchBuffers(shaders[0], state->recorder.get(), DispatchMoveBytes(), proof, writesEntry, CommitLeanOn());
                     moves.checked.fetch_add(1, std::memory_order_relaxed);
                     if (moved.has_value() && threadGroup != std::array<std::uint32_t, 3>{}) {
                         const auto data = cached->shaderDataAllocation(shaders[0]);
@@ -7240,6 +7651,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                         usable = false;
                         moves.refused[static_cast<std::size_t>(proof.refusal)].fetch_add(1, std::memory_order_relaxed);
                         recordRefusal = proof.refusal;
+                        recordOverlap = proof.overlap;
+                        NoteReadsInPlace(proof, false, false);
                     } else if (moved->empty()) {
                         moves.exact.fetch_add(1, std::memory_order_relaxed);
                     } else {
@@ -7247,7 +7660,9 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                         moves.buffers.fetch_add(proof.buffers, std::memory_order_relaxed);
                         moves.bytes.fetch_add(proof.bytes, std::memory_order_relaxed);
                         noteDispatchMoveSize(proof.bytes);
-                        if (proof.written != 0) movedList = std::move(*moved);
+                        NoteReadsInPlace(proof, true, false);
+                        if (proof.readsInPlace != 0) leanRecord = true;
+                        if (proof.written != 0 || proof.readsInPlace != 0) movedList = std::move(*moved);
                         else if (DispatchMovedWritesOn()) readMoveList = std::move(*moved);
                         reusedMoves = proof.written != 0 ? 2 : 1;
                     }
@@ -7272,6 +7687,10 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                     resources = std::move(cached);
                     fromCache = true;
                     ++d.cacheHits;
+                    if (!refusedMove && !exactEntry && prepared != nullptr && prepared->writesRefused) {
+                        if (prepared->beside) leanRecord = true;
+                        if (CommitCensusOn()) (prepared->beside ? CommitCounts().servedBeside : CommitCounts().servedMovable).fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             } else {
                 buildWhy = BuildWhy::Proof;
@@ -7291,11 +7710,17 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         const auto buildStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         resources = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, false, prepared != nullptr ? prepared->dispatchThreads : 0, htileClear);
         if (profile) timer.add(PhaseResourcesFullBuild, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildStart).count());
+        const bool besideRefused = prepared != nullptr && prepared->writesRefused && CommitLeanOn();
+        bool insertRefused = false;
         if (cacheable) {
             ++d.cacheMisses;
             if (refusedMove) noteRefusalBuild(resources->Reusable());
-            if (prepared != nullptr && prepared->movedWrites && !refusedMove && !prepared->exact) contentKey = DispatchContentKey(shaders[0], context.device, true, resources->MovableWrites());
-            if (resources->Reusable()) insert();
+            if (prepared != nullptr && prepared->movedWrites && !refusedMove && !prepared->exact && !besideRefused) contentKey = DispatchContentKey(shaders[0], context.device, true, resources->MovableWrites());
+            if (besideRefused && !refusedMove && !prepared->exact && !BesideKey(contentKey)) contentKey = BesideContentKey(contentKey);
+            if (resources->Reusable()) {
+                if (CommitCensusOn()) insertRefused = !resources->HasCachedStorageImages() || resources->HoldsReleasedTexture();
+                insert();
+            }
         }
         if (census) {
             auto& counts = TemplateCensus();
@@ -7306,6 +7731,34 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             else counts.builtNoTemplate[static_cast<std::size_t>(ClassifyTemplateBuild(programAddress, shaders[0]))].fetch_add(1, std::memory_order_relaxed);
             NoteBuiltTemplate(*resources);
         }
+        if (CommitCensusOn()) {
+            if (!cacheable) {
+                NoteCommitBuild(programAddress, shaders[0], BuildReason::NotCacheable, 0, false, BuildFate::NotKept, 0, false);
+            } else {
+                auto reason = BuildReason::FirstSeen;
+                std::size_t detail = 0;
+                if (buildWhy == BuildWhy::Record) {
+                    reason = BuildReason::RecordRefused;
+                    detail = RefusalDetail(recordRefusal, recordOverlap);
+                } else if (buildWhy == BuildWhy::Proof) {
+                    reason = BuildReason::Proof;
+                } else if (buildWhy == BuildWhy::StageA) {
+                    reason = BuildReason::ExactRefused;
+                    detail = prepared != nullptr ? RefusalDetail(prepared->refusal, prepared->exactOverlap) : 0;
+                } else if (prepared == nullptr) {
+                    reason = BuildReason::NoPrepare;
+                } else if (prepared->writesRefused) {
+                    reason = BuildReason::WritesRefused;
+                    detail = RefusalDetail(prepared->writesRefusal, prepared->writesOverlap);
+                } else if (!prepared->movedWrites) {
+                    reason = BuildReason::WritesOff;
+                }
+                std::uint8_t fateDetail = 0;
+                const auto fate = FateOfBuild(*resources, MovedWritesKey(contentKey), BesideKey(contentKey), insertRefused, refusedMove || (prepared != nullptr && prepared->exact), prepared != nullptr && prepared->movedWrites, fateDetail);
+                NoteCommitBuild(programAddress, shaders[0], reason, detail, reason == BuildReason::FirstSeen, fate, fateDetail, true);
+                if (BesideKey(contentKey) && resources->Reusable()) CommitCounts().besideInserted.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     } else if (census && fromCache) {
         auto& counts = TemplateCensus();
         (reusedMoves == 2 ? counts.reusedWritten : reusedMoves == 1 ? counts.reusedReadOnly : counts.reusedExact).fetch_add(1, std::memory_order_relaxed);
@@ -7314,6 +7767,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         TemplateCensus().commits.fetch_add(1, std::memory_order_relaxed);
         ReportTemplateCensus();
     }
+    lap.Route(fromCache ? (reusedMoves == 2 ? CommitRoute::ReusedWrites : reusedMoves == 1 ? CommitRoute::ReusedReads : CommitRoute::Reused) : CommitRoute::Built);
     resources->PatchPushConstants(pushBytes);
     if (profile) timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     // The lookup outcomes of this call: rows with counts on the [indirect] line, and a summary for
@@ -7337,6 +7791,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     timing.Mark("shader_resources");
     timer.phase(PhaseResources);
+    lap.Step(CommitStep::Resources);
     static const bool verifySetLayouts = std::getenv("APS5_VERIFY_SET_LAYOUTS") != nullptr;
     if (verifySetLayouts && objects != nullptr) require(objects->resourcesLayout == resources->Layout(), "the resident compute pipeline's set layout differs from the dispatch's");
     if (objects == nullptr) {
@@ -7349,15 +7804,18 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         objects = computePipeline(context, shader, layouts.main, layouts.mainKey, pushStages, programAddress);
         timing.Mark("pipeline_create");
         timer.phase(PhasePipeline);
+        lap.Step(CommitStep::Pipeline);
     }
     DispatchCompletion completion{context, shaders, pushStages, pushBytes, objects, resources, contentKey, cacheable, fromCache, revalidateMs, overlay, lookupsBefore, timer, timing, groupsText};
     completion.moved = std::move(movedList);
     completion.readMoves = std::move(readMoveList);
     completion.movesRecipe = overlay != nullptr && DispatchMovedRecipesOn();
+    completion.lean = leanRecord;
     return recordCompletedDispatch(shader, x, y, z, arguments, programAddress, recipeOut, threadGroup, htileClear, completion);
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, DispatchCompletion& completion) {
+    CommitLap lap(ActiveCommitTrace());
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto& context = completion.context;
     const auto& shaders = completion.shaders;
@@ -7385,10 +7843,14 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     record.key = &contentKey;
     record.moved = std::move(completion.moved);
     record.readMoves = std::move(completion.readMoves);
+    record.lean = completion.lean;
+    if (lap.trace != nullptr && record.lean) lap.trace->lean = true;
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
+    lap.Step(CommitStep::Setup);
     recordDispatch(record);
+    lap.Skip();
     timing.Mark("command_record");
     timer.phase(PhaseRecord);
     APS5_LOG_OUT_DEBUG("Dispatch recorded groups=%s", groupsText);
@@ -7457,11 +7919,13 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
         recipe->holdsLease = resources->HoldsLease();
         *recipeOut = std::move(recipe);
     }
+    lap.Step(CommitStep::Attach);
     timer.finish(lookupsBefore, groupsText, indirect);
     return outcome;
 }
 
 RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify, bool refreshByWords, const std::array<std::uint32_t, 3>& threadGroup) {
+    CommitLap lap(ActiveCommitTrace());
     const Graphics::Recorder::WriterScope writerScope{Graphics::Recorder::WriterTag(1, programAddress)};
     state->recorder->BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
@@ -7479,6 +7943,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     const bool census = DispatchCensus();
     const auto rebuild = [&](RecipeRebuild why) {
         if (census) TemplateCensus().recipeRebuilds[static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+        if (lap.trace != nullptr && lap.trace->rebuild == 0xffu) lap.trace->rebuild = static_cast<std::uint8_t>(why);
         return RecipeOutcome::Rebuild;
     };
     // Without the refresh the template holds the words it was keyed with: a data-only hit takes
@@ -7494,14 +7959,18 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         counters.rebuildDevice.fetch_add(1, std::memory_order_relaxed);
         return rebuild(RecipeRebuild::Device);
     }
+    lap.Step(CommitStep::Setup);
     if (recipe.moves) {
         if (!RecipeKeyMatches(shaders[0], recipe.key, state->device)) return rebuild(RecipeRebuild::Key);
+        lap.Step(CommitStep::Key);
         FlushBufferDepthPlanes(shader);
+        lap.Step(CommitStep::Planes);
     }
     if (hit->presyncSerial != 0) {
         timer.restart();
         ReapRecorded(hit->presyncSerial);
         timer.phase(PhaseReap);
+        lap.Step(CommitStep::Reap);
     }
     if (verify != nullptr) {
         // APS5_VERIFY_RECIPE=1: the ordinary path's answers beside the recipe's. The found object
@@ -7537,6 +8006,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         }
         counters.verified.fetch_add(1, std::memory_order_relaxed);
     }
+    lap.Step(CommitStep::Setup);
     // The proof (rules R6/R7): the template's Revalidate, T1 included; a failure removes the
     // template from the cache (the batch keeps it) and the caller rebuilds.
     const auto waitedBefore = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
@@ -7548,6 +8018,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     }
     timer.phase(PhaseProof);
+    lap.Step(CommitStep::Proof);
     if (!proved) {
         state->resourceCache.Remove(recipe.key, hit->resources.get());
         ++d.cacheInvalidated;
@@ -7560,9 +8031,10 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     std::vector<Graphics::ShaderResources::MovedBuffer> moved;
     std::shared_ptr<Graphics::ShaderResources::DrawBindings> overlay;
     std::array<std::byte, Graphics::PipelinePushConstantBytes> livePush{};
+    bool leanRecord = BesideKey(recipe.key);
     if (recipe.moves) {
         Graphics::ShaderResources::MoveProof proof;
-        auto found = hit->resources->MovedDispatchBuffers(shaders[0], state->recorder.get(), DispatchMoveBytes(), proof, DispatchMovedWritesOn() && MovedWritesKey(recipe.key));
+        auto found = hit->resources->MovedDispatchBuffers(shaders[0], state->recorder.get(), DispatchMoveBytes(), proof, DispatchMovedWritesOn() && MovedWritesKey(recipe.key), CommitLeanOn());
         if (found.has_value() && threadGroup != std::array<std::uint32_t, 3>{}) {
             const auto data = hit->resources->shaderDataAllocation(shaders[0]);
             if (data.has_value() && std::ranges::any_of(*found, [&](const Graphics::ShaderResources::MovedBuffer& entry) { return entry.allocation == *data; })) found.reset();
@@ -7572,12 +8044,18 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
             if (overlay != nullptr && overlay->allocation.set == VK_NULL_HANDLE && !hit->resources->HeapStage()) overlay.reset();
             if (overlay == nullptr) found.reset();
         }
-        if (!found.has_value()) return rebuild(RecipeRebuild::MoveRefused);
+        if (!found.has_value()) {
+            NoteReadsInPlace(proof, false, true);
+            return rebuild(RecipeRebuild::MoveRefused);
+        }
+        NoteReadsInPlace(proof, true, true);
+        if (proof.readsInPlace != 0) leanRecord = true;
         moved = std::move(*found);
         livePush = Graphics::AssemblePushConstants(shaders);
         hit->resources->PatchPushConstants(livePush);
         verifyMovedRecipe(recipe, shaders[0], programAddress);
     }
+    lap.Step(CommitStep::Overlay);
     const bool writesKey = MovedWritesKey(recipe.key);
     bool keyProved = recipe.moves && writesKey;
     if (writesKey && !recipe.moves && verify == nullptr && TemplateDataRefresh() && (refreshByWords || hit->resources->DataWordsHash() != recipe.dataWordsHash)) {
@@ -7600,10 +8078,13 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     record.bindings = overlay;
     record.moved = std::move(moved);
     record.key = &recipe.key;
+    record.lean = leanRecord;
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
+    lap.Step(CommitStep::Setup);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     recordDispatch(record);
+    lap.Skip();
     if (profile) counters.recordNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - recordStart).count()), std::memory_order_relaxed);
     timing.Mark("command_record");
     timer.phase(PhaseRecord);
@@ -7626,6 +8107,9 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     WatchMemory(programAddress);
     timer.finish(lookupsBefore, groupsText, indirect);
     if (profile) reportRecipes();
+    lap.Step(CommitStep::Setup);
+    lap.Route(recipe.moves ? CommitRoute::RecipeMoves : CommitRoute::Recipe);
+    if (lap.trace != nullptr && record.lean) lap.trace->lean = true;
     return RecipeOutcome::Recorded;
 }
 

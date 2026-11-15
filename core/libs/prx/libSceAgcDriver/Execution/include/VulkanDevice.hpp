@@ -368,6 +368,21 @@ public:
     enum class RecipeKind : std::size_t { Dispatch, Indirect, Draw };
     static void NoteRecipe(RecipeEvent event, bool indirect);
     static void NoteRecipe(RecipeEvent event, RecipeKind kind);
+    enum class CommitStep : std::size_t { Prepare, Lock, Labels, Key, Planes, Reap, Proof, Overlay, Setup, Resources, Pipeline, Commands, Keeps, Refresh, Bind, Marks, Completion, Attach, Notes, Count };
+    class CommitTraceScope {
+    public:
+        CommitTraceScope();
+        ~CommitTraceScope();
+        CommitTraceScope(const CommitTraceScope&) = delete;
+        CommitTraceScope& operator=(const CommitTraceScope&) = delete;
+        void Step(CommitStep step);
+        void Skip();
+
+    private:
+        bool on = false;
+        std::int64_t start = 0;
+        std::int64_t at = 0;
+    };
     enum class DrawRecipePrecheck : std::size_t { NoRecipe, Device };
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
     using DrawTraceContext = Graphics::DrawTraceContext;
@@ -375,7 +390,7 @@ public:
     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
     void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0, const std::vector<std::uint32_t>* contentKey = nullptr, const std::uint32_t* fragmentOutputs = nullptr, bool recordRecipe = false);
-    Graphics::DrawRecipeOutcome DrawFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace = nullptr, DrawCommitView* answer = nullptr, const Graphics::ShaderResources::PreparedBuffers* prepared = nullptr, Graphics::PreparedInputs* preparedInputs = nullptr, DrawFragment* fragment = nullptr);
+    Graphics::DrawRecipeOutcome DrawFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace = nullptr, DrawCommitView* answer = nullptr, const Graphics::ShaderResources::PreparedBuffers* prepared = nullptr, Graphics::PreparedInputs* preparedInputs = nullptr, DrawFragment* fragment = nullptr, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
     Graphics::ExpressOutcome ExpressFromRecord(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const Graphics::ShaderResources::PreparedBuffers* prepared, Graphics::PreparedInputs* preparedInputs, DrawFragment* fragment, bool verifyDue);
     bool ExpressFollow(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const Graphics::ShaderResources::PreparedBuffers& prepared, Graphics::PreparedInputs& preparedInputs, DrawFragment& fragment);
     bool RecordDrawFragment(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, const DrawFragmentBlock& block, const Graphics::ShaderResources::PreparedBuffers& prepared, const Graphics::PreparedInputs& inputs, DrawFragment& out, DrawFragmentRefusal& refusal) const;

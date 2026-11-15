@@ -684,10 +684,16 @@ public:
         std::size_t buffers = 0;
         std::size_t bytes = 0;
         std::size_t written = 0;
+        std::uint8_t overlap = 0;
+        MovedCount inPlace = MovedCount::Count;
+        bool guarded = false;
+        std::size_t readsInPlace = 0;
     };
     static const char* MoveRefusalName(MoveRefusal refusal);
-    std::optional<std::vector<MovedBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof, bool writes = false) const;
+    std::optional<std::vector<MovedBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof, bool writes = false, bool readsInPlace = false) const;
     bool MovableWrites() const;
+    std::size_t MovableWritesRefusal() const;
+    static const char* MovableWritesRefusalName(std::size_t refusal);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> MovedGpuWrites(std::span<const MovedBuffer> moved) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> MovedInPlaceReads(std::span<const MovedBuffer> moved) const;
     std::vector<std::string> VerifyMovedWrites(const CompiledShader& shader, std::span<const MovedBuffer> moved) const;

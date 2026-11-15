@@ -225,6 +225,54 @@ std::uint64_t everyFrom(const char* name) {
     return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
 }
 
+constexpr std::size_t LabelRunCap = 32;
+constexpr std::size_t NoQueuedLabel = static_cast<std::size_t>(-1);
+
+bool releasesInterrupt(std::span<const std::uint32_t> packet, std::uint32_t opcode) {
+    if (opcode != 0x49 || packet.size() < 3) return false;
+    const auto select = (packet[2] >> 24u) & 7u;
+    return select != 0 && select != 3;
+}
+
+std::pair<LabelRunCensus::Gap, std::uint32_t> labelGap(const std::vector<LeanPacket>& packets, std::size_t previous, std::size_t index) {
+    using Gap = LabelRunCensus::Gap;
+    if (previous == NoQueuedLabel || previous >= index) return {Gap::First, 0u};
+    if (previous + 1 == index) return {Gap::Adjacent, 0u};
+    if (index - previous - 1 > 32) return {Gap::Far, 0u};
+    bool draws = false;
+    bool dispatches = false;
+    bool waits = false;
+    bool other = false;
+    std::uint32_t otherOpcode = 0;
+    for (auto at = previous + 1; at < index; ++at) {
+        const auto& between = packets[at];
+        if (between.Has(LeanPacket::Draw)) {
+            draws = true;
+        } else if (between.opcode == 0x15 || between.opcode == 0x16) {
+            dispatches = true;
+        } else if (between.Has(LeanPacket::Wait) || between.Has(LeanPacket::RenderingWait)) {
+            waits = true;
+        } else if (!between.Has(LeanPacket::Plain)) {
+            if (!other) otherOpcode = between.opcode;
+            other = true;
+        }
+    }
+    if (draws) return {Gap::Draws, 0u};
+    if (dispatches) return {Gap::Dispatches, 0u};
+    if (other) return {Gap::Other, otherOpcode};
+    if (waits) return {Gap::Waits, 0u};
+    return {Gap::Registers, 0u};
+}
+
+LabelRunCensus::End labelRunEndAt(const LeanPacket& next) {
+    using End = LabelRunCensus::End;
+    if (next.Has(LeanPacket::Draw)) return End::Draw;
+    if (next.opcode == 0x15 || next.opcode == 0x16) return End::Dispatch;
+    if (next.Has(LeanPacket::Wait) || next.Has(LeanPacket::RenderingWait)) return End::Wait;
+    if (next.Has(LeanPacket::Plain)) return End::Registers;
+    return End::Other;
+}
+
 std::optional<std::uint32_t> firstRegisterDifference(const Registers& left, const Registers& right) {
     auto a = left.begin();
     auto b = right.begin();
@@ -824,6 +872,8 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
     const bool plainRegisters = LeanFront::SwitchSet(frontLatch, RuntimeSwitch::PlainRegisterPackets);
     const bool registerRuns = LeanFront::SwitchSet(frontLatch, RuntimeSwitch::RegisterRuns);
     const bool listRegisters = LeanFront::SwitchSet(frontLatch, RuntimeSwitch::ListRegisterPackets);
+    const bool labelRuns = LeanFront::SwitchSet(frontLatch, RuntimeSwitch::LabelRuns);
+    std::size_t lastQueuedLabel = NoQueuedLabel;
     std::uint64_t plainDone = 0;
     struct PlainProgress {
         Driver& driver;
@@ -962,11 +1012,111 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
         Timer timing("Driver.Packet");
         if (!predicated && entry.Has(LeanPacket::LabelIssue)) noteLabelIssue(packet, submission.queue);
         if (!predicated && !entry.Has(LeanPacket::FlipHeader) && !entry.Has(LeanPacket::RenderingWait) && !flip && (entry.Has(LeanPacket::Enqueues) || verifyPacket)) {
+            if constexpr (!Timers) {
+                if (labelRuns && submission.queue == 0 && entry.Has(LeanPacket::Enqueues) && (opcode == 0x49 || opcode == 0x37) && DrawFinisher::Overlap() && labelPacketQueues(packet, opcode)) {
+                    using End = LabelRunCensus::End;
+                    std::optional<End> stop;
+                    std::uint32_t stopOpcode = 0;
+                    auto end = index + 1;
+                    auto counted = run.packets;
+                    while (!stop) {
+                        if (end >= packets.size()) {
+                            stop = End::SegmentEnd;
+                            break;
+                        }
+                        if (end - index >= LabelRunCap) {
+                            stop = End::Cap;
+                            break;
+                        }
+                        const auto& follower = packets[end];
+                        const auto words = std::span(commands).subspan(follower.cursor, follower.words);
+                        if (follower.opcode != 0x49 && follower.opcode != 0x37) {
+                            stop = labelRunEndAt(follower);
+                            stopOpcode = follower.opcode;
+                        } else if (run.packetEpoch || failed.load(std::memory_order_acquire) || stopping.load(std::memory_order_acquire) || ((counted + 1) & 63u) == 0) {
+                            stop = End::Check;
+                        } else if ((follower.Has(LeanPacket::Predicated) && queue.predication.operation != 0) || follower.Has(LeanPacket::Flip) || follower.Has(LeanPacket::FlipHeader) || follower.Has(LeanPacket::RenderingWait) || !follower.Has(LeanPacket::Enqueues) || follower.Has(LeanPacket::Plain) || follower.Has(LeanPacket::Draw) || follower.Has(LeanPacket::Wait) || follower.Has(LeanPacket::IndirectRegisters) || !DrawFinisher::Overlap() || !labelPacketQueues(words, follower.opcode)) {
+                            stop = End::Unqueued;
+                        } else if (releasesInterrupt(words, follower.opcode)) {
+                            stop = End::Interrupt;
+                        } else {
+                            ++end;
+                            ++counted;
+                        }
+                    }
+                    if (end == index + 1) {
+                        if (LabelRunCensus::Enabled()) LabelRunCensus::NoteRun(1, 1, stop.value_or(End::SegmentEnd), stopOpcode);
+                    } else {
+                        const auto interrupt = releaseInterrupt(packet, opcode, false);
+                        auto labels = std::make_shared<LabelRun>();
+                        std::vector<DrawPipeline::Range> writes;
+                        const auto take = [&](std::span<const std::uint32_t> words, std::uint32_t code, std::uint32_t at, std::optional<std::uint32_t> raised) {
+                            const auto label = Pm4::DecodeLabelWrite(words);
+                            if (!label.has_value()) {
+                                if (!raised.has_value()) {
+                                    ++noOpLabels;
+                                    return false;
+                                }
+                                labels->labels.push_back({0, static_cast<std::uint32_t>(labels->bytes.size()), 0, code, at, false, raised});
+                                return true;
+                            }
+                            const auto stored = label->Bytes();
+                            labels->labels.push_back({label->address, static_cast<std::uint32_t>(labels->bytes.size()), static_cast<std::uint32_t>(stored.size()), code, at, true, raised});
+                            labels->bytes.insert(labels->bytes.end(), stored.begin(), stored.end());
+                            writes.emplace_back(label->address, label->address + stored.size());
+                            return true;
+                        };
+                        std::array<bool, LabelRunCap> items{};
+                        std::array<bool, LabelRunCap> checks{};
+                        items[0] = take(packet, opcode, cursor, interrupt);
+                        if (interrupt.has_value()) bumpEpoch(&EpochBumps::drains);
+                        for (auto at = index + 1; at < end; ++at) {
+                            const auto& follower = packets[at];
+                            const auto words = std::span(commands).subspan(follower.cursor, follower.words);
+                            ++run.packets;
+                            checks[at - index] = LeanFront::Due(frontLatch, LeanFront::Item::Packet);
+                            if (DrawFinisher::Busy() && !follower.Has(LeanPacket::KeepsFinisher)) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Packet, false);
+                            if (follower.Has(LeanPacket::LabelIssue)) noteLabelIssue(words, submission.queue);
+                            items[at - index] = take(words, follower.opcode, follower.cursor, std::nullopt);
+                        }
+                        static const std::uint64_t verifyEvery = everyFrom("APS5_VERIFY_LABEL_RUNS");
+                        static std::atomic<std::uint64_t> verifyOrdinal{0};
+                        if (verifyEvery != 0 && verifyOrdinal.fetch_add(1, std::memory_order_relaxed) % verifyEvery == 0) LabelRunCensus::NoteVerify(end - index, verifyLabelRun(submission, queue, table, index, end, *labels, writes, interrupt));
+                        const auto heldItems = labels->labels.size();
+                        if (heldItems != 0) enqueueLabelRun(submission.queue, std::move(labels), std::move(writes));
+                        if (verifyPacket) LeanFront::NoteChecked(LeanFront::Item::Packet);
+                        traceLabel(packet, submission.queue);
+                        recent.Record(cursor);
+                        for (auto at = index + 1; at < end; ++at) {
+                            const auto& follower = packets[at];
+                            if (checks[at - index]) LeanFront::NoteChecked(LeanFront::Item::Packet);
+                            traceLabel(std::span(commands).subspan(follower.cursor, follower.words), submission.queue);
+                            recent.Record(follower.cursor);
+                        }
+                        if (LabelRunCensus::Enabled()) {
+                            const auto [gap, otherOpcode] = labelGap(packets, lastQueuedLabel, index);
+                            LabelRunCensus::NoteQueued(gap, otherOpcode, items[0]);
+                            for (auto at = index + 1; at < end; ++at) LabelRunCensus::NoteQueued(LabelRunCensus::Gap::Adjacent, 0u, items[at - index]);
+                            LabelRunCensus::NoteRun(end - index, heldItems, stop.value_or(End::SegmentEnd), stopOpcode);
+                        }
+                        lastQueuedLabel = end - 1;
+                        index = end;
+                        continue;
+                    }
+                }
+            }
             if (enqueueLabelPacket(packet, opcode, submission.queue, releaseInterrupt(packet, opcode, false)) || enqueueDmaPacket(packet, opcode, submission.queue, queue) || enqueueConstantRamDump(packet, opcode, submission.queue, queue) || enqueueSampleDumpPacket(packet, opcode, submission.queue)) {
                 if (!entry.Has(LeanPacket::Enqueues)) LeanFront::NoteDifference(LeanFront::Field::PacketTable, where(submission, cursor) + ": today's code queued the packet beside the pipeline, the packet table skips that check");
                 if (verifyPacket) LeanFront::NoteChecked(LeanFront::Item::Packet);
                 traceLabel(packet, submission.queue);
                 recent.Record(cursor);
+                if (opcode == 0x49 || opcode == 0x37) {
+                    if (LabelRunCensus::Enabled()) {
+                        const auto [gap, otherOpcode] = labelGap(packets, lastQueuedLabel, index);
+                        LabelRunCensus::NoteQueued(gap, otherOpcode, Pm4::DecodeLabelWrite(packet).has_value() || releasesInterrupt(packet, opcode));
+                    }
+                    lastQueuedLabel = index;
+                }
                 index = next;
                 continue;
             }
@@ -1329,5 +1479,62 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
 
 template void Driver::runLeanPackets<true>(const Submission&, QueueState&, const PacketTable&, FlipHold&, LeanRun&);
 template void Driver::runLeanPackets<false>(const Submission&, QueueState&, const PacketTable&, FlipHold&, LeanRun&);
+
+std::size_t Driver::verifyLabelRun(const Submission& submission, const QueueState& queue, const PacketTable& table, std::size_t first, std::size_t end, const LabelRun& run, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::optional<std::uint32_t> leaderInterrupt) {
+    static std::atomic<std::uint64_t> printed{0};
+    std::size_t differing = 0;
+    const auto differ = [&](std::size_t cursor, const char* what) {
+        ++differing;
+        const auto count = printed.fetch_add(1, std::memory_order_relaxed);
+        if (count < 16 || count % 4096 == 0) std::fprintf(stderr, "[label-runs-verify] %s: %s (%llu differences so far)\n", where(submission, cursor).c_str(), what, static_cast<unsigned long long>(count + 1));
+    };
+    const auto leaderCursor = static_cast<std::size_t>(table.packets[first].cursor);
+    std::size_t held = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> expected;
+    for (auto at = first; at < end; ++at) {
+        const auto& entry = table.packets[at];
+        const auto cursor = static_cast<std::size_t>(entry.cursor);
+        const auto words = std::span<const std::uint32_t>(submission.commands).subspan(cursor, entry.words);
+        const auto header = submission.commands[cursor];
+        const auto opcode = (header >> 8u) & 0xffu;
+        const bool leader = at == first;
+        if (opcode != entry.opcode || (opcode != 0x49 && opcode != 0x37)) differ(cursor, "the run took a packet that is not a label packet");
+        if (Pm4::Predicated(header) && queue.predication.operation != 0) differ(cursor, "today's loop finds the packet predicated");
+        if (header == FlipPacketHeader || header == RenderingWaitPacketHeader || submission.flips.contains(cursor)) differ(cursor, "today's loop handles the packet as a flip or a rendering wait");
+        if (!labelPacketQueues(words, opcode)) differ(cursor, "today's rules do not queue the packet as a label item");
+        std::optional<std::uint32_t> raised;
+        try {
+            raised = releaseInterrupt(words, opcode, false);
+        } catch (...) {
+            differ(cursor, "today's interrupt decode throws for the packet");
+        }
+        if (leader ? raised != leaderInterrupt : raised.has_value()) differ(cursor, leader ? "the leader's interrupt differs from today's" : "a follower raises an interrupt");
+        const auto label = Pm4::DecodeLabelWrite(words);
+        if (!label.has_value() && !raised.has_value()) {
+            if (held < run.labels.size() && run.labels[held].cursor == cursor) differ(cursor, "the run holds a label for a packet today's code queues nothing for");
+            continue;
+        }
+        if (held >= run.labels.size() || run.labels[held].cursor != cursor) {
+            differ(cursor, "the run holds no label for a packet today's code queues an item for");
+            continue;
+        }
+        const auto& kept = run.labels[held++];
+        if (kept.opcode != opcode || kept.interrupt != raised) differ(cursor, "the run's label has another opcode or interrupt than today's item");
+        if (!label.has_value()) {
+            if (kept.stores || kept.size != 0) differ(cursor, "the run stores bytes for an interrupt today's item stores nothing for");
+            continue;
+        }
+        const auto bytes = label->Bytes();
+        expected.emplace_back(label->address, label->address + bytes.size());
+        const auto stored = run.BytesOf(kept);
+        const bool timestamp = opcode == 0x49 && (words[2] >> 29u) == 3u;
+        if (!kept.stores || kept.address != label->address || kept.size != bytes.size()) differ(cursor, "the run's label address or size differs from today's item");
+        else if (!timestamp && !std::equal(bytes.begin(), bytes.end(), stored.begin())) differ(cursor, "the run's label bytes differ from today's item");
+    }
+    if (held != run.labels.size()) differ(leaderCursor, "the run holds labels today's code would not queue");
+    if (!std::equal(expected.begin(), expected.end(), writes.begin(), writes.end())) differ(leaderCursor, "the run's write ranges differ from today's items");
+    if (!DrawFinisher::Overlap()) differ(leaderCursor, "the run was built with the finisher overlap off");
+    return differing;
+}
 
 }

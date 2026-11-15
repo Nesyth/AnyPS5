@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -171,7 +172,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
 void FailRecordChecks(DrawRecipeMiss check, std::uint32_t count);
 // `prepared`: the buffers a finisher prepared for a direct hit (APS5_DIRECT_BUFFERS), bound in place
 // of today's moved-buffer check and snapshot selection while they hold for the draw.
-DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace = nullptr, DrawCommitView* answer = nullptr, const ShaderResources::PreparedBuffers* prepared = nullptr, PreparedInputs* preparedInputs = nullptr, DrawFragment* fragment = nullptr);
+DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace = nullptr, DrawCommitView* answer = nullptr, const ShaderResources::PreparedBuffers* prepared = nullptr, PreparedInputs* preparedInputs = nullptr, DrawFragment* fragment = nullptr, std::span<const GuestMemorySnapshot> snapshots = {});
 bool RecordDrawFragment(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawFragmentBlock& block, const ShaderResources::PreparedBuffers& prepared, const PreparedInputs& inputs, DrawFragment& out, DrawFragmentRefusal& refusal);
 std::uint64_t CommitFragmentsVerifyEvery();
 struct ExpressOutcome {
@@ -304,6 +305,25 @@ std::string TakeFullDrawLookupText();
 std::string TakeTemplateBuildText();
 std::string TakeTemplateKeepText();
 std::string TakeViewTemplateKeepText();
+enum class FullDrawCause : std::uint8_t { Other, TodaysFinisher, TodaysWorker, TodaysInline, RecordFirst, RecordFirstAddressed, RecordMissed, RecordVerify, SpaceSwitchOff, SpaceKeyMoved, SpaceRefused, SpaceVerify, Count };
+class FullDrawCauseScope {
+public:
+    explicit FullDrawCauseScope(FullDrawCause cause);
+    ~FullDrawCauseScope();
+    FullDrawCauseScope(const FullDrawCauseScope&) = delete;
+    FullDrawCauseScope& operator=(const FullDrawCauseScope&) = delete;
+
+private:
+    FullDrawCause previous = FullDrawCause::Other;
+    bool set = false;
+};
+std::string TakeFullDrawStepText();
+enum class RecordHeavyEvent : std::uint8_t { MissNotRecordable, MissTargets, MissTemplate, MissObjects, MissProof, MissMoved, SpaceInUse, SpaceChanged, SpacePartial, SpaceSnapshotChanged, SpaceOutside, FirstCommit, SwitchOff, KeyMoved, Refused, VerifyDue, Built, RefusedDropped, RefusedNotCacheable, RefusedWaited, RefusedIndirect, RefusedMoved, RefusedMultisampled, RefusedReorders, RefusedShape, Adopted, NotAdopted, VerifyChecked, VerifyDiffering, Count };
+void NoteRecordHeavy(RecordHeavyEvent event);
+void NoteRecordHeavyMiss(DrawRecipeMiss miss);
+std::uint64_t RecordHeavyVerifyEvery();
+void NoteRecordHeavyVerifyDifference(std::string_view field, std::string_view detail);
+std::string TakeRecordHeavyText();
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> PipelinedColorMetadataPassWrites(const ColorMetadataPass& pass);

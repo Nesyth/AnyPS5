@@ -1269,6 +1269,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dispatch, [this, localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, attach, prepareThreads, dataHit, epoch, htileClearCompletion, htileMask, itemFixup = DispatchMissItemsEnabled() ? htileFixup : std::nullopt] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
+            VulkanDevice::CommitTraceScope traced;
             if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpDispatchNoCommit)) {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -1279,22 +1280,28 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
             try {
                 std::shared_ptr<RecipeHit> recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(recipe, false);
+                traced.Step(VulkanDevice::CommitStep::Prepare);
                 std::shared_ptr<const Recipe> builtRecipe;
                 bool writersNoted = false;
                 for (;;) {
                     std::shared_ptr<PreparedDispatch> prepared;
                     if (recipeHit == nullptr || VulkanDevice::VerifyRecipes() || htileClearCompletion.has_value()) prepared = localDevice->PrepareDispatch(compiledCommit, snapshots, prepareThreads, address, htileClearCompletion, registeredViews);
+                    traced.Step(VulkanDevice::CommitStep::Prepare);
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    traced.Step(VulkanDevice::CommitStep::Lock);
                     recordLabelsForPacket(localDevice.get(), queueId);
+                    traced.Step(VulkanDevice::CommitStep::Labels);
                     if (noteWrites && writerKeyedEvidence() && !writersNoted) {
                         noteWrittenBuffers(address, queueId, compiledCommit);
                         writersNoted = true;
                     }
                     const bool fixupCarried = itemFixup.has_value() && localDevice->HtileClearStateCurrent(*itemFixup);
+                    traced.Step(VulkanDevice::CommitStep::Notes);
                     if (recipeHit != nullptr) {
                         VulkanDevice::IndirectOutcome outcome{0, 0};
                         const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], 0, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit);
+                        traced.Skip();
                         if (recipeResult == RecipeOutcome::Rebuild) {
                             recipeHit = nullptr;
                             VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
@@ -1303,9 +1310,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                         }
                     } else {
                         localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() || attach == nullptr ? nullptr : &builtRecipe, htileClearCompletion, registeredViews);
+                        traced.Skip();
                     }
                     if (htileMask.bytes != 0u) localDevice->NoteHtileMask(htileMask);
                     if (itemFixup.has_value()) localDevice->NoteHtileZmaskFixup(*itemFixup, fixupCarried);
+                    traced.Step(VulkanDevice::CommitStep::Notes);
                     break;
                 }
                 if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
@@ -1318,6 +1327,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     attach->recipe.store(std::move(builtRecipe), std::memory_order_release);
                     VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
                 }
+                traced.Step(VulkanDevice::CommitStep::Attach);
             } catch (const std::exception& error) {
                 char where[64];
                 std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));

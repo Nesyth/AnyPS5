@@ -9318,7 +9318,7 @@ const char* ShaderResources::MoveRefusalName(MoveRefusal refusal) {
     return "?";
 }
 
-std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof, bool writes) const {
+std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof, bool writes, bool readsInPlace) const {
     proof = {};
     const auto refuse = [&](MoveRefusal why) {
         proof.refusal = why;
@@ -9356,6 +9356,41 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedD
         ++proof.written;
         return std::nullopt;
     };
+    const auto placeRead = [&](std::size_t allocation, std::uint64_t address, std::uint64_t size, std::uint64_t begin, std::size_t bytes) {
+        if (const auto why = InPlaceRefusal(*recorder, begin, bytes); why != MovedCount::Count) {
+            proof.inPlace = why;
+            return false;
+        }
+        const auto* import = HostImportFor(context, begin, bytes);
+        if (import == nullptr) {
+            proof.inPlace = MovedCount::NoImport;
+            return false;
+        }
+        if (begin < import->base || begin + bytes > import->base + import->bytes) {
+            proof.inPlace = MovedCount::OverRange;
+            return false;
+        }
+        const auto offset = HostImportOffset(*import, begin);
+        if (offset % std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4) != 0) {
+            proof.inPlace = MovedCount::Misaligned;
+            return false;
+        }
+        if (MayOverlapDepthGuards_nid_no_patch(begin, bytes) || MayOverlapMultisampleGuards(begin, bytes)) {
+            proof.guarded = true;
+            return false;
+        }
+        static_cast<void>(FlushDepthPlanes(begin, bytes));
+        MovedBuffer entry{allocation, address, static_cast<std::size_t>(size)};
+        entry.begin = begin;
+        entry.bytes = bytes;
+        entry.inPlace = import->buffer;
+        entry.importOffset = offset;
+        entry.behind = true;
+        moved.push_back(entry);
+        ++proof.buffers;
+        ++proof.readsInPlace;
+        return true;
+    };
     for (const auto& binding : shader.program->bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
         const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
@@ -9385,7 +9420,32 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedD
             if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return refuse(MoveRefusal::Inaccessible);
             const bool pending = recorder != nullptr ? recorder->PendingWriteOverlaps(begin, bytes) : Recorder::SnapshotWriteOverlaps(begin, bytes);
             const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{begin, begin + bytes}}};
-            if (guestMemory.WritesOverlap(begin, bytes) || pending || StorageTexture::AnyPendingOverlaps(range) || AnyShadowedOverlaps(begin, bytes)) return refuse(MoveRefusal::Overlap);
+            std::uint8_t overlap = 0;
+            if (guestMemory.WritesOverlap(begin, bytes)) overlap = 1;
+            else if (pending) overlap = 2;
+            else if (StorageTexture::AnyPendingOverlaps(range)) overlap = 3;
+            else if (AnyShadowedOverlaps(begin, bytes)) overlap = 4;
+            if (overlap == 2 && readsInPlace) {
+                if (recorder == nullptr) {
+                    if (heapStage || addressedBuffers || rebound || StorageTexture::AnyPendingOverlaps(range) || AnyShadowedOverlaps(begin, bytes)) {
+                        proof.overlap = overlap;
+                        return refuse(MoveRefusal::Overlap);
+                    }
+                    moved.push_back({kept->allocations[element], address, static_cast<std::size_t>(size)});
+                    ++proof.buffers;
+                    ++proof.readsInPlace;
+                    continue;
+                }
+                if (!placeRead(kept->allocations[element], address, size, begin, bytes)) {
+                    proof.overlap = overlap;
+                    return refuse(MoveRefusal::Overlap);
+                }
+                continue;
+            }
+            if (overlap != 0) {
+                proof.overlap = overlap;
+                return refuse(MoveRefusal::Overlap);
+            }
             moved.push_back({kept->allocations[element], address, static_cast<std::size_t>(size)});
             ++proof.buffers;
             proof.bytes += bytes;
@@ -9430,6 +9490,36 @@ bool ShaderResources::MovableWrites() const {
         if (!guestMemory.BoundInPlace(range.first, range.second)) return false;
     }
     return true;
+}
+
+std::size_t ShaderResources::MovableWritesRefusal() const {
+    if (!reusable) return 1;
+    if (NeedsCompletion()) return 2;
+    if (usesBda) return 3;
+    if (HoldsLease()) return 4;
+    if (heapStage) return 5;
+    if (addressedBuffers) return 6;
+    if (rebound) return 7;
+    if (htileClear.has_value()) return 8;
+    if (spaceReuse) return 9;
+    const auto& writes = guestMemory.Writes();
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        if (!item.guest || !item.written) continue;
+        const std::pair<std::uint64_t, std::uint64_t> range{item.address, item.address + item.size};
+        if (std::count(writes.begin(), writes.end(), range) != 1) return 10;
+        for (std::size_t other = 0; other < allocations.size(); ++other) {
+            const auto& alias = allocations[other];
+            if (other != index && alias.guest && alias.address < range.second && range.first < alias.address + alias.size) return 11;
+        }
+        if (!guestMemory.BoundInPlace(range.first, range.second)) return 12;
+    }
+    return 0;
+}
+
+const char* ShaderResources::MovableWritesRefusalName(std::size_t refusal) {
+    static constexpr std::array<const char*, 13> names{"movable", "not reusable", "needs completion", "address-based", "lease", "heap stage", "address table", "rebound selection", "HTILE clear", "address space reuse", "written range not listed once", "written range shared with another buffer", "written range not bound in place"};
+    return refusal < names.size() ? names[refusal] : "?";
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::MovedGpuWrites(std::span<const MovedBuffer> moved) const {

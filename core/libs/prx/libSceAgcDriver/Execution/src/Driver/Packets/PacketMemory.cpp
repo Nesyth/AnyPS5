@@ -582,6 +582,49 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     submitDueAfterCommit(localDevice.get());
 }
 
+void Driver::enqueueLabelRun(std::uint32_t queue, std::shared_ptr<const LabelRun> run, std::vector<std::pair<std::uint64_t, std::uint64_t>> writes) {
+    DrawFinisher::Pending held;
+    const bool beside = queue == 0 && DrawFinisher::Overlap() && DrawFinisher::Busy();
+    if (beside) {
+        held.unknown = false;
+        held.writes = writes;
+        held.labelRun = run;
+    }
+    auto enqueue = [this, queue, run, writes = std::move(writes)]() mutable {
+        DrawPipeline::Queue0().EnqueueLabelRun([this, queue, run] { commitLabelRun(queue, *run); }, std::move(writes), run);
+    };
+    if (beside) {
+        DrawFinisher::Get().Enqueue(std::move(enqueue), std::move(held));
+        return;
+    }
+    enqueue();
+}
+
+void Driver::commitLabelRun(std::uint32_t queue, const LabelRun& run) {
+    const bool ranged = GuestMemory::RangeProofs();
+    const auto breakProofs = [ranged](const LabelRun::Label& label) {
+        if (!ranged) {
+            GuestMemory::BreakProofs(GuestMemory::ProofBreak::NonDrawItem);
+            return;
+        }
+        if (!label.stores) return;
+        GuestMemory::BreakProofs(GuestMemory::ProofBreak::NonDrawItem, label.address, label.address + label.size);
+        if (label.address != 0 && label.size != 0) GuestMemory::BreakProofs(GuestMemory::ProofBreak::NonDrawItem, label.address, label.address + label.size);
+    };
+    std::size_t at = 0;
+    try {
+        for (; at < run.labels.size(); ++at) {
+            const auto& label = run.labels[at];
+            GuestMemory::SetCurrentPacket(label.opcode, queue);
+            commitLabel(queue, label.address, run.BytesOf(label), label.interrupt);
+            breakProofs(label);
+        }
+    } catch (...) {
+        for (auto later = at + 1; later < run.labels.size(); ++later) breakProofs(run.labels[later]);
+        throw;
+    }
+}
+
 void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
     if (localDevice == nullptr) return;
     const auto pending = Graphics::Recorder::PendingLabelSince();

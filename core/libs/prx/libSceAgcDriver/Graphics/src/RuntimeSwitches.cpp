@@ -237,6 +237,9 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_PROOF_KEEPS",
     "APS5_VIEW_TEMPLATE_KEEPS",
     "APS5_LEAN_FALLBACK_DRAWS",
+    "APS5_LABEL_RUNS",
+    "APS5_DISPATCH_COMMIT_LEAN",
+    "APS5_RECORD_HEAVY_DRAWS",
 };
 static_assert(SwitchNames.back() != nullptr, "every runtime switch needs a name");
 
@@ -474,6 +477,9 @@ struct SwitchValues {
             std::getenv("APS5_PROOF_KEEPS") != nullptr,
             std::getenv("APS5_VIEW_TEMPLATE_KEEPS") != nullptr,
             std::getenv("APS5_LEAN_FALLBACK_DRAWS") != nullptr,
+            std::getenv("APS5_LABEL_RUNS") != nullptr,
+            std::getenv("APS5_DISPATCH_COMMIT_LEAN") != nullptr,
+            std::getenv("APS5_RECORD_HEAVY_DRAWS") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

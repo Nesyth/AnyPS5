@@ -231,6 +231,9 @@ enum class RuntimeSwitch : std::size_t {
     ProofKeeps,
     ViewTemplateKeeps,
     LeanFallbackDraws,
+    LabelRuns,
+    DispatchCommitLean,
+    RecordHeavyDraws,
     Count,
 };
 

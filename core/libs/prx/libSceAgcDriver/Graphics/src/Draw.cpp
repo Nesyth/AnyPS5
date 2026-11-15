@@ -42,6 +42,7 @@
 #include <optional>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <string>
 #include <cstring>
 #include <limits>
@@ -1398,6 +1399,87 @@ std::atomic<std::uint64_t> templatesReplaced{0};
 constexpr std::array<const char*, 3> FullDrawLookupNames{"template hit", "built", "not resolved"};
 std::array<std::atomic<std::uint64_t>, FullDrawLookupNames.size()> fullDrawLookups{};
 std::array<std::atomic<std::uint64_t>, FullDrawLookupNames.size()> fullDrawLookupNs{};
+enum class FullDrawStep : std::uint8_t { Inputs, Targets, Depth, Lookup, Space, Proof, Moved, Checks, Pipeline, Bindings, Pass, Keep, Finish, Count };
+constexpr std::size_t FullDrawStepCount = static_cast<std::size_t>(FullDrawStep::Count);
+constexpr std::array<const char*, FullDrawStepCount> FullDrawStepNames{"inputs", "color targets", "depth target", "cache lookup", "address space", "proof", "moved buffers", "checks", "pipeline", "bindings", "pass and commands", "keep", "finish"};
+constexpr std::size_t FullDrawCauseCount = static_cast<std::size_t>(FullDrawCause::Count);
+constexpr std::array<const char*, FullDrawCauseCount> FullDrawCauseNames{"other", "today's path from a finisher", "today's path from the worker", "today's path inline", "record commit without a recipe", "record commit without a recipe, addressed stage", "record commit whose recipe missed", "record commit verify", "address-space recipe unused, switch off", "address-space recipe unused, content key moved", "address-space recipes refused after a verify difference", "address-space recipe verify"};
+constexpr std::size_t RecordHeavyEventCount = static_cast<std::size_t>(RecordHeavyEvent::Count);
+
+struct FullDrawSteps {
+    std::chrono::steady_clock::time_point mark = std::chrono::steady_clock::now();
+    std::array<std::uint64_t, FullDrawStepCount> ns{};
+    void Lap(FullDrawStep step) {
+        const auto now = std::chrono::steady_clock::now();
+        ns[static_cast<std::size_t>(step)] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count());
+        mark = now;
+    }
+};
+
+struct FullDrawStepCensus {
+    using Counter = std::atomic<std::uint64_t>;
+    std::array<Counter, FullDrawCauseCount> hits{};
+    std::array<Counter, FullDrawCauseCount> hitNs{};
+    std::array<Counter, FullDrawCauseCount> spaceHits{};
+    std::array<Counter, FullDrawCauseCount> builds{};
+    std::array<std::array<Counter, FullDrawStepCount>, FullDrawCauseCount> stepNs{};
+};
+
+FullDrawStepCensus& fullDrawStepCensus() {
+    static auto* census = new FullDrawStepCensus();
+    return *census;
+}
+
+struct RecordHeavyCensus {
+    using Counter = std::atomic<std::uint64_t>;
+    std::array<Counter, RecordHeavyEventCount> events{};
+    Counter served{0};
+    Counter servedNs{0};
+    std::array<Counter, FullDrawStepCount> servedStepNs{};
+    std::atomic<std::uint32_t> printed{0};
+    Counter reportedPresent{0};
+};
+
+RecordHeavyCensus& recordHeavyCensus() {
+    static auto* census = new RecordHeavyCensus();
+    return *census;
+}
+
+bool fullDrawCensus() {
+    static const bool census = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return census;
+}
+
+struct FullDrawCauseStorage {};
+
+FullDrawCause& fullDrawCause() {
+    return HostThreadLocal<FullDrawCause, FullDrawCauseStorage>();
+}
+
+std::uint64_t addSteps(const FullDrawSteps& steps, std::array<std::atomic<std::uint64_t>, FullDrawStepCount>& into) {
+    std::uint64_t total = 0;
+    for (std::size_t step = 0; step < FullDrawStepCount; ++step) {
+        total += steps.ns[step];
+        if (steps.ns[step] != 0) into[step].fetch_add(steps.ns[step], std::memory_order_relaxed);
+    }
+    return total;
+}
+
+void noteFullDrawSteps(FullDrawCause cause, bool space, const FullDrawSteps& steps) {
+    auto& census = fullDrawStepCensus();
+    const auto index = std::min(static_cast<std::size_t>(cause), FullDrawCauseCount - 1u);
+    const auto total = addSteps(steps, census.stepNs[index]);
+    census.hits[index].fetch_add(1, std::memory_order_relaxed);
+    census.hitNs[index].fetch_add(total, std::memory_order_relaxed);
+    if (space) census.spaceHits[index].fetch_add(1, std::memory_order_relaxed);
+}
+
+void noteRecordHeavyServed(const FullDrawSteps& steps) {
+    auto& census = recordHeavyCensus();
+    const auto total = addSteps(steps, census.servedStepNs);
+    census.served.fetch_add(1, std::memory_order_relaxed);
+    census.servedNs.fetch_add(total, std::memory_order_relaxed);
+}
 }
 
 namespace {
@@ -1633,6 +1715,96 @@ std::string TakeFullDrawLookupText() {
         std::snprintf(item, sizeof(item), " %s %llu (%.1f us)", FullDrawLookupNames[index], static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e3 / static_cast<double>(count));
         text += item;
     }
+    return text;
+}
+
+FullDrawCauseScope::FullDrawCauseScope(FullDrawCause cause) {
+    if (!fullDrawCensus()) return;
+    auto& current = fullDrawCause();
+    previous = current;
+    current = cause;
+    set = true;
+}
+
+FullDrawCauseScope::~FullDrawCauseScope() {
+    if (set) fullDrawCause() = previous;
+}
+
+std::string TakeFullDrawStepText() {
+    auto& census = fullDrawStepCensus();
+    std::string text;
+    for (std::size_t cause = 0; cause < FullDrawCauseCount; ++cause) {
+        const auto hits = census.hits[cause].exchange(0, std::memory_order_relaxed);
+        const auto ns = census.hitNs[cause].exchange(0, std::memory_order_relaxed);
+        const auto space = census.spaceHits[cause].exchange(0, std::memory_order_relaxed);
+        const auto builds = census.builds[cause].exchange(0, std::memory_order_relaxed);
+        std::array<std::uint64_t, FullDrawStepCount> steps{};
+        for (std::size_t step = 0; step < FullDrawStepCount; ++step) steps[step] = census.stepNs[cause][step].exchange(0, std::memory_order_relaxed);
+        if (hits == 0 && builds == 0) continue;
+        char item[192];
+        std::snprintf(item, sizeof(item), "%s %s: template hits %llu (%.1f us", text.empty() ? "" : ";", FullDrawCauseNames[cause], static_cast<unsigned long long>(hits), hits == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(hits));
+        text += item;
+        for (std::size_t step = 0; hits != 0 && step < FullDrawStepCount; ++step) {
+            if (steps[step] == 0) continue;
+            std::snprintf(item, sizeof(item), ", %s %.1f", FullDrawStepNames[step], static_cast<double>(steps[step]) / 1e3 / static_cast<double>(hits));
+            text += item;
+        }
+        std::snprintf(item, sizeof(item), "; on an address-space template %llu), builds %llu", static_cast<unsigned long long>(space), static_cast<unsigned long long>(builds));
+        text += item;
+    }
+    return text;
+}
+
+void NoteRecordHeavy(RecordHeavyEvent event) {
+    recordHeavyCensus().events[std::min(static_cast<std::size_t>(event), RecordHeavyEventCount - 1u)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteRecordHeavyMiss(DrawRecipeMiss miss) {
+    using enum RecordHeavyEvent;
+    NoteRecordHeavy(miss == DrawRecipeMiss::NotRecordable ? MissNotRecordable : miss == DrawRecipeMiss::TargetGone ? MissTargets : miss == DrawRecipeMiss::TemplateGone ? MissTemplate : miss == DrawRecipeMiss::Proof ? MissProof : miss == DrawRecipeMiss::Moved ? MissMoved : MissObjects);
+}
+
+std::uint64_t RecordHeavyVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_RECORD_HEAVY_DRAWS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+void NoteRecordHeavyVerifyDifference(std::string_view field, std::string_view detail) {
+    if (recordHeavyCensus().printed.fetch_add(1, std::memory_order_relaxed) < 8u) std::fprintf(stderr, "[record-heavy-draws-verify] %.*s differs: %.*s\n", static_cast<int>(field.size()), field.data(), static_cast<int>(detail.size()), detail.data());
+}
+
+std::string TakeRecordHeavyText() {
+    auto& census = recordHeavyCensus();
+    std::array<unsigned long long, RecordHeavyEventCount> events{};
+    for (std::size_t index = 0; index < RecordHeavyEventCount; ++index) events[index] = census.events[index].exchange(0, std::memory_order_relaxed);
+    const auto served = census.served.exchange(0, std::memory_order_relaxed);
+    const auto servedNs = census.servedNs.exchange(0, std::memory_order_relaxed);
+    std::string steps;
+    for (std::size_t step = 0; step < FullDrawStepCount; ++step) {
+        const auto ns = census.servedStepNs[step].exchange(0, std::memory_order_relaxed);
+        if (ns == 0 || served == 0) continue;
+        char item[64];
+        std::snprintf(item, sizeof(item), ", %s %.1f", FullDrawStepNames[step], static_cast<double>(ns) / 1e3 / static_cast<double>(served));
+        steps += item;
+    }
+    census.printed.store(0, std::memory_order_relaxed);
+    const auto present = Recorder::Presents();
+    const auto last = census.reportedPresent.exchange(present, std::memory_order_relaxed);
+    const auto presents = present - std::min(present, last);
+    const auto at = [&](RecordHeavyEvent event) { return events[static_cast<std::size_t>(event)]; };
+    using enum RecordHeavyEvent;
+    const auto missed = at(MissNotRecordable) + at(MissTargets) + at(MissTemplate) + at(MissObjects) + at(MissProof) + at(MissMoved);
+    const auto refused = at(RefusedDropped) + at(RefusedNotCacheable) + at(RefusedWaited) + at(RefusedIndirect) + at(RefusedMoved) + at(RefusedMultisampled) + at(RefusedReorders) + at(RefusedShape);
+    char text[1800];
+    std::snprintf(text, sizeof(text), "%llu presents, APS5_RECORD_HEAVY_DRAWS %s: address-space templates committed from a record recipe %llu (%.1f us each%s); record route missed %llu (not recordable %llu, targets gone %llu, template gone or address space not served %llu [in use %llu, space or epoch change %llu, partial overlap %llu, snapshot changed %llu, snapshot outside the space %llu], objects gone %llu, proof %llu, moved buffers %llu); today's draw call instead: addressed record without a recipe %llu, recipe unused with the switch off %llu, content key moved %llu, refused after a verify difference %llu, verify %llu; address-space recipes built %llu, adopted %llu, not adopted %llu, refused at the build %llu (dropped early %llu, not cacheable %llu, waited %llu, indirect %llu, moved buffers %llu, multisampled %llu, reorders samples %llu, a shape the record route refuses %llu); verify %llu checked, %llu differing",
+        static_cast<unsigned long long>(presents), RuntimeSwitches::Set(RuntimeSwitch::RecordHeavyDraws) ? "set" : "unset", static_cast<unsigned long long>(served), served == 0 ? 0.0 : static_cast<double>(servedNs) / 1e3 / static_cast<double>(served), steps.c_str(),
+        missed, at(MissNotRecordable), at(MissTargets), at(MissTemplate), at(SpaceInUse), at(SpaceChanged), at(SpacePartial), at(SpaceSnapshotChanged), at(SpaceOutside), at(MissObjects), at(MissProof), at(MissMoved),
+        at(FirstCommit), at(SwitchOff), at(KeyMoved), at(Refused), at(VerifyDue),
+        at(Built), at(Adopted), at(NotAdopted), refused, at(RefusedDropped), at(RefusedNotCacheable), at(RefusedWaited), at(RefusedIndirect), at(RefusedMoved), at(RefusedMultisampled), at(RefusedReorders), at(RefusedShape),
+        at(VerifyChecked), at(VerifyDiffering));
     return text;
 }
 
@@ -1878,7 +2050,11 @@ struct DrawTimer {
     bool profile;
     std::chrono::steady_clock::time_point phaseStart;
     std::array<double, PhaseCount> us{};
+    FullDrawSteps* steps = nullptr;
     explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {}
+    void lap(FullDrawStep step) {
+        if (steps != nullptr) steps->Lap(step);
+    }
     void phase(DrawPhase which) {
         if (!profile) return;
         const auto now = std::chrono::steady_clock::now();
@@ -3506,6 +3682,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         resolved.contentKey = plan.contentKey;
         if (view != nullptr) view->lookup = DrawCommitLookup::Absent;
         if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+            timer.lap(FullDrawStep::Lookup);
             if (view != nullptr) view->found = cached.get();
             const auto releaseSpace = [](ShaderResources* resources) { static_cast<void>(resources->ReleaseSpace()); };
             std::unique_ptr<ShaderResources, decltype(releaseSpace)> heldSpace(nullptr, releaseSpace);
@@ -3538,8 +3715,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                     }
                 }
             }
+            timer.lap(FullDrawStep::Space);
             ShaderResources::ProofReport proof;
             const bool valid = spaceHeld && (RuntimeSwitches::Set(RuntimeSwitch::XpProofAsIs) ? cached->AsIsCurrent() : cached->Revalidate(shaders, &proof));
+            timer.lap(FullDrawStep::Proof);
             if (counted && spaceHeld && !valid) reuse = AddressDrawReuse::Revalidation;
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
@@ -3608,6 +3787,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     }
     if (reuse.has_value()) countAddressDrawReuse(*reuse);
     timer.phase(PhaseResources);
+    timer.lap(FullDrawStep::Moved);
     APS5_LOG_CHARS_OUT_DEBUG("ShaderResources created");
     return resolved;
 }
@@ -4491,6 +4671,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool bindingsTimed = keptBindings == nullptr && record.bindings != nullptr && record.bindings->timed;
     const auto bindingsBegan = bindingsTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto drawBindings = fragmentBindings != nullptr ? fragmentBindings : keptBindings != nullptr ? keptBindings : record.push != nullptr && faultRecord == nullptr ? resources.PreparePushedDrawBindings(*recorder, record.moved, *record.push, selectedOut, record.prepared, &preparedSelection, route) : record.replay ? resources.PrepareReplayDrawBindings(*recorder, record.moved, shaders, faultRecord, replayProof, hitCensus, record.contentKey) : resources.PrepareDrawBindings(*recorder, record.moved, false, faultRecord, hitCensus, selectedOut, record.prepared, &preparedSelection, route);
+    timer.lap(FullDrawStep::Bindings);
     if (fragmentBindings != nullptr) keepFragmentBindings(*recorder, fragmentBindings);
     if (fragment != nullptr && record.fragmentVerify && preparedSelection != PreparedSelection::Taken) dropFragment(DrawFragmentDrop::Selection);
     if (bindingsTimed) record.bindings->nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - bindingsBegan).count());
@@ -4844,10 +5025,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
     timer.phase(PhaseRecord);
+    timer.lap(FullDrawStep::Pass);
     const auto keepBegan = bindingsTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), state.scissor, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, drawUse, record.spaceKeep != nullptr && *record.spaceKeep != nullptr ? record.spaceKeep->get() : nullptr, record.keeping);
     if (bindingsTimed) record.bindings->keepNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - keepBegan).count());
     timer.phase(PhaseKeep);
+    timer.lap(FullDrawStep::Keep);
     if (!record.staged.empty()) {
         const auto merged = recorder->Commands();
         for (auto& write : record.staged) {
@@ -4992,6 +5175,7 @@ struct PreparedDraw {
     std::optional<DepthSampleLocations> depthLocations;
     std::shared_ptr<std::shared_ptr<const void>> spaceKeep;
     DrawCommitView* view = nullptr;
+    FullDrawSteps* steps = nullptr;
 };
 
 void keepHeldSpace(PreparedDraw& prepared) {
@@ -5402,6 +5586,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& timer = prepared.timer;
     timer = DrawTimer(profile);
+    timer.steps = prepared.steps;
     // APS5_TRACE_DRAWS (together with APS5_PROFILE_DRAW; alone it only enables Driver.cpp's own
     // [draw] lines) additionally prints one line per draw with its phases and, for synchronous
     // draws, their inputs: per-draw string building at ~1400 draws per 10 s is itself a cost the
@@ -5424,6 +5609,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         if (VerifyDrawPlan()) requireDrawPlanRepeats(context, state, draw, shaders, plan);
         return false;
     }
+    timer.lap(FullDrawStep::Inputs);
     const auto* args = prepared.args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
     const int dumpLimit = prepared.dumpLimit = DumpTargetLimit();
@@ -5563,11 +5749,13 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         binding.target = std::make_unique<RenderTarget>(context, color, state.blends.at(color.exportIndex).blendEnable != 0);
         targetViews.push_back(binding.target->View());
     }
+    timer.lap(FullDrawStep::Targets);
     if (state.depth && !prepared.attachmentsFromMemo) {
         targetViews.push_back(DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)));
     }
     if (verifyAttachments) checkAttachments(state, prepared);
     timer.phase(PhasePrepare);
+    timer.lap(FullDrawStep::Depth);
     const bool recordDraws = RecordDraws();
     auto* recorder = prepared.recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
@@ -5751,6 +5939,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         resolved.moved.clear();
     }
     if (state.depth) RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
+    timer.lap(FullDrawStep::Checks);
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto& masked = prepared.masked;
@@ -5821,6 +6010,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     prepared.depthLocations = passDepthLocations(context, pipelineState, *pipeline);
     timer.phase(PhasePipeline);
+    timer.lap(FullDrawStep::Pipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     if (VerifyDrawPlan()) requireDrawPlanRepeats(context, state, draw, shaders, plan);
     return true;
@@ -5962,7 +6152,9 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         // A multisampled draw gets a recipe with APS5_MSAA_RECORDS, unless a target is staged.
         const bool multisampleRecipe = multisampled && RuntimeSwitches::Set(RuntimeSwitch::MsaaRecords) && std::ranges::none_of(targets, [](const TargetBinding& binding) { return binding.multisampled && (binding.stagedTemporary != nullptr || binding.multisampleOwner == nullptr); });
         const bool indirectRecipe = args != nullptr && prepared.recordRecipe && RuntimeSwitches::Set(RuntimeSwitch::DirectGpuIndirect) && indirect.path == IndirectDrawPath::Gpu && !state.stages.mesh && inputs.listRestartPrimitive == 0 && inputs.expandedIndexCount == 0 && inputs.restartTable.empty();
-        if (recipeOut != nullptr && (DrawRecipes() || prepared.recordRecipe) && cacheable && !outcome.waited && (args == nullptr || indirectRecipe) && resources->Reusable() && !resources->SpaceReuse() && (resolved.moved.empty() || dataRecipes) && (!multisampled || multisampleRecipe) && !pipeline->ReordersSamples()) {
+        const bool spaceAsked = prepared.recordRecipe && resources->SpaceReuse() && RuntimeSwitches::Set(RuntimeSwitch::RecordHeavyDraws);
+        const bool spaceShape = !state.stages.mesh && !state.stages.tessellationGeometry && state.tessellationCapture == nullptr && !state.quadList;
+        if (recipeOut != nullptr && (DrawRecipes() || prepared.recordRecipe) && cacheable && !outcome.waited && (args == nullptr || indirectRecipe) && resources->Reusable() && (!resources->SpaceReuse() || (spaceAsked && spaceShape)) && (resolved.moved.empty() || dataRecipes) && (!multisampled || multisampleRecipe) && !pipeline->ReordersSamples()) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->indirect = args != nullptr;
             if (multisampled) {
@@ -5987,10 +6179,13 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->shaderStages = inputs.shaderStages;
             recipe->hasDepth = state.depth.has_value();
             recipe->perDrawMoves = dataRecipes;
+            recipe->spaceReuse = resources->SpaceReuse();
+            if (recipe->spaceReuse) NoteRecordHeavy(RecordHeavyEvent::Built);
             *recipeOut = std::move(recipe);
         } else if (prepared.recordRecipe) {
             using enum RecipeRefusal;
             NoteRecipeRefusal(recipeOut == nullptr ? Dropped : !cacheable ? NotCacheable : outcome.waited ? Waited : args != nullptr ? Indirect : !resources->Reusable() ? NotReusable : resources->SpaceReuse() ? SpaceReuse : multisampled ? Multisampled : ReordersSamples);
+            if (spaceAsked) NoteRecordHeavy(recipeOut == nullptr ? RecordHeavyEvent::RefusedDropped : !cacheable || !resources->Reusable() ? RecordHeavyEvent::RefusedNotCacheable : outcome.waited ? RecordHeavyEvent::RefusedWaited : args != nullptr && !indirectRecipe ? RecordHeavyEvent::RefusedIndirect : !spaceShape ? RecordHeavyEvent::RefusedShape : !resolved.moved.empty() && !dataRecipes ? RecordHeavyEvent::RefusedMoved : multisampled && !multisampleRecipe ? RecordHeavyEvent::RefusedMultisampled : RecordHeavyEvent::RefusedReorders);
         }
         verifyMovedInPlace(context, state, draw, shaders, inputs.indexBytes, *resources, resolved.moved);
         timing.Mark("draw_and_resource_release");
@@ -6529,6 +6724,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     } heldSpace{prepared};
     static const bool lookupCensus = std::getenv("APS5_PIPELINE_STATS") != nullptr;
     const auto lookupBegan = lookupCensus ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::optional<FullDrawSteps> steps;
+    if (lookupCensus) prepared.steps = &steps.emplace();
     try {
         if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);
     } catch (...) {
@@ -6540,6 +6737,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         const std::size_t lookup = prepared.resolved.resources == nullptr ? 2u : prepared.resolved.built != nullptr ? 1u : 0u;
         fullDrawLookups[lookup].fetch_add(1, std::memory_order_relaxed);
         fullDrawLookupNs[lookup].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - lookupBegan).count()), std::memory_order_relaxed);
+        steps->Lap(FullDrawStep::Finish);
+        const auto cause = fullDrawCause();
+        if (lookup == 0u) noteFullDrawSteps(cause, prepared.resolved.resources->SpaceReuse(), *steps);
+        else if (lookup == 1u) fullDrawStepCensus().builds[std::min(static_cast<std::size_t>(cause), FullDrawCauseCount - 1u)].fetch_add(1, std::memory_order_relaxed);
     }
     if (IdentityCensus()) noteIdentity(prepared, state, draw);
 }
@@ -7246,7 +7447,56 @@ bool RecordDrawFragment(const Context& context, const State& state, const Pm4::D
     return true;
 }
 
-DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs, DrawFragment* fragment) {
+namespace {
+
+enum class RecordSpaceOutcome : std::uint8_t { Served, InUse, Changed, Partial, SnapshotChanged, Outside };
+
+RecordSpaceOutcome takeRecordSpace(ShaderResources& resources, std::span<const GuestMemorySnapshot> snapshots) {
+    if (auto* active = Recorder::Active(); active != nullptr) {
+        GuestBufferMemory::ReleaseRetainedSpaces(active->Id(), active->CompletedThrough());
+        static_cast<void>(resources.ReleaseCompletedSpace(active->Id(), active->CompletedThrough()));
+    }
+    if (resources.SpaceHeld()) return RecordSpaceOutcome::InUse;
+    if (!resources.RetakeSpace()) return RecordSpaceOutcome::Changed;
+    if (!resources.AddressTableGuardCurrent()) {
+        static_cast<void>(resources.ReleaseSpace());
+        return RecordSpaceOutcome::Changed;
+    }
+    completeSnapshotWrites(snapshots);
+    const auto service = resources.SnapshotsServedInPlace(snapshots);
+    if (service == SnapshotService::Served) return RecordSpaceOutcome::Served;
+    static_cast<void>(resources.ReleaseSpace());
+    return service == SnapshotService::Partial ? RecordSpaceOutcome::Partial : service == SnapshotService::Changed ? RecordSpaceOutcome::SnapshotChanged : RecordSpaceOutcome::Outside;
+}
+
+RecordHeavyEvent recordSpaceEvent(RecordSpaceOutcome outcome) {
+    return outcome == RecordSpaceOutcome::InUse ? RecordHeavyEvent::SpaceInUse : outcome == RecordSpaceOutcome::Changed ? RecordHeavyEvent::SpaceChanged : outcome == RecordSpaceOutcome::Partial ? RecordHeavyEvent::SpacePartial : outcome == RecordSpaceOutcome::SnapshotChanged ? RecordHeavyEvent::SpaceSnapshotChanged : RecordHeavyEvent::SpaceOutside;
+}
+
+struct RecordSpaceHold {
+    std::span<const GuestMemorySnapshot> snapshots;
+    std::shared_ptr<ShaderResources> resources;
+    Recorder* recorder = nullptr;
+    std::shared_ptr<std::shared_ptr<const void>> keep;
+    bool settled = false;
+    int exceptions = std::uncaught_exceptions();
+    RecordSpaceHold() = default;
+    RecordSpaceHold(const RecordSpaceHold&) = delete;
+    RecordSpaceHold& operator=(const RecordSpaceHold&) = delete;
+    void KeepOnThrow() {
+        if (!settled || keep != nullptr || recorder == nullptr || resources == nullptr || !resources->SpaceHeld()) return;
+        keep = reserveSpaceKeep(*recorder, *resources);
+    }
+    ~RecordSpaceHold() {
+        if (resources == nullptr || !resources->SpaceHeld()) return;
+        if (!settled) static_cast<void>(resources->ReleaseSpace());
+        else if (keep != nullptr) *keep = resources->ReleaseSpace();
+        else if (recorder != nullptr && std::uncaught_exceptions() > exceptions) resources->HoldSpaceThrough(recorder->Id(), recorder->OpenSerial());
+        else static_cast<void>(resources->ReleaseSpace());
+    }
+};
+
+DrawRecipeOutcome drawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs, DrawFragment* fragment, RecordSpaceHold& space) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     auto* recorder = Recorder::Active();
     const bool recording = answer == nullptr;
@@ -7277,6 +7527,11 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     auto resources = recipe.templateRef.lock();
     if (resources == nullptr) return miss(DrawRecipeMiss::TemplateGone);
     if (!resources->Reusable() || resources->HeapStage()) return miss(DrawRecipeMiss::Moved);
+    const bool spaceRoute = recipe.spaceReuse;
+    if (spaceRoute != resources->SpaceReuse() || (spaceRoute && !RuntimeSwitches::Set(RuntimeSwitch::RecordHeavyDraws))) return miss(DrawRecipeMiss::TemplateGone);
+    if (spaceRoute && resources->ChecksFaults() && std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->stencilReferences.empty(); })) return miss(DrawRecipeMiss::NotRecordable);
+    std::optional<FullDrawSteps> steps;
+    if (spaceRoute && recording && fullDrawCensus()) timer.steps = &steps.emplace();
     // A recipe with multisampled targets (APS5_MSAA_RECORDS): the draw must still have them where the
     // recipe has them, none staged, and must not sample one it renders to (the full draw refuses that).
     const bool multisampleRecipe = !recipe.multisampled.empty();
@@ -7330,6 +7585,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
             if (color.fmaskAddress != 0) GuardOneFragmentFmask(context, color);
         }
     }
+    timer.lap(FullDrawStep::Inputs);
     std::vector<std::shared_ptr<StorageTexture>> targets;
     targets.reserve(recipe.targets.size());
     // The owners and images of the multisampled targets, by color index (owners) and in order (images).
@@ -7406,6 +7662,18 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         }
     }
     timer.phase(PhasePrepare);
+    timer.lap(FullDrawStep::Targets);
+    if (spaceRoute) {
+        const auto taken = takeRecordSpace(*resources, space.snapshots);
+        timer.lap(FullDrawStep::Space);
+        if (taken != RecordSpaceOutcome::Served) {
+            if (recording) NoteRecordHeavy(recordSpaceEvent(taken));
+            timer.phase(PhaseLookup);
+            return miss(DrawRecipeMiss::TemplateGone);
+        }
+        space.resources = resources;
+        space.recorder = recorder;
+    }
     bool proofTrusted = false;
     const auto proved = [&] {
         const bool injected = failed(DrawRecipeMiss::Proof);
@@ -7422,6 +7690,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         timer.phase(PhaseLookup);
         return miss(DrawRecipeMiss::Proof);
     }
+    timer.lap(FullDrawStep::Proof);
     // Prepared buffers count only for the template whose plan they were prepared from. A verify
     // compares them with today's way, which then draws.
     const ShaderResources::PreparedBuffers* bound = nullptr;
@@ -7522,6 +7791,9 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         }
         countCache(&DrawProfile::cacheHits);
     }
+    if (spaceRoute && recording && verifyAddressDrawReuse()) verifyServedSpace(context, state, draw, shaders, space.snapshots, inputs.indexBytes, *resources);
+    space.settled = true;
+    timer.lap(FullDrawStep::Moved);
     timer.phase(PhaseLookup);
     auto pipeline = recipe.pipeline.lock();
     if (pipeline == nullptr || failed(DrawRecipeMiss::ObjectsGone)) return miss(DrawRecipeMiss::ObjectsGone);
@@ -7620,6 +7892,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         if (drop == DrawFragmentDrop::None) usableFragment = fragment;
     }
     timer.phase(PhasePipeline);
+    timer.lap(FullDrawStep::Pipeline);
     if (!recording) {
         answer->filled = true;
         answer->resources = resources.get();
@@ -7672,7 +7945,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     }
     IndirectRecord indirectRecord;
     if (draw.indirect && (inputs.listRestartPrimitive != 0 || inputs.expandedIndexCount != 0 || !inputs.restartTable.empty() || !gpuIndirectRecord(context, *recorder, *draw.indirect, indirectRecord))) return miss(DrawRecipeMiss::NotRecordable);
-    outcome.completion = resources->ChecksFaults();
+    outcome.completion = spaceRoute ? resources->NeedsCompletion() : resources->ChecksFaults();
     outcome.recorded = true;
     std::vector<StorageTexture*> residents;
     residents.reserve(targets.size());
@@ -7683,6 +7956,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     RecordedDraw drawn;
     drawn.recorder = recorder;
     drawn.completion = outcome.completion;
+    drawn.spaceKeep = spaceRoute ? &space.keep : nullptr;
     drawn.resources = std::move(resources);
     drawn.pipeline = std::move(pipeline);
     drawn.framebuffer = std::move(framebuffer);
@@ -7832,8 +8106,28 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
     verifyMovedInPlace(context, state, draw, shaders, inputs.indexBytes, *drawn.resources, moved);
     timing.Mark("draw_and_resource_release");
     reportDrawEnd(state, timer, nullptr, outcome, waitedBefore, ownWaitedMs, " recorded from record");
+    if (spaceRoute) {
+        countAddressDrawReuse(AddressDrawReuse::Reused);
+        if (steps.has_value()) {
+            steps->Lap(FullDrawStep::Finish);
+            noteRecordHeavyServed(*steps);
+        }
+    }
     result.recorded = true;
     return result;
+}
+
+}
+
+DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const DrawTraceContext* trace, DrawCommitView* answer, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs, DrawFragment* fragment, std::span<const GuestMemorySnapshot> snapshots) {
+    RecordSpaceHold space;
+    space.snapshots = snapshots;
+    try {
+        return drawWithRecord(context, state, draw, shaders, record, trace, answer, prepared, preparedInputs, fragment, space);
+    } catch (...) {
+        space.KeepOnThrow();
+        throw;
+    }
 }
 
 namespace {

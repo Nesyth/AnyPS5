@@ -97,6 +97,7 @@ struct DrawRecipe {
     // template hit does.
     bool perDrawMoves = false;
     bool indirect = false;
+    bool spaceReuse = false;
 };
 
 struct DrawRecordPass {
@@ -405,6 +406,7 @@ struct DrawRecordCommit {
     const void* fragmentPipeline = nullptr;
     const void* fragmentPushPipeline = nullptr;
     bool fragmentsRefused = false;
+    bool spaceRefused = false;
 
     void Adopt(std::shared_ptr<const DrawRecipe> built) {
         recipe = std::move(built);

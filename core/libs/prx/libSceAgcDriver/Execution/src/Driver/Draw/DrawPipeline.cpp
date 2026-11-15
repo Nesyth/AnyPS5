@@ -59,6 +59,142 @@ struct ClearOnExit {
     ~ClearOnExit() { items.clear(); }
 };
 
+struct LabelRunCounts {
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(LabelRunCensus::Gap::Count)> gaps{};
+    std::array<std::atomic<std::uint64_t>, 256> gapOpcodes{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(LabelRunCensus::End::Count)> ends{};
+    std::array<std::atomic<std::uint64_t>, 256> endOpcodes{};
+    std::array<std::atomic<std::uint64_t>, 4> lengths{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::CommitKind::Count) + 1> committedAfter{};
+    std::atomic<std::uint64_t> queued{0};
+    std::atomic<std::uint64_t> queuedItems{0};
+    std::atomic<std::uint64_t> runs{0};
+    std::atomic<std::uint64_t> runPackets{0};
+    std::atomic<std::uint64_t> runItems{0};
+    std::atomic<std::uint64_t> singles{0};
+    std::atomic<std::uint64_t> committedItems{0};
+    std::atomic<std::uint64_t> committedLabels{0};
+    std::atomic<std::uint64_t> verifiedRuns{0};
+    std::atomic<std::uint64_t> verifiedPackets{0};
+    std::atomic<std::uint64_t> verifyDiffering{0};
+};
+
+LabelRunCounts& labelRunCounts() {
+    static auto* counts = new LabelRunCounts;
+    return *counts;
+}
+
+std::string takeTopOpcodes(std::array<std::atomic<std::uint64_t>, 256>& opcodes) {
+    std::array<std::uint64_t, 256> taken{};
+    for (std::size_t index = 0; index < taken.size(); ++index) taken[index] = opcodes[index].exchange(0, std::memory_order_relaxed);
+    std::string text;
+    for (int shown = 0; shown < 4; ++shown) {
+        const auto top = std::max_element(taken.begin(), taken.end());
+        if (*top == 0) break;
+        char item[40];
+        std::snprintf(item, sizeof(item), "%s0x%02x x%llu", text.empty() ? "" : " ", static_cast<unsigned>(top - taken.begin()), static_cast<unsigned long long>(*top));
+        text += item;
+        *top = 0;
+    }
+    return text.empty() ? std::string("none") : text;
+}
+
+}
+
+LabelRun::Lookup LabelRun::Find(std::uint64_t address, std::size_t size, std::uint64_t& value) const {
+    const auto end = address + size;
+    for (auto label = labels.rbegin(); label != labels.rend(); ++label) {
+        if (!label->stores) continue;
+        const auto last = label->address + label->size;
+        if (address >= last || label->address >= end) continue;
+        if (label->size == 0 || address < label->address || end > last || size > sizeof(value)) return Lookup::Unknown;
+        value = 0;
+        std::memcpy(&value, bytes.data() + label->offset + (address - label->address), size);
+        return Lookup::Value;
+    }
+    return Lookup::NotHeld;
+}
+
+namespace LabelRunCensus {
+
+bool Enabled() {
+    static const bool enabled = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return enabled;
+}
+
+void NoteQueued(Gap gap, std::uint32_t otherOpcode, bool item) {
+    auto& counts = labelRunCounts();
+    counts.queued.fetch_add(1, std::memory_order_relaxed);
+    if (item) counts.queuedItems.fetch_add(1, std::memory_order_relaxed);
+    counts.gaps[static_cast<std::size_t>(gap)].fetch_add(1, std::memory_order_relaxed);
+    if (gap == Gap::Other) counts.gapOpcodes[otherOpcode & 0xffu].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteRun(std::size_t packets, std::size_t items, End end, std::uint32_t otherOpcode) {
+    auto& counts = labelRunCounts();
+    counts.ends[static_cast<std::size_t>(end)].fetch_add(1, std::memory_order_relaxed);
+    if (end == End::Other) counts.endOpcodes[otherOpcode & 0xffu].fetch_add(1, std::memory_order_relaxed);
+    if (packets < 2) {
+        counts.singles.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    counts.runs.fetch_add(1, std::memory_order_relaxed);
+    counts.runPackets.fetch_add(packets, std::memory_order_relaxed);
+    counts.runItems.fetch_add(items, std::memory_order_relaxed);
+    counts.lengths[packets == 2 ? 0 : packets <= 4 ? 1 : packets <= 8 ? 2 : 3].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteVerify(std::size_t packets, std::size_t differing) {
+    auto& counts = labelRunCounts();
+    counts.verifiedRuns.fetch_add(1, std::memory_order_relaxed);
+    counts.verifiedPackets.fetch_add(packets, std::memory_order_relaxed);
+    counts.verifyDiffering.fetch_add(differing, std::memory_order_relaxed);
+}
+
+void NoteCommitted(DrawPipeline::CommitKind previous, bool first, std::uint32_t labels) {
+    auto& counts = labelRunCounts();
+    counts.committedItems.fetch_add(1, std::memory_order_relaxed);
+    counts.committedLabels.fetch_add(labels, std::memory_order_relaxed);
+    counts.committedAfter[first ? static_cast<std::size_t>(DrawPipeline::CommitKind::Count) : static_cast<std::size_t>(previous)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string Take() {
+    auto& counts = labelRunCounts();
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto queued = take(counts.queued);
+    const auto committedItems = take(counts.committedItems);
+    const auto committedLabels = take(counts.committedLabels);
+    const auto verifiedRuns = take(counts.verifiedRuns);
+    if (queued == 0 && committedItems == 0 && verifiedRuns == 0) return {};
+    const auto queuedItems = take(counts.queuedItems);
+    std::array<unsigned long long, static_cast<std::size_t>(Gap::Count)> gaps{};
+    for (std::size_t index = 0; index < gaps.size(); ++index) gaps[index] = take(counts.gaps[index]);
+    std::array<unsigned long long, static_cast<std::size_t>(End::Count)> ends{};
+    for (std::size_t index = 0; index < ends.size(); ++index) ends[index] = take(counts.ends[index]);
+    std::array<unsigned long long, 4> lengths{};
+    for (std::size_t index = 0; index < lengths.size(); ++index) lengths[index] = take(counts.lengths[index]);
+    const auto gapOpcodes = takeTopOpcodes(counts.gapOpcodes);
+    const auto endOpcodes = takeTopOpcodes(counts.endOpcodes);
+    const auto at = [](auto value) { return static_cast<std::size_t>(value); };
+    char head[1024];
+    std::snprintf(head, sizeof(head), "label packets queued on the lean loop %llu (label items %llu, storing nothing %llu); since the previous queued label of the segment: none %llu, no packet %llu, register packets only %llu, waits and register packets only %llu, draws %llu, dispatches %llu, other packets %llu (first other opcode: %s), more than 32 packets %llu; ",
+        queued, queuedItems, queued - std::min(queued, queuedItems), gaps[at(Gap::First)], gaps[at(Gap::Adjacent)], gaps[at(Gap::Registers)], gaps[at(Gap::Waits)], gaps[at(Gap::Draws)], gaps[at(Gap::Dispatches)], gaps[at(Gap::Other)], gapOpcodes.c_str(), gaps[at(Gap::Far)]);
+    char runs[1024];
+    std::snprintf(runs, sizeof(runs), "runs %llu of %llu packets with %llu label items (2 packets %llu, 3-4 %llu, 5-8 %llu, 9+ %llu), single labels %llu; runs and single labels ended by: segment end %llu, a draw %llu, a dispatch %llu, a wait %llu, register packets %llu, another packet %llu (%s), a label not queued %llu, an interrupting label %llu, the failure check %llu, the cap %llu; ",
+        take(counts.runs), take(counts.runPackets), take(counts.runItems), lengths[0], lengths[1], lengths[2], lengths[3], take(counts.singles), ends[at(End::SegmentEnd)], ends[at(End::Draw)], ends[at(End::Dispatch)], ends[at(End::Wait)], ends[at(End::Registers)], ends[at(End::Other)], endOpcodes.c_str(), ends[at(End::Unqueued)], ends[at(End::Interrupt)], ends[at(End::Check)], ends[at(End::Cap)]);
+    std::string after;
+    for (std::size_t index = 0; index < counts.committedAfter.size(); ++index) {
+        const auto count = take(counts.committedAfter[index]);
+        if (count == 0) continue;
+        char item[48];
+        std::snprintf(item, sizeof(item), " %s %llu", index < KindNames.size() ? KindNames[index] : "first", count);
+        after += item;
+    }
+    char tail[512];
+    std::snprintf(tail, sizeof(tail), "committer label items %llu holding %llu labels, by the item committed before:%s; verify: runs %llu, packets %llu, differing %llu", committedItems, committedLabels, after.empty() ? " none" : after.c_str(), verifiedRuns, take(counts.verifiedPackets), take(counts.verifyDiffering));
+    return std::string(head) + runs + tail;
+}
+
 }
 
 namespace {
@@ -536,6 +672,7 @@ DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std:
         if (held.unknown) return LabelLookup::Unknown;
         const bool overlaps = std::any_of(held.writes.begin(), held.writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
         if (!overlaps) return std::nullopt;
+        if (held.labelRun != nullptr) return held.labelRun->Find(address, bytes, value) == LabelRun::Lookup::Value ? LabelLookup::Value : LabelLookup::Unknown;
         if (held.labelBytes.empty() || address < held.labelAddress || end > held.labelAddress + held.labelBytes.size()) return LabelLookup::Unknown;
         value = 0;
         std::memcpy(&value, held.labelBytes.data() + (address - held.labelAddress), bytes);
@@ -1289,6 +1426,7 @@ void DrawFinisher::PublishLean(LeanRunner runner, std::span<const Range> writes,
     held.writes.assign(writes.begin(), writes.end());
     held.labelAddress = 0;
     held.labelBytes.clear();
+    held.labelRun.reset();
     publishLean(slot);
 }
 
@@ -1876,6 +2014,17 @@ void DrawPipeline::EnqueueStore(Commit commit, std::uint64_t address, std::vecto
     enqueue({std::move(commit), {{address, end}}, address, std::move(bytes), {}, false, true, CommitKind::Store});
 }
 
+void DrawPipeline::EnqueueLabelRun(Commit commit, std::vector<Range> writes, std::shared_ptr<const LabelRun> run) {
+    Item item;
+    item.commit = std::move(commit);
+    item.writes = std::move(writes);
+    item.kind = CommitKind::EndOfPipe;
+    item.quiet = true;
+    item.parts = static_cast<std::uint32_t>(std::max<std::size_t>(run->labels.size(), 1));
+    item.labelRun = std::move(run);
+    enqueue(std::move(item));
+}
+
 namespace {
 struct ItemTurnSlot {};
 using ItemTurn = HostThreadSlot<bool, ItemTurnSlot>;
@@ -1898,6 +2047,7 @@ void DrawPipeline::enqueue(Item item) {
             held.writes = item.writes;
             held.labelAddress = item.labelAddress;
             held.labelBytes = item.labelBytes;
+            held.labelRun = item.labelRun;
             itemsByTurn.fetch_add(1, std::memory_order_relaxed);
             const auto parked = item.reads.empty() ? std::uint64_t{0} : DrawFinisher::Get().ParkReads(item.reads);
             auto shared = std::make_shared<Item>(std::move(item));
@@ -2029,7 +2179,12 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         kindText += item;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[commits] by kind (10 s):%s\n", kindText.c_str());
+    if (LabelRunCensus::Enabled()) {
+        if (const auto labelRuns = LabelRunCensus::Take(); !labelRuns.empty()) AgcDriver::ProfilePrint_nid_no_patch("[label-runs] 10 s: %s\n", labelRuns.c_str());
+    }
     if (const auto lookups = Graphics::TakeFullDrawLookupText(); !lookups.empty()) AgcDriver::ProfilePrint_nid_no_patch("[commits] full draws by the template lookup (10 s, on any thread):%s\n", lookups.c_str());
+    if (const auto steps = Graphics::TakeFullDrawStepText(); !steps.empty()) AgcDriver::ProfilePrint_nid_no_patch("[commits] full draws with a template hit by cause, microseconds per draw by step (10 s, on any thread):%s\n", steps.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[record-heavy-draws] 10 s, %s\n", Graphics::TakeRecordHeavyText().c_str());
     if (const auto builds = Graphics::TakeTemplateBuildText(); !builds.empty()) AgcDriver::ProfilePrint_nid_no_patch("[template-builds] 10 s, %s\n", builds.c_str());
     if (Graphics::ResourceCache::FateCensus()) AgcDriver::ProfilePrint_nid_no_patch("[template-keeps] 10 s, %s\n", Graphics::TakeTemplateKeepText().c_str());
     if (Graphics::ResourceCache::FateCensus()) AgcDriver::ProfilePrint_nid_no_patch("[view-template-keeps] 10 s, %s\n", Graphics::TakeViewTemplateKeepText().c_str());
@@ -2067,6 +2222,7 @@ void DrawPipeline::run() {
     std::uint32_t itemParts = 1;
     std::vector<Range> itemRanges;
     bool taken = false;
+    auto previousKind = CommitKind::Count;
     const auto takeFront = [&] {
         if (depositVerifyEvery() != 0) verifyOrder(items.front().order);
         commit = stopped ? nullptr : &items.front().commit;
@@ -2159,6 +2315,10 @@ void DrawPipeline::run() {
             const auto kindIndex = static_cast<std::size_t>(items.front().kind);
             kindCommits[kindIndex].fetch_add(itemParts, std::memory_order_relaxed);
             kindNs[kindIndex].fetch_add(spent, std::memory_order_relaxed);
+            if (LabelRunCensus::Enabled()) {
+                if (items.front().kind == CommitKind::EndOfPipe) LabelRunCensus::NoteCommitted(previousKind, previousKind == CommitKind::Count, itemParts);
+                previousKind = items.front().kind;
+            }
             retired.push_back(std::move(items.front()));
             items.pop_front();
             commits += itemParts;
@@ -2296,6 +2456,11 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
         const bool overlaps = std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
         if (!overlaps) continue;
+        if (item->labelRun != nullptr) {
+            std::uint64_t held = 0;
+            if (item->labelRun->Find(address, bytes, held) != LabelRun::Lookup::Value) return std::nullopt;
+            return held;
+        }
         if (item->labelBytes.empty() || address < item->labelAddress || end > item->labelAddress + item->labelBytes.size()) return std::nullopt;
         std::uint64_t value = 0;
         std::memcpy(&value, item->labelBytes.data() + (address - item->labelAddress), bytes);
