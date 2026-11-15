@@ -26,6 +26,9 @@ constexpr std::size_t CounterCount = static_cast<std::size_t>(Counter::Count);
 constexpr std::size_t StepCount = static_cast<std::size_t>(Step::Count);
 constexpr std::size_t FieldCount = static_cast<std::size_t>(Field::Count);
 constexpr std::size_t AllowedKinds = static_cast<std::size_t>(Allowed::Count);
+constexpr std::size_t TrustSites = static_cast<std::size_t>(TrustSite::Count);
+constexpr std::size_t TrustEvents = static_cast<std::size_t>(TrustEvent::Count);
+constexpr std::size_t TrustCounts = TrustSites * TrustEvents;
 constexpr std::uint64_t PrintedPerWindow = 8;
 constexpr std::uint64_t BuildLinesPerReason = 16;
 constexpr std::int64_t WindowMs = 10000;
@@ -90,7 +93,11 @@ static_assert(static_cast<std::size_t>(Counter::BindingsLeftPushedRebound) - sta
 
 constexpr std::array<const char*, StepCount> StepNames{"request", "invocation", "walk", "key", "side", "class", "checks", "buffers", "inputs", "hand-off", "buffers prepare", "buffers settle", "buffers place", "hand-off fragment", "hand-off commit"};
 
+constexpr std::array<const char*, TrustSites> TrustSiteNames{"stage memo inputs", "stage memo nested values", "stage memo settle", "stage view settle", "fresh walk settle", "captured memory and labels", "prepared buffers settle", "prepared index settle"};
+constexpr std::array<const char*, TrustSites> TrustObjectNames{"stage memo entry", "stage memo entry", "stage memo entry", "stage memo entry", "thread's invocation slot", "draw shape", "direct class", "direct class"};
+
 static_assert(CounterNames.back() != nullptr && StepNames.back() != nullptr, "every direct draw counter and step needs a name");
+static_assert(TrustSiteNames.back() != nullptr && TrustObjectNames.back() != nullptr, "every trust audit site needs a name and an object");
 static_assert(static_cast<std::size_t>(Counter::FragmentsThrown) - static_cast<std::size_t>(Counter::FragmentsNoBlock) + 2 == static_cast<std::size_t>(DrawFragmentRefusal::Count), "every reason a finisher makes no fragment needs a counter");
 static_assert(static_cast<std::size_t>(Counter::ExpressCaptureUnreached) - static_cast<std::size_t>(Counter::ExpressCaptured) + 2 == static_cast<std::size_t>(DrawExpressCapture::Count), "every express capture outcome needs a counter");
 static_assert(static_cast<std::size_t>(Counter::ExpressVerify) - static_cast<std::size_t>(Counter::ExpressNoState) + 2 == static_cast<std::size_t>(DrawExpressMiss::Count), "every reason an express commit is not taken needs a counter");
@@ -103,6 +110,7 @@ struct Block {
     std::array<std::atomic<std::uint64_t>, CounterCount> counters{};
     std::array<std::atomic<std::uint64_t>, StepCount> stepNanoseconds{};
     std::array<std::atomic<std::uint64_t>, StepCount> stepDraws{};
+    std::array<std::atomic<std::uint64_t>, TrustCounts> trust{};
 };
 
 struct Registry {
@@ -122,6 +130,7 @@ void bump(std::atomic<std::uint64_t>& value, std::uint64_t count) {
 
 void fold(Block& into, const Block& from) {
     for (std::size_t index = 0; index < CounterCount; ++index) bump(into.counters[index], from.counters[index].load(std::memory_order_relaxed));
+    for (std::size_t index = 0; index < TrustCounts; ++index) bump(into.trust[index], from.trust[index].load(std::memory_order_relaxed));
     for (std::size_t index = 0; index < StepCount; ++index) {
         bump(into.stepNanoseconds[index], from.stepNanoseconds[index].load(std::memory_order_relaxed));
         bump(into.stepDraws[index], from.stepDraws[index].load(std::memory_order_relaxed));
@@ -167,6 +176,7 @@ struct Window {
     std::array<std::uint64_t, CounterCount> counters{};
     std::array<std::uint64_t, StepCount> stepNanoseconds{};
     std::array<std::uint64_t, StepCount> stepDraws{};
+    std::array<std::uint64_t, TrustCounts> trust{};
 };
 
 Window totals() {
@@ -175,6 +185,7 @@ Window totals() {
     std::lock_guard lock(kept.mutex);
     const auto add = [&](const Block& block) {
         for (std::size_t index = 0; index < CounterCount; ++index) now.counters[index] += block.counters[index].load(std::memory_order_relaxed);
+        for (std::size_t index = 0; index < TrustCounts; ++index) now.trust[index] += block.trust[index].load(std::memory_order_relaxed);
         for (std::size_t index = 0; index < StepCount; ++index) {
             now.stepNanoseconds[index] += block.stepNanoseconds[index].load(std::memory_order_relaxed);
             now.stepDraws[index] += block.stepDraws[index].load(std::memory_order_relaxed);
@@ -218,6 +229,18 @@ std::string reasons(const std::array<std::uint64_t, CounterCount>& counts, Count
         text += std::to_string(counts[index]);
     }
     return text.empty() ? text : text + ")";
+}
+
+std::string trustText(const std::uint64_t* row) {
+    const auto at = [&](TrustEvent event) { return row[static_cast<std::size_t>(event)]; };
+    const auto audits = at(TrustEvent::Audited);
+    const auto failed = at(TrustEvent::AuditFailed);
+    const double rate = audits != 0 ? static_cast<double>(failed) / static_cast<double>(audits) : 0.0;
+    std::array<char, 512> text{};
+    std::snprintf(text.data(), text.size(), ": trusted %llu, audited %llu, audits failed %llu (%.2f%% of audits, about %.0f stale trusted uses at that rate), tested while volatile %llu (%llu failed), demoted %llu",
+        static_cast<unsigned long long>(at(TrustEvent::Trusted)), static_cast<unsigned long long>(audits), static_cast<unsigned long long>(failed), 100.0 * rate, rate * static_cast<double>(at(TrustEvent::Trusted)),
+        static_cast<unsigned long long>(at(TrustEvent::Volatile)), static_cast<unsigned long long>(at(TrustEvent::VolatileFailed)), static_cast<unsigned long long>(at(TrustEvent::Demoted)));
+    return text.data();
 }
 
 }
@@ -292,6 +315,28 @@ void AddTrusted(std::uint64_t count) {
     trusted.fetch_add(count, std::memory_order_relaxed);
 }
 
+void AddTrust(TrustSite site, TrustEvent event) {
+    bump(own().trust[static_cast<std::size_t>(site) * TrustEvents + static_cast<std::size_t>(event)], 1);
+}
+
+std::uint32_t TrustAuditEvery() {
+    static const std::uint32_t every = [] {
+        const char* text = std::getenv("APS5_TRUST_AUDIT_EVERY");
+        if (text == nullptr || *text == 0) return std::uint32_t{32};
+        return static_cast<std::uint32_t>(std::clamp<unsigned long long>(std::strtoull(text, nullptr, 10), 2ull, 0x7fffffffull));
+    }();
+    return every;
+}
+
+std::uint32_t TrustAuditHold() {
+    static const std::uint32_t hold = [] {
+        const char* text = std::getenv("APS5_TRUST_AUDIT_HOLD");
+        if (text == nullptr || *text == 0) return std::uint32_t{600};
+        return static_cast<std::uint32_t>(std::clamp<unsigned long long>(std::strtoull(text, nullptr, 10), 1ull, 0x3fffffffull));
+    }();
+    return hold;
+}
+
 void NoteClasses(std::size_t known, std::size_t bytes) {
     classesKnown.store(known, std::memory_order_relaxed);
     classBytes.store(bytes, std::memory_order_relaxed);
@@ -344,6 +389,7 @@ void Report(bool force) {
         since.stepNanoseconds[index] = current.stepNanoseconds[index] - reported.stepNanoseconds[index];
         since.stepDraws[index] = current.stepDraws[index] - reported.stepDraws[index];
     }
+    for (std::size_t index = 0; index < TrustCounts; ++index) since.trust[index] = current.trust[index] - reported.trust[index];
     reported = current;
     const auto trustedNow = trusted.load(std::memory_order_relaxed);
     const auto trustedSince = trustedNow - trustedReported;
@@ -378,6 +424,17 @@ void Report(bool force) {
     std::uint64_t splitDraws = 0;
     for (auto index = static_cast<std::size_t>(Step::BuffersPrepare); index < StepCount; ++index) splitDraws += since.stepDraws[index];
     if (splitDraws != 0) AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] split us per direct draw: buffers prepare %.2f, settle %.2f, place %.2f; hand-off fragment %.2f, commit %.2f\n", perDraw(Step::BuffersPrepare), perDraw(Step::BuffersSettle), perDraw(Step::BuffersPlace), perDraw(Step::Fragment), perDraw(Step::Commit));
+    if (std::ranges::any_of(since.trust, [](std::uint64_t count) { return count != 0; })) {
+        std::array<std::uint64_t, TrustEvents> all{};
+        for (std::size_t index = 0; index < TrustCounts; ++index) all[index % TrustEvents] += since.trust[index];
+        const auto every = TrustAuditEvery();
+        AgcDriver::ProfilePrint_nid_no_patch("[trust-audit] finisher, not exact: each object runs the tests it would skip once in %u to %u uses (drawn again after each audit), a failed test keeps the object tested for %u presents; all sites%s\n", static_cast<unsigned>(every - (every + 1u) / 2u + 1u), static_cast<unsigned>(every), static_cast<unsigned>(TrustAuditHold()), trustText(all.data()).c_str());
+        for (std::size_t site = 0; site < TrustSites; ++site) {
+            const auto* const row = since.trust.data() + site * TrustEvents;
+            if (std::all_of(row, row + TrustEvents, [](std::uint64_t count) { return count == 0; })) continue;
+            AgcDriver::ProfilePrint_nid_no_patch("[trust-audit] finisher, %s, state on the %s%s\n", TrustSiteNames[site], TrustObjectNames[site], trustText(row).c_str());
+        }
+    }
     if (at(Counter::CensusHits) != 0) {
         const auto share = [&](Counter part, Counter whole) { return at(whole) == 0 ? 0.0 : 100.0 * static_cast<double>(at(part)) / static_cast<double>(at(whole)); };
         AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] repeat census: %llu hits, %llu ranges, %llu bytes; %.1f%% of bytes and %.1f%% of ranges repeat a range this thread uploaded with equal bytes; %.1f%% of hits repeat every slice\n",

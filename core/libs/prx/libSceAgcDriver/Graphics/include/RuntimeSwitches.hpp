@@ -227,6 +227,7 @@ enum class RuntimeSwitch : std::size_t {
     DispatchRelocateTrials,
     DirectRectLists,
     DirectAddressed,
+    TrustAudit,
     Count,
 };
 

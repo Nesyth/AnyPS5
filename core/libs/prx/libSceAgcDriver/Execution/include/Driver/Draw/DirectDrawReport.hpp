@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecordReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/LeanFront.hpp"
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -527,6 +528,24 @@ enum class Counter : std::uint16_t {
 
 enum class Step : std::uint8_t { Request, Invocation, Walk, Key, Side, Class, Checks, Buffers, Inputs, HandOff, BuffersPrepare, BuffersSettle, BuffersPlace, Fragment, Commit, Count };
 
+enum class TrustSite : std::uint8_t { StageInputs, StageNested, StageSettle, ViewSettle, WalkSettle, CapturedMemory, BuffersSettle, IndexSettle, Count };
+enum class TrustEvent : std::uint8_t { Trusted, Audited, AuditFailed, Volatile, VolatileFailed, Demoted, Count };
+enum class TrustUse : std::uint8_t { Test, Skip, Audit, Volatile };
+
+struct TrustState {
+    std::atomic<std::uint32_t> uses{0};
+    std::atomic<std::uint32_t> volatileUntil{0};
+
+    TrustState() = default;
+    TrustState(const TrustState&) noexcept {}
+    TrustState& operator=(const TrustState&) noexcept { return *this; }
+};
+
+struct LocalTrustState {
+    std::uint32_t uses = 0;
+    std::uint32_t volatileUntil = 0;
+};
+
 constexpr std::uint64_t StepSampleEvery = 64;
 
 std::uint64_t VerifyEvery();
@@ -547,6 +566,9 @@ inline bool Due(LeanFront::Latch& latch) {
 void Add(Counter counter, std::uint64_t count = 1);
 void AddStep(Step step, std::uint64_t nanoseconds);
 void AddTrusted(std::uint64_t count);
+void AddTrust(TrustSite site, TrustEvent event);
+std::uint32_t TrustAuditEvery();
+std::uint32_t TrustAuditHold();
 void NoteClasses(std::size_t known, std::size_t bytes);
 void NoteStages(std::size_t known);
 void NoteDifference(DrawRecords::Field field, std::string_view detail);

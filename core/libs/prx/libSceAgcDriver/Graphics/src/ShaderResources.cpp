@@ -5388,12 +5388,180 @@ ShaderResources::ExpressMiss ShaderResources::ExpressCurrentFollowing() {
     return expressCurrent(true);
 }
 
+namespace {
+
+constexpr std::size_t CommitterTrustSites = static_cast<std::size_t>(CommitterTrustSite::Count);
+
+constexpr std::array<const char*, CommitterTrustSites> CommitterTrustSiteNames{
+    "follower, template current (watched writes, sources, views, pending CPU writes, staging, shadowed regions)",
+    "leader, template current (the same tests)",
+    "template proof (record, repeat and reproving commits)",
+    "follower, buffer hazards (prepared buffer zones, pass reads and images, queued stores, selection and guest buffer guards)",
+    "leader, buffer hazards (prepared buffer zones, moved and in-place ranges, queued stores, selection and guest buffer guards)",
+    "record draw, prepared buffers (moved and in-place ranges)",
+    "follower, vertex inputs (pending writes, labels and queued stores over vertex ranges, input read guards)",
+    "leader, vertex inputs (the same tests)",
+    "record draw, input read guards",
+};
+
+constexpr std::array<const char*, CommitterTrustSites> CommitterTrustObjectNames{
+    "the template, shared by its three currency sites",
+    "the template, shared by its three currency sites",
+    "the template, shared by its three currency sites",
+    "the template, shared by its three buffer sites",
+    "the template, shared by its three buffer sites",
+    "the template, shared by its three buffer sites",
+    "the template, shared by its three input sites",
+    "the template, shared by its three input sites",
+    "the template, shared by its three input sites",
+};
+
+struct CommitterTrustCensus {
+    std::array<std::atomic<std::uint64_t>, CommitterTrustSites> audits{};
+    std::array<std::atomic<std::uint64_t>, CommitterTrustSites> auditFailures{};
+    std::array<std::atomic<std::uint64_t>, CommitterTrustSites> volatileUses{};
+    std::array<std::atomic<std::uint64_t>, CommitterTrustSites> volatileFailures{};
+    std::array<std::atomic<std::uint64_t>, CommitterTrustSites> demoted{};
+    std::atomic<std::uint64_t> checkedPresent{0};
+    std::atomic<std::uint64_t> reportedPresent{0};
+    std::atomic<std::int64_t> reportedAt{0};
+    std::atomic<std::uint32_t> seed{0x9e3779b9u};
+};
+
+CommitterTrustCensus committerTrustCensus;
+
+void countCommitterTrust(std::atomic<std::uint64_t>& counter) {
+    counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
+
+std::uint32_t committerTrustEvery() {
+    static const std::uint32_t every = [] {
+        const char* text = std::getenv("APS5_TRUST_AUDIT_EVERY");
+        if (text == nullptr || *text == 0) return std::uint32_t{32};
+        return static_cast<std::uint32_t>(std::clamp<unsigned long long>(std::strtoull(text, nullptr, 10), 2ull, 0x7fffffffull));
+    }();
+    return every;
+}
+
+std::uint32_t committerTrustHold() {
+    static const std::uint32_t hold = [] {
+        const char* text = std::getenv("APS5_TRUST_AUDIT_HOLD");
+        if (text == nullptr || *text == 0) return std::uint32_t{600};
+        return static_cast<std::uint32_t>(std::clamp<unsigned long long>(std::strtoull(text, nullptr, 10), 1ull, 0x3fffffffull));
+    }();
+    return hold;
+}
+
+std::uint32_t committerTrustPeriod() {
+    const auto every = committerTrustEvery();
+    auto& seed = committerTrustCensus.seed;
+    const auto next = seed.load(std::memory_order_relaxed) * 1664525u + 1013904223u;
+    seed.store(next, std::memory_order_relaxed);
+    return every - (next >> 16) % ((every + 1u) / 2u);
+}
+
+struct CommitterTrustRow {
+    std::uint64_t trusted = 0;
+    std::uint64_t audits = 0;
+    std::uint64_t auditFailures = 0;
+    std::uint64_t volatileUses = 0;
+    std::uint64_t volatileFailures = 0;
+    std::uint64_t demoted = 0;
+};
+
+std::string committerTrustText(const CommitterTrustRow& row) {
+    const double rate = row.audits != 0 ? static_cast<double>(row.auditFailures) / static_cast<double>(row.audits) : 0.0;
+    std::array<char, 512> text{};
+    std::snprintf(text.data(), text.size(), ": trusted %llu, audited %llu, audits failed %llu (%.2f%% of audits, about %.0f stale trusted uses at that rate), tested while volatile %llu (%llu failed), demoted %llu",
+        static_cast<unsigned long long>(row.trusted), static_cast<unsigned long long>(row.audits), static_cast<unsigned long long>(row.auditFailures), 100.0 * rate, rate * static_cast<double>(row.trusted),
+        static_cast<unsigned long long>(row.volatileUses), static_cast<unsigned long long>(row.volatileFailures), static_cast<unsigned long long>(row.demoted));
+    return text.data();
+}
+
+void reportCommitterTrust(std::uint64_t presents) {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!stats) return;
+    auto& census = committerTrustCensus;
+    if (census.checkedPresent.load(std::memory_order_relaxed) == presents) return;
+    census.checkedPresent.store(presents, std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (census.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    const auto interval = presents - census.reportedPresent.exchange(presents, std::memory_order_relaxed);
+    std::array<CommitterTrustRow, CommitterTrustSites> rows{};
+    CommitterTrustRow all;
+    for (std::size_t at = 0; at < CommitterTrustSites; ++at) {
+        auto& row = rows[at];
+        row.trusted = committerTrustTrusted[at].exchange(0, std::memory_order_relaxed);
+        row.audits = census.audits[at].exchange(0, std::memory_order_relaxed);
+        row.auditFailures = census.auditFailures[at].exchange(0, std::memory_order_relaxed);
+        row.volatileUses = census.volatileUses[at].exchange(0, std::memory_order_relaxed);
+        row.volatileFailures = census.volatileFailures[at].exchange(0, std::memory_order_relaxed);
+        row.demoted = census.demoted[at].exchange(0, std::memory_order_relaxed);
+        all.trusted += row.trusted;
+        all.audits += row.audits;
+        all.auditFailures += row.auditFailures;
+        all.volatileUses += row.volatileUses;
+        all.volatileFailures += row.volatileFailures;
+        all.demoted += row.demoted;
+    }
+    if (all.trusted == 0 && all.audits == 0 && all.volatileUses == 0) return;
+    const auto every = committerTrustEvery();
+    AgcDriver::ProfilePrint_nid_no_patch("[trust-audit] committer, %llu presents, not exact: each state of a template runs the real test once in %u to %u uses (drawn again after each audit), a failed test has that state tested at every use for %u presents; all sites%s\n", static_cast<unsigned long long>(interval), every - (every + 1u) / 2u + 1u, every, committerTrustHold(), committerTrustText(all).c_str());
+    for (std::size_t at = 0; at < CommitterTrustSites; ++at) {
+        const auto& row = rows[at];
+        if (row.trusted == 0 && row.audits == 0 && row.volatileUses == 0) continue;
+        AgcDriver::ProfilePrint_nid_no_patch("[trust-audit] committer, %s, state on %s%s\n", CommitterTrustSiteNames[at], CommitterTrustObjectNames[at], committerTrustText(row).c_str());
+    }
+}
+
+}
+
+CommitterTrustUse CommitterTrustSlow(CommitterTrustState& state, CommitterTrustSite site) {
+    const auto at = static_cast<std::size_t>(site);
+    auto& census = committerTrustCensus;
+    const auto presents = Recorder::Presents();
+    reportCommitterTrust(presents);
+    if (state.untilAudit == 0 && static_cast<std::int32_t>(state.volatileUntil - static_cast<std::uint32_t>(presents)) > 0) {
+        countCommitterTrust(census.volatileUses[at]);
+        return CommitterTrustUse::Volatile;
+    }
+    state.untilAudit = committerTrustPeriod();
+    countCommitterTrust(census.audits[at]);
+    return CommitterTrustUse::Audit;
+}
+
+void CommitterTrustFailed(CommitterTrustState& state, CommitterTrustSite site, CommitterTrustUse use) {
+    const auto at = static_cast<std::size_t>(site);
+    auto& census = committerTrustCensus;
+    if (use == CommitterTrustUse::Audit) {
+        countCommitterTrust(census.auditFailures[at]);
+        countCommitterTrust(census.demoted[at]);
+    } else {
+        countCommitterTrust(census.volatileFailures[at]);
+    }
+    state.untilAudit = 0;
+    state.volatileUntil = static_cast<std::uint32_t>(Recorder::Presents()) + committerTrustHold();
+}
+
 ShaderResources::ExpressMiss ShaderResources::ExpressCurrentTrusted() const {
+    const auto kept = ExpressCurrentKept();
+    if (kept == ExpressMiss::None) NoteCommitterTrusted();
+    return kept;
+}
+
+ShaderResources::ExpressMiss ShaderResources::ExpressCurrentKept() const {
     if (!expressValid || !cleanProved || expressWatch == nullptr) return ExpressMiss::NotProved;
     if (GuestMemory::CleanForgetSerial() != expressAt.forget) return ExpressMiss::Forget;
     if (HostImportSetGeneration() != expressAt.imports || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != expressAt.allocations || GuestMemory::UnwatchSerial() != expressAt.unwatched || DepthSurfacesSerial() != expressAt.depthSurfaces) return ExpressMiss::Serials;
-    NoteCommitterTrusted();
     return ExpressMiss::None;
+}
+
+ShaderResources::ExpressMiss ShaderResources::ExpressCurrentAudited(CommitterTrustCheck& check, bool following) {
+    const bool candidate = ExpressCurrentKept() == ExpressMiss::None;
+    if (candidate && check.Skip()) return ExpressMiss::None;
+    const auto missed = expressCurrent(following);
+    if (candidate && missed != ExpressMiss::None) check.Fail();
+    return missed;
 }
 
 ShaderResources::ExpressMiss ShaderResources::expressCurrent(bool memo) {
@@ -8545,7 +8713,7 @@ bool ShaderResources::PreparedZonesClearBy(const PreparedBuffers& prepared, Zone
     return true;
 }
 
-bool ShaderResources::PreparedInPlaceHolds(const PreparedBuffers& prepared, const Recorder& recorder, bool& behind) const {
+bool ShaderResources::PreparedInPlaceHolds(const PreparedBuffers& prepared, const Recorder& recorder, bool& behind, CommitterTrustCheck* trust) const {
     if (!prepared.inPlace) return true;
     const auto refuse = [](MovedCount why) {
         noteMoved(why);
@@ -8555,15 +8723,22 @@ bool ShaderResources::PreparedInPlaceHolds(const PreparedBuffers& prepared, cons
     if ((prepared.forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared.forget || HostImportSetGeneration() != prepared.imports || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != prepared.mapping) return refuse(MovedCount::PreparedInPlaceSerials);
     const bool trusted = RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter);
     if (trusted) NoteCommitterTrusted();
+    const bool skipped = trusted || (trust != nullptr && trust->Skip());
     for (const auto& entry : prepared.moved) {
         if (entry.inPlace == VK_NULL_HANDLE) continue;
-        if (trusted) {
+        if (skipped) {
             if (heapStage || addressedBuffers || usesBda || rebound) return refuse(MovedCount::NotEligible);
             if (entry.bytes > context.limits.maxStorageBufferRange) return refuse(MovedCount::OverRange);
             continue;
         }
-        if (guestMemory.WritesOverlap(entry.begin, entry.bytes)) return refuse(MovedCount::PreparedInPlaceWrites);
-        if (const auto why = InPlaceRefusal(recorder, entry.begin, entry.bytes); why != MovedCount::Count) return refuse(why);
+        if (guestMemory.WritesOverlap(entry.begin, entry.bytes)) {
+            if (trust != nullptr) trust->Fail();
+            return refuse(MovedCount::PreparedInPlaceWrites);
+        }
+        if (const auto why = InPlaceRefusal(recorder, entry.begin, entry.bytes); why != MovedCount::Count) {
+            if (trust != nullptr && why != MovedCount::NotEligible && why != MovedCount::OverRange) trust->Fail();
+            return refuse(why);
+        }
     }
     for (const auto& entry : prepared.moved) {
         if (entry.inPlace == VK_NULL_HANDLE) continue;
@@ -9384,19 +9559,19 @@ bool ShaderResources::PlaceDirectBuffers(const Context& context, PreparedBuffers
     return true;
 }
 
-ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched) const {
+ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched, CommitterTrustCheck* trust) const {
     auto selection = PreparedBuffers::Selection::Hazard;
-    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, route, untouched, nullptr, RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter)));
+    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, route, untouched, nullptr, RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter), trust));
     return selection;
 }
 
-ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHoldsBy(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, bool untouched, const GuardTests* guards) const {
+ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHoldsBy(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, bool untouched, const GuardTests* guards, CommitterTrustCheck* trust) const {
     auto selection = PreparedBuffers::Selection::Hazard;
-    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, nullptr, untouched, guards, RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter)));
+    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, nullptr, untouched, guards, RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter), trust));
     return selection;
 }
 
-bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched, const GuardTests* guards, bool trusted) const {
+bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched, const GuardTests* guards, bool trusted, CommitterTrustCheck* trust) const {
     using Selection = PreparedBuffers::Selection;
     selection = Selection::Hazard;
     const auto& plan = *prepared.plan;
@@ -9406,32 +9581,46 @@ bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const
     // memory it overlaps, after the finisher read that memory; a guard set up or dropped since the
     // read may have published them already.
     if (trusted) NoteCommitterTrusted(3);
-    const bool guardsMoved = !trusted && DepthGuardsGeneration_nid_no_patch() != prepared.depthGuards;
-    if (!trusted && (guardsMoved || HasResidentDepthGuards_nid_no_patch()) && std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && !item.inPlace && (guardsMoved || (guards != nullptr ? guards->depth(guards->tests, item.begin, item.bytes) : MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes))); })) {
-        selection = Selection::DepthGuards;
+    const bool skipped = trusted || (trust != nullptr && trust->Skip());
+    const auto failed = [trust] {
+        if (trust != nullptr) trust->Fail();
         return false;
+    };
+    const bool guardsMoved = !skipped && DepthGuardsGeneration_nid_no_patch() != prepared.depthGuards;
+    if (!skipped && (guardsMoved || HasResidentDepthGuards_nid_no_patch()) && std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && !item.inPlace && (guardsMoved || (guards != nullptr ? guards->depth(guards->tests, item.begin, item.bytes) : MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes))); })) {
+        selection = Selection::DepthGuards;
+        return failed();
     }
-    if (trusted) {
-    } else if (route != nullptr && route->stamps && requireMovedGuestBuffers(moved)) {
+    bool guarded = false;
+    bool* const found = trust != nullptr && trust->Audits() ? &guarded : nullptr;
+    const struct GuardFails {
+        CommitterTrustCheck* check;
+        const bool& seen;
+        ~GuardFails() {
+            if (seen) check->Fail();
+        }
+    } guardFails{trust, guarded};
+    if (skipped) {
+    } else if (route != nullptr && route->stamps && requireMovedGuestBuffers(moved, nullptr, found)) {
         ++route->guards;
         if (route->verifyStamps && std::ranges::any_of(moved, [&](const MovedBuffer& entry) { return allocations[entry.allocation].guest && MayOverlapDepthGuards_nid_no_patch(entry.address, entry.size); })) {
             ++route->refuted;
-            requireGuestBuffers(moved);
+            requireGuestBuffers(moved, found);
         }
-    } else if (route == nullptr && RuntimeSwitches::Set(RuntimeSwitch::CommitStamps) && requireMovedGuestBuffers(moved, guards)) {
+    } else if (route == nullptr && RuntimeSwitches::Set(RuntimeSwitch::CommitStamps) && requireMovedGuestBuffers(moved, guards, found)) {
     } else {
-        requireGuestBuffers(moved);
+        requireGuestBuffers(moved, found);
     }
     prepareFaultSlot();
     bindingsChecked = heapStage && RuntimeSwitches::Set(RuntimeSwitch::ReplayBind);
-    if (trusted) {
+    if (skipped) {
     } else if (route != nullptr) {
-        if (!unmovedClear(recorder, prepared, route)) return false;
+        if (!unmovedClear(recorder, prepared, route)) return failed();
     } else {
         for (const auto& item : prepared.selected) {
             if (item.moved || untouched || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor) || RuntimeSwitches::Set(RuntimeSwitch::XpExpressFloor)) continue;
             const auto& allocation = allocations[item.allocation];
-            if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return false;
+            if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return failed();
         }
     }
     selection = Selection::Taken;
@@ -10237,7 +10426,19 @@ void ShaderResources::prepareFaultSlot() const {
     if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
-void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) const {
+void ShaderResources::RequireGuestBuffersAudited(CommitterTrustCheck& trust) const {
+    bool found = false;
+    const struct FoundFails {
+        CommitterTrustCheck& check;
+        const bool& seen;
+        ~FoundFails() {
+            if (seen) check.Fail();
+        }
+    } fails{trust, found};
+    requireGuestBuffers({}, &found);
+}
+
+void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved, bool* found) const {
     if (!completed || !RuntimeSwitches::Set(RuntimeSwitch::GuardRangeMemo) || RuntimeSwitches::Set(RuntimeSwitch::NoGuardSpans) || VerifyGuardSpans()) {
         for (std::size_t index = 0; index < allocations.size(); ++index) {
             const auto& item = allocations[index];
@@ -10245,6 +10446,7 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
             const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
             const auto address = override != moved.end() ? override->address : item.address;
             const auto bytes = override != moved.end() ? override->size : item.size;
+            if (found != nullptr && !*found && (!DepthReadGuardIdle_nid_no_patch(address, bytes) || MayOverlapMultisampleGuards(address, bytes))) *found = true;
             RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
             RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
         }
@@ -10266,10 +10468,12 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
         const auto bytes = own ? item.size : override->size;
         if ((!own || !depthHeld) && MayOverlapDepthGuards_nid_no_patch(address, bytes)) {
             depthClear = false;
+            if (found != nullptr) *found = true;
             RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
         }
         if ((!own || !multisampleHeld) && MayOverlapMultisampleGuards(address, bytes)) {
             multisampleClear = false;
+            if (found != nullptr) *found = true;
             RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
         }
     }
@@ -10277,7 +10481,7 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
     if (multisampleClear && !multisampleHeld) multisampleGuardsClear.store(multisampleGeneration, std::memory_order_relaxed);
 }
 
-bool ShaderResources::requireMovedGuestBuffers(std::span<const MovedBuffer> moved, const GuardTests* guards) const {
+bool ShaderResources::requireMovedGuestBuffers(std::span<const MovedBuffer> moved, const GuardTests* guards, bool* found) const {
     if (moved.empty() || !completed || !RuntimeSwitches::Set(RuntimeSwitch::GuardRangeMemo) || RuntimeSwitches::Set(RuntimeSwitch::NoGuardSpans) || VerifyGuardSpans()) return false;
     if (depthGuardsClear.load(std::memory_order_relaxed) != DepthGuardsGeneration_nid_no_patch() || multisampleGuardsClear.load(std::memory_order_relaxed) != MultisampleGuardsGeneration()) return false;
     for (std::size_t index = 0; index < moved.size(); ++index) {
@@ -10285,7 +10489,10 @@ bool ShaderResources::requireMovedGuestBuffers(std::span<const MovedBuffer> move
     }
     for (const auto& entry : moved) {
         if (!allocations[entry.allocation].guest) continue;
-        if (guards != nullptr ? guards->multisample(guards->tests, entry.address, entry.size) : MayOverlapMultisampleGuards(entry.address, entry.size)) RequireNoMultisampleColorTarget(entry.address, entry.size, "a shader buffer access");
+        if (guards != nullptr ? guards->multisample(guards->tests, entry.address, entry.size) : MayOverlapMultisampleGuards(entry.address, entry.size)) {
+            if (found != nullptr) *found = true;
+            RequireNoMultisampleColorTarget(entry.address, entry.size, "a shader buffer access");
+        }
     }
     return true;
 }

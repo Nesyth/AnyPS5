@@ -97,6 +97,7 @@ struct DirectClass {
     std::shared_ptr<const ShaderRecompiler::RectListShaders> generated;
     std::shared_ptr<const DrawRecord> record;
     DirectDraws::Counter refusal = DirectDraws::Counter::Count;
+    mutable DirectDraws::TrustState trust;
 
     std::size_t Bytes() const;
 };
@@ -231,6 +232,7 @@ struct DirectStages {
     std::shared_ptr<const ShaderRecompiler::RectListShaders> rect;
     const ShaderRecompiler::RecompileResult* rectControl = nullptr;
     bool addressed = false;
+    DirectDraws::TrustUse checksUse = DirectDraws::TrustUse::Test;
 
     const std::vector<Graphics::DecodeRead>& DecodeReads(std::size_t index) const { return stages[index].decodeView != nullptr ? *stages[index].decodeView : decodeReads[index]; }
     const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& VertexInfo(std::size_t index) const { return stages[index].vertexView != nullptr ? *stages[index].vertexView : vertexInfos[index]; }

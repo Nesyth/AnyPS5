@@ -2687,16 +2687,27 @@ bool sameVertexLayout(const VertexInputLayout& a, const VertexInputLayout& b) {
     return std::ranges::equal(a.bindings, b.bindings, sameBinding) && std::ranges::equal(a.attributes, b.attributes, sameAttribute);
 }
 
-DrawRecordInputs takePreparedInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, PreparedInputs& prepared, DrawInputs& inputs, DrawTimer& timer, PerformanceTimer& timing, bool atFloor = false, bool validated = false) {
+void requireInputGuards(CommitterTrustCheck* trust, std::uint64_t address, std::size_t bytes, const char* access) {
+    if (trust != nullptr && trust->Audits() && (!DepthReadGuardIdle_nid_no_patch(address, bytes) || MayOverlapMultisampleGuards(address, bytes))) trust->Fail();
+    RequireNoMultisampleTarget(address, bytes, access);
+}
+
+CommitterTrustCheck committerTrustCheck(const ShaderResources& resources, CommitterTrustFamily family, CommitterTrustSite site) {
+    if (!RuntimeSwitches::Set(RuntimeSwitch::TrustAudit) || RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter)) return {};
+    return resources.TrustCheck(family, site);
+}
+
+DrawRecordInputs takePreparedInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, PreparedInputs& prepared, DrawInputs& inputs, DrawTimer& timer, PerformanceTimer& timing, bool atFloor = false, bool validated = false, CommitterTrustCheck* trust = nullptr) {
     const std::size_t indexRanges = draw.indexed ? 1u : 0u;
     if (prepared.recipe.get() != &recipe || prepared.device != context.device || prepared.state != &state || prepared.draw != &draw || prepared.shaders != shaders.data() || prepared.stages != shaders.size() || prepared.ranges.size() < indexRanges || context.recorder == nullptr || !context.drawInputsInPlace) return DrawRecordInputs::Shape;
     const bool mapped = (prepared.forget & 1u) == 0 && GuestMemory::ForgetSerial() == prepared.forget;
     const auto indexBytes = static_cast<std::size_t>(prepared.indexBytes);
     const bool trusted = !atFloor && RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter);
     if (trusted) NoteCommitterTrusted();
+    const bool guardsSkipped = trusted || (!atFloor && trust != nullptr && trust->Skip());
     if (draw.indexed && !atFloor) {
         if (!mapped) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), indexBytes, draw.indexSize);
-        if (!trusted) RequireNoMultisampleTarget(draw.indexAddress, indexBytes, "an index buffer read");
+        if (!guardsSkipped) requireInputGuards(trust, draw.indexAddress, indexBytes, "an index buffer read");
     }
     if (!atFloor && !validated) {
         requireUncountedKills(state);
@@ -2725,7 +2736,7 @@ DrawRecordInputs takePreparedInputs(const Context& context, const State& state, 
         const auto& range = prepared.ranges[at];
         const auto bytes = static_cast<std::size_t>(range.end - range.begin);
         if (!mapped) GuestMemory::CheckRange(reinterpret_cast<const void*>(range.begin), bytes, 1);
-        if (!atFloor && !trusted && at + prepared.indirectRanges < prepared.ranges.size()) RequireNoMultisampleTarget(range.begin, bytes, "a vertex buffer read");
+        if (!atFloor && !guardsSkipped && at + prepared.indirectRanges < prepared.ranges.size()) requireInputGuards(trust, range.begin, bytes, "a vertex buffer read");
         if (const auto use = served(range, &behind); use != DrawRecordInputs::Used) return use;
     }
     inputs.indexBytes = prepared.indexBytes;
@@ -6772,7 +6783,7 @@ std::uint64_t commitBindingTimingOrdinal = 0;
 std::uint64_t commitBindingVerifyOrdinal = 0;
 std::atomic<CommitBindingsHookForTest> commitBindingsHook{nullptr};
 
-bool proveRecordTemplate(DrawRecordCommit& record, ShaderResources& resources, std::span<const CompiledShader> shaders, DrawRecipeOutcome& result, bool injected) {
+bool proveRecordTemplate(DrawRecordCommit& record, ShaderResources& resources, std::span<const CompiledShader> shaders, DrawRecipeOutcome& result, bool injected, bool* proofTrusted = nullptr) {
     if (injected) return false;
     record.effects.proved = true;
     // A ceiling for the proof work of record draws, not a mode: the template is taken as it is
@@ -6780,7 +6791,16 @@ bool proveRecordTemplate(DrawRecordCommit& record, ShaderResources& resources, s
     static const bool none = std::getenv("APS5_XP_PROOF_NONE") != nullptr;
     if (RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor)) return true;
     if (RuntimeSwitches::Set(RuntimeSwitch::XpProofAsIs)) return none || resources.AsIsCurrent();
-    if (RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter) && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits) && resources.ExpressCurrentTrusted() == ShaderResources::ExpressMiss::None) {
+    const bool trusted = RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter);
+    bool fast = trusted && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits) && resources.ExpressCurrentTrusted() == ShaderResources::ExpressMiss::None;
+    bool skippedByAudit = false;
+    CommitterTrustCheck check;
+    if (!trusted && RuntimeSwitches::Set(RuntimeSwitch::TrustAudit) && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits) && resources.ExpressCurrentKept() == ShaderResources::ExpressMiss::None) {
+        check = resources.TrustCheck(CommitterTrustFamily::Template, CommitterTrustSite::Proof);
+        skippedByAudit = fast = check.Skip();
+        if (!fast && resources.ExpressCurrent() != ShaderResources::ExpressMiss::None) check.Fail();
+    }
+    if (fast) {
         bool staged = true;
         if (auto* recorder = Recorder::Active(); recorder != nullptr) {
             try {
@@ -6792,13 +6812,19 @@ bool proveRecordTemplate(DrawRecordCommit& record, ShaderResources& resources, s
         if (staged) {
             result.proof = {ShaderResources::ProofPath::Fast, ShaderResources::ProofFailure::None};
             if (record.cleanProofs) record.effects.cleanProof = ShaderResources::CleanProof::Skipped;
+            if (skippedByAudit && proofTrusted != nullptr) *proofTrusted = true;
             return true;
         }
     }
-    if (!record.cleanProofs) return resources.ProveCurrent(shaders, &result.proof);
+    if (!record.cleanProofs) {
+        const bool ok = resources.ProveCurrent(shaders, &result.proof);
+        if (!ok) check.Fail();
+        return ok;
+    }
     ShaderResources::CleanProof clean = ShaderResources::CleanProof::FirstProof;
     const bool ok = resources.ProveCurrent(shaders, &result.proof, &clean);
     record.effects.cleanProof = clean;
+    if (!ok) check.Fail();
     return ok;
 }
 
@@ -6964,7 +6990,7 @@ void publishFragmentBlock(const Context& context, DrawRecordCommit& record, cons
 
 std::uint64_t commitFragmentVerifyOrdinal = 0;
 
-void captureExpress(const Context& context, const State& state, const DrawRecipe& recipe, DrawRecordCommit& record, const Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, const DrawFragment& fragment, std::shared_ptr<Framebuffer> framebuffer, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::pair<std::uint32_t, std::uint32_t>> slices, std::vector<std::shared_ptr<void>> multisample, std::vector<VkImage> multisampleImages) {
+void captureExpress(const Context& context, const State& state, const DrawRecipe& recipe, DrawRecordCommit& record, const Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, const DrawFragment& fragment, std::shared_ptr<Framebuffer> framebuffer, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::pair<std::uint32_t, std::uint32_t>> slices, std::vector<std::shared_ptr<void>> multisample, std::vector<VkImage> multisampleImages, bool proofTrusted = false) {
     record.express.reset();
     auto& noted = record.effects.fragment.expressCapture;
     if (!record.effects.fragment.spliced && !record.effects.fragment.replayed) {
@@ -6975,7 +7001,7 @@ void captureExpress(const Context& context, const State& state, const DrawRecipe
         noted = DrawExpressCapture::Objects;
         return;
     }
-    if (const auto why = RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter) ? resources->ExpressCurrentTrusted() : resources->ExpressCurrent(); why != ShaderResources::ExpressMiss::None && (why == ShaderResources::ExpressMiss::Regions || !RuntimeSwitches::Set(RuntimeSwitch::ExpressKeepState) || !resources->ExpressWatchable())) {
+    if (const auto why = RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter) ? resources->ExpressCurrentTrusted() : proofTrusted ? resources->ExpressCurrentKept() : resources->ExpressCurrent(); why != ShaderResources::ExpressMiss::None && (why == ShaderResources::ExpressMiss::Regions || !RuntimeSwitches::Set(RuntimeSwitch::ExpressKeepState) || !resources->ExpressWatchable())) {
         noted = static_cast<DrawExpressCapture>(static_cast<std::size_t>(DrawExpressCapture::NotProved) + static_cast<std::size_t>(why) - static_cast<std::size_t>(ShaderResources::ExpressMiss::NotProved));
         return;
     }
@@ -7221,7 +7247,8 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
                     if (!difference.empty()) noteInputsDifference(difference);
                     ready = true;
                 } else {
-                    record.effects.inputs = takePreparedInputs(context, state, draw, shaders, recipe, *preparedInputs, inputs, timer, timing);
+                    auto inputsCheck = committerTrustCheck(*resources, CommitterTrustFamily::Inputs, CommitterTrustSite::RecordInputs);
+                    record.effects.inputs = takePreparedInputs(context, state, draw, shaders, recipe, *preparedInputs, inputs, timer, timing, false, false, &inputsCheck);
                     ready = record.effects.inputs == DrawRecordInputs::Used || record.effects.inputs == DrawRecordInputs::Rechecked;
                 }
             }
@@ -7312,9 +7339,10 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         }
     }
     timer.phase(PhasePrepare);
+    bool proofTrusted = false;
     const auto proved = [&] {
         const bool injected = failed(DrawRecipeMiss::Proof);
-        return proveRecordTemplate(record, *resources, shaders, result, injected);
+        return proveRecordTemplate(record, *resources, shaders, result, injected, &proofTrusted);
     };
     if (!proved()) {
         noteFailedProof(context, ProofSite::Record, result.proof, recording ? &recipe.key : nullptr);
@@ -7364,8 +7392,16 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         }
         const bool trusted = bound != nullptr && RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter) && (bound->forget & 1u) == 0 && GuestMemory::ForgetSerial() == bound->forget;
         if (trusted) NoteCommitterTrusted();
+        auto buffersCheck = bound != nullptr ? committerTrustCheck(*resources, CommitterTrustFamily::Buffers, CommitterTrustSite::RecordBuffers) : CommitterTrustCheck{};
         if (bound != nullptr) {
-            if ((trusted || resources->PreparedMovesClear(*bound, *recorder, &ticket)) && resources->PreparedInPlaceHolds(*bound, *recorder, preparedBehind)) {
+            const bool boundMapped = buffersCheck.Armed() && (bound->forget & 1u) == 0 && GuestMemory::ForgetSerial() == bound->forget;
+            const auto movesClear = [&] {
+                if (trusted || (boundMapped && buffersCheck.Skip())) return true;
+                if (resources->PreparedMovesClear(*bound, *recorder, &ticket)) return true;
+                if (boundMapped) buffersCheck.Fail();
+                return false;
+            };
+            if (movesClear() && resources->PreparedInPlaceHolds(*bound, *recorder, preparedBehind, &buffersCheck)) {
                 found.emplace(bound->moved.begin(), bound->moved.end());
                 for (auto& entry : *found) {
                     if (entry.inPlace != VK_NULL_HANDLE) entry.behind = recorder->PendingWriteOverlaps(entry.begin, entry.bytes);
@@ -7693,7 +7729,7 @@ DrawRecipeOutcome DrawWithRecord(const Context& context, const State& state, con
         else if (record.fragmentsRefused) blockMiss = DrawFragmentBlockMiss::Refused;
         else if (!fragmentModes()) blockMiss = DrawFragmentBlockMiss::Modes;
     }
-    if (expressWanted && expressFramebuffer != nullptr) captureExpress(context, state, recipe, record, *recorder, drawn.resources, *usableFragment, std::move(expressFramebuffer), std::move(expressTargets), std::move(expressSlices), std::move(expressMultisample), std::move(expressMultisampleImages));
+    if (expressWanted && expressFramebuffer != nullptr) captureExpress(context, state, recipe, record, *recorder, drawn.resources, *usableFragment, std::move(expressFramebuffer), std::move(expressTargets), std::move(expressSlices), std::move(expressMultisample), std::move(expressMultisampleImages), proofTrusted);
     if (dynamicRoute && drawn.bindings != nullptr && drawn.bindings->pushed && drawn.bindings->written) record.secondSetWritten = true;
     record.effects.passHeld = held;
     if ((!multisampleRecipe || RuntimeSwitches::Set(RuntimeSwitch::MsaaRecordHold)) && recorder->RenderPassOpen() && GuestMemory::CollectEpoch() != 0) {
@@ -7908,7 +7944,8 @@ RepeatOutcome RepeatCommit(const Context& context, const State& state, const Pm4
     if (record.keep.batch != recorder->OpenSerial() || !recorder->RenderPassOpen()) return refuse(RepeatRefusal::Batch);
     record.effects = {};
     DrawInputs inputs;
-    out.inputs = takePreparedInputs(context, state, draw, shaders, *recipe, *preparedInputs, inputs, timer, timing);
+    auto inputsCheck = committerTrustCheck(resources, CommitterTrustFamily::Inputs, CommitterTrustSite::RecordInputs);
+    out.inputs = takePreparedInputs(context, state, draw, shaders, *recipe, *preparedInputs, inputs, timer, timing, false, false, &inputsCheck);
     if (out.inputs != DrawRecordInputs::Used && out.inputs != DrawRecordInputs::Rechecked) return refuse(RepeatRefusal::Inputs);
     const auto giveBack = [&](RepeatRefusal why) {
         preparedInputs->vertexInput = std::move(inputs.vertexInput);
@@ -8843,7 +8880,12 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     if (fragment == nullptr || fragment->bindings == nullptr || fragment->device != context.device || fragment->resources.get() != keep.resources.get() || fragment->pipeline.get() != keep.pipeline.get() || fragment->indirect != draw.indirect.has_value()) return miss(DrawExpressMiss::Objects);
     auto& resources = *keep.resources;
     const bool trusted = RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter);
-    const auto templateMiss = resume != nullptr ? resume->templateMiss : trusted ? resources.ExpressCurrentTrusted() : resources.ExpressCurrent();
+    const bool audit = !trusted && RuntimeSwitches::Set(RuntimeSwitch::TrustAudit);
+    auto templateCheck = audit ? resources.TrustCheck(CommitterTrustFamily::Template, CommitterTrustSite::LeaderTemplate) : CommitterTrustCheck{};
+    auto buffersCheck = audit ? resources.TrustCheck(CommitterTrustFamily::Buffers, CommitterTrustSite::LeaderBuffers) : CommitterTrustCheck{};
+    auto inputsCheck = audit ? resources.TrustCheck(CommitterTrustFamily::Inputs, CommitterTrustSite::LeaderInputs) : CommitterTrustCheck{};
+    const auto preparedMapped = [&] { return (prepared->forget & 1u) == 0 && GuestMemory::ForgetSerial() == prepared->forget; };
+    const auto templateMiss = resume != nullptr ? resume->templateMiss : trusted ? resources.ExpressCurrentTrusted() : audit ? resources.ExpressCurrentAudited(templateCheck, false) : resources.ExpressCurrent();
     const bool reprove = resume != nullptr ? templateMiss != ShaderResources::ExpressMiss::None : templateMiss != ShaderResources::ExpressMiss::None && templateMiss != ShaderResources::ExpressMiss::Regions && (templateMiss != ShaderResources::ExpressMiss::NotProved || (RuntimeSwitches::Set(RuntimeSwitch::ExpressKeepState) && resources.ExpressWatchable()));
     if (templateMiss != ShaderResources::ExpressMiss::None && !reprove) return miss(DrawExpressMiss::Template);
     const bool appendOn = RuntimeSwitches::Set(RuntimeSwitch::XpAppendCommits);
@@ -8972,16 +9014,21 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
             for (std::size_t at = 0; refusal == AppendRefusal::None && at < taken.ranges.size(); ++at) {
                 const auto& range = taken.ranges[at];
                 const auto bytes = static_cast<std::size_t>(range.end - range.begin);
-                const bool rangeTrusted = trusted && at >= indexRanges && at + taken.indirectRanges < taken.ranges.size();
+                const bool vertexRange = at >= indexRanges && at + taken.indirectRanges < taken.ranges.size();
+                const bool rangeTrusted = vertexRange && (trusted || inputsCheck.Skip());
                 if (range.import == nullptr) refusal = AppendRefusal::Imports;
                 else if (!rangeTrusted && !PendingZones::Clear(range.begin, bytes) && (recorder->PendingWriteOverlaps(range.begin, bytes) || PendingStorageOverlaps(range.begin, bytes, nullptr))) refusal = AppendRefusal::InputWrites;
                 else if (!rangeTrusted && (recorder->PendingLabelIn(range.begin, bytes) || recorder->QueuedStoreOverlaps(range.begin, bytes))) refusal = AppendRefusal::InputStores;
+                if (vertexRange && (refusal == AppendRefusal::InputWrites || refusal == AppendRefusal::InputStores)) inputsCheck.Fail();
             }
         }
         if (refusal == AppendRefusal::None && trusted) {
             NoteCommitterTrusted();
             if ((prepared->forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared->forget) refusal = AppendRefusal::Buffers;
-        } else if (refusal == AppendRefusal::None && !resources.PreparedZonesClear(*prepared, *recorder)) refusal = AppendRefusal::Buffers;
+        } else if (refusal == AppendRefusal::None && !(buffersCheck.Armed() && preparedMapped() && buffersCheck.Skip()) && !resources.PreparedZonesClear(*prepared, *recorder)) {
+            refusal = AppendRefusal::Buffers;
+            if (buffersCheck.Audits() && preparedMapped()) buffersCheck.Fail();
+        }
         return refusal;
     };
     if (resume == nullptr && RuntimeSwitches::Set(RuntimeSwitch::AppendCommits) && !atFloor && !verifyDue && !reprove && templateMiss == ShaderResources::ExpressMiss::None) {
@@ -8989,7 +9036,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         conditionsGeneration = recorder->RenderPassGeneration();
         const auto generation = conditionsGeneration;
         auto refusal = conditions(false, false);
-        if (refusal == AppendRefusal::None && !resources.PreparedInPlaceHolds(*prepared, *recorder, inPlaceBehind)) {
+        if (refusal == AppendRefusal::None && !resources.PreparedInPlaceHolds(*prepared, *recorder, inPlaceBehind, &buffersCheck)) {
             refusal = AppendRefusal::Buffers;
             inPlaceRefused = true;
         }
@@ -9168,13 +9215,14 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     }
     DrawInputs inputs;
     const bool leanOn = RuntimeSwitches::Set(RuntimeSwitch::LeanExpress);
-    const auto taken = appended ? DrawRecordInputs::Used : takePreparedInputs(context, state, draw, shaders, *recipe, *preparedInputs, inputs, timer, timing, atFloor, leanOn);
+    const auto taken = appended ? DrawRecordInputs::Used : takePreparedInputs(context, state, draw, shaders, *recipe, *preparedInputs, inputs, timer, timing, atFloor, leanOn, &inputsCheck);
     if (appended) {
         inputs.indexBytes = preparedInputs->indexBytes;
+        const bool guardsSkipped = trusted || inputsCheck.Skip();
         for (std::size_t at = 0; at < preparedInputs->ranges.size(); ++at) {
             const auto& range = preparedInputs->ranges[at];
             const auto bytes = static_cast<std::size_t>(range.end - range.begin);
-            if (!trusted && at + preparedInputs->indirectRanges < preparedInputs->ranges.size()) RequireNoMultisampleTarget(range.begin, bytes, at == 0 && draw.indexed ? "an index buffer read" : "a vertex buffer read");
+            if (!guardsSkipped && at + preparedInputs->indirectRanges < preparedInputs->ranges.size()) requireInputGuards(&inputsCheck, range.begin, bytes, at == 0 && draw.indexed ? "an index buffer read" : "a vertex buffer read");
             recorder->NotePendingRead(range.begin, bytes, Recorder::ReadKind::DrawInput);
         }
         if (trusted) NoteCommitterTrusted();
@@ -9203,18 +9251,21 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     if (leanOn) noteLeanExpress(untouched);
     const bool movesTrusted = trusted && (prepared->forget & 1u) == 0 && GuestMemory::ForgetSerial() == prepared->forget;
     if (movesTrusted && !atFloor && !untouched) NoteCommitterTrusted();
-    if (!atFloor && !untouched && !movesTrusted) {
+    if (!atFloor && !untouched && !movesTrusted && !(buffersCheck.Armed() && preparedMapped() && buffersCheck.Skip())) {
         auto ticket = record.ticket;
         ticket.ranges = &record.ticketRanges;
         ticket.checked = 0;
         ticket.trusted = 0;
-        if (!resources.PreparedMovesClear(*prepared, *recorder, &ticket)) return giveBack(DrawExpressMiss::Moved);
+        if (!resources.PreparedMovesClear(*prepared, *recorder, &ticket)) {
+            if (buffersCheck.Audits() && preparedMapped()) buffersCheck.Fail();
+            return giveBack(DrawExpressMiss::Moved);
+        }
         ticket.ranges = nullptr;
         record.ticket = ticket;
         record.effects.movedChecked = ticket.checked;
         record.effects.movedTrusted = ticket.trusted;
     }
-    if (!appended && (inPlaceRefused || !resources.PreparedInPlaceHolds(*prepared, *recorder, inPlaceBehind))) return giveBack(DrawExpressMiss::Moved);
+    if (!appended && (inPlaceRefused || !resources.PreparedInPlaceHolds(*prepared, *recorder, inPlaceBehind, &buffersCheck))) return giveBack(DrawExpressMiss::Moved);
     const auto indirectTouches = [&](std::uint64_t begin, std::uint64_t end) {
         if (!indirectExpress) return false;
         const auto& args = *draw.indirect;
@@ -9226,9 +9277,16 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     };
     const bool storesTrusted = trusted && !indirectExpress;
     if (storesTrusted) NoteCommitterTrusted();
-    if (!storesTrusted && recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) recorder->FlushKeyStores();
-    if (!storesTrusted && recorder->HasQueuedStores() && recorder->AnyQueuedStore(touches)) recorder->FlushStores();
-    if (resources.FragmentSelectionHolds(*recorder, prepared->moved, *prepared, nullptr, untouched) != ShaderResources::PreparedBuffers::Selection::Taken) return giveBack(DrawExpressMiss::Selection);
+    const bool storesSkipped = storesTrusted || (!indirectExpress && buffersCheck.Skip());
+    if (!storesSkipped && recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) {
+        if (!indirectExpress) buffersCheck.Fail();
+        recorder->FlushKeyStores();
+    }
+    if (!storesSkipped && recorder->HasQueuedStores() && recorder->AnyQueuedStore(touches)) {
+        if (!indirectExpress) buffersCheck.Fail();
+        recorder->FlushStores();
+    }
+    if (resources.FragmentSelectionHolds(*recorder, prepared->moved, *prepared, nullptr, untouched, &buffersCheck) != ShaderResources::PreparedBuffers::Selection::Taken) return giveBack(DrawExpressMiss::Selection);
     if (resources.ChecksFaults() && fragment->faultGeneration != resources.FaultGeneration()) resources.RewriteFragmentFaults(*fragment->bindings);
     try {
         if (!reprove) resources.ExpressStage(*recorder);
@@ -9255,7 +9313,10 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         express->keptBatch = recorder->OpenSerial();
     }
     if (trusted) NoteCommitterTrusted();
-    else resources.RequireGuestBuffers();
+    else if (buffersCheck.Skip()) {
+    } else if (buffersCheck.Audits()) {
+        resources.RequireGuestBuffersAudited(buffersCheck);
+    } else resources.RequireGuestBuffers();
     const auto& inPlaceReads = appended ? preparedInputs->inPlaceReads : inputs.inPlaceReads;
     bool passSeen = appended && RuntimeSwitches::Set(RuntimeSwitch::PassReadsOnce) && express->passSeenRecorder == recorder->Id() && express->passSeenGeneration == recorder->RenderPassGeneration() && express->writes.empty() && express->writeOnly.empty() && express->images.empty() && recorder->PassPureReads() && recorder->AppendablePass(express->passKey) != VK_NULL_HANDLE;
     const bool passSeenVerify = passSeen && appendVerifyDue();
@@ -9570,6 +9631,11 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     const bool windows = RuntimeSwitches::Set(RuntimeSwitch::FollowWindows) && !VerifyGuardSpans();
     const bool widerCensus = RuntimeSwitches::Set(RuntimeSwitch::FollowWider);
     const bool trusted = RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter);
+    const bool audit = !trusted && keep.resources != nullptr && RuntimeSwitches::Set(RuntimeSwitch::TrustAudit);
+    auto templateCheck = audit ? keep.resources->TrustCheck(CommitterTrustFamily::Template, CommitterTrustSite::FollowerTemplate) : CommitterTrustCheck{};
+    auto buffersCheck = audit ? keep.resources->TrustCheck(CommitterTrustFamily::Buffers, CommitterTrustSite::FollowerBuffers) : CommitterTrustCheck{};
+    auto inputsCheck = audit ? keep.resources->TrustCheck(CommitterTrustFamily::Inputs, CommitterTrustSite::FollowerInputs) : CommitterTrustCheck{};
+    const auto preparedMapped = [&] { return (prepared.forget & 1u) == 0 && GuestMemory::ForgetSerial() == prepared.forget; };
     const bool intentOn = RuntimeSwitches::Set(RuntimeSwitch::ExpressDepthIntent);
     const std::uint8_t ownIntent = intentOn ? depthIntent(state) : 0u;
     const auto depthMemoHolds = [&] {
@@ -9644,7 +9710,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
         }
         if (first) mark(1);
         auto& resources = *keep.resources;
-        if (const auto missed = trusted ? resources.ExpressCurrentTrusted() : resources.ExpressCurrentFollowing(); missed != ShaderResources::ExpressMiss::None) {
+        if (const auto missed = trusted ? resources.ExpressCurrentTrusted() : templateCheck.Armed() ? resources.ExpressCurrentAudited(templateCheck, true) : resources.ExpressCurrentFollowing(); missed != ShaderResources::ExpressMiss::None) {
             const bool reprovable = missed != ShaderResources::ExpressMiss::Regions && (missed != ShaderResources::ExpressMiss::NotProved || (RuntimeSwitches::Set(RuntimeSwitch::ExpressKeepState) && resources.ExpressWatchable()));
             if (first && widerCensus) {
                 ++run.census.templateMisses[static_cast<std::size_t>(missed)];
@@ -9658,8 +9724,15 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
         const std::size_t indexRanges = draw.indexed ? 1u : 0u;
         if (preparedInputs.recipe.get() != recipe || preparedInputs.device != context.device || preparedInputs.state != &state || preparedInputs.draw != &draw || preparedInputs.shaders != shaders.data() || preparedInputs.stages != shaders.size() || preparedInputs.ranges.size() < indexRanges || (preparedInputs.forget & 1u) != 0 || forget != preparedInputs.forget || imports != preparedInputs.imports || mapping != preparedInputs.mapping) return ExpressRunRefusal::Inputs;
         if (trusted) NoteCommitterTrusted(2);
-        if (!trusted && !recorder->PassReadsFollow(express->reads, preparedInputs.inPlaceReads)) return ExpressRunRefusal::PassWrites;
-        if (!trusted && !recorder->PassImagesFollow(express->images, std::span<const std::pair<VkImage, bool>>(run.attachments.data(), run.targets))) return ExpressRunRefusal::ImageHazard;
+        const bool passSkipped = trusted || buffersCheck.Skip();
+        if (!passSkipped && !recorder->PassReadsFollow(express->reads, preparedInputs.inPlaceReads)) {
+            buffersCheck.Fail();
+            return ExpressRunRefusal::PassWrites;
+        }
+        if (!passSkipped && !recorder->PassImagesFollow(express->images, std::span<const std::pair<VkImage, bool>>(run.attachments.data(), run.targets))) {
+            buffersCheck.Fail();
+            return ExpressRunRefusal::ImageHazard;
+        }
         if (express->fenced && !recorder->PassFenced()) return ExpressRunRefusal::Fenced;
         keyRunRanges(run.clear, recorderId, recorder->WriteNoteCount(), StorageTexture::PendingSerial(), Recorder::QueuedLabelSerial());
         if (windows) keyRunWindows(run, *recorder);
@@ -9668,8 +9741,13 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
         for (const auto& range : preparedInputs.ranges) {
             const auto bytes = static_cast<std::size_t>(range.end - range.begin);
             if (range.import == nullptr) return ExpressRunRefusal::Inputs;
-            if (trusted && (!draw.indexed || &range != &preparedInputs.ranges.front())) continue;
-            if (queuedStores && recorder->QueuedStoreOverlaps(range.begin, bytes)) return ExpressRunRefusal::InputStores;
+            const bool vertexRange = !draw.indexed || &range != &preparedInputs.ranges.front();
+            if (vertexRange && (trusted || inputsCheck.Skip())) continue;
+            const auto hazard = [&](ExpressRunRefusal why) {
+                if (vertexRange) inputsCheck.Fail();
+                return why;
+            };
+            if (queuedStores && recorder->QueuedStoreOverlaps(range.begin, bytes)) return hazard(ExpressRunRefusal::InputStores);
             if (runRangesHold(run.clear, range.begin, range.end, true)) {
                 ++run.census.rangesSkipped;
                 continue;
@@ -9680,13 +9758,13 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
                 pendingClear = !pendingOver();
                 noteWindowVerify(WindowFact::Pending, pendingClear);
             }
-            if (!pendingClear && pendingOver()) return ExpressRunRefusal::InputWrites;
+            if (!pendingClear && pendingOver()) return hazard(ExpressRunRefusal::InputWrites);
             bool labelsClear = windows && runWindowsClear(run, *recorder, WindowFact::Labels, range.begin, bytes);
             if (labelsClear && windowVerifyDue()) {
                 labelsClear = !recorder->PendingLabelIn(range.begin, bytes);
                 noteWindowVerify(WindowFact::Labels, labelsClear);
             }
-            if (!labelsClear && recorder->PendingLabelIn(range.begin, bytes)) return ExpressRunRefusal::InputStores;
+            if (!labelsClear && recorder->PendingLabelIn(range.begin, bytes)) return hazard(ExpressRunRefusal::InputStores);
             addRunRange(run.clear, range.begin, range.end);
         }
         if (first) mark(3);
@@ -9694,13 +9772,19 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
         if (trusted) {
             NoteCommitterTrusted(2);
             if ((prepared.forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared.forget) return ExpressRunRefusal::Buffers;
-        } else if (!resources.PreparedZonesClearBy(prepared, &followZoneClear, &zones)) return ExpressRunRefusal::Buffers;
-        if (!trusted && (recorder->HasQueuedKeyStores() || queuedStores)) {
+        } else if (!(buffersCheck.Armed() && preparedMapped() && buffersCheck.Skip()) && !resources.PreparedZonesClearBy(prepared, &followZoneClear, &zones)) {
+            if (buffersCheck.Audits() && preparedMapped()) buffersCheck.Fail();
+            return ExpressRunRefusal::Buffers;
+        }
+        if (!trusted && !buffersCheck.Skip() && (recorder->HasQueuedKeyStores() || queuedStores)) {
             const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
                 const auto bytes = static_cast<std::size_t>(end - begin);
                 return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes);
             };
-            if ((recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) || (queuedStores && recorder->AnyQueuedStore(touches))) return ExpressRunRefusal::Stores;
+            if ((recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) || (queuedStores && recorder->AnyQueuedStore(touches))) {
+                buffersCheck.Fail();
+                return ExpressRunRefusal::Stores;
+            }
         }
         return ExpressRunRefusal::Count;
     };
@@ -9770,7 +9854,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     FollowGuards guards{run, *recorder};
     const ShaderResources::GuardTests guardTests{&followDepthGuards, &followMultisampleGuards, &guards};
     if (windows) keyRunGuardWindows(run, *recorder);
-    const auto selection = windows ? resources.FragmentSelectionHoldsBy(*recorder, prepared.moved, prepared, true, &guardTests) : resources.FragmentSelectionHolds(*recorder, prepared.moved, prepared, nullptr, true);
+    const auto selection = windows ? resources.FragmentSelectionHoldsBy(*recorder, prepared.moved, prepared, true, &guardTests, &buffersCheck) : resources.FragmentSelectionHolds(*recorder, prepared.moved, prepared, nullptr, true, &buffersCheck);
     if (selection != ShaderResources::PreparedBuffers::Selection::Taken) return late(ExpressRunRefusal::Selection);
     mark(5);
     try {
@@ -9780,7 +9864,8 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     }
     if (windows) keyRunGuardWindows(run, *recorder);
     if (trusted) NoteCommitterTrusted();
-    for (std::size_t at = 0; !trusted && at < preparedInputs.ranges.size(); ++at) {
+    const bool guardsSkipped = trusted || inputsCheck.Skip();
+    for (std::size_t at = 0; !guardsSkipped && at < preparedInputs.ranges.size(); ++at) {
         const auto& range = preparedInputs.ranges[at];
         const auto bytes = static_cast<std::size_t>(range.end - range.begin);
         if (windows && runWindowsClear(run, *recorder, WindowFact::DepthReads, range.begin, bytes) && runWindowsClear(run, *recorder, WindowFact::MultisampleSpans, range.begin, bytes)) {
@@ -9791,13 +9876,16 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
             noteWindowVerify(WindowFact::MultisampleSpans, multisampleIdle);
             if (depthIdle && multisampleIdle) continue;
         }
-        RequireNoMultisampleTarget(range.begin, bytes, at == 0 && draw.indexed ? "an index buffer read" : "a vertex buffer read");
+        requireInputGuards(&inputsCheck, range.begin, bytes, at == 0 && draw.indexed ? "an index buffer read" : "a vertex buffer read");
     }
     if (resources.ChecksFaults() && fragment.faultGeneration != resources.FaultGeneration()) resources.RewriteFragmentFaults(*fragment.bindings);
     if (!(prepared.aliasesClear && RuntimeSwitches::Set(RuntimeSwitch::AliasesAtPrepare))) CheckBufferAliases(shaders, state.color, draw.indexAddress, preparedInputs.indexBytes);
     if (recipe->hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     if (trusted) NoteCommitterTrusted();
-    else resources.RequireGuestBuffers();
+    else if (buffersCheck.Skip()) {
+    } else if (buffersCheck.Audits()) {
+        resources.RequireGuestBuffersAudited(buffersCheck);
+    } else resources.RequireGuestBuffers();
     if (recorder->AppendablePass(express->passKey) != commands || recorder->RenderPassGeneration() != generation) return late(ExpressRunRefusal::PassMoved);
     mark(6);
     const auto batch = recorder->OpenSerial();

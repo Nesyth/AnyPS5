@@ -196,6 +196,48 @@ struct PresyncSurface {
     bool dccKeys;
 };
 
+struct CommitterTrustState {
+    std::uint32_t untilAudit = 0;
+    std::uint32_t volatileUntil = 0;
+};
+
+enum class CommitterTrustFamily : std::uint8_t { Template, Buffers, Inputs, Count };
+enum class CommitterTrustSite : std::uint8_t { FollowerTemplate, LeaderTemplate, Proof, FollowerBuffers, LeaderBuffers, RecordBuffers, FollowerInputs, LeaderInputs, RecordInputs, Count };
+enum class CommitterTrustUse : std::uint8_t { Today, Trusted, Audit, Volatile };
+
+inline std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitterTrustSite::Count)> committerTrustTrusted{};
+
+CommitterTrustUse CommitterTrustSlow(CommitterTrustState& state, CommitterTrustSite site);
+void CommitterTrustFailed(CommitterTrustState& state, CommitterTrustSite site, CommitterTrustUse use);
+
+inline CommitterTrustUse CommitterTrustDecide(CommitterTrustState& state, CommitterTrustSite site) {
+    if (state.untilAudit > 1) {
+        --state.untilAudit;
+        auto& trusted = committerTrustTrusted[static_cast<std::size_t>(site)];
+        trusted.store(trusted.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        return CommitterTrustUse::Trusted;
+    }
+    return CommitterTrustSlow(state, site);
+}
+
+struct CommitterTrustCheck {
+    CommitterTrustState* state = nullptr;
+    CommitterTrustSite site = CommitterTrustSite::Count;
+    CommitterTrustUse use = CommitterTrustUse::Today;
+    bool failed = false;
+    bool Armed() const { return state != nullptr; }
+    bool Skip() {
+        if (state != nullptr && use == CommitterTrustUse::Today) use = CommitterTrustDecide(*state, site);
+        return use == CommitterTrustUse::Trusted;
+    }
+    bool Audits() const { return use == CommitterTrustUse::Audit || use == CommitterTrustUse::Volatile; }
+    void Fail() {
+        if (!Audits() || failed) return;
+        failed = true;
+        CommitterTrustFailed(*state, site, use);
+    }
+};
+
 class ShaderResources {
 public:
     ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes);
@@ -224,6 +266,7 @@ public:
     void NoteCoverageSerial(std::uint64_t serial) const { coverageSerial = serial; }
     void RefreshHeapStage(std::span<const CompiledShader> shaders);
     void RequireGuestBuffers() const { requireGuestBuffers(); }
+    void RequireGuestBuffersAudited(CommitterTrustCheck& trust) const;
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
     void BindDescriptorHeaps(VkCommandBuffer commands) const;
     struct DrawBindings {
@@ -498,14 +541,17 @@ public:
     ExpressMiss ExpressCurrent();
     ExpressMiss ExpressCurrentFollowing();
     ExpressMiss ExpressCurrentTrusted() const;
+    ExpressMiss ExpressCurrentKept() const;
+    ExpressMiss ExpressCurrentAudited(CommitterTrustCheck& check, bool following);
+    CommitterTrustCheck TrustCheck(CommitterTrustFamily family, CommitterTrustSite site) const { return {&committerTrust[static_cast<std::size_t>(family)], site}; }
     void ExpressStage(Recorder& recorder);
-    PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched = false) const;
+    PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched = false, CommitterTrustCheck* trust = nullptr) const;
     struct GuardTests {
         bool (*depth)(void* tests, std::uint64_t address, std::uint64_t bytes) = nullptr;
         bool (*multisample)(void* tests, std::uint64_t address, std::uint64_t bytes) = nullptr;
         void* tests = nullptr;
     };
-    PreparedBuffers::Selection FragmentSelectionHoldsBy(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, bool untouched, const GuardTests* guards) const;
+    PreparedBuffers::Selection FragmentSelectionHoldsBy(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, bool untouched, const GuardTests* guards, CommitterTrustCheck* trust = nullptr) const;
     void PushFragmentBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
     void WriteFragmentSets(DrawBindings& result, std::span<const std::size_t> selected, std::int32_t pushedSet) const;
     struct FragmentPlanNote {
@@ -624,7 +670,7 @@ public:
     bool PreparedZonesClear(const PreparedBuffers& prepared, const Recorder& recorder) const;
     using ZoneClear = bool (*)(void* tests, std::uint64_t begin, std::size_t bytes, bool moved);
     bool PreparedZonesClearBy(const PreparedBuffers& prepared, ZoneClear clear, void* tests) const;
-    bool PreparedInPlaceHolds(const PreparedBuffers& prepared, const Recorder& recorder, bool& behind) const;
+    bool PreparedInPlaceHolds(const PreparedBuffers& prepared, const Recorder& recorder, bool& behind, CommitterTrustCheck* trust = nullptr) const;
     static void NotePreparedInPlaceTaken(const PreparedBuffers& prepared);
     static bool PreparedInPlaceOverlaps(const PreparedBuffers& prepared, std::uint64_t begin, std::uint64_t end);
     bool UnmovedRangesClear(const PreparedBuffers& prepared, Recorder& recorder) const;
@@ -988,8 +1034,8 @@ private:
     std::uint64_t guestBufferBytes(std::span<const std::uint32_t> words) const;
     static std::uint64_t ClampedBufferBytes(std::span<const std::uint32_t> words, std::uint64_t maxStorageBufferRange);
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
-    void requireGuestBuffers(std::span<const MovedBuffer> moved = {}) const;
-    bool requireMovedGuestBuffers(std::span<const MovedBuffer> moved, const GuardTests* guards = nullptr) const;
+    void requireGuestBuffers(std::span<const MovedBuffer> moved = {}, bool* found = nullptr) const;
+    bool requireMovedGuestBuffers(std::span<const MovedBuffer> moved, const GuardTests* guards = nullptr, bool* found = nullptr) const;
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
     // locks itself); stage B looks the sampled textures and storage images up (resolveImageBinding).
     void addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, std::span<const std::uint32_t> guest, VkShaderStageFlags flags);
@@ -1342,7 +1388,7 @@ private:
     void pushPlannedBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const;
     static std::uint64_t NextPlanSerial();
     std::uint64_t planSerial = NextPlanSerial();
-    bool preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched = false, const GuardTests* guards = nullptr, bool trusted = false) const;
+    bool preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched = false, const GuardTests* guards = nullptr, bool trusted = false, CommitterTrustCheck* trust = nullptr) const;
     void pushBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const;
     void writeOwnDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     mutable std::unique_ptr<PushPlan> pushPlan;
@@ -1436,6 +1482,7 @@ private:
     std::uint64_t expressGeneration = 0;
     CleanStamp expressAt;
     bool expressValid = false;
+    mutable std::array<CommitterTrustState, static_cast<std::size_t>(CommitterTrustFamily::Count)> committerTrust{};
     std::atomic<std::uint64_t> expressViewsAt{0};
     std::atomic<std::uint64_t> expressRegionsAt{0};
     std::vector<std::pair<const StorageTexture*, std::uint64_t>> expressSources;

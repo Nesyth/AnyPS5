@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_LEANDRAW_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_LEANDRAW_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
@@ -30,6 +31,7 @@ struct LeanShape : std::enable_shared_from_this<LeanShape> {
     std::uint32_t reg207 = 0;
     bool skipped = false;
     std::vector<DrawPipeline::Range> writes;
+    mutable DirectDraws::TrustState trust;
 };
 
 struct ShapeRecord {
