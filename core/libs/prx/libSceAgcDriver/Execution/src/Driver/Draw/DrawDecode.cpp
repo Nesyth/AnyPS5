@@ -73,7 +73,7 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeOrderedVertexStageInfo(std::span<c
     std::vector<DrawPipeline::Range> ranges;
     ranges.reserve(reads.size());
     for (const auto& read : reads) ranges.emplace_back(read.address, read.address + read.size);
-    if (!queue.WrittenSince(watch, ranges)) return info;
+    if (!queue.WrittenSince(watch, ranges) || DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Capture)) return info;
     queue.NoteDecodeDrain();
     queue.Drain(DrawPipeline::DrainReason::Capture);
     return decode();

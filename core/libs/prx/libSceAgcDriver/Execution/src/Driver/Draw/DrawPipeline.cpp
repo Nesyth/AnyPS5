@@ -380,6 +380,11 @@ std::uint64_t finisherDepth() {
     return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DeeperRing) ? PublishedKeys::Capacity : PublishedKeys::DeepDepth;
 }
 
+bool pipelineStats() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return stats;
+}
+
 bool spinHandoff() {
     return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SpinHandoff);
 }
@@ -629,10 +634,15 @@ bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
     }
     const bool ring = ringMode.load(std::memory_order_acquire);
     if (ring) retireLean();
-    if (lockless()) {
+    const bool flow = Flow();
+    if (lockless() || flow) {
         const Range range{begin, end};
-        const auto answer = published.Overlaps({&range, 1});
+        const auto answer = published.Overlaps({&range, 1}, nullptr, nullptr, flow);
         if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Hit;
+        if (flow) {
+            NoteFlowLookup(FlowLookup::PendingWrites);
+            return false;
+        }
     }
     if (ring) {
         for (auto seq = frontSeq.load(std::memory_order_acquire); seq < nextSeq; ++seq) {
@@ -664,12 +674,13 @@ DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std:
     }
     const bool ring = ringMode.load(std::memory_order_acquire);
     if (ring) retireLean();
-    if (lockless()) {
+    const bool flow = Flow();
+    if (lockless() || flow) {
         const Range range{address, end};
-        if (published.Overlaps({&range, 1}) == PublishedRanges::Answer::Clear) return LabelLookup::NotHeld;
+        if (published.Overlaps({&range, 1}, nullptr, nullptr, flow) == PublishedRanges::Answer::Clear) return LabelLookup::NotHeld;
     }
     const auto lookup = [&](const Pending& held) -> std::optional<LabelLookup> {
-        if (held.unknown) return LabelLookup::Unknown;
+        if (held.unknown && !flow) return LabelLookup::Unknown;
         const bool overlaps = std::any_of(held.writes.begin(), held.writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
         if (!overlaps) return std::nullopt;
         if (held.labelRun != nullptr) return held.labelRun->Find(address, bytes, value) == LabelRun::Lookup::Value ? LabelLookup::Value : LabelLookup::Unknown;
@@ -697,9 +708,14 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
     if (!FinisherProducer::Get()) return aheadWait(ranges);
     const bool ring = ringMode.load(std::memory_order_acquire);
     if (ring) retireLean();
-    if (lockless()) {
-        const auto answer = published.Overlaps(ranges);
+    const bool flow = Flow();
+    if (lockless() || flow) {
+        const auto answer = published.Overlaps(ranges, nullptr, nullptr, flow);
         if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Hit;
+        if (flow) {
+            NoteFlowLookup(FlowLookup::PendingWrites);
+            return false;
+        }
     }
     if (ring) {
         for (auto seq = frontSeq.load(std::memory_order_acquire); seq < nextSeq; ++seq) {
@@ -728,6 +744,10 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
 bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
     FlushOpenRun();
     if (!Busy() || !FinisherProducer::Get()) return false;
+    if (Flow()) {
+        NoteFlowLookup(FlowLookup::SameKey);
+        return false;
+    }
     const bool precise = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PreciseLookupDrain);
     const bool ring = ringMode.load(std::memory_order_acquire);
     if (ring) retireLean();
@@ -749,6 +769,10 @@ bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
 PublishedKeys::Answer DrawFinisher::KeyBefore(std::uint64_t key, std::uint64_t shape, bool insertsOnly) const {
     const auto seq = FinisherSeq::Get();
     if (seq == 0 || frontSeq.load(std::memory_order_acquire) >= seq) return PublishedKeys::Answer::Clear;
+    if (Flow()) {
+        NoteFlowLookup(FlowLookup::EarlierKey);
+        return PublishedKeys::Answer::Clear;
+    }
     return keys.FindBefore(key, shape, insertsOnly, seq);
 }
 
@@ -796,12 +820,38 @@ void noteTurnWait(PublishedRanges::Answer answer, bool unknownHeld, std::span<co
 }
 }
 
+namespace {
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawFinisher::FlowSite::Count)> flowSkips{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawFinisher::FlowLookup::Count)> flowLookups{};
+std::atomic<std::uint64_t> flowTurnSkipsCrowded{0};
+std::atomic<std::uint64_t> flowTurnSkipsUnknown{0};
+std::atomic<std::uint64_t> flowTurnWaitsKept{0};
+std::atomic<std::uint64_t> ringDepthHighest{0};
+std::atomic<std::uint64_t> ringDepthSum{0};
+std::atomic<std::uint64_t> ringDepthSamples{0};
+
+void noteRingDepth(std::uint64_t depth) {
+    ringDepthSum.fetch_add(depth, std::memory_order_relaxed);
+    ringDepthSamples.fetch_add(1, std::memory_order_relaxed);
+    if (depth > ringDepthHighest.load(std::memory_order_relaxed)) ringDepthHighest.store(depth, std::memory_order_relaxed);
+}
+}
+
 bool DrawFinisher::aheadWait(std::span<const Range> ranges) {
     if (!FinisherAhead::Get() || !AheadBusy()) return false;
     Range pendingHit{};
     bool unknownHeld = false;
     auto answer = published.Overlaps(ranges, &pendingHit, &unknownHeld);
     if (answer == PublishedRanges::Answer::Clear) return false;
+    if (Flow()) {
+        if (unknownHeld) answer = published.Overlaps(ranges, &pendingHit, nullptr, true);
+        if (answer != PublishedRanges::Answer::Hit) {
+            (answer == PublishedRanges::Answer::Unsure ? flowTurnSkipsCrowded : flowTurnSkipsUnknown).fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        unknownHeld = false;
+        flowTurnWaitsKept.fetch_add(1, std::memory_order_relaxed);
+    }
     if (unknownHeld && ringMode.load(std::memory_order_acquire) && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::TurnWaitsByJob)) {
         const auto seq = FinisherSeq::Get();
         std::uint64_t blocker = 0;
@@ -860,6 +910,42 @@ std::string DrawFinisher::DrainText() {
         std::snprintf(item, sizeof(item), " 0x%02zx x%llu (%llu)", top, static_cast<unsigned long long>(count), static_cast<unsigned long long>(drainedBeside[top].exchange(0)));
         text += item;
     }
+    return text;
+}
+
+bool DrawFinisher::Flow() {
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpFlow);
+}
+
+bool DrawFinisher::FlowSkips(FlowSite site) {
+    if (!Flow()) return false;
+    flowSkips[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void DrawFinisher::NoteFlowLookup(FlowLookup lookup) {
+    flowLookups[static_cast<std::size_t>(lookup)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string DrawFinisher::FlowText() {
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto samples = take(ringDepthSamples);
+    const auto sum = take(ringDepthSum);
+    const auto highest = take(ringDepthHighest);
+    std::array<unsigned long long, static_cast<std::size_t>(FlowSite::Count)> skipped{};
+    for (std::size_t index = 0; index < skipped.size(); ++index) skipped[index] = take(flowSkips[index]);
+    std::array<unsigned long long, static_cast<std::size_t>(FlowLookup::Count)> unscanned{};
+    for (std::size_t index = 0; index < unscanned.size(); ++index) unscanned[index] = take(flowLookups[index]);
+    const auto crowded = take(flowTurnSkipsCrowded);
+    const auto unknown = take(flowTurnSkipsUnknown);
+    const auto kept = take(flowTurnWaitsKept);
+    const auto site = [&](FlowSite at) { return skipped[static_cast<std::size_t>(at)]; };
+    const auto lookup = [&](FlowLookup at) { return unscanned[static_cast<std::size_t>(at)]; };
+    char text[1024];
+    std::snprintf(text, sizeof(text), "switch %s, ring span %llu slots; outstanding finisher jobs at each publish: highest %llu, mean %.1f over %llu jobs; drains skipped (capture ones on finisher jobs too): packet finisher %llu, packet committer %llu, predication %llu, dispatch %llu, dispatch reads %llu, indirect arguments %llu, relocation %llu, capture %llu; lookups answered without a scan: same key %llu, earlier key %llu, pending writes %llu, queued writes %llu, held reads %llu, write watches %llu; turn waits of jobs ahead skipped: crowded write list %llu, unknown writes %llu; kept for a published write over the read %llu",
+        Flow() ? "set" : "unset", static_cast<unsigned long long>(Get().leanMask.load(std::memory_order_relaxed) + 1), highest, samples == 0 ? 0.0 : static_cast<double>(sum) / static_cast<double>(samples), samples,
+        site(FlowSite::PacketFinisher), site(FlowSite::PacketCommitter), site(FlowSite::Predication), site(FlowSite::Dispatch), site(FlowSite::DispatchReads), site(FlowSite::Indirect), site(FlowSite::Relocation), site(FlowSite::Capture),
+        lookup(FlowLookup::SameKey), lookup(FlowLookup::EarlierKey), lookup(FlowLookup::PendingWrites), lookup(FlowLookup::QueuedWrites), lookup(FlowLookup::HeldReads), lookup(FlowLookup::Watch), crowded, unknown, kept);
     return text;
 }
 
@@ -1175,6 +1261,7 @@ bool DrawFinisher::Adopt(bool ring) {
     }
     if (ring) {
         if (lean == nullptr) lean = std::make_unique<std::array<LeanSlot, LeanSlots>>();
+        leanMask.store((Flow() ? LeanSlots : NarrowLeanSlots) - 1, std::memory_order_seq_cst);
         leanTake.store(nextSeq, std::memory_order_seq_cst);
         leanTail.store(nextSeq, std::memory_order_seq_cst);
         leanRetired = nextSeq;
@@ -1195,11 +1282,13 @@ void DrawFinisher::retireLean() {
     bool unlisted = false;
     for (; leanRetired < front; ++leanRetired) {
         auto& slot = leanSlot(leanRetired);
-        republish = countPending(slot.pending, false) || republish;
-        if (slot.pending.unknown) {
-            if (const auto listed = std::find(unknownSeqs.begin(), unknownSeqs.end(), leanRetired); listed != unknownSeqs.end()) {
-                unknownSeqs.erase(listed);
-                unlisted = true;
+        if (slot.counted) {
+            republish = countPending(slot.pending, false) || republish;
+            if (slot.pending.unknown) {
+                if (const auto listed = std::find(unknownSeqs.begin(), unknownSeqs.end(), leanRetired); listed != unknownSeqs.end()) {
+                    unknownSeqs.erase(listed);
+                    unlisted = true;
+                }
             }
         }
         if (const auto retirer = std::exchange(slot.retirer, nullptr); retirer != nullptr) retirer(slot.payload.data(), std::move(slot.answer));
@@ -1253,9 +1342,18 @@ void DrawFinisher::helpLean(TWaiting&& waiting, bool room) {
     noteHelped(room, jobs, start);
 }
 
+void DrawFinisher::fitLeanSpan() {
+    const std::uint64_t wanted = Flow() ? LeanSlots : NarrowLeanSlots;
+    if (leanMask.load(std::memory_order_relaxed) + 1 == wanted || outstanding.load(std::memory_order_seq_cst) != 0) return;
+    retireLean();
+    if (leanRetired != nextSeq) return;
+    leanMask.store(wanted - 1, std::memory_order_seq_cst);
+}
+
 void DrawFinisher::awaitLeanRoom(bool helping) {
-    static_assert(PublishedKeys::Capacity <= LeanSlots && 16 <= LeanSlots, "the finisher ring must hold the deepest finisher queue");
-    const std::uint64_t depth = finisherDepth();
+    static_assert(PublishedKeys::Capacity <= NarrowLeanSlots && 16 <= NarrowLeanSlots && NarrowLeanSlots <= LeanSlots && (NarrowLeanSlots & (NarrowLeanSlots - 1)) == 0 && (LeanSlots & (LeanSlots - 1)) == 0, "the finisher ring must hold the deepest finisher queue, in a power-of-two number of slots");
+    fitLeanSpan();
+    const std::uint64_t depth = Flow() && leanMask.load(std::memory_order_relaxed) + 1 == LeanSlots ? LeanSlots : finisherDepth();
     const auto full = [&] { return nextSeq - frontSeq.load(std::memory_order_seq_cst) >= depth && !closed.load(std::memory_order_acquire); };
     if (!full()) {
         retireLean();
@@ -1372,11 +1470,12 @@ bool DrawFinisher::parkInSlot(unsigned index) {
 
 void DrawFinisher::publishLean(LeanSlot& slot) {
     const auto seq = nextSeq;
-    if (!slot.batch && slot.pending.unknown) {
+    slot.counted = slot.batch || !Flow() || (pendingWrites.size() <= PublishedRanges::Capacity && unknownSeqs.size() <= PublishedRanges::UnknownCapacity);
+    if (!slot.batch && slot.counted && slot.pending.unknown) {
         unknownSeqs.push_back(seq);
         published.PublishUnknownJobs(unknownSeqs);
     }
-    if (!slot.batch && countPending(slot.pending, true)) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
+    if (!slot.batch && slot.counted && countPending(slot.pending, true)) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
     keys.Push(seq, slot.pending.key, slot.pending.shape, slot.pending.inserts);
     slot.seq.store(seq, std::memory_order_relaxed);
     slot.state.store(LeanReady, std::memory_order_relaxed);
@@ -1384,6 +1483,7 @@ void DrawFinisher::publishLean(LeanSlot& slot) {
     nextSeq = seq + 1;
     issued.store(nextSeq, std::memory_order_relaxed);
     leanTail.store(nextSeq, std::memory_order_seq_cst);
+    if (pipelineStats()) noteRingDepth(nextSeq - frontSeq.load(std::memory_order_relaxed));
     unsigned wanted = 1u;
     for (unsigned index = 1; index <= extra.size(); ++index) wanted |= finisherTakes(index) ? 1u << index : 0u;
     if ((started.load(std::memory_order_acquire) & wanted) != wanted) {
@@ -2040,8 +2140,9 @@ void DrawPipeline::enqueue(Item item) {
         finisher.AwaitTurn();
     }
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) {
-        const bool dispatchTurn = item.kind == CommitKind::Dispatch && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchBeside);
-        if ((item.reads.empty() || dispatchTurn) && !ItemTurn::Get() && FinisherProducer::Get() && DrawFinisher::Overlap() && !GuestMemory::GpuMutex().HeldByThisThread() && (dispatchTurn || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ItemsByTurn))) {
+        const bool flow = DrawFinisher::Flow();
+        const bool dispatchTurn = item.kind == CommitKind::Dispatch && (flow || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchBeside));
+        if ((item.reads.empty() || dispatchTurn || flow) && !ItemTurn::Get() && FinisherProducer::Get() && DrawFinisher::Overlap() && !GuestMemory::GpuMutex().HeldByThisThread() && (dispatchTurn || flow || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ItemsByTurn))) {
             DrawFinisher::Pending held;
             held.unknown = false;
             held.writes = item.writes;
@@ -2049,7 +2150,7 @@ void DrawPipeline::enqueue(Item item) {
             held.labelBytes = item.labelBytes;
             held.labelRun = item.labelRun;
             itemsByTurn.fetch_add(1, std::memory_order_relaxed);
-            const auto parked = item.reads.empty() ? std::uint64_t{0} : DrawFinisher::Get().ParkReads(item.reads);
+            const auto parked = item.reads.empty() || flow ? std::uint64_t{0} : DrawFinisher::Get().ParkReads(item.reads);
             auto shared = std::make_shared<Item>(std::move(item));
             DrawFinisher::Get().Enqueue([this, shared, parked] {
                 struct Scope {
@@ -2085,7 +2186,7 @@ void DrawPipeline::queueItem(Item item) {
         item.commit();
         return;
     }
-    const auto roomLimit = deepQueues() ? std::max<std::size_t>(Depth(), 32) : Depth();
+    const auto roomLimit = DrawFinisher::Flow() ? DrawFinisher::LeanSlots : deepQueues() ? std::max<std::size_t>(Depth(), 32) : Depth();
     if (items.size() >= roomLimit) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
@@ -2109,9 +2210,11 @@ void DrawPipeline::queueItem(Item item) {
     depthSum += items.size();
     ++enqueued;
     heldReadRanges.fetch_add(item.reads.size(), std::memory_order_relaxed);
-    countWrites(item.writes, true);
+    item.counted = !DrawFinisher::Flow() || queuedWrites.size() <= PublishedRanges::Capacity;
+    if (item.counted) countWrites(item.writes, true);
     enqueuedItems.fetch_add(1, std::memory_order_release);
     items.push_back(std::move(item));
+    if (pipelineStats()) deepestItems = std::max(deepestItems, items.size());
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
         thread = std::thread([this] {
@@ -2163,6 +2266,8 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     reportedTurnItems = turnCount;
     if (depositVerifyEvery() != 0) AgcDriver::ProfilePrint_nid_no_patch("[finisher-deposit-verify] 10 s: every %llu; items checked %llu, out of order %llu; drains checked %llu, with deposits left %llu\n", static_cast<unsigned long long>(depositVerifyEvery()), static_cast<unsigned long long>(orderChecks.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(orderDifferences.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drainChecks.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drainDifferences.exchange(0, std::memory_order_relaxed)));
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
+    if (pipelineStats()) AgcDriver::ProfilePrint_nid_no_patch("[xp-flow] 10 s, %s; committer queue: highest %zu items, mean %.2f items ahead of an enqueued one\n", DrawFinisher::FlowText().c_str(), deepestItems, queued);
+    deepestItems = 0;
     if (const auto encoded = Graphics::CommandEncoders::TotalsText(); !encoded.empty()) AgcDriver::ProfilePrint_nid_no_patch("[encode] (cumulative): %s\n", encoded.c_str());
     AgcDriver::ProfilePrint_nid_no_patch("[indirect-draws] (cumulative): %s\n", Graphics::IndirectDrawTotalsText().c_str());
     // The census of what moves template proofs (APS5_STAGE_STATS counts them): breaks by site, why
@@ -2311,7 +2416,7 @@ void DrawPipeline::run() {
         {
             const auto lock = lockFor(mutex);
             retiredItems.fetch_add(1, std::memory_order_release);
-            countWrites(items.front().writes, false);
+            if (items.front().counted) countWrites(items.front().writes, false);
             const auto kindIndex = static_cast<std::size_t>(items.front().kind);
             kindCommits[kindIndex].fetch_add(itemParts, std::memory_order_relaxed);
             kindNs[kindIndex].fetch_add(spent, std::memory_order_relaxed);
@@ -2408,6 +2513,10 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || unordered) return false;
     if (FinisherDeposits::Get() && DrawFinisher::Get().depositsRead(address, bytes)) return true;
     if (DrawFinisher::Get().ParkedReadsOverlap(address, bytes)) return true;
+    if (DrawFinisher::Flow()) {
+        DrawFinisher::NoteFlowLookup(DrawFinisher::FlowLookup::HeldReads);
+        return false;
+    }
     const auto end = address + bytes;
     auto& pipeline = Queue0();
     const auto lock = lockFor(pipeline.mutex);
@@ -2448,7 +2557,7 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
         if (lookup == DrawFinisher::LabelLookup::Unknown) return std::nullopt;
     }
     const auto end = address + bytes;
-    if (lockless()) {
+    if (lockless() || DrawFinisher::Flow()) {
         const Range range{address, end};
         if (published.Overlaps({&range, 1}) == PublishedRanges::Answer::Clear) return std::nullopt;
     }
@@ -2476,9 +2585,14 @@ DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::
         if (DrawFinisher::Get().depositsWrite({&range, 1})) return QueuedWrite::Unknown;
     }
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) return QueuedWrite::Unknown;
-    if (lockless()) {
+    if (lockless() || DrawFinisher::Flow()) {
         const Range range{address, end};
-        if (published.Overlaps({&range, 1}) == PublishedRanges::Answer::Clear) return QueuedWrite::None;
+        const auto queued = published.Overlaps({&range, 1});
+        if (queued == PublishedRanges::Answer::Clear) return QueuedWrite::None;
+        if (queued == PublishedRanges::Answer::Unsure && DrawFinisher::Flow()) {
+            DrawFinisher::NoteFlowLookup(DrawFinisher::FlowLookup::QueuedWrites);
+            return QueuedWrite::None;
+        }
     }
     auto answer = QueuedWrite::None;
     const auto lock = lockFor(mutex);
@@ -2505,10 +2619,16 @@ void DrawPipeline::countWrites(const std::vector<Range>& writes, bool added) {
 DrawPipeline::Watch DrawPipeline::WatchWrites() {
     if (!Busy()) return {Retired(), 0, {}};
     const bool own = FinisherDeposits::Get();
-    if (lockless() && !own) {
+    const bool flow = DrawFinisher::Flow();
+    if ((lockless() || flow) && !own) {
         Watch watch;
         const auto enqueuedBefore = enqueuedItems.load(std::memory_order_acquire);
-        if (published.Copy(watch.snapshotWrites, watch.snapshotCount)) {
+        const bool copied = published.Copy(watch.snapshotWrites, watch.snapshotCount);
+        if (copied || flow) {
+            if (!copied) {
+                watch.snapshotCount = 0;
+                DrawFinisher::NoteFlowLookup(DrawFinisher::FlowLookup::Watch);
+            }
             watch.retired = retiredItems.load(std::memory_order_acquire);
             watch.items = enqueuedBefore > watch.retired ? static_cast<std::size_t>(enqueuedBefore - watch.retired) : 0;
             watch.snapshot = true;
@@ -2517,7 +2637,11 @@ DrawPipeline::Watch DrawPipeline::WatchWrites() {
     }
     const auto lock = lockFor(mutex);
     Watch watch{retiredItems.load(std::memory_order_relaxed), items.size(), {}};
-    for (const auto& item : items) watch.writes.insert(watch.writes.end(), item.writes.begin(), item.writes.end());
+    if (!flow) {
+        for (const auto& item : items) watch.writes.insert(watch.writes.end(), item.writes.begin(), item.writes.end());
+    } else {
+        DrawFinisher::NoteFlowLookup(DrawFinisher::FlowLookup::Watch);
+    }
     if (own) {
         for (const auto& held : DrawFinisher::Get().ownDeposits()) {
             ++watch.items;
@@ -2536,10 +2660,11 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
     if (FinisherDeposits::Get() && DrawFinisher::Get().depositsWrite(reads)) return true;
     const auto watched = watch.snapshot ? std::span<const Range>(watch.snapshotWrites.data(), watch.snapshotCount) : std::span<const Range>(watch.writes);
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(reads)) return true;
-    if (lockless()) {
+    if (lockless() || DrawFinisher::Flow()) {
         const auto queued = published.Overlaps(reads);
         if (queued == PublishedRanges::Answer::Hit) return true;
-        if (queued == PublishedRanges::Answer::Clear) {
+        if (queued == PublishedRanges::Answer::Clear || DrawFinisher::Flow()) {
+            if (queued != PublishedRanges::Answer::Clear) DrawFinisher::NoteFlowLookup(DrawFinisher::FlowLookup::QueuedWrites);
             const auto retiredNow = retiredItems.load(std::memory_order_acquire);
             if (retiredNow == watch.retired) return false;
             return retiredNow - watch.retired > watch.items || overlaps(watched);
@@ -2559,9 +2684,13 @@ bool DrawPipeline::Busy() const {
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     if (FinisherDeposits::Get() && DrawFinisher::Get().depositsWrite(ranges)) return true;
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(ranges)) return true;
-    if (lockless()) {
+    if (lockless() || DrawFinisher::Flow()) {
         const auto answer = published.Overlaps(ranges);
         if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Hit;
+        if (DrawFinisher::Flow()) {
+            DrawFinisher::NoteFlowLookup(DrawFinisher::FlowLookup::QueuedWrites);
+            return false;
+        }
     }
     const auto lock = lockFor(mutex);
     for (const auto& [range, count] : queuedWrites) {
@@ -2579,10 +2708,14 @@ bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
         if (DrawFinisher::Get().depositsWrite({&range, 1})) return true;
     }
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) return true;
-    if (lockless()) {
+    if (lockless() || DrawFinisher::Flow()) {
         const Range range{address, end};
         const auto answer = published.Overlaps({&range, 1});
         if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Hit;
+        if (DrawFinisher::Flow()) {
+            DrawFinisher::NoteFlowLookup(DrawFinisher::FlowLookup::QueuedWrites);
+            return false;
+        }
     }
     const auto lock = lockFor(mutex);
     for (const auto& [range, count] : queuedWrites) {

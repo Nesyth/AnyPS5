@@ -831,7 +831,7 @@ DrawVerdict Driver::drawLean(QueueState& queue, std::span<const std::uint32_t> p
 void Driver::openLeanRun(std::byte* payload, std::uint64_t anchor, std::uint64_t seq) {
     if (leanRunJobs.empty()) leanRunJobs.resize(DrawFinisher::LeanSlots * static_cast<std::size_t>(LeanRunCap));
     leanRun.payload = payload;
-    leanRun.jobs = leanRunJobs.data() + static_cast<std::size_t>(seq % DrawFinisher::LeanSlots) * LeanRunCap;
+    leanRun.jobs = leanRunJobs.data() + DrawFinisher::Get().SlotIndex(seq) * LeanRunCap;
     leanRun.count = 0;
     leanRun.anchor = anchor;
     leanRun.writes.clear();

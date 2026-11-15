@@ -237,6 +237,7 @@ enum class RuntimeSwitch : std::size_t {
     InPlaceExact,
     XpNoPacketDrains,
     XpJobReplay,
+    XpFlow,
     Count,
 };
 

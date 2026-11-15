@@ -251,7 +251,7 @@ void drainPendingInputWrites(std::uint32_t queueId, std::initializer_list<std::p
     auto& pipeline = DrawPipeline::Queue0();
     for (const auto& [address, bytes] : inputs) {
         if (!pipeline.Overlaps(address, bytes)) continue;
-        pipeline.Drain(DrawPipeline::DrainReason::Capture, 0x15);
+        if (!DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Capture)) pipeline.Drain(DrawPipeline::DrainReason::Capture, 0x15);
         return;
     }
 }
@@ -287,6 +287,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         const auto range = MatchesGcnPatternFillKernel(code, userData, compute) ? DecodeGcnPatternFillRange(userData, packet) : DecodePatternFillRange(userData, packet);
         if (!range) return false;
         if (range->invocations == 0) return true;
+        if (queueId == 0 && DrawPipeline::Active() && DrawFinisher::Flow() && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Capture, 0x15);
         drainPendingInputWrites(queueId, {{range->control, 8}, {range->source, 4}});
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
         inputLock.lock();

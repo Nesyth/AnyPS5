@@ -150,6 +150,7 @@ private:
         std::uint32_t parts = 1;
         std::shared_ptr<const void> keep;
         std::shared_ptr<const LabelRun> labelRun;
+        bool counted = true;
     };
     DrawPipeline() = default;
     void enqueue(Item item);
@@ -198,6 +199,7 @@ private:
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindCommits{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindNs{};
     std::uint64_t depthSum = 0;
+    std::size_t deepestItems = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -208,7 +210,8 @@ public:
     using LeanRunner = void (*)(const std::byte* payload);
     using LeanRetirer = void (*)(const std::byte* payload, std::shared_ptr<const void>&& answer);
     static constexpr std::size_t LeanPayloadBytes = 1024;
-    static constexpr std::size_t LeanSlots = 64;
+    static constexpr std::size_t LeanSlots = 1024;
+    static constexpr std::size_t NarrowLeanSlots = 64;
     class AheadScope {
     public:
         AheadScope();
@@ -246,6 +249,12 @@ public:
     bool PendingKey(std::uint64_t key, std::uint64_t shape);
     enum class DrainSite : std::uint32_t { Lookup, Reads, Packet, Kept, Count };
     static void NoteDrain(DrainSite site, bool drained);
+    enum class FlowSite : std::uint32_t { PacketFinisher, PacketCommitter, Predication, Dispatch, DispatchReads, Indirect, Relocation, Capture, Count };
+    enum class FlowLookup : std::uint32_t { SameKey, EarlierKey, PendingWrites, QueuedWrites, HeldReads, Watch, Count };
+    static bool Flow();
+    static bool FlowSkips(FlowSite site);
+    static void NoteFlowLookup(FlowLookup lookup);
+    static std::string FlowText();
     static std::string DrainText();
     static void NoteDrainedOpcode(std::uint32_t opcode, bool besideCommits);
     static DrawFinisher& Get();
@@ -262,6 +271,7 @@ public:
     void HoldOpenRunWrite(const Range& range);
     std::uint64_t Issued() const { return issued.load(std::memory_order_relaxed); }
     std::uint64_t Front() const { return frontSeq.load(std::memory_order_acquire); }
+    std::size_t SlotIndex(std::uint64_t seq) const { return static_cast<std::size_t>(seq & leanMask.load(std::memory_order_relaxed)); }
     unsigned IdleState() const;
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
@@ -299,6 +309,7 @@ private:
         LeanRunner runner = nullptr;
         LeanRetirer retirer = nullptr;
         bool batch = false;
+        bool counted = true;
         std::shared_ptr<const void> answer;
         Job closure;
         Pending pending;
@@ -315,7 +326,7 @@ private:
     Slot* untaken();
     bool countPending(const Pending& held, bool added);
     void startFinishers();
-    LeanSlot& leanSlot(std::uint64_t seq) { return (*lean)[static_cast<std::size_t>(seq % LeanSlots)]; }
+    LeanSlot& leanSlot(std::uint64_t seq) { return (*lean)[SlotIndex(seq)]; }
     bool leanReady() const { return leanTake.load(std::memory_order_acquire) < leanTail.load(std::memory_order_acquire); }
     bool takeLean(unsigned index, std::uint64_t& seq);
     void runLean(std::uint64_t seq, std::chrono::steady_clock::time_point& lastEnd);
@@ -332,6 +343,7 @@ private:
     void checkDrainDeposits();
     void retireLean();
     void rethrowLeanFailure();
+    void fitLeanSpan();
     void awaitLeanRoom(bool helping = false);
     void awaitLeanIdle();
     bool takeHelped(std::uint64_t& seq);
@@ -387,6 +399,7 @@ private:
     std::array<ParkSlot, 9> parkSlots;
     std::atomic<std::uint64_t> leanTake{1};
     std::atomic<std::uint64_t> leanTail{1};
+    std::atomic<std::uint64_t> leanMask{NarrowLeanSlots - 1};
     std::uint64_t leanRetired = 1;
     std::unique_ptr<std::array<LeanSlot, LeanSlots>> lean;
     std::mutex parkedReadsMutex;

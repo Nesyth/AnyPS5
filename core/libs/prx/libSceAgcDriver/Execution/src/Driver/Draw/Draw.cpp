@@ -445,7 +445,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto& indirect = *drawParameters.indirect;
         auto& pipeline = DrawPipeline::Queue0();
         const bool overlaps = pipeline.Busy() && (pipeline.Overlaps(indirect.arguments, static_cast<std::size_t>(std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes))) || (indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4)));
-        if (!pipelinedIndirect || overlaps) pipeline.Drain(DrawPipeline::DrainReason::Indirect);
+        if (!pipelinedIndirect || (overlaps && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Indirect))) pipeline.Drain(DrawPipeline::DrainReason::Indirect);
     }
     auto& traceIndirect = tail.traceIndirect;
     const auto prechecked = precheckDraw(queue, submission, packetOffset, packet, drawParameters, rejected, traceIndirect);
@@ -507,7 +507,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::shared_ptr<const DrawRelocation> relocation;
         bool aliasFirst = false;
         if (drawRelocationEnabled()) {
-            if (DrawFinisher::Busy() && drawRelocationPending.key != 0) DrawFinisher::Get().Drain();
+            if (DrawFinisher::Busy() && drawRelocationPending.key != 0 && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Relocation)) DrawFinisher::Get().Drain();
             drawIdentity = drawIdentityKey(queue, *submission.shaders);
             std::lock_guard cacheLock(drawCacheMutex);
             learnPendingRelocation();

@@ -1029,7 +1029,7 @@ using ExpectedWords = std::vector<std::pair<std::uint64_t, std::uint32_t>>;
 void syncPipelinedWrites(std::uint64_t address, std::size_t bytes) {
     if (!DrawPipeline::Active()) return;
     auto& pipeline = DrawPipeline::Queue0();
-    if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+    if (pipeline.Busy() && pipeline.Overlaps(address, bytes) && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Capture)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
 }
 
 bool readExpectedWord(void* context, std::uint64_t address, std::uint32_t* value) {

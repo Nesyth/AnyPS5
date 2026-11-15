@@ -231,7 +231,7 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
             pipeline.Drain(DrawPipeline::DrainReason::Capture);
             return Policy::VerifyKnownValue;
         }
-        if (queued == DrawPipeline::QueuedWrite::Unknown) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        if (queued == DrawPipeline::QueuedWrite::Unknown && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Capture)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
     }
     std::uint64_t ValidateCounters::*reason = nullptr;
     PendingView pending;

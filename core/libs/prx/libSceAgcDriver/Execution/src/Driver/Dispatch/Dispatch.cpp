@@ -697,7 +697,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!partialLastGroup && indirectArguments == 0 && (MatchDwordPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchConstantDwordFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchClampedGlobalFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchMemoryValueBufferFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
         if (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
     } else {
-        if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchBeside)) {
+        if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread() && (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchBeside) || DrawFinisher::Flow())) {
             const auto code = std::span(snapshot.code).subspan(codeOffset);
             const bool sideEffects = !pipelineCandidate
                 || (indirectArguments == 0 && Graphics::MatchMultisampledSingleClear(code, userData, compute.numThreads))
@@ -707,7 +707,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 || Graphics::HtileDepthClearAddress(code, userData, compute.numThreads) != 0
                 || Graphics::MatchHtileBufferMaskClear(code, userData, compute, packet, indirectArguments).has_value()
                 || Graphics::MatchHtileZmaskFixup(code, userData, compute, packet, indirectArguments).has_value();
-            if (sideEffects && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpNoPacketDrains)) DrawFinisher::Get().Drain();
+            if (sideEffects && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpNoPacketDrains) && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Dispatch)) DrawFinisher::Get().Drain();
         }
         if (indirectArguments == 0 && Graphics::TakeMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) {
             census.outcome = CensusOutcome::Clear;
@@ -982,6 +982,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             NoteItemFallback(ItemFallback::Verify);
         } else {
             readsClear = std::none_of(reads.begin(), reads.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
+            if (!readsClear && DrawFinisher::FlowSkips(DrawFinisher::FlowSite::DispatchReads)) readsClear = true;
             if (!readsClear) NoteItemFallback(ItemFallback::Reads);
         }
         if (!readsClear && !lateItem && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
@@ -1239,6 +1240,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         bool queued = plain;
         if (queued && lateItem) {
             queued = std::none_of(captured.begin(), captured.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
+            if (!queued && DrawFinisher::FlowSkips(DrawFinisher::FlowSite::DispatchReads)) queued = true;
             if (!queued) NoteItemFallback(ItemFallback::Reads);
         } else if (!plain) {
             NoteItemFallback(lateItem ? ItemFallback::Miss : ItemFallback::NoRecipe);

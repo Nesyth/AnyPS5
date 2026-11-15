@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/IndirectDispatch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -70,6 +71,7 @@ std::string Driver::describeIndirectSource() {
 }
 
 std::array<std::uint32_t, 5> Driver::readDispatchArguments(std::uint32_t queue, std::uint64_t arguments, std::uint32_t initiator) {
+    if (queue == 0 && !resolvingAhead() && DrawFinisher::Flow() && DrawPipeline::Active() && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect, 0x16);
     recordQueuedLabelsBeforeRead(queue);
     if (!resolvingAhead()) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Indirect);
