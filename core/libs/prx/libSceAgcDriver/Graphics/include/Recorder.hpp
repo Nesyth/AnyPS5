@@ -486,6 +486,7 @@ public:
     static std::uint64_t PublishGeneration();
     // bumped by every RecordStore (queued or recorded), which notes no pending write;
     static std::uint64_t QueuedStoreGeneration();
+    static std::uint64_t StoreGenerationForValidation();
     // labels waiting in completion actions (the CPU must reap their batch for them to land);
     static std::uint64_t PendingCompletionLabels();
     static std::uint64_t PendingCompletionStores();
@@ -510,6 +511,8 @@ public:
     bool PassFenced() const;
     bool PassReadsFollow(GuestRangeList first, GuestRangeList second) const;
     bool PassImagesFollow(std::span<const std::pair<VkImage, bool>> images, std::span<const std::pair<VkImage, bool>> attachments) const;
+    std::uint64_t PassHazardSerial() const;
+    bool PassNoWrites() const;
     static std::uint64_t QueuedLabelSerial();
     bool BeginPassLayouts(VkCommandBuffer commands, std::span<const std::pair<VkImage, bool>> attachments);
     bool BeginDepthLayout(VkCommandBuffer commands, VkImage image, VkImageAspectFlags aspects);
@@ -1080,6 +1083,7 @@ private:
     std::shared_ptr<Buffer> containingDrawSnapshot(std::uint64_t address, std::size_t bytes, VkDeviceSize* offset);
     mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
     mutable bool publishedWriteRangesValid = false;
+    mutable bool unpublishedForValidation = false;
 };
 
 inline void EmitNvCheckpointToken(VkCommandBuffer commands, AgcDriver::FaultToken token, PFN_vkCmdSetCheckpointNV setCheckpoint) noexcept {

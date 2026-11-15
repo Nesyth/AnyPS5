@@ -489,6 +489,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineJournal.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/RuntimeSwitches.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/WriteValidation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeferredDestruction.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MemoryAccounting.cpp
@@ -867,6 +868,18 @@ function(agc_add_deep_flow_test agcTestName)
     agc_add_env_test(${agcTestName}_frame_flow ${agcTestName}_tests
             ENV ${agcPipelineEnvironment} ${agcLateStackEnvironment} ${agcLeanFrontEnvironment} ${agcDeepFlowEnvironment} ${agcFrameFlowEnvironment})
     set_tests_properties(${agcTestName}_frame_flow PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDeepFlowDifference};${agcFrameFlowDifference}")
+endfunction()
+
+set(agcWriteValidationDifference "\\[write-validation-verify\\] [-a-z ]+ differs:")
+
+function(agc_add_write_validation_test agcTestName)
+    set(agcPipelineEnvironment ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1)
+    agc_add_env_test(${agcTestName}_write_validation ${agcTestName}_tests
+            ENV ${agcPipelineEnvironment} ${agcLateStackEnvironment} ${agcLeanFrontEnvironment}
+            APS5_DIRECT_DRAWS=1 APS5_DIRECT_BUFFERS=1 APS5_DIRECT_INPUTS=1 APS5_COMMIT_BINDINGS=1 APS5_COMMIT_BINDINGS_STAMPS=1 APS5_COMMIT_FRAGMENTS=1
+            APS5_ASYNC_SUBMIT=1 APS5_DEFERRED_ENCODE=1 APS5_DIRECT_CLEAN_PROOFS=1 APS5_CLEAN_PRECISE_SERIALS=1 APS5_EXPRESS_COMMITS=1
+            APS5_RUN_FOLLOW=1 APS5_PROOF_KEEPS=1 APS5_WRITE_VALIDATION=1 APS5_VERIFY_WRITE_VALIDATION=1 APS5_PIPELINE_STATS=1)
+    set_tests_properties(${agcTestName}_write_validation PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};\\[draw-records-verify\\] [-a-z ]+ differs:;\\[express-commits-verify\\] ;${agcWriteValidationDifference}")
 endfunction()
 
 set(agcDrawRecordsDifference "\\[draw-records-verify\\] [-a-z ]+ differs:")

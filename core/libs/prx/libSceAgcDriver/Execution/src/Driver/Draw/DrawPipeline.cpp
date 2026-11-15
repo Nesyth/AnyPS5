@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/WriteValidation.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommandEncoder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
@@ -463,6 +464,11 @@ void noteDeepSiteWait(DeepSite site, bool job) {
     (job ? deepSiteJobWaits : deepSiteItemWaits)[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
 }
 
+void raiseQueued(Graphics::WriteValidation::Source source, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes) {
+    if (writes.empty() || Graphics::WriteValidation::Session() == 0) return;
+    for (const auto& [begin, end] : writes) Graphics::WriteValidation::Raise(Graphics::WriteValidation::Class::Q, source, begin, end);
+}
+
 bool rangesOverlap(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const std::pair<std::uint64_t, std::uint64_t>> reads) {
     for (const auto& [first, last] : writes) {
         for (const auto& [begin, end] : reads) {
@@ -556,6 +562,21 @@ bool PublishedRanges::UnknownAhead(std::uint64_t front, std::uint64_t asker, std
         return found;
     }
     blocker = asker - 1;
+    return true;
+}
+
+bool PublishedRanges::UnknownHeld() const {
+    for (unsigned attempt = 0; attempt < PublishedReadAttempts; ++attempt) {
+        const auto before = seq.load(std::memory_order_acquire);
+        if ((before & 1u) != 0) {
+            SpinPause();
+            continue;
+        }
+        const auto held = unknown.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (seq.load(std::memory_order_relaxed) != before) continue;
+        return held != 0;
+    }
     return true;
 }
 
@@ -862,6 +883,25 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
         }
     }
     return false;
+}
+
+bool DrawFinisher::PendingClearForValidation(std::span<const Range> ranges) {
+    if (FinisherDeposits::Get() && depositsWrite(ranges)) return false;
+    if (ringMode.load(std::memory_order_acquire) && deepRing.load(std::memory_order_acquire)) {
+        if (deepWrites == nullptr) return false;
+        const auto front = frontSeq.load(std::memory_order_seq_cst);
+        if (lastUnknown.load(std::memory_order_seq_cst) >= front) return false;
+        return deepWrites->Newest(ranges, front).answer == DeepAnswer::Clear;
+    }
+    return published.Overlaps(ranges, nullptr, nullptr, Flow()) == PublishedRanges::Answer::Clear;
+}
+
+bool DrawFinisher::UnknownWritesAhead() {
+    if (!Busy()) return false;
+    auto& finisher = Get();
+    if (finisher.ringMode.load(std::memory_order_acquire) && finisher.deepRing.load(std::memory_order_acquire)) return finisher.lastUnknown.load(std::memory_order_seq_cst) >= finisher.frontSeq.load(std::memory_order_seq_cst);
+    if (Flow()) return false;
+    return finisher.published.UnknownHeld();
 }
 
 bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
@@ -2051,6 +2091,7 @@ void DrawFinisher::FlushOpenRun() {
 }
 
 void DrawFinisher::HoldOpenRunWrite(const Range& range) {
+    const Graphics::WriteValidation::RaiseScope raised(Graphics::WriteValidation::Class::Q, Graphics::WriteValidation::Source::RunWrite, range.first, range.second);
     if (deepRing.load(std::memory_order_relaxed)) {
         deepWrites->Insert({&range, 1}, nextSeq, frontSeq.load(std::memory_order_acquire));
         openRunWrites.push_back(range);
@@ -2119,9 +2160,11 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     issued.store(nextSeq, std::memory_order_relaxed);
     frontSeq.store(jobs.front().seq, std::memory_order_release);
     untakenJobs.fetch_add(1, std::memory_order_release);
+    if (!held.unknown) raiseQueued(Graphics::WriteValidation::Source::PendingJob, held.writes);
     if (countPending(held, true)) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
     keys.Push(jobs.back().seq, held.key, held.shape, held.inserts);
     pending.push_back(std::move(held));
+    if (!pending.back().unknown) raiseQueued(Graphics::WriteValidation::Source::PendingJob, pending.back().writes);
     outstanding.fetch_add(1, std::memory_order_release);
     startFinishers();
     if (const auto asleep = dormant.load(std::memory_order_acquire); asleep != 0) {
@@ -2403,6 +2446,8 @@ bool DrawFinisher::parkInSlot(unsigned index) {
 
 void DrawFinisher::publishLean(LeanSlot& slot) {
     const auto seq = nextSeq;
+    const bool raises = !slot.pending.unknown;
+    if (raises) raiseQueued(Graphics::WriteValidation::Source::FinisherJob, slot.pending.writes);
     if (deepRing.load(std::memory_order_relaxed)) {
         slot.counted = false;
         slot.resolved.store(0, std::memory_order_relaxed);
@@ -2425,6 +2470,7 @@ void DrawFinisher::publishLean(LeanSlot& slot) {
         if (!slot.batch && slot.counted && countPending(slot.pending, true)) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
         keys.Push(seq, slot.pending.key, slot.pending.shape, slot.pending.inserts);
     }
+    if (raises) raiseQueued(Graphics::WriteValidation::Source::FinisherJob, slot.pending.writes);
     slot.seq.store(seq, std::memory_order_relaxed);
     slot.state.store(LeanReady, std::memory_order_relaxed);
     outstanding.fetch_add(1, std::memory_order_acq_rel);
@@ -2611,7 +2657,9 @@ bool DrawFinisher::deposit(DrawPipeline& pipeline, DrawPipeline::Item& item) {
         turnItems.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    raiseQueued(Graphics::WriteValidation::Source::Deposit, item.writes);
     slot.deposits.push_back({&pipeline, std::move(item)});
+    raiseQueued(Graphics::WriteValidation::Source::Deposit, slot.deposits.back().item.writes);
     FinisherDeposits::Set(true);
     depositedItems.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -3297,6 +3345,7 @@ void DrawPipeline::queueItem(Item item) {
     depthSum += items.size();
     ++enqueued;
     heldReadRanges.fetch_add(item.reads.size(), std::memory_order_relaxed);
+    raiseQueued(Graphics::WriteValidation::Source::QueueItem, item.writes);
     if (deepQueue.load(std::memory_order_relaxed)) {
         item.counted = false;
         const auto stamp = enqueuedItems.load(std::memory_order_relaxed) + 1;
@@ -3306,6 +3355,7 @@ void DrawPipeline::queueItem(Item item) {
         item.counted = !DrawFinisher::Flow() || queuedWrites.size() <= PublishedRanges::Capacity;
         if (item.counted) countWrites(item.writes, true);
     }
+    raiseQueued(Graphics::WriteValidation::Source::QueueItem, item.writes);
     enqueuedItems.fetch_add(1, std::memory_order_release);
     items.push_back(std::move(item));
     if (pipelineStats()) deepestItems = std::max(deepestItems, items.size());
@@ -4194,6 +4244,18 @@ bool DrawPipeline::queuedOverlap(std::span<const Range> ranges) {
         }
     }
     return false;
+}
+
+bool DrawPipeline::QueuedClearForValidation(std::span<const Range> ranges) {
+    if (deepQueue.load(std::memory_order_seq_cst)) {
+        const auto found = deepQueued(ranges, retiredItems.load(std::memory_order_acquire) + 1);
+        if (found.answer != DeepAnswer::Unsure) return found.answer == DeepAnswer::Clear;
+    } else if (lockless() && !DrawFinisher::Flow()) {
+        const auto answer = published.Overlaps(ranges);
+        if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Clear;
+    }
+    const auto lock = lockFor(mutex);
+    return std::none_of(items.begin(), items.end(), [&](const Item& item) { return rangesOverlap(item.writes, ranges); });
 }
 
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {

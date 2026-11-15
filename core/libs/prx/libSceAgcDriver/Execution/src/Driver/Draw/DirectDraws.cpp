@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/WriteValidation.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
@@ -37,6 +38,7 @@
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -514,6 +516,384 @@ bool readsSettledSince(const AddressRanges& ranges, const DirectStages& resolved
     return Graphics::Recorder::ReadsSettled(ranges, pending);
 }
 
+namespace Validation = Graphics::WriteValidation;
+
+constexpr std::size_t FinisherSlots = 2048;
+constexpr std::uint64_t FinisherRangeWindows = 8;
+constexpr std::size_t FinisherWindowLimit = 64;
+constexpr std::uint8_t FinisherLiveSkip = 64;
+constexpr std::uint8_t SlotNone = 0;
+constexpr std::uint8_t SlotClear = 1;
+constexpr std::uint8_t SlotLive = 2;
+constexpr unsigned ArmSessionShift = 48;
+constexpr std::uint64_t ArmEpochMask = (std::uint64_t{1} << ArmSessionShift) - 1u;
+constexpr std::uint64_t ArmSessionLimit = std::uint64_t{1} << (64u - ArmSessionShift);
+constexpr std::size_t ProgramArmSlots = 256;
+constexpr std::uint8_t ArmBackoff = 64;
+
+struct FinisherSlot {
+    std::uint64_t window = ~std::uint64_t{0};
+    std::uint64_t armed = 0;
+    std::uint64_t retired = 0;
+    std::uint32_t epoch = 0;
+    std::uint8_t state = SlotNone;
+    std::uint8_t liveSkip = 0;
+};
+
+struct FinisherTable {
+    std::uint64_t session = 0;
+    std::uint64_t switches = 0;
+    std::uint32_t epoch = 0;
+    std::array<FinisherSlot, FinisherSlots> slots{};
+};
+
+struct FinisherTableHandle {
+    std::unique_ptr<FinisherTable> table;
+};
+
+struct FinisherTableStorage {};
+
+FinisherTable& finisherTable(std::uint64_t session) {
+    auto& handle = HostThreadLocal<FinisherTableHandle, FinisherTableStorage>();
+    if (handle.table == nullptr) handle.table = std::make_unique<FinisherTable>();
+    auto& table = *handle.table;
+    const auto switches = Graphics::RuntimeSwitches::Generation();
+    if (table.session != session || table.switches != switches) {
+        table.session = session;
+        table.switches = switches;
+        if (++table.epoch == 0) {
+            table.slots.fill(FinisherSlot{});
+            table.epoch = 1;
+        }
+    }
+    return table;
+}
+
+std::size_t finisherSlot(std::uint64_t window) {
+    return static_cast<std::size_t>((window * 0x9E3779B97F4A7C15ull) >> 53);
+}
+
+struct FinisherWindows {
+    std::array<std::uint64_t, FinisherWindowLimit> windows{};
+    std::size_t count = 0;
+};
+
+struct FinisherWindowsStorage {};
+
+bool collectWindows(const AddressRanges& ranges, FinisherWindows& out) {
+    out.count = 0;
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) continue;
+        const auto first = begin >> Validation::WindowShift;
+        const auto last = (end - 1u) >> Validation::WindowShift;
+        if (last - first >= FinisherRangeWindows) return false;
+        for (auto window = first;; ++window) {
+            const auto* const known = out.windows.data();
+            if (std::find(known, known + out.count, window) == known + out.count) {
+                if (out.count == out.windows.size()) return false;
+                out.windows[out.count++] = window;
+            }
+            if (window == last) break;
+        }
+    }
+    return out.count != 0;
+}
+
+bool windowClocksHeld(std::uint64_t window, std::uint64_t armed, bool clean) {
+    if (Validation::Clock(Validation::Class::W, window) > armed) return false;
+    if (Validation::Clock(Validation::Class::Q, window) > armed) return false;
+    if (Validation::Clock(Validation::Class::L, window) > armed) return false;
+    return !clean || Validation::Clock(Validation::Class::C, window) <= armed;
+}
+
+bool rangeClocksHeld(std::uint64_t begin, std::uint64_t end, std::uint64_t armed) {
+    if (end <= begin) return true;
+    const auto last = (end - 1u) >> Validation::WindowShift;
+    for (auto window = begin >> Validation::WindowShift;; ++window) {
+        if (!windowClocksHeld(window, armed, true)) return false;
+        if (window == last) break;
+    }
+    return true;
+}
+
+bool settleProof(std::uint64_t window) {
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> span{{{window << Validation::WindowShift, (window + 1u) << Validation::WindowShift}}};
+    if (!DrawFinisher::Get().PendingClearForValidation(span)) return false;
+    if (DrawPipeline::Active() && !DrawPipeline::Queue0().QueuedClearForValidation(span)) return false;
+    return Graphics::Recorder::ReadsSettled(span, nullptr, nullptr);
+}
+
+bool capturedSnapshotsClear(const AddressRanges& ranges, const DirectStages& resolved, const Graphics::Recorder::WriteRanges* also) {
+    const auto* before = resolved.before.get();
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) continue;
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        if (Graphics::Recorder::SnapshotOverlaps(before, begin, bytes) || Graphics::Recorder::SnapshotOverlaps(also, begin, bytes)) return false;
+    }
+    return true;
+}
+
+bool copiedWatchClear(const AddressRanges& ranges, const DrawPipeline::Watch& watch) {
+    if (!watch.snapshot) return true;
+    const auto count = std::min<std::size_t>(watch.snapshotCount, watch.snapshotWrites.size());
+    for (std::size_t at = 0; at < count; ++at) {
+        const auto& [first, last] = watch.snapshotWrites[at];
+        for (const auto& [begin, end] : ranges) {
+            if (begin < last && first < end) return false;
+        }
+    }
+    return true;
+}
+
+Validation::Answer finisherAnswer(const AddressRanges& ranges, const DirectStages& resolved, const Graphics::Recorder::WriteRanges* also, const DrawPipeline::Watch* watch, Validation::Test test, bool quiet) {
+    const auto session = Validation::Session();
+    if (session == 0) return Validation::Answer::Today;
+    const auto note = [&](Validation::Outcome outcome) {
+        if (!quiet) Validation::Note(test, outcome);
+    };
+    const auto today = [&](Validation::Outcome outcome) {
+        note(outcome);
+        return Validation::Answer::Today;
+    };
+    if (resolved.wvSession != session) return today(Validation::Outcome::Session);
+    auto& windows = HostThreadLocal<FinisherWindows, FinisherWindowsStorage>();
+    if (!collectWindows(ranges, windows)) return today(Validation::Outcome::Wide);
+    if (DrawFinisher::UnknownWritesAhead()) return today(Validation::Outcome::Unknown);
+    auto& table = finisherTable(session);
+    auto answer = Validation::Answer::Generations;
+    for (std::size_t at = 0; at < windows.count; ++at) {
+        const auto window = windows.windows[at];
+        auto& slot = table.slots[finisherSlot(window)];
+        if (slot.window != window || slot.epoch != table.epoch) {
+            if (quiet) return Validation::Answer::Today;
+            if (slot.epoch == table.epoch && slot.state == SlotClear) note(Validation::Outcome::Evicted);
+            slot = FinisherSlot{};
+            slot.window = window;
+            slot.epoch = table.epoch;
+        }
+        if (slot.state == SlotClear && !windowClocksHeld(window, slot.armed, false)) {
+            if (quiet) return Validation::Answer::Today;
+            slot.state = SlotNone;
+            note(Validation::Outcome::Moved);
+        }
+        if (slot.state == SlotLive) {
+            if (quiet) return Validation::Answer::Today;
+            if (slot.liveSkip != 0) {
+                --slot.liveSkip;
+                return today(Validation::Outcome::Live);
+            }
+            slot.state = SlotNone;
+        }
+        if (slot.state == SlotNone) {
+            if (quiet) return Validation::Answer::Today;
+            const auto before = Validation::Epoch();
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            const bool proved = settleProof(window);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (!proved) {
+                slot.state = SlotLive;
+                slot.liveSkip = FinisherLiveSkip;
+                return today(Validation::Outcome::Live);
+            }
+            slot.state = SlotClear;
+            slot.armed = before;
+            slot.retired = DrawPipeline::Active() ? DrawPipeline::Queue0().Retired() : 0;
+            answer = Validation::Answer::Proved;
+        }
+        if (watch != nullptr && watch->retired < slot.retired) return today(Validation::Outcome::Watch);
+    }
+    if (answer == Validation::Answer::Proved) {
+        for (std::size_t at = 0; at < windows.count; ++at) {
+            const auto window = windows.windows[at];
+            const auto& slot = table.slots[finisherSlot(window)];
+            if (slot.window != window || slot.epoch != table.epoch || slot.state != SlotClear || !windowClocksHeld(window, slot.armed, false)) return today(Validation::Outcome::Live);
+        }
+    }
+    if (watch != nullptr && DrawPipeline::Active()) {
+        const auto retiredNow = DrawPipeline::Queue0().Retired();
+        if (retiredNow != watch->retired && retiredNow - watch->retired > watch->items) return today(Validation::Outcome::Watch);
+    }
+    if (watch != nullptr && !copiedWatchClear(ranges, *watch)) return today(Validation::Outcome::Watch);
+    if (!capturedSnapshotsClear(ranges, resolved, also)) return today(Validation::Outcome::Snapshot);
+    if (!RangesStamped(ranges, resolved.generation)) return today(Validation::Outcome::Stamps);
+    note(answer == Validation::Answer::Generations ? Validation::Outcome::Answered : Validation::Outcome::Armed);
+    return answer;
+}
+
+template<typename TToday>
+bool settledOr(const AddressRanges& ranges, const DirectStages& resolved, const Graphics::Recorder::WriteRanges* also, const DrawPipeline::Watch* watch, Validation::Test test, TToday&& today) {
+    const auto answer = finisherAnswer(ranges, resolved, also, watch, test, false);
+    if (answer == Validation::Answer::Today) return today();
+    if (answer == Validation::Answer::Proved || !Validation::VerifyDue(test)) return true;
+    if (today()) {
+        Validation::NoteVerify(test, false, nullptr);
+        return true;
+    }
+    const bool differs = finisherAnswer(ranges, resolved, also, watch, test, true) == Validation::Answer::Generations;
+    Validation::NoteVerify(test, differs, "today's settle test refused ranges whose windows raised no queued, pending, label or store event since their proof");
+    return false;
+}
+
+bool settledValidated(const AddressRanges& ranges, const DirectStages& resolved, Validation::Test test) {
+    return settledOr(ranges, resolved, nullptr, nullptr, test, [&] { return settledSince(ranges, resolved); });
+}
+
+void raiseCleanForget(std::uintptr_t start, std::uintptr_t end) {
+    Validation::Raise(Validation::Class::C, Validation::Source::CleanForget, start, end);
+}
+
+void ensureCleanForgetHook() {
+    static const bool hooked = [] {
+        GuestMemory::SetCleanForgetHook(&raiseCleanForget);
+        return true;
+    }();
+    static_cast<void>(hooked);
+}
+
+std::uint64_t packArm(std::uint64_t session, std::uint64_t epoch) {
+    return (session << ArmSessionShift) | (epoch & ArmEpochMask);
+}
+
+bool armable(std::uint64_t session, std::uint64_t epoch) {
+    return session != 0 && session < ArmSessionLimit && epoch <= ArmEpochMask;
+}
+
+struct ProgramArm {
+    std::weak_ptr<const void> owner;
+    const void* raw = nullptr;
+    std::uint64_t packed = 0;
+    std::uint8_t skips = 0;
+};
+
+struct ProgramArms {
+    std::array<ProgramArm, ProgramArmSlots> slots{};
+};
+
+struct ProgramArmsHandle {
+    std::unique_ptr<ProgramArms> arms;
+};
+
+struct ProgramArmsStorage {};
+struct ProgramRangesStorage {};
+
+ProgramArms& programArms() {
+    auto& handle = HostThreadLocal<ProgramArmsHandle, ProgramArmsStorage>();
+    if (handle.arms == nullptr) handle.arms = std::make_unique<ProgramArms>();
+    return *handle.arms;
+}
+
+std::size_t programArmSlot(const void* raw) {
+    return static_cast<std::size_t>((static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(raw)) * 0x9E3779B97F4A7C15ull) >> 56);
+}
+
+template<typename TPointer>
+bool armOwns(const ProgramArm& arm, const TPointer& owner) {
+    return owner != nullptr && arm.raw == static_cast<const void*>(owner.get()) && !arm.owner.owner_before(owner) && !owner.owner_before(arm.owner);
+}
+
+const DrawProgram* programOfRegion(const DirectStages& resolved, const ShaderRecompiler::MemoryRegion& region) {
+    for (const auto& program : resolved.decode->programs) {
+        if (program.snapshot == nullptr) continue;
+        for (const auto& held : program.memory) {
+            if (!held.bytes.empty() && held.guestAddress == region.guestAddress && held.bytes.data() == region.bytes.data() && held.bytes.size() == region.bytes.size()) return &program;
+        }
+    }
+    return nullptr;
+}
+
+bool programArmsHeld(const DirectStages& resolved, std::span<const ShaderRecompiler::MemoryRegion> regions, std::size_t prefix, std::uint64_t session) {
+    auto& arms = programArms();
+    for (std::size_t at = 0; at < prefix; ++at) {
+        const auto& region = regions[at];
+        const auto* program = programOfRegion(resolved, region);
+        if (program == nullptr) return false;
+        const auto& arm = arms.slots[programArmSlot(program->snapshot.get())];
+        if (!armOwns(arm, program->snapshot) || arm.packed == 0 || (arm.packed >> ArmSessionShift) != session) return false;
+        if (!rangeClocksHeld(region.guestAddress, region.guestAddress + region.bytes.size(), arm.packed & ArmEpochMask)) return false;
+    }
+    return true;
+}
+
+std::size_t programMemoryHeld(const DirectStages& resolved, std::span<const ShaderRecompiler::MemoryRegion> regions, std::size_t compared, bool& verify) {
+    constexpr auto test = Validation::Test::CapturedMemory;
+    verify = false;
+    const auto session = Validation::Session();
+    if (session == 0) return 0;
+    const auto prefix = resolved.memory.size();
+    if (prefix == 0 || prefix > compared || prefix > regions.size() || resolved.decode == nullptr) return 0;
+    if (resolved.wvSession != session) {
+        Validation::Note(test, Validation::Outcome::Session);
+        return 0;
+    }
+    if (DrawFinisher::UnknownWritesAhead()) {
+        Validation::Note(test, Validation::Outcome::Unknown);
+        return 0;
+    }
+    if (!programArmsHeld(resolved, regions, prefix, session)) return 0;
+    Validation::Note(test, Validation::Outcome::Answered);
+    verify = Validation::VerifyDue(test);
+    return prefix;
+}
+
+void armProgramMemory(const DirectStages& resolved) {
+    constexpr auto test = Validation::Test::CapturedMemory;
+    const auto session = resolved.wvSession;
+    if (resolved.memory.empty() || resolved.decode == nullptr || session == 0 || session != Validation::Session()) return;
+    auto& arms = programArms();
+    auto& ranges = HostThreadLocal<AddressRanges, ProgramRangesStorage>();
+    auto& windows = HostThreadLocal<FinisherWindows, FinisherWindowsStorage>();
+    for (const auto& program : resolved.decode->programs) {
+        if (program.snapshot == nullptr) continue;
+        ranges.clear();
+        for (const auto& region : program.memory) {
+            if (!region.bytes.empty()) ranges.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+        }
+        if (ranges.empty()) continue;
+        auto& arm = arms.slots[programArmSlot(program.snapshot.get())];
+        const bool owned = armOwns(arm, program.snapshot);
+        if (owned && arm.packed != 0 && (arm.packed >> ArmSessionShift) == session) {
+            bool held = true;
+            for (const auto& [begin, end] : ranges) held = held && rangeClocksHeld(begin, end, arm.packed & ArmEpochMask);
+            if (held) continue;
+        }
+        if (owned && arm.skips != 0) {
+            --arm.skips;
+            continue;
+        }
+        arm.owner = program.snapshot;
+        arm.raw = program.snapshot.get();
+        arm.packed = 0;
+        arm.skips = ArmBackoff;
+        if (!collectWindows(ranges, windows)) {
+            Validation::Note(test, Validation::Outcome::Wide);
+            continue;
+        }
+        ensureCleanForgetHook();
+        const auto before = Validation::Epoch();
+        if (!armable(session, before)) continue;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (!GuestMemory::AllClean(ranges)) {
+            Validation::Note(test, Validation::Outcome::NotClean);
+            continue;
+        }
+        bool proved = true;
+        for (std::size_t at = 0; proved && at < windows.count; ++at) proved = settleProof(windows.windows[at]);
+        if (!proved) {
+            Validation::Note(test, Validation::Outcome::Live);
+            continue;
+        }
+        bool equal = true;
+        for (const auto& region : program.memory) {
+            if (!region.bytes.empty() && GuestMemory::CompareMapped(region.guestAddress, region.bytes) != GuestMemory::Compare::Equal) equal = false;
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (!equal) continue;
+        arm.packed = packArm(session, before);
+        arm.skips = 0;
+        Validation::Note(test, Validation::Outcome::Armed);
+    }
+}
+
 Counter BufferRefusal(Graphics::ShaderResources::PreparedBuffers::Refusal refusal) {
     using Refusal = Graphics::ShaderResources::PreparedBuffers::Refusal;
     switch (refusal) {
@@ -663,7 +1043,8 @@ void prepareBuffers(const LeanDrawJob& job, const LeanAnchor& anchor, const Dire
     const bool deferred = (prepared.shortcuts & Graphics::ShaderResources::PreparedBuffers::DeferredImports) != 0;
     if (prepared.lookupsDeferred != 0) DirectDraws::Add(Counter::LookupsDeferred, prepared.lookupsDeferred);
     if (prepared.lookupsForced != 0) DirectDraws::Add(Counter::LookupsForced, prepared.lookupsForced);
-    const auto unsettled = [&](const AddressRanges& ranges) { return !settledSince(ranges, resolved, Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle) ? pending : nullptr) || (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle) && !readsSettledSince(ranges, resolved, pending)) || (queued.has_value() && DrawPipeline::Queue0().WrittenSince(*queued, ranges)); };
+    const auto todayUnsettled = [&](const AddressRanges& ranges) { return !settledSince(ranges, resolved, Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle) ? pending : nullptr) || (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle) && !readsSettledSince(ranges, resolved, pending)) || (queued.has_value() && DrawPipeline::Queue0().WrittenSince(*queued, ranges)); };
+    const auto unsettled = [&](const AddressRanges& ranges) { return !settledOr(ranges, resolved, pending, queued.has_value() ? &*queued : nullptr, Validation::Test::BuffersSettle, [&] { return !todayUnsettled(ranges); }); };
     struct ReadStorage {};
     auto& read = HostThreadLocal<AddressRanges, ReadStorage>();
     read.clear();
@@ -810,7 +1191,8 @@ void prepareInputs(const LeanDrawJob& job, const LeanAnchor& anchor, const Direc
     read.clear();
     if (hit.parameters.indexed) read.emplace_back(prepared.ranges.front().begin, prepared.ranges.front().end);
     if (!read.empty()) noteUse(TrustSite::IndexSettle, classUse);
-    if (!settleTrusted && !read.empty() && (!settledSince(read, resolved, Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle) ? pending : nullptr) || (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle) && !readsSettledSince(read, resolved, pending)) || (queued.has_value() && DrawPipeline::Queue0().WrittenSince(*queued, read)))) {
+    const auto indexUnsettled = [&] { return !settledSince(read, resolved, Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle) ? pending : nullptr) || (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle) && !readsSettledSince(read, resolved, pending)) || (queued.has_value() && DrawPipeline::Queue0().WrittenSince(*queued, read)); };
+    if (!settleTrusted && !read.empty() && !settledOr(read, resolved, pending, queued.has_value() ? &*queued : nullptr, Validation::Test::IndexSettle, [&] { return !indexUnsettled(); })) {
         noteFailed(classTrust, TrustSite::IndexSettle, classUse);
         DirectDraws::Add(Counter::InputsUnsettled);
         hit.preparedInputs.reset();
@@ -1237,7 +1619,7 @@ std::uint64_t DirectStores::Follow(std::uint64_t serial) {
     auto live = Graphics::RuntimeSwitches::Snapshot();
     // Switches that change only what the committer does with a hit, or only dispatch packets,
     // leave the stages and classes as they are, so an in-run A/B of one keeps the stores.
-    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic, Graphics::RuntimeSwitch::CommitFragments, Graphics::RuntimeSwitch::ExpressCommits, Graphics::RuntimeSwitch::XpStreamSegments, Graphics::RuntimeSwitch::XpNoEagerStore, Graphics::RuntimeSwitch::LabelOrderedStores, Graphics::RuntimeSwitch::DeeperRing, Graphics::RuntimeSwitch::BesideSampleDumps, Graphics::RuntimeSwitch::DispatchBeside, Graphics::RuntimeSwitch::FaultFragments, Graphics::RuntimeSwitch::StageMemo, Graphics::RuntimeSwitch::KeepFaultSlots, Graphics::RuntimeSwitch::SiblingFinishers, Graphics::RuntimeSwitch::FastSettle, Graphics::RuntimeSwitch::XpSlowFinisher, Graphics::RuntimeSwitch::XpSlowCommitter, Graphics::RuntimeSwitch::XpSlowWorker, Graphics::RuntimeSwitch::XpExpressFloor, Graphics::RuntimeSwitch::LeanExpress, Graphics::RuntimeSwitch::XpAppendCommits, Graphics::RuntimeSwitch::PreciseSettle, Graphics::RuntimeSwitch::AppendCommits, Graphics::RuntimeSwitch::StageMemoPatchVertex, Graphics::RuntimeSwitch::StageMemoPatchBuffers, Graphics::RuntimeSwitch::StageMemoPatchData, Graphics::RuntimeSwitch::RunFollow, Graphics::RuntimeSwitch::TurnWaitsByJob, Graphics::RuntimeSwitch::ExpressKeepState, Graphics::RuntimeSwitch::StageMemoFront, Graphics::RuntimeSwitch::StageMemoAdmitThird, Graphics::RuntimeSwitch::CommitStamps, Graphics::RuntimeSwitch::PassReadsOnce, Graphics::RuntimeSwitch::ReapThrottle, Graphics::RuntimeSwitch::OcclusionWindows, Graphics::RuntimeSwitch::ExpressPassStamps, Graphics::RuntimeSwitch::PassBarriersMerged, Graphics::RuntimeSwitch::LabelReadbackMemo, Graphics::RuntimeSwitch::ExpressTargetUploads, Graphics::RuntimeSwitch::DrawRuns, Graphics::RuntimeSwitch::LargeBatches, Graphics::RuntimeSwitch::ReplayStateDedupe, Graphics::RuntimeSwitch::RunFollowNoCarry, Graphics::RuntimeSwitch::RunFollowPlainLoop, Graphics::RuntimeSwitch::FinisherParkSlots, Graphics::RuntimeSwitch::ListHooksOnce, Graphics::RuntimeSwitch::DispatchEnvOnce, Graphics::RuntimeSwitch::PlainRegisterPackets, Graphics::RuntimeSwitch::UserWordBlocks, Graphics::RuntimeSwitch::XpDeviceUploads, Graphics::RuntimeSwitch::XpDepthLayouts, Graphics::RuntimeSwitch::XpTargetRestarts, Graphics::RuntimeSwitch::TargetRestarts, Graphics::RuntimeSwitch::MovedInPlace, Graphics::RuntimeSwitch::IndirectInPass, Graphics::RuntimeSwitch::FragmentOwnSets, Graphics::RuntimeSwitch::DirectBuffersInPlace, Graphics::RuntimeSwitch::DirectGpuIndirect, Graphics::RuntimeSwitch::ExpressGpuIndirect, Graphics::RuntimeSwitch::RegisterRuns, Graphics::RuntimeSwitch::ListRegisterPackets, Graphics::RuntimeSwitch::PacketClassTable, Graphics::RuntimeSwitch::RangeMemo, Graphics::RuntimeSwitch::PendingIndexKept, Graphics::RuntimeSwitch::FillImageIndex, Graphics::RuntimeSwitch::WatchedReaps, Graphics::RuntimeSwitch::DeferredBatchStamps, Graphics::RuntimeSwitch::StageViews, Graphics::RuntimeSwitch::StageMemoLeanStores, Graphics::RuntimeSwitch::SettleSerial, Graphics::RuntimeSwitch::FragmentPlans, Graphics::RuntimeSwitch::BufferBlobAppend, Graphics::RuntimeSwitch::ShapePrologue, Graphics::RuntimeSwitch::DirectHandoff, Graphics::RuntimeSwitch::InputsMemo, Graphics::RuntimeSwitch::WorkerHelps, Graphics::RuntimeSwitch::DispatchMovedWrites, Graphics::RuntimeSwitch::DispatchRelocate, Graphics::RuntimeSwitch::DispatchMovedRecipes, Graphics::RuntimeSwitch::StageMemoPatchMerged, Graphics::RuntimeSwitch::StageMemoChained, Graphics::RuntimeSwitch::StageMemoAdmitWays, Graphics::RuntimeSwitch::StageMemoInvocationWays, Graphics::RuntimeSwitch::ImportSnapshots, Graphics::RuntimeSwitch::FollowWindows, Graphics::RuntimeSwitch::KeepBindingsMoved, Graphics::RuntimeSwitch::FollowWider, Graphics::RuntimeSwitch::ExpressDepthIntent, Graphics::RuntimeSwitch::LazyInPlaceImports, Graphics::RuntimeSwitch::PreparedCapacity, Graphics::RuntimeSwitch::MergedSettle, Graphics::RuntimeSwitch::IdleHitRelease, Graphics::RuntimeSwitch::FragmentParkedSets, Graphics::RuntimeSwitch::UnlockedStamps, Graphics::RuntimeSwitch::WriteSnapshotFronts, Graphics::RuntimeSwitch::PendingFronts, Graphics::RuntimeSwitch::InvocationSlotsWide, Graphics::RuntimeSwitch::XpTrustFinisher, Graphics::RuntimeSwitch::XpTrustCommitter, Graphics::RuntimeSwitch::TemplateKeeps, Graphics::RuntimeSwitch::DepthCheckLean, Graphics::RuntimeSwitch::DispatchRelocateTrials, Graphics::RuntimeSwitch::DirectRectLists, Graphics::RuntimeSwitch::DirectAddressed, Graphics::RuntimeSwitch::TrustAudit, Graphics::RuntimeSwitch::ProofKeeps, Graphics::RuntimeSwitch::ViewTemplateKeeps, Graphics::RuntimeSwitch::LeanFallbackDraws, Graphics::RuntimeSwitch::LabelRuns, Graphics::RuntimeSwitch::DispatchCommitLean, Graphics::RuntimeSwitch::RecordHeavyDraws, Graphics::RuntimeSwitch::InPlaceExact, Graphics::RuntimeSwitch::XpJobReplay, Graphics::RuntimeSwitch::XpFlow, Graphics::RuntimeSwitch::DeepFlow, Graphics::RuntimeSwitch::TailsAhead, Graphics::RuntimeSwitch::FixupsByTurn, Graphics::RuntimeSwitch::FrameFlow, Graphics::RuntimeSwitch::XpNoResolveWaits}) live.Assign(id, false);
+    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic, Graphics::RuntimeSwitch::CommitFragments, Graphics::RuntimeSwitch::ExpressCommits, Graphics::RuntimeSwitch::XpStreamSegments, Graphics::RuntimeSwitch::XpNoEagerStore, Graphics::RuntimeSwitch::LabelOrderedStores, Graphics::RuntimeSwitch::DeeperRing, Graphics::RuntimeSwitch::BesideSampleDumps, Graphics::RuntimeSwitch::DispatchBeside, Graphics::RuntimeSwitch::FaultFragments, Graphics::RuntimeSwitch::StageMemo, Graphics::RuntimeSwitch::KeepFaultSlots, Graphics::RuntimeSwitch::SiblingFinishers, Graphics::RuntimeSwitch::FastSettle, Graphics::RuntimeSwitch::XpSlowFinisher, Graphics::RuntimeSwitch::XpSlowCommitter, Graphics::RuntimeSwitch::XpSlowWorker, Graphics::RuntimeSwitch::XpExpressFloor, Graphics::RuntimeSwitch::LeanExpress, Graphics::RuntimeSwitch::XpAppendCommits, Graphics::RuntimeSwitch::PreciseSettle, Graphics::RuntimeSwitch::AppendCommits, Graphics::RuntimeSwitch::StageMemoPatchVertex, Graphics::RuntimeSwitch::StageMemoPatchBuffers, Graphics::RuntimeSwitch::StageMemoPatchData, Graphics::RuntimeSwitch::RunFollow, Graphics::RuntimeSwitch::TurnWaitsByJob, Graphics::RuntimeSwitch::ExpressKeepState, Graphics::RuntimeSwitch::StageMemoFront, Graphics::RuntimeSwitch::StageMemoAdmitThird, Graphics::RuntimeSwitch::CommitStamps, Graphics::RuntimeSwitch::PassReadsOnce, Graphics::RuntimeSwitch::ReapThrottle, Graphics::RuntimeSwitch::OcclusionWindows, Graphics::RuntimeSwitch::ExpressPassStamps, Graphics::RuntimeSwitch::PassBarriersMerged, Graphics::RuntimeSwitch::LabelReadbackMemo, Graphics::RuntimeSwitch::ExpressTargetUploads, Graphics::RuntimeSwitch::DrawRuns, Graphics::RuntimeSwitch::LargeBatches, Graphics::RuntimeSwitch::ReplayStateDedupe, Graphics::RuntimeSwitch::RunFollowNoCarry, Graphics::RuntimeSwitch::RunFollowPlainLoop, Graphics::RuntimeSwitch::FinisherParkSlots, Graphics::RuntimeSwitch::ListHooksOnce, Graphics::RuntimeSwitch::DispatchEnvOnce, Graphics::RuntimeSwitch::PlainRegisterPackets, Graphics::RuntimeSwitch::UserWordBlocks, Graphics::RuntimeSwitch::XpDeviceUploads, Graphics::RuntimeSwitch::XpDepthLayouts, Graphics::RuntimeSwitch::XpTargetRestarts, Graphics::RuntimeSwitch::TargetRestarts, Graphics::RuntimeSwitch::MovedInPlace, Graphics::RuntimeSwitch::IndirectInPass, Graphics::RuntimeSwitch::FragmentOwnSets, Graphics::RuntimeSwitch::DirectBuffersInPlace, Graphics::RuntimeSwitch::DirectGpuIndirect, Graphics::RuntimeSwitch::ExpressGpuIndirect, Graphics::RuntimeSwitch::RegisterRuns, Graphics::RuntimeSwitch::ListRegisterPackets, Graphics::RuntimeSwitch::PacketClassTable, Graphics::RuntimeSwitch::RangeMemo, Graphics::RuntimeSwitch::PendingIndexKept, Graphics::RuntimeSwitch::FillImageIndex, Graphics::RuntimeSwitch::WatchedReaps, Graphics::RuntimeSwitch::DeferredBatchStamps, Graphics::RuntimeSwitch::StageViews, Graphics::RuntimeSwitch::StageMemoLeanStores, Graphics::RuntimeSwitch::SettleSerial, Graphics::RuntimeSwitch::FragmentPlans, Graphics::RuntimeSwitch::BufferBlobAppend, Graphics::RuntimeSwitch::ShapePrologue, Graphics::RuntimeSwitch::DirectHandoff, Graphics::RuntimeSwitch::InputsMemo, Graphics::RuntimeSwitch::WorkerHelps, Graphics::RuntimeSwitch::DispatchMovedWrites, Graphics::RuntimeSwitch::DispatchRelocate, Graphics::RuntimeSwitch::DispatchMovedRecipes, Graphics::RuntimeSwitch::StageMemoPatchMerged, Graphics::RuntimeSwitch::StageMemoChained, Graphics::RuntimeSwitch::StageMemoAdmitWays, Graphics::RuntimeSwitch::StageMemoInvocationWays, Graphics::RuntimeSwitch::ImportSnapshots, Graphics::RuntimeSwitch::FollowWindows, Graphics::RuntimeSwitch::KeepBindingsMoved, Graphics::RuntimeSwitch::FollowWider, Graphics::RuntimeSwitch::ExpressDepthIntent, Graphics::RuntimeSwitch::LazyInPlaceImports, Graphics::RuntimeSwitch::PreparedCapacity, Graphics::RuntimeSwitch::MergedSettle, Graphics::RuntimeSwitch::IdleHitRelease, Graphics::RuntimeSwitch::FragmentParkedSets, Graphics::RuntimeSwitch::UnlockedStamps, Graphics::RuntimeSwitch::WriteSnapshotFronts, Graphics::RuntimeSwitch::PendingFronts, Graphics::RuntimeSwitch::InvocationSlotsWide, Graphics::RuntimeSwitch::XpTrustFinisher, Graphics::RuntimeSwitch::XpTrustCommitter, Graphics::RuntimeSwitch::TemplateKeeps, Graphics::RuntimeSwitch::DepthCheckLean, Graphics::RuntimeSwitch::DispatchRelocateTrials, Graphics::RuntimeSwitch::DirectRectLists, Graphics::RuntimeSwitch::DirectAddressed, Graphics::RuntimeSwitch::TrustAudit, Graphics::RuntimeSwitch::ProofKeeps, Graphics::RuntimeSwitch::ViewTemplateKeeps, Graphics::RuntimeSwitch::LeanFallbackDraws, Graphics::RuntimeSwitch::LabelRuns, Graphics::RuntimeSwitch::DispatchCommitLean, Graphics::RuntimeSwitch::RecordHeavyDraws, Graphics::RuntimeSwitch::InPlaceExact, Graphics::RuntimeSwitch::XpJobReplay, Graphics::RuntimeSwitch::XpFlow, Graphics::RuntimeSwitch::DeepFlow, Graphics::RuntimeSwitch::TailsAhead, Graphics::RuntimeSwitch::FixupsByTurn, Graphics::RuntimeSwitch::FrameFlow, Graphics::RuntimeSwitch::XpNoResolveWaits, Graphics::RuntimeSwitch::WriteValidation}) live.Assign(id, false);
     if (!tagged || deviceSerial != serial || !(live == switches)) {
         tagged = true;
         deviceSerial = serial;
@@ -1488,6 +1870,16 @@ struct StageMemoPattern {
     bool operator==(const StageMemoPattern& other) const = default;
 };
 
+struct NestedArm {
+    std::atomic<std::uint64_t> validated{0};
+    std::atomic<std::uint64_t> forget{0};
+    std::atomic<std::uint32_t> skips{0};
+
+    NestedArm() = default;
+    NestedArm(const NestedArm&) noexcept {}
+    NestedArm& operator=(const NestedArm&) noexcept { return *this; }
+};
+
 struct StageMemoEntry {
     std::shared_ptr<const DrawDecode> decode;
     std::uint32_t stage = 0;
@@ -1528,6 +1920,7 @@ struct StageMemoEntry {
     std::vector<std::uint32_t> vertexInputs;
     std::uint64_t layoutHash = 0;
     mutable DirectDraws::TrustState trust;
+    mutable NestedArm nestedArm;
 };
 
 void viewStageEntry(StageMemoEntry& entry, const StageMemoPattern& pattern, std::span<const std::uint32_t> userData, ShaderRecompiler::ShaderStage stage, std::size_t count) {
@@ -1827,6 +2220,97 @@ bool stageMemoRead(std::uint64_t address, std::uint32_t& value, std::uint64_t& p
     }
     std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
     return true;
+}
+
+struct NestedRangesStorage {};
+
+bool nestedClocksHeld(const StageMemoEntry& entry, std::uint64_t armed) {
+    std::uint64_t last = ~std::uint64_t{0};
+    for (const auto& word : entry.nested) {
+        const auto first = word.first >> Validation::WindowShift;
+        const auto end = (word.first + sizeof(std::uint32_t) - 1u) >> Validation::WindowShift;
+        for (auto window = first;; ++window) {
+            if (window != last && !windowClocksHeld(window, armed, true)) return false;
+            last = window;
+            if (window == end) break;
+        }
+    }
+    return true;
+}
+
+bool nestedValuesSame(const StageMemoEntry& entry) {
+    std::uint64_t page = ~std::uint64_t{0};
+    for (const auto& [address, value] : entry.nested) {
+        std::uint32_t live = 0;
+        if (!stageMemoRead(address, live, page) || live != value) return false;
+    }
+    return true;
+}
+
+bool nestedArmHolds(const StageMemoEntry& entry, const DirectStages& resolved) {
+    constexpr auto test = Validation::Test::NestedValues;
+    const auto session = resolved.wvSession;
+    if (session == 0 || session != Validation::Session()) return false;
+    const auto packed = entry.nestedArm.validated.load(std::memory_order_acquire);
+    if (packed == 0 || (packed >> ArmSessionShift) != session) return false;
+    const auto forget = entry.nestedArm.forget.load(std::memory_order_acquire);
+    if ((forget & 1u) != 0 || forget != GuestMemory::ForgetSerial()) {
+        Validation::Note(test, Validation::Outcome::Moved);
+        return false;
+    }
+    if (DrawFinisher::UnknownWritesAhead()) {
+        Validation::Note(test, Validation::Outcome::Unknown);
+        return false;
+    }
+    const auto armed = packed & ArmEpochMask;
+    if (!nestedClocksHeld(entry, armed)) {
+        Validation::Note(test, Validation::Outcome::Moved);
+        return false;
+    }
+    Validation::Note(test, Validation::Outcome::Answered);
+    if (!Validation::VerifyDue(test)) return true;
+    if (nestedValuesSame(entry)) {
+        Validation::NoteVerify(test, false, nullptr);
+        return true;
+    }
+    Validation::NoteVerify(test, nestedClocksHeld(entry, armed), "a nested descriptor word changed although its clean, settled windows raised no event since its arm");
+    return false;
+}
+
+void armNested(const StageMemoEntry& entry, const DirectStages& resolved) {
+    constexpr auto test = Validation::Test::NestedValues;
+    const auto session = resolved.wvSession;
+    if (session == 0 || session != Validation::Session()) return;
+    auto& arm = entry.nestedArm;
+    if (const auto skips = arm.skips.load(std::memory_order_relaxed); skips != 0) {
+        arm.skips.store(skips - 1u, std::memory_order_relaxed);
+        return;
+    }
+    const auto forget = GuestMemory::ForgetSerial();
+    if ((forget & 1u) != 0) return;
+    auto& ranges = HostThreadLocal<AddressRanges, NestedRangesStorage>();
+    ranges.clear();
+    for (const auto& word : entry.nested) ranges.emplace_back(word.first, word.first + sizeof(std::uint32_t));
+    auto& windows = HostThreadLocal<FinisherWindows, FinisherWindowsStorage>();
+    const auto backoff = [&](Validation::Outcome outcome) {
+        arm.skips.store(ArmBackoff, std::memory_order_relaxed);
+        Validation::Note(test, outcome);
+    };
+    if (!collectWindows(ranges, windows)) return backoff(Validation::Outcome::Wide);
+    ensureCleanForgetHook();
+    const auto before = Validation::Epoch();
+    if (!armable(session, before)) return;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!GuestMemory::AllClean(ranges)) return backoff(Validation::Outcome::NotClean);
+    for (std::size_t at = 0; at < windows.count; ++at) {
+        if (!settleProof(windows.windows[at])) return backoff(Validation::Outcome::Live);
+    }
+    if (!nestedValuesSame(entry)) return;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (GuestMemory::ForgetSerial() != forget) return;
+    arm.forget.store(forget, std::memory_order_relaxed);
+    arm.validated.store(packArm(session, before), std::memory_order_release);
+    Validation::Note(test, Validation::Outcome::Armed);
 }
 
 std::uint64_t stageMemoContentKey(std::uint64_t key, std::size_t way, const StageMemoPattern& pattern, std::span<const std::uint32_t> userData, std::span<const std::uint32_t> rootValues, const Pm4::DrawParameters& parameters, std::uint32_t cursor, const DirectStage* previous) {
@@ -2221,7 +2705,7 @@ StageMemoOutcome adoptViews(StageMemo& memo, const StageMemoEntry& entry, const 
         return StageMemoOutcome::Unsettled;
     };
     if (!settleTrusted && entry.decodeReads.empty()) {
-        if (!settledSince(ranges, resolved)) return viewUnsettled();
+        if (!settledValidated(ranges, resolved, Validation::Test::ViewSettle)) return viewUnsettled();
     } else if (!settleTrusted) {
         auto& decodeRanges = memo.decodeRanges;
         if (!sameAddresses) {
@@ -2229,14 +2713,14 @@ StageMemoOutcome adoptViews(StageMemo& memo, const StageMemoEntry& entry, const 
             for (std::size_t read = 0; read < entry.decodeReads.size(); ++read) decodeRanges.emplace_back(addresses[read], addresses[read] + entry.decodeReads[read].size);
         }
         if (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle)) {
-            if (!settledSince(ranges, resolved) || !settledSince(sameAddresses ? entry.decodeRanges : decodeRanges, resolved)) return viewUnsettled();
+            if (!settledValidated(ranges, resolved, Validation::Test::ViewSettle) || !settledValidated(sameAddresses ? entry.decodeRanges : decodeRanges, resolved, Validation::Test::ViewSettle)) return viewUnsettled();
         } else if (sameAddresses) {
-            if (!settledSince(entry.settled, resolved)) return viewUnsettled();
+            if (!settledValidated(entry.settled, resolved, Validation::Test::ViewSettle)) return viewUnsettled();
         } else {
             auto& settled = memo.settled;
             settled.assign(ranges.begin(), ranges.end());
             settled.insert(settled.end(), decodeRanges.begin(), decodeRanges.end());
-            if (!settledSince(settled, resolved)) return viewUnsettled();
+            if (!settledValidated(settled, resolved, Validation::Test::ViewSettle)) return viewUnsettled();
         }
     }
     bool forwardsSame = true;
@@ -2421,6 +2905,7 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, std::span<c
         const auto entryUse = auditUse(entry.trust);
         const bool inputsTrusted = trusted() || entryUse == TrustUse::Skip;
         noteUse(TrustSite::StageInputs, entryUse);
+        if (resolved.wvSession != 0) Validation::Note(Validation::Test::StageInputs, Validation::Outcome::Kept);
         const auto sameInputs = [&](bool trustedInputs) {
             bool same = trustedInputs ? (entry.tag == resolved.tag && entry.variant == slot.variant && entry.convertedSamples == slot.convertedSamples && entry.layerRowSamples == slot.layerRowSamples && entry.userData.size() == userData.size()) : entry.decode.get() == decode.get() && entry.stage == index && entry.way == way && entry.cursor == cursor && entry.tag == resolved.tag && entry.previous.get() == previous && (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::StageMemoNoIndex) || (entry.indexAddress == parameters.indexAddress && entry.indexCount == parameters.indexCount && entry.indexSize == parameters.indexSize && entry.instanceCount == parameters.instanceCount)) && entry.variant == slot.variant && entry.convertedSamples == slot.convertedSamples && entry.layerRowSamples == slot.layerRowSamples && entry.userData.size() == userData.size();
             for (std::size_t word = 0; same && word < userData.size(); ++word) {
@@ -2444,14 +2929,16 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, std::span<c
         bool nestedSame = true;
         const bool nestedTrusted = !entry.nested.empty() && (trusted() || entryUse == TrustUse::Skip);
         if (!entry.nested.empty()) noteUse(TrustSite::StageNested, entryUse);
+        const bool nestedHeld = !nestedTrusted && !entry.nested.empty() && nestedArmHolds(entry, resolved);
         for (const auto& [address, value] : entry.nested) {
-            if (nestedTrusted) break;
+            if (nestedTrusted || nestedHeld) break;
             std::uint32_t live = 0;
             if (!stageMemoRead(address, live, page) || live != value) {
                 nestedSame = false;
                 break;
             }
         }
+        if (nestedSame && !nestedTrusted && !nestedHeld && !entry.nested.empty()) armNested(entry, resolved);
         if (!nestedSame) {
             entryFailed(memo, contentKey, entry, TrustSite::StageNested, entryUse);
             last = StageMemoOutcome::Values;
@@ -2510,14 +2997,14 @@ StageMemoOutcome adoptStage(StageMemo& memo, const LeanDrawJob& job, std::span<c
         };
         for (std::size_t read = 0; !settleTrusted && read < entry.decodeReads.size(); ++read) decodeRanges.emplace_back(addresses[read], addresses[read] + entry.decodeReads[read].size);
         if (!settleTrusted && decodeRanges.empty()) {
-            if (!settledSince(stage.ranges, resolved)) return entryUnsettled();
+            if (!settledValidated(stage.ranges, resolved, Validation::Test::StageSettle)) return entryUnsettled();
         } else if (!settleTrusted && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FastSettle)) {
-            if (!settledSince(stage.ranges, resolved) || !settledSince(decodeRanges, resolved)) return entryUnsettled();
+            if (!settledValidated(stage.ranges, resolved, Validation::Test::StageSettle) || !settledValidated(decodeRanges, resolved, Validation::Test::StageSettle)) return entryUnsettled();
         } else if (!settleTrusted) {
             auto& settled = memo.settled;
             settled.assign(stage.ranges.begin(), stage.ranges.end());
             settled.insert(settled.end(), decodeRanges.begin(), decodeRanges.end());
-            if (!settledSince(settled, resolved)) return entryUnsettled();
+            if (!settledValidated(settled, resolved, Validation::Test::StageSettle)) return entryUnsettled();
         }
         stage.side = entry.side;
         bool forwarded = true;
@@ -3599,6 +4086,8 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
     const bool snapshotTrusted = trusted();
     resolved.serialed = !snapshotTrusted && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SettleSerial);
     if (resolved.serialed) resolved.beforeSerial = Graphics::Recorder::PublishGeneration();
+    resolved.wvSession = Validation::Session();
+    if (resolved.wvSession != 0) Validation::Note(Validation::Test::PendingSnapshot, Validation::Outcome::Kept);
     if (snapshotTrusted) resolved.before.reset();
     else resolved.before = Graphics::Recorder::PendingWriteSnapshot();
     resolved.generation = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::CommitStamps) ? GuestMemory::TrackerGenerationSettled() : GuestMemory::TrackerGeneration();
@@ -3725,7 +4214,7 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
         if (!CaptureRegisteredViewsCurrent(snapshot.registeredImages)) return Counter::FallbackViews;
         const auto walkUse = slot != nullptr && !memoUnsettled ? auditUse(slot->trust) : TrustUse::Test;
         noteUse(TrustSite::WalkSettle, walkUse);
-        if (!trusted() && walkUse != TrustUse::Skip && !settledSince(stage.ranges, resolved)) {
+        if (!trusted() && walkUse != TrustUse::Skip && !settledValidated(stage.ranges, resolved, Validation::Test::WalkSettle)) {
             if (slot != nullptr) noteFailed(slot->trust, TrustSite::WalkSettle, walkUse);
             noteUnsettled(stage.ranges, resolved.before.get(), resolved.generation);
             return Counter::FallbackUnsettled;
@@ -3921,10 +4410,18 @@ std::optional<Counter> Driver::assembleDirectHit(const LeanDrawJob& job, DirectS
     const auto checksUse = resolved.checksUse;
     const bool checksTrusted = trusted() || checksUse == TrustUse::Skip;
     noteUse(TrustSite::CapturedMemory, checksUse);
-    if (!checksTrusted && capturedMemoryChanged(regions.first(compared))) {
+    bool programVerify = false;
+    auto programHeld = checksTrusted ? std::size_t{0} : programMemoryHeld(resolved, regions, compared, programVerify);
+    if (programVerify) {
+        const bool changed = capturedMemoryChanged(regions.first(programHeld));
+        Validation::NoteVerify(Validation::Test::CapturedMemory, changed && programArmsHeld(resolved, regions, programHeld, Validation::Session()), "program memory changed although its clean, settled windows raised no event since its arm");
+        if (changed) programHeld = 0;
+    }
+    if (!checksTrusted && capturedMemoryChanged(regions.subspan(programHeld, compared - programHeld))) {
         noteFailed(job.shape->trust, TrustSite::CapturedMemory, checksUse);
         return Counter::FallbackMemoryChanged;
     }
+    if (!checksTrusted && programHeld == 0) armProgramMemory(resolved);
     if (!checksTrusted && compared < regions.size()) {
         struct OrdinalStorage {};
         auto& ordinal = HostThreadLocal<std::uint64_t, OrdinalStorage>();
@@ -3937,6 +4434,7 @@ std::optional<Counter> Driver::assembleDirectHit(const LeanDrawJob& job, DirectS
             }
         }
     }
+    if (resolved.wvSession != 0) Validation::Note(Validation::Test::LabelOverlap, Validation::Outcome::Kept);
     if (recordQueuedLabelsAfterCapture(job.queue, checksTrusted ? std::span<const ShaderRecompiler::MemoryRegion>() : regions)) {
         noteFailed(job.shape->trust, TrustSite::CapturedMemory, checksUse);
         return Counter::FallbackLabels;

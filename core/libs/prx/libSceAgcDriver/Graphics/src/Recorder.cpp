@@ -34,6 +34,7 @@
 #include "prx/libSceAgcDriver/Graphics/shaders/DispatchArguments_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/QueueSubmitter.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommandEncoder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/WriteValidation.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -557,6 +558,7 @@ std::atomic<std::int64_t> pendingLabelSince{NoPendingLabel};
 std::atomic<std::uint64_t> writeGeneration{0};
 std::atomic<std::uint64_t> publishGeneration{0};
 std::atomic<std::uint64_t> queuedStoreGeneration{0};
+std::atomic<std::uint64_t> wvStoreGeneration{0};
 std::atomic<std::uint64_t> completionLabels{0};
 std::atomic<std::uint64_t> completionStores{0};
 std::atomic<std::uint64_t> writeBackCompletions{0};
@@ -1664,6 +1666,10 @@ std::uint64_t Recorder::QueuedStoreGeneration() {
     return queuedStoreGeneration.load(std::memory_order_acquire);
 }
 
+std::uint64_t Recorder::StoreGenerationForValidation() {
+    return wvStoreGeneration.load(std::memory_order_acquire);
+}
+
 std::uint64_t Recorder::QueuedLabelSerial() {
     return queuedLabelSerial.load(std::memory_order_acquire);
 }
@@ -1703,12 +1709,16 @@ Recorder* Recorder::Active() {
 }
 
 void Recorder::Activate() {
+    WriteValidation::RaiseAll(WriteValidation::Class::W, WriteValidation::Source::RecorderNote);
+    WriteValidation::RaiseAll(WriteValidation::Class::L, WriteValidation::Source::RecordedLabel);
     activeRecorder = this;
     {
         std::lock_guard tableLock(labelTableMutex);
         labelTableOwner = this;
     }
     GuestMemory::SetFlushHook(&FlushForAccess);
+    WriteValidation::RaiseAll(WriteValidation::Class::W, WriteValidation::Source::RecorderNote);
+    WriteValidation::RaiseAll(WriteValidation::Class::L, WriteValidation::Source::RecordedLabel);
 }
 
 std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) {
@@ -1824,6 +1834,7 @@ void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
 
 void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
     if (bytes.size() < 4 || address % 4 != 0) return;
+    const WriteValidation::RaiseScope raised(WriteValidation::Class::L, WriteValidation::Source::QueuedLabel, address, address + bytes.size());
     // The range before the table: the hook covers the group whether or not a table exists to
     // enter it in (no owner: the callback records it outright, by a CPU store when need be).
     QueuedLabelRanges().emplace_back(address, address + bytes.size());
@@ -2209,6 +2220,14 @@ bool Recorder::PassImagesFollow(std::span<const std::pair<VkImage, bool>> images
     return open != nullptr && open->renderPass.open && open->passHazards.ImagesFollow(images, attachments);
 }
 
+std::uint64_t Recorder::PassHazardSerial() const {
+    return open != nullptr ? open->passHazards.Serial() : 0;
+}
+
+bool Recorder::PassNoWrites() const {
+    return open != nullptr && open->passHazards.NoWrites();
+}
+
 void Recorder::NotePassReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     if (open != nullptr) open->passHazards.AddReads(ranges, RuntimeSwitches::Set(RuntimeSwitch::LazyPassReads));
 }
@@ -2263,6 +2282,7 @@ void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
 }
 
 void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end) {
+    if (WriteValidation::Session() != 0) wvStoreGeneration.fetch_add(1, std::memory_order_release);
     ensureOpen();
     // A queued label store over the keys lands first (program order: the key store is later).
     FlushStoresOverlapping(begin, static_cast<std::size_t>(end - begin));
@@ -2276,7 +2296,10 @@ void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize l
             return;
         }
     }
-    open->keyStores.push_back({buffer, first, last, std::move(seed), begin, end});
+    {
+        const WriteValidation::RaiseScope raised(WriteValidation::Class::L, WriteValidation::Source::KeyStore, begin, end);
+        open->keyStores.push_back({buffer, first, last, std::move(seed), begin, end});
+    }
     if (KeyStoresEach()) recordKeyStores(false);
 }
 
@@ -2393,6 +2416,7 @@ void Recorder::ensureOpen() {
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
     queuedStoreGeneration.fetch_add(1, std::memory_order_release);
+    if (WriteValidation::Session() != 0) wvStoreGeneration.fetch_add(1, std::memory_order_release);
     ensureOpen();
     flushDeferredDispatch();
     auto& run = open->run;
@@ -2411,11 +2435,14 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
                 return;
             }
             if (offset == lastEnd && last.bytes.size() + bytes.size() <= 65536) {
+                const auto joinedAt = last.End();
+                const WriteValidation::RaiseScope raised(WriteValidation::Class::L, WriteValidation::Source::QueuedStore, joinedAt, joinedAt + bytes.size());
                 last.bytes.insert(last.bytes.end(), bytes.begin(), bytes.end());
                 storesJoined.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
         }
+        const WriteValidation::RaiseScope raised(WriteValidation::Class::L, WriteValidation::Source::QueuedStore, address, address + bytes.size());
         run.queued.push_back({buffer, offset, std::vector<std::byte>(bytes.begin(), bytes.end()), address});
         return;
     }
@@ -3418,6 +3445,8 @@ bool Recorder::DumpSamples(VkDeviceAddress target, std::uint64_t address) {
             if (xpVisible) pendingSamples.push_back({nullptr, VK_NULL_HANDLE, 0});
             if (open->renderPass.open) dumpsQueuedInPass.fetch_add(1, std::memory_order_relaxed);
             if (open->run.queued.empty()) storeRuns.fetch_add(1, std::memory_order_relaxed);
+            if (WriteValidation::Session() != 0) wvStoreGeneration.fetch_add(1, std::memory_order_release);
+            const WriteValidation::RaiseScope raised(WriteValidation::Class::L, WriteValidation::Source::QueuedDump, address, address + SampleDumpBytes);
             auto& queued = open->run.queued.emplace_back();
             queued.address = address;
             queued.dumpTarget = target;
@@ -4208,6 +4237,7 @@ std::uint64_t Recorder::WriterOfNote(std::uint64_t note) {
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
+    WriteValidation::Raise(WriteValidation::Class::W, WriteValidation::Source::RecorderNote, address, address + bytes);
     GpuZones::Mark(address, bytes);
     ensureOpen();
     const auto end = address + bytes;
@@ -4225,6 +4255,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     // leaves the published union unchanged, so the O(N log N) rebuild is skipped.
     if (SnapshotCovers(address, end)) {
         ++snapshotCovered;
+        WriteValidation::Raise(WriteValidation::Class::W, WriteValidation::Source::RecorderNote, address, end);
         return false;
     }
     return true;
@@ -4243,6 +4274,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
+    const WriteValidation::RaiseScope raised(WriteValidation::Class::W, WriteValidation::Source::InFlightNote, address, address + bytes);
     batch.writes.emplace_back(address, address + bytes);
     PendingZones::Add(address, bytes);
     batch.writeNotes.push_back(++writeNoteCount);
@@ -4314,6 +4346,10 @@ void Recorder::notePendingRanges(std::span<const std::pair<std::uint64_t, std::u
 void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions) const {
     if (activeRecorder != this) {
         publishedWriteRangesValid = false;
+        unpublishedForValidation = true;
+        if (WriteValidation::Session() != 0) {
+            for (const auto& [begin, end] : additions) WriteValidation::Raise(WriteValidation::Class::W, WriteValidation::Source::RecorderNote, begin, end);
+        }
         return;
     }
     const auto started = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -4360,6 +4396,11 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
     pendingWritesWord.store(merged.get(), std::memory_order_release);
     pendingWrites.store(std::move(merged), std::memory_order_release);
     publishGeneration.fetch_add(1, std::memory_order_release);
+    const bool unpublished = !extend && std::exchange(unpublishedForValidation, false);
+    if (WriteValidation::Session() != 0) {
+        for (const auto& [begin, end] : additions) WriteValidation::Raise(WriteValidation::Class::W, WriteValidation::Source::RecorderNote, begin, end);
+        if (unpublished) WriteValidation::RaiseAll(WriteValidation::Class::W, WriteValidation::Source::RecorderNote);
+    }
     ++snapshotRebuilds;
     if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
 }
@@ -4684,6 +4725,7 @@ bool Recorder::HasCompletions() const {
 }
 
 void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool behindCompletion) {
+    const WriteValidation::RaiseScope raised(WriteValidation::Class::L, WriteValidation::Source::RecordedLabel, address, address + bytes.size());
     // One entry per dword; a label overlapping older entries (a 4-byte store inside an 8-byte one or
     // the reverse) replaces exactly the dwords it stores, so a lookup composes what memory will hold.
     std::lock_guard tableLock(labelTableMutex);
@@ -4699,6 +4741,7 @@ void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const 
 }
 
 void Recorder::markBehindCompletion(const Batch& batch, std::uint64_t begin, std::uint64_t end) {
+    const WriteValidation::RaiseScope raised(WriteValidation::Class::L, WriteValidation::Source::BehindCompletion, begin, end);
     std::lock_guard tableLock(labelTableMutex);
     for (auto it = labels.lower_bound(begin); it != labels.end() && it->first < end; ++it) {
         if (it->second.batch == &batch) it->second.behindCompletion = true;
@@ -4713,6 +4756,7 @@ void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes
     if (tabled) {
         noteLabelOn(*open, address, bytes, stamp, queue);
     } else {
+        const WriteValidation::RaiseScope raised(WriteValidation::Class::L, WriteValidation::Source::WideLabel, address, address + bytes.size());
         std::lock_guard tableLock(labelTableMutex);
         labels.erase(labels.lower_bound(address), labels.lower_bound(address + bytes.size()));
         recordedLabels.store(labels.size(), std::memory_order_relaxed);

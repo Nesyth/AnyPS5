@@ -260,6 +260,7 @@ public:
             for (const auto alias : page.aliases) {
                 auto& view = views.at(alias);
                 if (view.armed == 0) continue;
+                announceCleanWrite(alias, alias + pageBytes);
                 protectSubpages(alias, view.armed, view.protection, "pin shared guest page writable", view.viewBytes);
                 view.armed = 0;
             }
@@ -336,6 +337,11 @@ public:
     // alias invalidation), and whether every range in pairs (begin, end, ...) lies inside remembered clean ranges.
     static std::uint64_t CleanForgetSerial() {
         return cleanForgetSerial().load(std::memory_order_acquire);
+    }
+
+    using CleanForgetHook = void (*)(std::uintptr_t start, std::uintptr_t end);
+    static void SetCleanForgetHook(CleanForgetHook hook) {
+        cleanForgetHook().store(hook, std::memory_order_release);
     }
 
     bool AllClean(const std::uint64_t* pairs, std::size_t count) {
@@ -1103,6 +1109,11 @@ private:
         return serial;
     }
 
+    static std::atomic<CleanForgetHook>& cleanForgetHook() {
+        static std::atomic<CleanForgetHook> hook{nullptr};
+        return hook;
+    }
+
     static std::atomic<bool>& rearmQuietFlag() {
         static std::atomic<bool> rearm{false};
         return rearm;
@@ -1190,6 +1201,7 @@ private:
 
     void resumeResidentView(std::uintptr_t base) {
         auto& view = views.at(base);
+        announceCleanWrite(base, base + pageBytes);
         DWORD previous;
         if (!VirtualProtect(reinterpret_cast<void*>(base), pageBytes, view.protection, &previous)) fail("resume a resident guest view");
         view.armed = 0;
@@ -1729,8 +1741,18 @@ private:
         ranges.emplace(start, end);
     }
 
+    void announceCleanWrite(std::uintptr_t start, std::uintptr_t end) {
+        const auto hook = cleanForgetHook().load(std::memory_order_acquire);
+        if (hook == nullptr) return;
+        auto it = cleanRanges.lower_bound(start);
+        if (it != cleanRanges.begin() && std::prev(it)->second > start) --it;
+        if (it != cleanRanges.end() && it->first < end) hook(start, end);
+    }
+
     void forgetClean(std::uintptr_t start, std::uintptr_t end) {
-        if (forget(cleanRanges, start, end)) cleanForgetSerial().fetch_add(1, std::memory_order_acq_rel);
+        if (!forget(cleanRanges, start, end)) return;
+        if (const auto hook = cleanForgetHook().load(std::memory_order_acquire); hook != nullptr) hook(start, end);
+        cleanForgetSerial().fetch_add(1, std::memory_order_acq_rel);
     }
 
     void rememberClean(std::uintptr_t start, std::uintptr_t end) {

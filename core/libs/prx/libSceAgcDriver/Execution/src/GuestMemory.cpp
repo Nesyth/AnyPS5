@@ -3521,6 +3521,14 @@ std::uint64_t CleanForgetSerial() {
 #endif
 }
 
+void SetCleanForgetHook(void (*hook)(std::uintptr_t start, std::uintptr_t end)) {
+#ifdef _WIN32
+    GuestArena::GuestArenaSetCleanForgetHook_nid_no_patch(hook);
+#else
+    static_cast<void>(hook);
+#endif
+}
+
 bool AllClean(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
 #ifdef _WIN32
     static_assert(sizeof(std::pair<std::uint64_t, std::uint64_t>) == 2 * sizeof(std::uint64_t));

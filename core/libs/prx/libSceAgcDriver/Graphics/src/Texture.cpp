@@ -27,6 +27,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/WriteValidation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/QueueSubmitter.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -2241,6 +2242,7 @@ public:
     iterator begin() { return textures.begin(); }
     iterator end() { return textures.end(); }
     void push_back(StorageTexture* texture) {
+        const WriteValidation::RaiseScope raised(WriteValidation::Class::W, WriteValidation::Source::StoragePending, texture->Descriptor().baseAddress, texture->Descriptor().baseAddress + texture->GuestBytes());
         GpuZones::Mark(texture->Descriptor().baseAddress, texture->GuestBytes());
         PendingZones::Add(texture->Descriptor().baseAddress, texture->GuestBytes());
         textures.push_back(texture);

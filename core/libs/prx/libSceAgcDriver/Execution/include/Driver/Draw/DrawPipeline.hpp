@@ -32,6 +32,7 @@ public:
     void PublishUnknownJobs(std::span<const std::uint64_t> jobs);
     Answer Overlaps(std::span<const Range> ranges, Range* pendingHit = nullptr, bool* unknownHeld = nullptr, bool ignoreUnknown = false) const;
     bool UnknownAhead(std::uint64_t front, std::uint64_t asker, std::uint64_t& blocker) const;
+    bool UnknownHeld() const;
     bool Copy(std::array<Range, Capacity>& out, std::uint32_t& size) const;
 
 private:
@@ -156,6 +157,7 @@ public:
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
     bool OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+    bool QueuedClearForValidation(std::span<const Range> ranges);
     Watch WatchWrites();
     bool WrittenSince(const Watch& watch, const std::vector<Range>& reads);
     std::uint64_t Retired() const { return retiredItems.load(std::memory_order_acquire); }
@@ -307,6 +309,8 @@ public:
     bool ParkedReadsOverlap(std::uint64_t address, std::size_t bytes);
     LabelLookup PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value);
     bool PendingOverlapsAny(std::span<const Range> ranges);
+    bool PendingClearForValidation(std::span<const Range> ranges);
+    static bool UnknownWritesAhead();
     bool PendingKey(std::uint64_t key, std::uint64_t shape);
     enum class DrainSite : std::uint32_t { Lookup, Reads, Packet, Kept, Count };
     static void NoteDrain(DrainSite site, bool drained);

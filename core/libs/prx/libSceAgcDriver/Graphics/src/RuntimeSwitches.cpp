@@ -249,6 +249,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_FIXUPS_BY_TURN",
     "APS5_FRAME_FLOW",
     "APS5_XP_NO_RESOLVE_WAITS",
+    "APS5_WRITE_VALIDATION",
 };
 static_assert(SwitchNames.back() != nullptr, "every runtime switch needs a name");
 
@@ -498,6 +499,7 @@ struct SwitchValues {
             std::getenv("APS5_FIXUPS_BY_TURN") != nullptr,
             std::getenv("APS5_FRAME_FLOW") != nullptr,
             std::getenv("APS5_XP_NO_RESOLVE_WAITS") != nullptr,
+            std::getenv("APS5_WRITE_VALIDATION") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }
@@ -507,6 +509,8 @@ SwitchValues& Values() {
     static SwitchValues values;
     return values;
 }
+
+std::atomic<RuntimeSwitches::AssignHook> assignHook{nullptr};
 
 std::string_view Trim(std::string_view text) {
     while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) text.remove_prefix(1);
@@ -542,7 +546,13 @@ bool Set(RuntimeSwitch id) {
 
 void Assign(RuntimeSwitch id, bool set) {
     auto& values = Values();
-    if (values.set.at(static_cast<std::size_t>(id)).exchange(set, std::memory_order_relaxed) != set) values.generation.fetch_add(1, std::memory_order_release);
+    if (values.set.at(static_cast<std::size_t>(id)).exchange(set, std::memory_order_relaxed) == set) return;
+    values.generation.fetch_add(1, std::memory_order_release);
+    if (const auto hook = assignHook.load(std::memory_order_acquire); hook != nullptr) hook(id);
+}
+
+void SetAssignHook(AssignHook hook) {
+    assignHook.store(hook, std::memory_order_release);
 }
 
 std::uint64_t Generation() {

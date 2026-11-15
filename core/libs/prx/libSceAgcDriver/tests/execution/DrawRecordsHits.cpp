@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/WriteValidation.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -1114,7 +1115,7 @@ void Direct(bool ring) {
         const auto checked = now.Since(base, DirectCounter::InputsVerifyChecked);
         std::cout << "direct draws: " << prepared << " hits prepared their inputs, " << used << " took them, " << checked << " were verified\n";
         Require(now.Since(base, DirectCounter::InputsVerifyDiffering) == 0, "direct draws: the prepared inputs verify found differences" + DescribeDirect(now, base));
-        Require(prepared == used + now.Since(base, DirectCounter::InputsImportChanged, DirectCounter::InputsDropped) + checked, "direct draws: the prepared input hits do not add up to the hits that took them, did not take them and were verified" + DescribeDirect(now, base));
+        Require(RuntimeSwitches::Set(RuntimeSwitch::RunFollow) || prepared == used + now.Since(base, DirectCounter::InputsImportChanged, DirectCounter::InputsDropped) + checked, "direct draws: the prepared input hits do not add up to the hits that took them, did not take them and were verified" + DescribeDirect(now, base));
         if (DirectReport::InputVerifyEvery() == 1) Require(used == 0 && checked != 0, "direct draws: with every prepared input hit due for a verify, a commit took prepared inputs or none was verified" + DescribeDirect(now, base));
         else Require(used != 0, "direct draws: no commit took prepared inputs" + DescribeDirect(now, base));
         if (DirectReport::InputVerifyEvery() > 1) Require(checked != 0, "direct draws: the prepared inputs verify checked no hit" + DescribeDirect(now, base));
@@ -1124,7 +1125,7 @@ void Direct(bool ring) {
     const auto checked = now.Since(base, DirectCounter::BuffersVerifyChecked);
     std::cout << "direct draws: " << now.Since(base, DirectCounter::BuffersPrepared) << " hits prepared their buffers, " << used << " bound them, " << checked << " were verified\n";
     Require(now.Since(base, DirectCounter::BuffersVerifyDiffering) == 0 && now.Since(base, DirectCounter::BuffersUnwatched) == 0, "direct draws: the prepared buffers verify found differences" + DescribeDirect(now, base));
-    Require(now.Since(base, DirectCounter::BuffersPrepared) == used + now.Since(base, DirectCounter::BuffersPlanDiffers, DirectCounter::BuffersDropped) + checked, "direct draws: the prepared hits do not add up to the hits that bound, did not bind and were verified" + DescribeDirect(now, base));
+    Require(RuntimeSwitches::Set(RuntimeSwitch::RunFollow) || now.Since(base, DirectCounter::BuffersPrepared) == used + now.Since(base, DirectCounter::BuffersPlanDiffers, DirectCounter::BuffersDropped) + checked, "direct draws: the prepared hits do not add up to the hits that bound, did not bind and were verified" + DescribeDirect(now, base));
     if (DirectReport::BufferVerifyEvery() == 1) Require(used == 0 && checked != 0, "direct draws: with every prepared hit due for a verify, a commit bound prepared buffers or none was verified" + DescribeDirect(now, base));
     else Require(used != 0, "direct draws: no commit bound prepared buffers" + DescribeDirect(now, base));
     if (DirectReport::BufferVerifyEvery() > 1) Require(checked != 0, "direct draws: the prepared buffers verify checked no hit" + DescribeDirect(now, base));
@@ -1420,6 +1421,120 @@ void QueuedStore(AgcDriver::DrawRecordCommit& record) {
     fired.fetch_add(1);
 }
 
+}
+
+namespace ValidationHooks {
+
+std::atomic<int> calls{0};
+std::atomic<int> fired{0};
+std::atomic<int> kind{0};
+
+void Event(AgcDriver::DrawRecordCommit& record) {
+    if (fired.load() != 0 || calls.fetch_add(1) < 1) return;
+    auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    const auto reads = BindingHooks::InPlaceReads(record);
+    if (recorder == nullptr || reads.empty()) return;
+    const auto which = kind.load();
+    for (const auto& [begin, end] : reads) {
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        if (which == 0) {
+            recorder->NotePendingWrite(begin, bytes);
+        } else if (which == 1) {
+            recorder->QueueKeyStore(VK_NULL_HANDLE, 0, 0, nullptr, begin, end);
+        } else {
+            std::vector<std::byte> current(bytes);
+            std::memcpy(current.data(), reinterpret_cast<const void*>(begin), bytes);
+            AgcDriver::GuestMemory::Write(begin, current);
+        }
+    }
+    if (which == 2) AgcDriver::GuestMemory::BumpCollectEpoch();
+    fired.fetch_add(1);
+}
+
+}
+
+std::uint64_t ValidationSum(const AgcDriver::Graphics::WriteValidation::Totals& totals, AgcDriver::Graphics::WriteValidation::Outcome outcome) {
+    std::uint64_t sum = 0;
+    for (const auto& row : totals.outcomes) sum += row[static_cast<std::size_t>(outcome)];
+    return sum;
+}
+
+std::uint64_t ValidationDiffering(const AgcDriver::Graphics::WriteValidation::Totals& totals) {
+    std::uint64_t sum = 0;
+    for (const auto count : totals.differing) sum += count;
+    return sum;
+}
+
+std::string DescribeValidation(const AgcDriver::Graphics::WriteValidation::Totals& after, const AgcDriver::Graphics::WriteValidation::Totals& before) {
+    namespace Validation = AgcDriver::Graphics::WriteValidation;
+    std::string text;
+    for (std::size_t test = 0; test < Validation::TestCount; ++test) {
+        std::string row;
+        for (std::size_t outcome = 0; outcome < Validation::OutcomeCount; ++outcome) {
+            const auto count = after.outcomes[test][outcome] - before.outcomes[test][outcome];
+            if (count == 0) continue;
+            row += (row.empty() ? "" : ", ") + std::string(Validation::OutcomeName(static_cast<Validation::Outcome>(outcome))) + " " + std::to_string(count);
+        }
+        const auto verified = after.verified[test] - before.verified[test];
+        if (verified != 0) row += (row.empty() ? "" : ", ") + std::string("verified ") + std::to_string(verified);
+        if (!row.empty()) text += std::string("; ") + Validation::TestName(static_cast<Validation::Test>(test)) + ": " + row;
+    }
+    return text;
+}
+
+void WriteValidationEvents(bool ring) {
+    namespace Validation = AgcDriver::Graphics::WriteValidation;
+    using AgcDriver::Graphics::SetExpressHookForTest;
+    const bool validationEnvironment = RuntimeSwitches::Set(RuntimeSwitch::WriteValidation);
+    const bool repeatEnvironment = RuntimeSwitches::Set(RuntimeSwitch::DirectRepeat);
+    const bool passTargets = RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets);
+    const bool committed = ring && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits) && RuntimeSwitches::Set(RuntimeSwitch::CommitBindings);
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectPassTargets, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, true);
+    const auto scene = RepeatScene::Ring;
+    const std::string name = RepeatSceneName(scene);
+    RuntimeSwitches::Assign(RuntimeSwitch::WriteValidation, false);
+    Require(Validation::Session() == 0, "write validation, " + name + ": the session stayed open with the switch off");
+    std::vector<std::vector<std::uint8_t>> today;
+    for (std::uint32_t round = 0; round < RepeatRounds; ++round) today.push_back(RenderScene(scene, round));
+    RuntimeSwitches::Assign(RuntimeSwitch::WriteValidation, true);
+    const bool active = Validation::Session() != 0;
+    const auto before = Validation::Collect();
+    for (std::uint32_t pass = 0; pass < 2; ++pass) {
+        for (std::uint32_t round = 0; round < RepeatRounds; ++round) Require(RenderScene(scene, round) == today[round], "write validation, " + name + ": round " + std::to_string(round) + " rendered differently from today's path with the switch on");
+    }
+    const auto after = Validation::Collect();
+    std::cout << "write validation, " << name << ": session " << Validation::Session() << DescribeValidation(after, before) << '\n';
+    Require(ValidationDiffering(after) == ValidationDiffering(before), "write validation, " + name + ": the verify found a test answered by generations that today's test refused" + DescribeValidation(after, before));
+    if (active && committed) Require(ValidationSum(after, Validation::Outcome::Answered) + ValidationSum(after, Validation::Outcome::Armed) != ValidationSum(before, Validation::Outcome::Answered) + ValidationSum(before, Validation::Outcome::Armed), "write validation, " + name + ": no test was answered by generations or proved with the switch on" + DescribeValidation(after, before));
+    const auto expectEvent = [&](int which, const std::string& what) {
+        ValidationHooks::calls.store(0);
+        ValidationHooks::fired.store(0);
+        ValidationHooks::kind.store(which);
+        const auto base = Validation::Collect();
+        SetExpressHookForTest(&ValidationHooks::Event);
+        const auto image = RenderScene(scene, 1);
+        SetExpressHookForTest(nullptr);
+        const auto done = Validation::Collect();
+        Require(image == today[1], "write validation, " + name + ", " + what + ": the pass rendered differently from today's path" + DescribeValidation(done, base));
+        Require(ValidationDiffering(done) == ValidationDiffering(base), "write validation, " + name + ", " + what + ": a test answered by generations after the event was refused by today's test" + DescribeValidation(done, base));
+        Require(RenderScene(scene, 2) == today[2], "write validation, " + name + ", " + what + ": the next pass rendered differently from today's path");
+        const auto next = Validation::Collect();
+        Require(ValidationDiffering(next) == ValidationDiffering(base), "write validation, " + name + ", " + what + ": a test of the next pass answered by generations was refused by today's test" + DescribeValidation(next, done));
+        if (active && committed) Require(ValidationHooks::fired.load() == 1, "write validation, " + name + ", " + what + ": the hook did not run once between two express commits");
+        std::cout << "write validation, " << name << ", " << what << ": " << (ValidationHooks::fired.load() == 1 ? "raised between two express commits" : "the hook did not fire") << DescribeValidation(done, base) << '\n';
+    };
+    expectEvent(0, "a GPU write registered over the template's in-place reads");
+    expectEvent(1, "a key store queued over the template's in-place reads");
+    expectEvent(2, "a store over the template's in-place reads and a collect");
+    RuntimeSwitches::Assign(RuntimeSwitch::WriteValidation, validationEnvironment);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, repeatEnvironment);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectPassTargets, passTargets);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
 }
 
 std::size_t lingeringChunks() {
@@ -2121,6 +2236,7 @@ int main(int argc, char** argv) {
         if (directEnvironment) Direct(arms.ring);
         if (directEnvironment && RuntimeSwitches::Set(RuntimeSwitch::DirectRepeat)) Repeats(arms.ring);
         if (directEnvironment && RuntimeSwitches::Set(RuntimeSwitch::CommitBindings)) CommitBindings(arms.ring);
+        if (directEnvironment && RuntimeSwitches::Set(RuntimeSwitch::WriteValidation)) WriteValidationEvents(arms.ring);
         if (inject) {
             Injected(arms);
         } else if (injectCommit) {

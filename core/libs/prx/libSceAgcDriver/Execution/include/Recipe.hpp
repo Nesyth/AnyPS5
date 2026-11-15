@@ -222,6 +222,14 @@ struct DrawExpress {
     std::uint64_t keptBatch = 0;
     std::uint64_t passSeenRecorder = 0;
     std::uint64_t passSeenGeneration = 0;
+    std::uint64_t wvPassSession = 0;
+    std::uint64_t wvPassSwitches = 0;
+    std::uint64_t wvPassRecorder = 0;
+    std::uint64_t wvPassBatch = 0;
+    std::uint64_t wvPassGeneration = 0;
+    std::uint64_t wvPassSerial = 0;
+    std::uint64_t wvPassAttachments = 0;
+    bool wvPassNoWrites = false;
 };
 
 enum class DrawExpressMiss : std::uint8_t { None, NoState, Shape, Objects, Template, Targets, Depth, Stores, Linear, Buffers, Inputs, Moved, Selection, Staging, Verify, Count };

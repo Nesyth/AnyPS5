@@ -2,7 +2,9 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/WriteValidation.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -496,6 +498,68 @@ void OverflowedHistory(AgcDriver::VulkanDevice& device) {
     Require(GuestMemory::SubscriptionBumpsSince(*subscription, settled, plain, lookup) && plain == std::vector<std::uint64_t>{GuestMemory::WriteBlockOf(base + 2u * BlockBytes)} && lookup.empty(), "overflow: after the overflow cleared, a new bump of block 2 was not listed by itself");
 }
 
+void WriteValidationClocks(AgcDriver::VulkanDevice&) {
+    namespace Validation = AgcDriver::Graphics::WriteValidation;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    if (RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter) || RuntimeSwitches::Set(RuntimeSwitch::XpTrustFinisher) || RuntimeSwitches::Set(RuntimeSwitch::TrustAudit)) {
+        std::puts("write validation clocks: skipped, a trust mode is set");
+        return;
+    }
+    const bool environment = RuntimeSwitches::Set(RuntimeSwitch::WriteValidation);
+    constexpr std::uint64_t Window = std::uint64_t{1} << Validation::WindowShift;
+    constexpr std::uint64_t Super = Window << Validation::SuperShift;
+    constexpr std::uint64_t Base = 0x5a5a00000000ull;
+    using Class = Validation::Class;
+    using Source = Validation::Source;
+    RuntimeSwitches::Assign(RuntimeSwitch::WriteValidation, false);
+    Require(Validation::Session() == 0, "write validation clocks: the session is open with the switch off");
+    const auto offEpoch = Validation::Epoch();
+    Validation::Raise(Class::W, Source::RecorderNote, Base, Base + Window);
+    Validation::RaiseAll(Class::L, Source::RecordedLabel);
+    Require(Validation::Epoch() == offEpoch, "write validation clocks: a raise with the switch off moved the epoch");
+    RuntimeSwitches::Assign(RuntimeSwitch::WriteValidation, true);
+    const auto first = Validation::Session();
+    Require(first != 0, "write validation clocks: the switch did not open a session");
+    const auto firstWindow = Base >> Validation::WindowShift;
+    const auto blockEpoch = Validation::Epoch();
+    Validation::Raise(Class::C, Source::CleanForget, Base + 16u, Base + 2u * Window + 16u);
+    std::vector<std::size_t> raisedSlots;
+    for (std::uint64_t window = firstWindow; window <= firstWindow + 2u; ++window) {
+        Require(Validation::Clock(Class::C, window) > blockEpoch, "write validation clocks: window " + std::to_string(window - firstWindow) + " of a raised range kept its clock");
+        Require(Validation::Clock(Class::Q, window) <= blockEpoch, "write validation clocks: a raise of one class moved another class's clock");
+        raisedSlots.push_back(Validation::BlockSlot(window));
+    }
+    for (std::uint64_t window = firstWindow + 3u; window < firstWindow + 40u; ++window) {
+        if (std::find(raisedSlots.begin(), raisedSlots.end(), Validation::BlockSlot(window)) != raisedSlots.end()) continue;
+        Require(Validation::Clock(Class::C, window) <= blockEpoch, "write validation clocks: window " + std::to_string(window - firstWindow) + " outside the raised range moved its clock");
+    }
+    const auto superBase = Base + 64u * Super;
+    const auto firstSuper = (superBase >> Validation::WindowShift) >> Validation::SuperShift;
+    const auto superEpoch = Validation::Epoch();
+    Validation::Raise(Class::Q, Source::QueueItem, superBase, superBase + 100u * Window);
+    for (std::uint64_t window : {superBase >> Validation::WindowShift, (superBase >> Validation::WindowShift) + 99u}) Require(Validation::Clock(Class::Q, window) > superEpoch, "write validation clocks: a range over 64 windows did not move the clock of its 4 MiB windows");
+    const std::array<std::size_t, 2> superSlots{Validation::SuperSlot(firstSuper), Validation::SuperSlot(firstSuper + 1u)};
+    for (std::uint64_t super = firstSuper + 3u; super < firstSuper + 12u; ++super) {
+        if (std::find(superSlots.begin(), superSlots.end(), Validation::SuperSlot(super)) != superSlots.end()) continue;
+        const auto window = super << Validation::SuperShift;
+        Require(Validation::Clock(Class::Q, window) <= superEpoch, "write validation clocks: a 4 MiB window outside a raised range over 64 windows moved its clock");
+    }
+    const auto floorEpoch = Validation::Epoch();
+    Validation::Raise(Class::L, Source::QueuedStore, Base + 1024u * Super, Base + 1200u * Super);
+    Require(Validation::Clock(Class::L, firstWindow + 7u) > floorEpoch && Validation::Clock(Class::L, (Base >> Validation::WindowShift) + 900000u) > floorEpoch, "write validation clocks: a range over 64 windows of 4 MiB did not move the class's floor");
+    Require(Validation::Clock(Class::Q, (Base >> Validation::WindowShift) + 900000u) <= floorEpoch, "write validation clocks: a floor raise moved another class's floor");
+    RuntimeSwitches::Assign(RuntimeSwitch::WriteValidation, false);
+    Require(Validation::Session() == 0, "write validation clocks: the session stayed open after the switch went off");
+    const auto closedEpoch = Validation::Epoch();
+    Validation::Raise(Class::W, Source::RecorderNote, Base, Base + Window);
+    Require(Validation::Epoch() == closedEpoch, "write validation clocks: a raise after the switch went off moved the epoch");
+    RuntimeSwitches::Assign(RuntimeSwitch::WriteValidation, true);
+    const auto second = Validation::Session();
+    Require(second != 0 && second != first, "write validation clocks: turning the switch off and on again did not open a new session");
+    RuntimeSwitches::Assign(RuntimeSwitch::WriteValidation, environment);
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -520,7 +584,7 @@ int main(int argc, char** argv) {
         TargetBytes = AgcDriver::Graphics::ColorTargetLayout(TargetWidth, TargetHeight, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4).Bytes();
         GuestBlocks target((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
         Target = &target;
-        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 11> cases{{{"cpu", &CpuWrite}, {"table", &TableWord}, {"pending", &PendingWrite}, {"remap", &Remap}, {"compared", &Compared}, {"driver", &DriverStore}, {"unwatch", &UnwatchRange}, {"release", &Released}, {"import", &Imported}, {"array", &ArraySlices}, {"overflow", &OverflowedHistory}}};
+        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 12> cases{{{"cpu", &CpuWrite}, {"table", &TableWord}, {"pending", &PendingWrite}, {"remap", &Remap}, {"compared", &Compared}, {"driver", &DriverStore}, {"unwatch", &UnwatchRange}, {"release", &Released}, {"import", &Imported}, {"array", &ArraySlices}, {"overflow", &OverflowedHistory}, {"write-validation", &WriteValidationClocks}}};
         for (const auto& [name, run] : cases) {
             if (!args.empty() && std::find(args.begin(), args.end(), name) == args.end()) continue;
             run(*device);

@@ -21,6 +21,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/WriteValidation.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -2902,6 +2903,29 @@ bool sameVertexLayout(const VertexInputLayout& a, const VertexInputLayout& b) {
     return std::ranges::equal(a.bindings, b.bindings, sameBinding) && std::ranges::equal(a.attributes, b.attributes, sameAttribute);
 }
 
+bool inputRangeHazard(const Recorder& recorder, std::uint64_t begin, std::size_t bytes) {
+    return recorder.QueuedStoreOverlaps(begin, bytes) || (!PendingZones::Clear(begin, bytes) && (recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr))) || recorder.PendingLabelIn(begin, bytes);
+}
+
+bool inputRangeAnswered(const Recorder& recorder, std::uint64_t begin, std::size_t bytes, WriteValidation::Test test) {
+    const auto answer = WriteValidation::CommitterClear(recorder, begin, bytes, WriteValidation::Fact::Inputs, test);
+    if (answer == WriteValidation::Answer::Today) return false;
+    if (answer == WriteValidation::Answer::Proved || !WriteValidation::VerifyDue(test)) return true;
+    const bool hazard = inputRangeHazard(recorder, begin, bytes);
+    WriteValidation::NoteVerify(test, hazard, "an input range has a queued store, a pending write, a pending storage image or a pending label");
+    return !hazard;
+}
+
+bool inputGuardsAnswered(const Recorder* recorder, std::uint64_t address, std::size_t bytes, WriteValidation::Test test) {
+    if (recorder == nullptr || WriteValidation::Session() == 0) return false;
+    const auto answer = WriteValidation::CommitterClear(*recorder, address, bytes, WriteValidation::Fact::Guards, test);
+    if (answer == WriteValidation::Answer::Today) return false;
+    if (answer == WriteValidation::Answer::Proved || !WriteValidation::VerifyDue(test)) return true;
+    const bool idle = DepthReadGuardIdle_nid_no_patch(address, bytes) && !MayOverlapMultisampleGuards(address, bytes);
+    WriteValidation::NoteVerify(test, !idle, "an input range overlaps a depth or multisample guard, or an overwrite proof is pending");
+    return idle;
+}
+
 void requireInputGuards(CommitterTrustCheck* trust, std::uint64_t address, std::size_t bytes, const char* access) {
     if (trust != nullptr && trust->Audits() && (!DepthReadGuardIdle_nid_no_patch(address, bytes) || MayOverlapMultisampleGuards(address, bytes))) trust->Fail();
     RequireNoMultisampleTarget(address, bytes, access);
@@ -2922,7 +2946,7 @@ DrawRecordInputs takePreparedInputs(const Context& context, const State& state, 
     const bool guardsSkipped = trusted || (!atFloor && trust != nullptr && trust->Skip());
     if (draw.indexed && !atFloor) {
         if (!mapped) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), indexBytes, draw.indexSize);
-        if (!guardsSkipped) requireInputGuards(trust, draw.indexAddress, indexBytes, "an index buffer read");
+        if (!guardsSkipped && !inputGuardsAnswered(context.recorder, draw.indexAddress, indexBytes, WriteValidation::Test::LeaderGuards)) requireInputGuards(trust, draw.indexAddress, indexBytes, "an index buffer read");
     }
     if (!atFloor && !validated) {
         requireUncountedKills(state);
@@ -2951,7 +2975,7 @@ DrawRecordInputs takePreparedInputs(const Context& context, const State& state, 
         const auto& range = prepared.ranges[at];
         const auto bytes = static_cast<std::size_t>(range.end - range.begin);
         if (!mapped) GuestMemory::CheckRange(reinterpret_cast<const void*>(range.begin), bytes, 1);
-        if (!atFloor && !guardsSkipped && at + prepared.indirectRanges < prepared.ranges.size()) requireInputGuards(trust, range.begin, bytes, "a vertex buffer read");
+        if (!atFloor && !guardsSkipped && at + prepared.indirectRanges < prepared.ranges.size() && !inputGuardsAnswered(context.recorder, range.begin, bytes, WriteValidation::Test::LeaderGuards)) requireInputGuards(trust, range.begin, bytes, "a vertex buffer read");
         if (const auto use = served(range, &behind); use != DrawRecordInputs::Used) return use;
     }
     inputs.indexBytes = prepared.indexBytes;
@@ -7050,6 +7074,7 @@ bool CommitBindingTimings() {
 std::uint64_t commitBindingTimingOrdinal = 0;
 std::uint64_t commitBindingVerifyOrdinal = 0;
 std::atomic<CommitBindingsHookForTest> commitBindingsHook{nullptr};
+std::atomic<ExpressHookForTest> expressHook{nullptr};
 
 bool proveRecordTemplate(DrawRecordCommit& record, ShaderResources& resources, std::span<const CompiledShader> shaders, DrawRecipeOutcome& result, bool injected, bool* proofTrusted = nullptr) {
     if (injected) return false;
@@ -7269,6 +7294,7 @@ void captureExpress(const Context& context, const State& state, const DrawRecipe
         noted = DrawExpressCapture::Objects;
         return;
     }
+    if (WriteValidation::Session() != 0) WriteValidation::Note(WriteValidation::Test::TemplateCurrent, WriteValidation::Outcome::Kept);
     if (const auto why = RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter) ? resources->ExpressCurrentTrusted() : proofTrusted ? resources->ExpressCurrentKept() : resources->ExpressCurrent(); why != ShaderResources::ExpressMiss::None && (why == ShaderResources::ExpressMiss::Regions || !RuntimeSwitches::Set(RuntimeSwitch::ExpressKeepState) || !resources->ExpressWatchable())) {
         noted = static_cast<DrawExpressCapture>(static_cast<std::size_t>(DrawExpressCapture::NotProved) + static_cast<std::size_t>(why) - static_cast<std::size_t>(ShaderResources::ExpressMiss::NotProved));
         return;
@@ -7731,13 +7757,15 @@ DrawRecipeOutcome drawWithRecord(const Context& context, const State& state, con
         auto buffersCheck = bound != nullptr ? committerTrustCheck(*resources, CommitterTrustFamily::Buffers, CommitterTrustSite::RecordBuffers) : CommitterTrustCheck{};
         if (bound != nullptr) {
             const bool boundMapped = buffersCheck.Armed() && (bound->forget & 1u) == 0 && GuestMemory::ForgetSerial() == bound->forget;
+            const bool recordValidation = WriteValidation::Session() != 0;
             const auto movesClear = [&] {
                 if (trusted || (boundMapped && buffersCheck.Skip())) return true;
-                if (resources->PreparedMovesClear(*bound, *recorder, &ticket)) return true;
+                const auto byWindows = recordValidation ? resources->PreparedMovesClearByWindows(*bound, *recorder, &ticket, WriteValidation::Test::RecordMoves) : std::optional<bool>{};
+                if (byWindows.has_value() ? *byWindows : resources->PreparedMovesClear(*bound, *recorder, &ticket)) return true;
                 if (boundMapped) buffersCheck.Fail();
                 return false;
             };
-            if (movesClear() && resources->PreparedInPlaceHolds(*bound, *recorder, preparedBehind, &buffersCheck)) {
+            if (movesClear() && resources->PreparedInPlaceHolds(*bound, *recorder, preparedBehind, &buffersCheck, recordValidation ? std::optional<WriteValidation::Test>{WriteValidation::Test::RecordInPlace} : std::optional<WriteValidation::Test>{})) {
                 found.emplace(bound->moved.begin(), bound->moved.end());
                 for (auto& entry : *found) {
                     if (entry.inPlace != VK_NULL_HANDLE) entry.behind = recorder->PendingWriteOverlaps(entry.begin, entry.bytes);
@@ -8179,6 +8207,10 @@ void SetCommitBindingsHookForTest(CommitBindingsHookForTest hook) {
     commitBindingsHook.store(hook, std::memory_order_release);
 }
 
+void SetExpressHookForTest(ExpressHookForTest hook) {
+    expressHook.store(hook, std::memory_order_release);
+}
+
 std::uint64_t CommitBindingsVerifyEvery() {
     static const std::uint64_t every = [] {
         const char* text = std::getenv("APS5_VERIFY_COMMIT_BINDINGS");
@@ -8340,7 +8372,8 @@ RepeatOutcome RepeatCommit(const Context& context, const State& state, const Pm4
         ticket.ranges = &record.ticketRanges;
         ticket.checked = 0;
         ticket.trusted = 0;
-        if (!resources.PreparedMovesClear(*prepared, *recorder, &ticket)) return giveBack(RepeatRefusal::MovedHazard);
+        const auto movesByWindows = WriteValidation::Session() != 0 ? resources.PreparedMovesClearByWindows(*prepared, *recorder, &ticket, WriteValidation::Test::RecordMoves) : std::optional<bool>{};
+        if (!(movesByWindows.has_value() ? *movesByWindows : resources.PreparedMovesClear(*prepared, *recorder, &ticket))) return giveBack(RepeatRefusal::MovedHazard);
         ticket.ranges = nullptr;
         record.ticket = ticket;
         record.effects.movedChecked = ticket.checked;
@@ -8766,9 +8799,12 @@ struct ExpressRun {
     ExpressRunWindows windows;
     ExpressResume resume;
     ExpressRunCensus census;
+    std::uint64_t wvAttachments = 0;
 };
 
 struct ExpressRunStorage {};
+
+std::atomic<std::uint64_t> expressRunAttachments{0};
 
 ExpressRun& expressRun() {
     return HostThreadLocal<ExpressRun, ExpressRunStorage>();
@@ -8992,6 +9028,7 @@ bool leadExpressRun(ExpressRun& run, Recorder& recorder, const DrawExpress& expr
         keeps = owner == run.owners[index] && image == run.images[index];
     }
     if (!keeps) finishRun(run, ExpressRunEnd::Refusal);
+    if (!keeps) run.wvAttachments = expressRunAttachments.fetch_add(1, std::memory_order_relaxed) + 1;
     const auto fail = [&run] {
         finishRun(run, ExpressRunEnd::Refusal);
         return false;
@@ -9083,14 +9120,57 @@ bool runWindowsClear(ExpressRun& run, const Recorder& recorder, WindowFact fact,
     return true;
 }
 
+std::optional<bool> guardsByValidation(const Recorder& recorder, std::uint64_t address, std::uint64_t bytes, std::uint16_t fact, WriteValidation::Test test) {
+    const auto answer = WriteValidation::CommitterClear(recorder, address, bytes, fact, test);
+    if (answer == WriteValidation::Answer::Today) return std::nullopt;
+    if (answer == WriteValidation::Answer::Proved || !WriteValidation::VerifyDue(test)) return false;
+    const auto size = static_cast<std::size_t>(bytes);
+    const bool depth = fact == WriteValidation::Fact::DepthSpans;
+    const bool overlaps = depth ? MayOverlapDepthGuards_nid_no_patch(address, size) : MayOverlapMultisampleGuards(address, size);
+    WriteValidation::NoteVerify(test, overlaps, depth ? "a selected buffer overlaps a depth guard" : "a moved buffer overlaps a multisample guard");
+    return overlaps;
+}
+
+struct ValidationGuards {
+    const Recorder& recorder;
+    WriteValidation::Test test;
+};
+
+bool validationDepthGuards(void* tests, std::uint64_t address, std::uint64_t bytes) {
+    const auto& guards = *static_cast<const ValidationGuards*>(tests);
+    if (const auto answered = guardsByValidation(guards.recorder, address, bytes, WriteValidation::Fact::DepthSpans, guards.test); answered.has_value()) return *answered;
+    return MayOverlapDepthGuards_nid_no_patch(address, static_cast<std::size_t>(bytes));
+}
+
+bool validationMultisampleGuards(void* tests, std::uint64_t address, std::uint64_t bytes) {
+    const auto& guards = *static_cast<const ValidationGuards*>(tests);
+    if (const auto answered = guardsByValidation(guards.recorder, address, bytes, WriteValidation::Fact::MultisampleSpans, guards.test); answered.has_value()) return *answered;
+    return MayOverlapMultisampleGuards(address, static_cast<std::size_t>(bytes));
+}
+
+bool validationWrites(void* tests, std::uint64_t address, std::uint64_t bytes) {
+    const auto& guards = *static_cast<const ValidationGuards*>(tests);
+    const auto size = static_cast<std::size_t>(bytes);
+    const auto answer = WriteValidation::CommitterClear(guards.recorder, address, bytes, WriteValidation::Fact::Writes, guards.test);
+    if (answer == WriteValidation::Answer::Today) return guards.recorder.PendingWriteOverlaps(address, size);
+    if (answer == WriteValidation::Answer::Proved || !WriteValidation::VerifyDue(guards.test)) return false;
+    const bool overlaps = guards.recorder.PendingWriteOverlaps(address, size);
+    WriteValidation::NoteVerify(guards.test, overlaps, "an unmoved selected buffer has a pending write");
+    return overlaps;
+}
+
 struct FollowGuards {
     ExpressRun& run;
     const Recorder& recorder;
+    bool validation = false;
 };
 
 bool followDepthGuards(void* tests, std::uint64_t address, std::uint64_t bytes) {
     auto& guards = *static_cast<FollowGuards*>(tests);
     const auto size = static_cast<std::size_t>(bytes);
+    if (guards.validation) {
+        if (const auto answered = guardsByValidation(guards.recorder, address, bytes, WriteValidation::Fact::DepthSpans, WriteValidation::Test::FollowerSelection); answered.has_value()) return *answered;
+    }
     if (!runWindowsClear(guards.run, guards.recorder, WindowFact::DepthSpans, address, bytes)) return MayOverlapDepthGuards_nid_no_patch(address, size);
     if (!windowVerifyDue()) return false;
     const bool overlaps = MayOverlapDepthGuards_nid_no_patch(address, size);
@@ -9101,6 +9181,9 @@ bool followDepthGuards(void* tests, std::uint64_t address, std::uint64_t bytes) 
 bool followMultisampleGuards(void* tests, std::uint64_t address, std::uint64_t bytes) {
     auto& guards = *static_cast<FollowGuards*>(tests);
     const auto size = static_cast<std::size_t>(bytes);
+    if (guards.validation) {
+        if (const auto answered = guardsByValidation(guards.recorder, address, bytes, WriteValidation::Fact::MultisampleSpans, WriteValidation::Test::FollowerSelection); answered.has_value()) return *answered;
+    }
     if (!runWindowsClear(guards.run, guards.recorder, WindowFact::MultisampleSpans, address, bytes)) return MayOverlapMultisampleGuards(address, size);
     if (!windowVerifyDue()) return false;
     const bool overlaps = MayOverlapMultisampleGuards(address, size);
@@ -9112,10 +9195,10 @@ struct FollowZones {
     ExpressRun& run;
     const Recorder& recorder;
     bool windows = false;
+    bool validation = false;
 };
 
-bool followZoneClear(void* tests, std::uint64_t begin, std::size_t bytes, bool moved) {
-    auto& zones = *static_cast<FollowZones*>(tests);
+bool followZoneToday(FollowZones& zones, std::uint64_t begin, std::size_t bytes, bool moved) {
     auto& run = zones.run;
     const auto end = begin + bytes;
     const auto pendingOver = [&] { return !PendingZones::Clear(begin, bytes) && (zones.recorder.PendingWriteOverlaps(begin, bytes) || (moved && PendingStorageOverlaps(begin, bytes, nullptr))); };
@@ -9147,6 +9230,20 @@ bool followZoneClear(void* tests, std::uint64_t begin, std::size_t bytes, bool m
         addRunRange(run.shadowLive, first, last);
     }
     return !AnyShadowedOverlaps(begin, bytes);
+}
+
+bool followZoneClear(void* tests, std::uint64_t begin, std::size_t bytes, bool moved) {
+    auto& zones = *static_cast<FollowZones*>(tests);
+    if (zones.validation && bytes != 0) {
+        constexpr auto test = WriteValidation::Test::FollowerZones;
+        if (const auto answer = WriteValidation::CommitterClear(zones.recorder, begin, bytes, moved ? WriteValidation::Fact::Moved : WriteValidation::Fact::Writes, test); answer != WriteValidation::Answer::Today) {
+            if (answer == WriteValidation::Answer::Proved || !WriteValidation::VerifyDue(test)) return true;
+            const bool held = followZoneToday(zones, begin, bytes, moved);
+            WriteValidation::NoteVerify(test, !held, "a template buffer has a pending write, a pending storage image or a live shadow");
+            return held;
+        }
+    }
+    return followZoneToday(zones, begin, bytes, moved);
 }
 
 constexpr std::size_t ExpressTargetHeld = 8;
@@ -9187,6 +9284,7 @@ bool followWiderAllowed(const ExpressRun& run, const DrawExpressKeep& keep, cons
 }
 
 ExpressOutcome ExpressCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers* prepared, PreparedInputs* preparedInputs, DrawFragment* fragment, bool verifyDue) {
+    if (const auto hook = expressHook.load(std::memory_order_acquire); hook != nullptr) hook(record);
     ExpressOutcome out;
     auto& run = expressRun();
     if (run.dropped) finishRun(run, run.dropReason);
@@ -9242,11 +9340,14 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     auto& resources = *keep.resources;
     const bool trusted = RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter);
     const bool audit = !trusted && RuntimeSwitches::Set(RuntimeSwitch::TrustAudit);
+    const bool validation = WriteValidation::Session() != 0;
+    const auto inPlaceValidation = validation ? std::optional<WriteValidation::Test>{WriteValidation::Test::LeaderInPlace} : std::optional<WriteValidation::Test>{};
     auto templateCheck = audit ? resources.TrustCheck(CommitterTrustFamily::Template, CommitterTrustSite::LeaderTemplate) : CommitterTrustCheck{};
     auto buffersCheck = audit ? resources.TrustCheck(CommitterTrustFamily::Buffers, CommitterTrustSite::LeaderBuffers) : CommitterTrustCheck{};
     auto inputsCheck = audit ? resources.TrustCheck(CommitterTrustFamily::Inputs, CommitterTrustSite::LeaderInputs) : CommitterTrustCheck{};
     const auto preparedMapped = [&] { return (prepared->forget & 1u) == 0 && GuestMemory::ForgetSerial() == prepared->forget; };
     const auto templateMiss = resume != nullptr ? resume->templateMiss : trusted ? resources.ExpressCurrentTrusted() : audit ? resources.ExpressCurrentAudited(templateCheck, false) : resources.ExpressCurrent();
+    if (validation && resume == nullptr) WriteValidation::Note(WriteValidation::Test::TemplateCurrent, WriteValidation::Outcome::Kept);
     const bool reprove = resume != nullptr ? templateMiss != ShaderResources::ExpressMiss::None : templateMiss != ShaderResources::ExpressMiss::None && templateMiss != ShaderResources::ExpressMiss::Regions && (templateMiss != ShaderResources::ExpressMiss::NotProved || (RuntimeSwitches::Set(RuntimeSwitch::ExpressKeepState) && resources.ExpressWatchable()));
     if (templateMiss != ShaderResources::ExpressMiss::None && !reprove) return miss(DrawExpressMiss::Template);
     const bool appendOn = RuntimeSwitches::Set(RuntimeSwitch::XpAppendCommits);
@@ -9377,16 +9478,17 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
                 const auto bytes = static_cast<std::size_t>(range.end - range.begin);
                 const bool vertexRange = at >= indexRanges && at + taken.indirectRanges < taken.ranges.size();
                 const bool rangeTrusted = vertexRange && (trusted || inputsCheck.Skip());
+                const bool rangeAnswered = validation && !rangeTrusted && range.import != nullptr && inputRangeAnswered(*recorder, range.begin, bytes, WriteValidation::Test::LeaderInputs);
                 if (range.import == nullptr) refusal = AppendRefusal::Imports;
-                else if (!rangeTrusted && !PendingZones::Clear(range.begin, bytes) && (recorder->PendingWriteOverlaps(range.begin, bytes) || PendingStorageOverlaps(range.begin, bytes, nullptr))) refusal = AppendRefusal::InputWrites;
-                else if (!rangeTrusted && (recorder->PendingLabelIn(range.begin, bytes) || recorder->QueuedStoreOverlaps(range.begin, bytes))) refusal = AppendRefusal::InputStores;
+                else if (!rangeTrusted && !rangeAnswered && !PendingZones::Clear(range.begin, bytes) && (recorder->PendingWriteOverlaps(range.begin, bytes) || PendingStorageOverlaps(range.begin, bytes, nullptr))) refusal = AppendRefusal::InputWrites;
+                else if (!rangeTrusted && !rangeAnswered && (recorder->PendingLabelIn(range.begin, bytes) || recorder->QueuedStoreOverlaps(range.begin, bytes))) refusal = AppendRefusal::InputStores;
                 if (vertexRange && (refusal == AppendRefusal::InputWrites || refusal == AppendRefusal::InputStores)) inputsCheck.Fail();
             }
         }
         if (refusal == AppendRefusal::None && trusted) {
             NoteCommitterTrusted();
             if ((prepared->forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared->forget) refusal = AppendRefusal::Buffers;
-        } else if (refusal == AppendRefusal::None && !(buffersCheck.Armed() && preparedMapped() && buffersCheck.Skip()) && !resources.PreparedZonesClear(*prepared, *recorder)) {
+        } else if (refusal == AppendRefusal::None && !(buffersCheck.Armed() && preparedMapped() && buffersCheck.Skip()) && !(validation ? resources.PreparedZonesClearByWindows(*prepared, *recorder) : resources.PreparedZonesClear(*prepared, *recorder))) {
             refusal = AppendRefusal::Buffers;
             if (buffersCheck.Audits() && preparedMapped()) buffersCheck.Fail();
         }
@@ -9397,7 +9499,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         conditionsGeneration = recorder->RenderPassGeneration();
         const auto generation = conditionsGeneration;
         auto refusal = conditions(false, false);
-        if (refusal == AppendRefusal::None && !resources.PreparedInPlaceHolds(*prepared, *recorder, inPlaceBehind, &buffersCheck)) {
+        if (refusal == AppendRefusal::None && !resources.PreparedInPlaceHolds(*prepared, *recorder, inPlaceBehind, &buffersCheck, inPlaceValidation)) {
             refusal = AppendRefusal::Buffers;
             inPlaceRefused = true;
         }
@@ -9583,7 +9685,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         for (std::size_t at = 0; at < preparedInputs->ranges.size(); ++at) {
             const auto& range = preparedInputs->ranges[at];
             const auto bytes = static_cast<std::size_t>(range.end - range.begin);
-            if (!guardsSkipped && at + preparedInputs->indirectRanges < preparedInputs->ranges.size()) requireInputGuards(&inputsCheck, range.begin, bytes, at == 0 && draw.indexed ? "an index buffer read" : "a vertex buffer read");
+            if (!guardsSkipped && at + preparedInputs->indirectRanges < preparedInputs->ranges.size() && !(validation && inputGuardsAnswered(recorder, range.begin, bytes, WriteValidation::Test::LeaderGuards))) requireInputGuards(&inputsCheck, range.begin, bytes, at == 0 && draw.indexed ? "an index buffer read" : "a vertex buffer read");
             recorder->NotePendingRead(range.begin, bytes, Recorder::ReadKind::DrawInput);
         }
         if (trusted) NoteCommitterTrusted();
@@ -9617,7 +9719,8 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         ticket.ranges = &record.ticketRanges;
         ticket.checked = 0;
         ticket.trusted = 0;
-        if (!resources.PreparedMovesClear(*prepared, *recorder, &ticket)) {
+        const auto movesByWindows = validation ? resources.PreparedMovesClearByWindows(*prepared, *recorder, &ticket, WriteValidation::Test::LeaderMoves) : std::optional<bool>{};
+        if (!(movesByWindows.has_value() ? *movesByWindows : resources.PreparedMovesClear(*prepared, *recorder, &ticket))) {
             if (buffersCheck.Audits() && preparedMapped()) buffersCheck.Fail();
             return giveBack(DrawExpressMiss::Moved);
         }
@@ -9626,7 +9729,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         record.effects.movedChecked = ticket.checked;
         record.effects.movedTrusted = ticket.trusted;
     }
-    if (!appended && (inPlaceRefused || !resources.PreparedInPlaceHolds(*prepared, *recorder, inPlaceBehind, &buffersCheck))) return giveBack(DrawExpressMiss::Moved);
+    if (!appended && (inPlaceRefused || !resources.PreparedInPlaceHolds(*prepared, *recorder, inPlaceBehind, &buffersCheck, inPlaceValidation))) return giveBack(DrawExpressMiss::Moved);
     const auto indirectTouches = [&](std::uint64_t begin, std::uint64_t end) {
         if (!indirectExpress) return false;
         const auto& args = *draw.indirect;
@@ -9639,15 +9742,34 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     const bool storesTrusted = trusted && !indirectExpress;
     if (storesTrusted) NoteCommitterTrusted();
     const bool storesSkipped = storesTrusted || (!indirectExpress && buffersCheck.Skip());
-    if (!storesSkipped && recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) {
+    constexpr auto storesTest = WriteValidation::Test::LeaderStores;
+    const bool storesArmable = validation && !storesSkipped && !indirectExpress && !prepared->inPlace && (recorder->HasQueuedKeyStores() || recorder->HasQueuedStores());
+    const bool storesHeld = storesArmable && resources.StoresArmHolds(*recorder);
+    const bool storesVerify = storesHeld && WriteValidation::VerifyDue(storesTest);
+    const bool storesAnswered = storesHeld && !storesVerify;
+    const auto storesBefore = Recorder::StoreGenerationForValidation();
+    bool storesFlushed = false;
+    if (!storesSkipped && !storesAnswered && recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) {
         if (!indirectExpress) buffersCheck.Fail();
+        storesFlushed = true;
         recorder->FlushKeyStores();
     }
-    if (!storesSkipped && recorder->HasQueuedStores() && recorder->AnyQueuedStore(touches)) {
+    if (!storesSkipped && !storesAnswered && recorder->HasQueuedStores() && recorder->AnyQueuedStore(touches)) {
         if (!indirectExpress) buffersCheck.Fail();
+        storesFlushed = true;
         recorder->FlushStores();
     }
-    if (resources.FragmentSelectionHolds(*recorder, prepared->moved, *prepared, nullptr, untouched, &buffersCheck) != ShaderResources::PreparedBuffers::Selection::Taken) return giveBack(DrawExpressMiss::Selection);
+    if (storesVerify) {
+        WriteValidation::NoteVerify(storesTest, storesFlushed, "a queued store or key store touches the template's buffers");
+    } else if (storesAnswered) {
+        WriteValidation::Note(storesTest, WriteValidation::Outcome::Answered);
+    } else if (storesArmable && !storesFlushed) {
+        resources.ArmStores(*recorder, storesBefore);
+        WriteValidation::Note(storesTest, WriteValidation::Outcome::Armed);
+    }
+    ValidationGuards selectionGuards{*recorder, WriteValidation::Test::LeaderSelection};
+    const ShaderResources::GuardTests selectionTests{&validationDepthGuards, &validationMultisampleGuards, &selectionGuards, &validationWrites};
+    if ((validation ? resources.FragmentSelectionHoldsBy(*recorder, prepared->moved, *prepared, untouched, &selectionTests, &buffersCheck) : resources.FragmentSelectionHolds(*recorder, prepared->moved, *prepared, nullptr, untouched, &buffersCheck)) != ShaderResources::PreparedBuffers::Selection::Taken) return giveBack(DrawExpressMiss::Selection);
     if (resources.ChecksFaults() && fragment->faultGeneration != resources.FaultGeneration()) resources.RewriteFragmentFaults(*fragment->bindings);
     try {
         if (!reprove) resources.ExpressStage(*recorder);
@@ -9957,6 +10079,7 @@ std::uint64_t TakeCommitterTrusted() {
 }
 
 bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers& prepared, PreparedInputs& preparedInputs, DrawFragment& fragment) {
+    if (const auto hook = expressHook.load(std::memory_order_acquire); hook != nullptr) hook(record);
     auto& run = expressRun();
     if (!run.led || run.dropped) return false;
     if (!RuntimeSwitches::Set(RuntimeSwitch::RunFollow)) {
@@ -9993,6 +10116,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     const bool widerCensus = RuntimeSwitches::Set(RuntimeSwitch::FollowWider);
     const bool trusted = RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter);
     const bool audit = !trusted && keep.resources != nullptr && RuntimeSwitches::Set(RuntimeSwitch::TrustAudit);
+    const bool validation = WriteValidation::Session() != 0;
     auto templateCheck = audit ? keep.resources->TrustCheck(CommitterTrustFamily::Template, CommitterTrustSite::FollowerTemplate) : CommitterTrustCheck{};
     auto buffersCheck = audit ? keep.resources->TrustCheck(CommitterTrustFamily::Buffers, CommitterTrustSite::FollowerBuffers) : CommitterTrustCheck{};
     auto inputsCheck = audit ? keep.resources->TrustCheck(CommitterTrustFamily::Inputs, CommitterTrustSite::FollowerInputs) : CommitterTrustCheck{};
@@ -10071,6 +10195,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
         }
         if (first) mark(1);
         auto& resources = *keep.resources;
+        if (validation && first) WriteValidation::Note(WriteValidation::Test::TemplateCurrent, WriteValidation::Outcome::Kept);
         if (const auto missed = trusted ? resources.ExpressCurrentTrusted() : templateCheck.Armed() ? resources.ExpressCurrentAudited(templateCheck, true) : resources.ExpressCurrentFollowing(); missed != ShaderResources::ExpressMiss::None) {
             const bool reprovable = missed != ShaderResources::ExpressMiss::Regions && (missed != ShaderResources::ExpressMiss::NotProved || (RuntimeSwitches::Set(RuntimeSwitch::ExpressKeepState) && resources.ExpressWatchable()));
             if (first && widerCensus) {
@@ -10086,13 +10211,41 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
         if (preparedInputs.recipe.get() != recipe || preparedInputs.device != context.device || preparedInputs.state != &state || preparedInputs.draw != &draw || preparedInputs.shaders != shaders.data() || preparedInputs.stages != shaders.size() || preparedInputs.ranges.size() < indexRanges || (preparedInputs.forget & 1u) != 0 || forget != preparedInputs.forget || imports != preparedInputs.imports || mapping != preparedInputs.mapping) return ExpressRunRefusal::Inputs;
         if (trusted) NoteCommitterTrusted(2);
         const bool passSkipped = trusted || buffersCheck.Skip();
-        if (!passSkipped && !recorder->PassReadsFollow(express->reads, preparedInputs.inPlaceReads)) {
+        constexpr auto passTest = WriteValidation::Test::FollowerPass;
+        const bool passChecked = validation && !passSkipped;
+        const auto passSession = passChecked ? WriteValidation::Session() : std::uint64_t{0};
+        const auto passSwitches = RuntimeSwitches::Generation();
+        const auto passBatch = recorder->OpenSerial();
+        const auto passSerial = recorder->PassHazardSerial();
+        const bool passHeld = passChecked && passSession != 0 && express->wvPassSession == passSession && express->wvPassSwitches == passSwitches && express->wvPassRecorder == recorderId && express->wvPassBatch == passBatch && express->wvPassGeneration == generation && express->wvPassSerial == passSerial && express->wvPassAttachments == run.wvAttachments;
+        const bool passVerify = passHeld && WriteValidation::VerifyDue(passTest);
+        const bool readsHeld = passHeld && !passVerify && express->wvPassNoWrites;
+        const bool imagesHeld = passHeld && !passVerify;
+        if (!passSkipped && !readsHeld && !recorder->PassReadsFollow(express->reads, preparedInputs.inPlaceReads)) {
+            if (passVerify && express->wvPassNoWrites) WriteValidation::NoteVerify(passTest, true, "a write of the pass overlaps the draw's reads");
             buffersCheck.Fail();
             return ExpressRunRefusal::PassWrites;
         }
-        if (!passSkipped && !recorder->PassImagesFollow(express->images, std::span<const std::pair<VkImage, bool>>(run.attachments.data(), run.targets))) {
+        if (!passSkipped && !imagesHeld && !recorder->PassImagesFollow(express->images, std::span<const std::pair<VkImage, bool>>(run.attachments.data(), run.targets))) {
+            if (passVerify) WriteValidation::NoteVerify(passTest, true, "an image of the draw or of the run conflicts with the images or attachments of the pass");
             buffersCheck.Fail();
             return ExpressRunRefusal::ImageHazard;
+        }
+        if (passVerify) WriteValidation::NoteVerify(passTest, false, nullptr);
+        if (passChecked && passSession != 0) {
+            if (passHeld) {
+                WriteValidation::Note(passTest, WriteValidation::Outcome::Answered);
+            } else {
+                express->wvPassSession = passSession;
+                express->wvPassSwitches = passSwitches;
+                express->wvPassRecorder = recorderId;
+                express->wvPassBatch = passBatch;
+                express->wvPassGeneration = generation;
+                express->wvPassSerial = passSerial;
+                express->wvPassAttachments = run.wvAttachments;
+                express->wvPassNoWrites = recorder->PassNoWrites();
+                WriteValidation::Note(passTest, WriteValidation::Outcome::Armed);
+            }
         }
         if (express->fenced && !recorder->PassFenced()) return ExpressRunRefusal::Fenced;
         keyRunRanges(run.clear, recorderId, recorder->WriteNoteCount(), StorageTexture::PendingSerial(), Recorder::QueuedLabelSerial());
@@ -10108,6 +10261,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
                 if (vertexRange) inputsCheck.Fail();
                 return why;
             };
+            if (validation && inputRangeAnswered(*recorder, range.begin, bytes, WriteValidation::Test::FollowerInputs)) continue;
             if (queuedStores && recorder->QueuedStoreOverlaps(range.begin, bytes)) return hazard(ExpressRunRefusal::InputStores);
             if (runRangesHold(run.clear, range.begin, range.end, true)) {
                 ++run.census.rangesSkipped;
@@ -10129,7 +10283,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
             addRunRange(run.clear, range.begin, range.end);
         }
         if (first) mark(3);
-        FollowZones zones{run, *recorder, windows};
+        FollowZones zones{run, *recorder, windows, validation};
         if (trusted) {
             NoteCommitterTrusted(2);
             if ((prepared.forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared.forget) return ExpressRunRefusal::Buffers;
@@ -10138,13 +10292,28 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
             return ExpressRunRefusal::Buffers;
         }
         if (!trusted && !buffersCheck.Skip() && (recorder->HasQueuedKeyStores() || queuedStores)) {
-            const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
-                const auto bytes = static_cast<std::size_t>(end - begin);
-                return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes);
-            };
-            if ((recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) || (queuedStores && recorder->AnyQueuedStore(touches))) {
-                buffersCheck.Fail();
-                return ExpressRunRefusal::Stores;
+            constexpr auto storesTest = WriteValidation::Test::FollowerStores;
+            const bool storesHeld = validation && resources.StoresArmHolds(*recorder);
+            const bool storesVerify = storesHeld && WriteValidation::VerifyDue(storesTest);
+            const auto storesBefore = Recorder::StoreGenerationForValidation();
+            if (storesHeld && !storesVerify) {
+                WriteValidation::Note(storesTest, WriteValidation::Outcome::Answered);
+            } else {
+                const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
+                    const auto bytes = static_cast<std::size_t>(end - begin);
+                    return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes);
+                };
+                if ((recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) || (queuedStores && recorder->AnyQueuedStore(touches))) {
+                    if (storesVerify) WriteValidation::NoteVerify(storesTest, true, "a queued store or key store touches the template's buffers");
+                    buffersCheck.Fail();
+                    return ExpressRunRefusal::Stores;
+                }
+                if (storesVerify) {
+                    WriteValidation::NoteVerify(storesTest, false, nullptr);
+                } else if (validation) {
+                    resources.ArmStores(*recorder, storesBefore);
+                    WriteValidation::Note(storesTest, WriteValidation::Outcome::Armed);
+                }
             }
         }
         return ExpressRunRefusal::Count;
@@ -10212,10 +10381,12 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
         resume.cleanProof = record.effects.cleanProof;
         if (const auto why = holds(false); why != ExpressRunRefusal::Count) return late(why);
     }
-    FollowGuards guards{run, *recorder};
+    FollowGuards guards{run, *recorder, validation};
     const ShaderResources::GuardTests guardTests{&followDepthGuards, &followMultisampleGuards, &guards};
+    ValidationGuards selectionGuards{*recorder, WriteValidation::Test::FollowerSelection};
+    const ShaderResources::GuardTests selectionTests{&validationDepthGuards, &validationMultisampleGuards, &selectionGuards, &validationWrites};
     if (windows) keyRunGuardWindows(run, *recorder);
-    const auto selection = windows ? resources.FragmentSelectionHoldsBy(*recorder, prepared.moved, prepared, true, &guardTests, &buffersCheck) : resources.FragmentSelectionHolds(*recorder, prepared.moved, prepared, nullptr, true, &buffersCheck);
+    const auto selection = windows ? resources.FragmentSelectionHoldsBy(*recorder, prepared.moved, prepared, true, &guardTests, &buffersCheck) : validation ? resources.FragmentSelectionHoldsBy(*recorder, prepared.moved, prepared, true, &selectionTests, &buffersCheck) : resources.FragmentSelectionHolds(*recorder, prepared.moved, prepared, nullptr, true, &buffersCheck);
     if (selection != ShaderResources::PreparedBuffers::Selection::Taken) return late(ExpressRunRefusal::Selection);
     mark(5);
     try {
@@ -10229,6 +10400,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     for (std::size_t at = 0; !guardsSkipped && at < preparedInputs.ranges.size(); ++at) {
         const auto& range = preparedInputs.ranges[at];
         const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+        if (validation && inputGuardsAnswered(recorder, range.begin, bytes, WriteValidation::Test::FollowerGuards)) continue;
         if (windows && runWindowsClear(run, *recorder, WindowFact::DepthReads, range.begin, bytes) && runWindowsClear(run, *recorder, WindowFact::MultisampleSpans, range.begin, bytes)) {
             if (!windowVerifyDue()) continue;
             const bool depthIdle = DepthReadGuardIdle_nid_no_patch(range.begin, bytes);

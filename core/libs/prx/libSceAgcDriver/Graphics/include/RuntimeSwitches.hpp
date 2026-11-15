@@ -243,6 +243,7 @@ enum class RuntimeSwitch : std::size_t {
     FixupsByTurn,
     FrameFlow,
     XpNoResolveWaits,
+    WriteValidation,
     Count,
 };
 
@@ -273,6 +274,8 @@ void Assign(RuntimeSwitch id, bool set);
 std::uint64_t Generation();
 SwitchSnapshot Snapshot();
 std::optional<RuntimeSwitch> Find(std::string_view name);
+using AssignHook = void (*)(RuntimeSwitch id);
+void SetAssignHook(AssignHook hook);
 
 }
 

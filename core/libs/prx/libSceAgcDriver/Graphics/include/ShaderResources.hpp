@@ -12,6 +12,7 @@
 #include "Recompiler.hpp"
 #include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/WriteValidation.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -551,6 +552,7 @@ public:
         bool (*depth)(void* tests, std::uint64_t address, std::uint64_t bytes) = nullptr;
         bool (*multisample)(void* tests, std::uint64_t address, std::uint64_t bytes) = nullptr;
         void* tests = nullptr;
+        bool (*writes)(void* tests, std::uint64_t address, std::uint64_t bytes) = nullptr;
     };
     PreparedBuffers::Selection FragmentSelectionHoldsBy(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, bool untouched, const GuardTests* guards, CommitterTrustCheck* trust = nullptr) const;
     void PushFragmentBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
@@ -671,7 +673,11 @@ public:
     bool PreparedZonesClear(const PreparedBuffers& prepared, const Recorder& recorder) const;
     using ZoneClear = bool (*)(void* tests, std::uint64_t begin, std::size_t bytes, bool moved);
     bool PreparedZonesClearBy(const PreparedBuffers& prepared, ZoneClear clear, void* tests) const;
-    bool PreparedInPlaceHolds(const PreparedBuffers& prepared, const Recorder& recorder, bool& behind, CommitterTrustCheck* trust = nullptr) const;
+    bool PreparedZonesClearByWindows(const PreparedBuffers& prepared, const Recorder& recorder) const;
+    std::optional<bool> PreparedMovesClearByWindows(const PreparedBuffers& prepared, Recorder& recorder, MoveTicket* ticket, WriteValidation::Test test) const;
+    bool PreparedInPlaceHolds(const PreparedBuffers& prepared, const Recorder& recorder, bool& behind, CommitterTrustCheck* trust = nullptr, std::optional<WriteValidation::Test> validation = std::nullopt) const;
+    bool StoresArmHolds(const Recorder& recorder) const;
+    void ArmStores(const Recorder& recorder, std::uint64_t generationBefore) const;
     static void NotePreparedInPlaceTaken(const PreparedBuffers& prepared);
     static bool PreparedInPlaceOverlaps(const PreparedBuffers& prepared, std::uint64_t begin, std::uint64_t end);
     bool UnmovedRangesClear(const PreparedBuffers& prepared, Recorder& recorder) const;
@@ -1308,6 +1314,7 @@ private:
     };
     bool movedRangesClear(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::size_t>> ranges, MoveTicket* ticket, bool accessible, std::vector<InPlaceRange>* inPlace = nullptr, MovedCount* why = nullptr) const;
     bool takeMovedInPlace(const Recorder& recorder, std::uint64_t begin, std::size_t bytes, InPlaceRange& out) const;
+    std::optional<MovedCount> inPlaceRefusalByWindows(const Recorder& recorder, std::uint64_t begin, std::size_t bytes, WriteValidation::Test test) const;
     std::shared_ptr<DrawBindings> selectDrawSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, std::vector<std::size_t>& selected, bool census) const;
     // The selection of prepared buffers, their blob in one upload slice; null, before any upload,
     // when an unmoved range is no longer clear or a resident depth surface may hold a selected
@@ -1508,6 +1515,15 @@ private:
     std::vector<std::uint64_t> expressProofEpochsBefore;
     std::uint64_t proofKeptSum = 0;
     bool proofKeepVerify = false;
+    struct StoresArm {
+        std::uint64_t session = 0;
+        std::uint64_t switches = 0;
+        std::uint64_t recorder = 0;
+        std::uint64_t stores = 0;
+        std::uint64_t proof = 0;
+    };
+    mutable StoresArm wvStores;
+    std::uint64_t wvProofSerial = 0;
     std::uint8_t cleanEligibility = 0;
     std::uint32_t cleanMisses = 0;
     CleanProof cleanRefusal = CleanProof::FirstProof;

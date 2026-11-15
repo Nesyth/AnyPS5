@@ -70,10 +70,15 @@ public:
     bool ReadsFollow(GuestRangeList first, GuestRangeList second) const;
     bool ImagesFollow(std::span<const std::pair<VkImage, bool>> access, std::span<const std::pair<VkImage, bool>> targets) const;
     void AddImages(std::span<const std::pair<VkImage, bool>> access);
-    void BeginPass() { ++pass; }
+    void BeginPass() {
+        ++pass;
+        ++serial;
+    }
     void SealWriteOnly();
     void Clear();
     bool Empty() const;
+    std::uint64_t Serial() const { return serial; }
+    bool NoWrites() const { return writes.Empty() && writeOnly.Empty() && !anyWrites; }
 
 private:
     struct Attachment {
@@ -89,6 +94,7 @@ private:
     std::vector<std::pair<VkImage, bool>> images;
     std::vector<Attachment> attachments;
     std::uint64_t pass = 0;
+    std::uint64_t serial = 0;
     bool anyReads = false;
     bool anyWrites = false;
 };

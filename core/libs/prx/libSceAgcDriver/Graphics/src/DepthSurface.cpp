@@ -3705,6 +3705,10 @@ std::uint64_t DepthGuardsGeneration_nid_no_patch() {
     return depthGuardGeneration().load(std::memory_order_acquire);
 }
 
+std::uint32_t DepthOverwriteProofsPending_nid_no_patch() {
+    return pendingOverwriteProofs().load(std::memory_order_acquire);
+}
+
 bool MayOverlapDepthGuards_nid_no_patch(std::uint64_t address, std::size_t bytes) {
     return bytes != 0u && (address > std::numeric_limits<std::uint64_t>::max() - bytes || mayOverlapDepthGuard(address, bytes));
 }

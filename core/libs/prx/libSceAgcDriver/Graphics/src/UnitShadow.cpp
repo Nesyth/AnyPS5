@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/WriteValidation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
@@ -281,10 +282,15 @@ CpuPublishes& cpuPublishes() {
 
 std::uint64_t noteCpuPublish(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
     auto& kept = cpuPublishes();
-    std::lock_guard lock(kept.mutex);
-    const auto ticket = ++kept.next;
-    for (const auto& [begin, end] : ranges) kept.ranges.push_back({ticket, begin, end});
-    kept.live.store(kept.ranges.size(), std::memory_order_release);
+    for (const auto& [begin, end] : ranges) WriteValidation::Raise(WriteValidation::Class::L, WriteValidation::Source::CpuPublish, begin, end);
+    std::uint64_t ticket = 0;
+    {
+        std::lock_guard lock(kept.mutex);
+        ticket = ++kept.next;
+        for (const auto& [begin, end] : ranges) kept.ranges.push_back({ticket, begin, end});
+        kept.live.store(kept.ranges.size(), std::memory_order_release);
+    }
+    for (const auto& [begin, end] : ranges) WriteValidation::Raise(WriteValidation::Class::L, WriteValidation::Source::CpuPublish, begin, end);
     return ticket;
 }
 
@@ -917,6 +923,7 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
             if (end <= begin) continue;
             bytes += end - begin;
             GpuZones::Mark(shadow->UnitBegin(shadow->UnitOf(begin)), shadow->UnitBegin(shadow->UnitOf(end - 1) + 1) - shadow->UnitBegin(shadow->UnitOf(begin)));
+            const WriteValidation::RaiseScope raised(WriteValidation::Class::W, WriteValidation::Source::ShadowLive, shadow->UnitBegin(shadow->UnitOf(begin)), shadow->UnitBegin(shadow->UnitOf(end - 1) + 1));
             for (auto unit = shadow->UnitOf(begin); unit <= shadow->UnitOf(end - 1); ++unit) {
                 const auto& current = shadow->slabs[static_cast<std::size_t>(unit / SlabUnits())];
                 if (current == nullptr || current != slab) {

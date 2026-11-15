@@ -233,6 +233,8 @@ void SetRepeatHookForTest(RepeatHookForTest hook);
 std::uint64_t CommitBindingsVerifyEvery();
 using CommitBindingsHookForTest = void (*)(DrawRecordCommit& record);
 void SetCommitBindingsHookForTest(CommitBindingsHookForTest hook);
+using ExpressHookForTest = void (*)(DrawRecordCommit& record);
+void SetExpressHookForTest(ExpressHookForTest hook);
 // Whether DrawWithRecord can record a draw at all (APS5_SYNC_DRAWS and APS5_DUMP_TARGETS unset).
 bool DrawsRecordable();
 // Why a full draw asked for a record's recipe built none, counted per reason since the start:

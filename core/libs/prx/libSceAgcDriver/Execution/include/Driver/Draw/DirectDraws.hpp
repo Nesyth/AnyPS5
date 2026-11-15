@@ -228,6 +228,7 @@ struct DirectStages {
     std::uint64_t layoutHash = 0;
     bool layoutHashed = false;
     std::uint64_t beforeSerial = 0;
+    std::uint64_t wvSession = 0;
     bool serialed = false;
     bool viewing = false;
     std::shared_ptr<const ShaderRecompiler::RectListShaders> rect;

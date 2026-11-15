@@ -3,6 +3,7 @@ if(BUILD_TESTING)
     agc_add_draw_records_test(agc_driver_draw_records_hits LATE)
     agc_add_stage_plans_test(agc_driver_draw_records_hits LATE)
     agc_add_direct_draws_test(agc_driver_draw_records_hits LATE)
+    agc_add_write_validation_test(agc_driver_draw_records_hits)
     set_tests_properties(agc_driver_draw_records_hits_draw_pipeline agc_driver_draw_records_hits_late PROPERTIES FAIL_REGULAR_EXPRESSION "${agcDrawRecordsDifference}")
     agc_add_env_test(agc_driver_draw_records_hits_direct_draws_deposit agc_driver_draw_records_hits_tests
             ENV ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1 ${agcLeanFrontEnvironment} APS5_DIRECT_DRAWS=1 ${agcLateStackEnvironment}

@@ -176,6 +176,7 @@ std::uint64_t CollectEpoch();
 // range lies inside remembered clean ranges. Elsewhere 0 and false.
 std::uint64_t CleanForgetSerial();
 bool AllClean(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+void SetCleanForgetHook(void (*hook)(std::uintptr_t start, std::uintptr_t end));
 std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();
 std::uint64_t UnwatchSerial();

@@ -867,6 +867,10 @@ std::uint64_t GuestArenaCleanForgetSerial_nid_no_patch() {
     return WindowsMappings::CleanForgetSerial();
 }
 
+void GuestArenaSetCleanForgetHook_nid_no_patch(void (*hook)(std::uintptr_t start, std::uintptr_t end)) {
+    WindowsMappings::SetCleanForgetHook(hook);
+}
+
 bool GuestArenaAllClean_nid_no_patch(const std::uint64_t* pairs, std::size_t count) {
     return WindowsMappings::Get().AllClean(pairs, count);
 }

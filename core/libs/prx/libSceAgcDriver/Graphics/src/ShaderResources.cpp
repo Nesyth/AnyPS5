@@ -5679,6 +5679,7 @@ ShaderResources::ExpressBefore ShaderResources::expressBefore() {
 }
 
 void ShaderResources::expressAfter(bool proved, const ExpressBefore& before) {
+    ++wvProofSerial;
     expressValid = false;
     if (!proved || !before.watched || !cleanProved) return;
     std::size_t at = 0;
@@ -6104,6 +6105,7 @@ const char* ShaderResources::FastFailName(std::size_t reason) {
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report, CleanProof* clean) {
+    ++wvProofSerial;
     if (!RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits)) {
         if (expressValid || expressWatch != nullptr) {
             expressValid = false;
@@ -9243,6 +9245,107 @@ bool ShaderResources::PreparedZonesClear(const PreparedBuffers& prepared, const 
     return true;
 }
 
+bool ShaderResources::PreparedZonesClearByWindows(const PreparedBuffers& prepared, const Recorder& recorder) const {
+    constexpr auto test = WriteValidation::Test::LeaderZones;
+    if ((prepared.forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared.forget) return false;
+    bool generations = false;
+    const auto answered = [&](std::uint64_t begin, std::size_t bytes, std::uint16_t facts) {
+        if (bytes == 0) return true;
+        const auto answer = WriteValidation::CommitterClear(recorder, begin, bytes, facts, test);
+        generations = generations || answer == WriteValidation::Answer::Generations;
+        return answer != WriteValidation::Answer::Today;
+    };
+    for (const auto& entry : prepared.moved) {
+        const auto& item = allocations[entry.allocation];
+        if (!item.guest || entry.inPlace != VK_NULL_HANDLE) continue;
+        const auto begin = entry.address - item.adjustment;
+        const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment));
+        if (guestMemory.WritesOverlap(begin, bytes)) return false;
+        if (!answered(begin, bytes, WriteValidation::Fact::Moved)) return PreparedZonesClear(prepared, recorder);
+    }
+    for (const auto& item : prepared.selected) {
+        if (item.moved) continue;
+        const auto& allocation = allocations[item.allocation];
+        if (guestMemory.WritesOverlap(allocation.address, allocation.size)) return false;
+        if (!answered(allocation.address, static_cast<std::size_t>(allocation.size), WriteValidation::Fact::Writes)) return PreparedZonesClear(prepared, recorder);
+    }
+    if (generations && WriteValidation::VerifyDue(test)) {
+        const bool held = PreparedZonesClear(prepared, recorder);
+        WriteValidation::NoteVerify(test, !held, "a prepared buffer has a pending write, a pending storage image or a live shadow");
+        return held;
+    }
+    return true;
+}
+
+std::optional<bool> ShaderResources::PreparedMovesClearByWindows(const PreparedBuffers& prepared, Recorder& recorder, MoveTicket* ticket, WriteValidation::Test test) const {
+    if ((prepared.forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared.forget || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor) || WriteValidation::Session() == 0) return std::nullopt;
+    struct WindowRangesStorage {};
+    auto& ranges = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::size_t>>, WindowRangesStorage>();
+    ranges.clear();
+    for (const auto& entry : prepared.moved) {
+        const auto& item = allocations[entry.allocation];
+        if (!item.guest || entry.inPlace != VK_NULL_HANDLE) continue;
+        ranges.emplace_back(entry.address - item.adjustment, static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment)));
+    }
+    bool generations = false;
+    for (const auto& [begin, bytes] : ranges) {
+        if (bytes == 0 || guestMemory.WritesOverlap(begin, bytes)) return std::nullopt;
+        const auto answer = WriteValidation::CommitterClear(recorder, begin, bytes, WriteValidation::Fact::Moved, test);
+        if (answer == WriteValidation::Answer::Today) return std::nullopt;
+        generations = generations || answer == WriteValidation::Answer::Generations;
+    }
+    if (generations && WriteValidation::VerifyDue(test)) {
+        const bool held = movedRangesClear(recorder, ranges, ticket, true);
+        WriteValidation::NoteVerify(test, !held, "a moved range has a pending write, a pending storage image or a live shadow");
+        return held;
+    }
+    if (ticket != nullptr && ticket->ranges != nullptr) {
+        ticket->checked += ranges.size();
+        ticket->ranges->clear();
+        for (const auto& [begin, bytes] : ranges) ticket->ranges->emplace_back(begin, begin + bytes);
+        ticket->valid = true;
+        ticket->recorder = recorder.Id();
+        ticket->note = recorder.WriteNoteCount();
+        ticket->pending = StorageTexture::PendingSerial();
+        ticket->allocations = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        ticket->epoch = GuestMemory::CollectEpoch();
+    }
+    return true;
+}
+
+bool ShaderResources::StoresArmHolds(const Recorder& recorder) const {
+    const auto session = WriteValidation::Session();
+    return session != 0 && wvStores.session == session && wvStores.switches == RuntimeSwitches::Generation() && wvStores.recorder == recorder.Id() && wvStores.stores == Recorder::StoreGenerationForValidation() && wvStores.proof == wvProofSerial;
+}
+
+void ShaderResources::ArmStores(const Recorder& recorder, std::uint64_t generationBefore) const {
+    const auto session = WriteValidation::Session();
+    if (session == 0) return;
+    wvStores.session = session;
+    wvStores.switches = RuntimeSwitches::Generation();
+    wvStores.recorder = recorder.Id();
+    wvStores.stores = generationBefore;
+    wvStores.proof = wvProofSerial;
+}
+
+std::optional<ShaderResources::MovedCount> ShaderResources::inPlaceRefusalByWindows(const Recorder& recorder, std::uint64_t begin, std::size_t bytes, WriteValidation::Test test) const {
+    if (heapStage || addressedBuffers || usesBda || rebound) return MovedCount::NotEligible;
+    const auto answer = WriteValidation::CommitterClear(recorder, begin, bytes, WriteValidation::Fact::InPlace, test);
+    if (answer == WriteValidation::Answer::Today) return std::nullopt;
+    if (answer == WriteValidation::Answer::Generations && WriteValidation::VerifyDue(test)) {
+        const auto why = InPlaceRefusal(recorder, begin, bytes, InPlaceUser::DrawPrepared);
+        const bool differs = why == MovedCount::InPlaceStorage || why == MovedCount::InPlaceShadowed || why == MovedCount::CpuPublish || why == MovedCount::Label || why == MovedCount::QueuedStore;
+        WriteValidation::NoteVerify(test, differs, "an in-place range has a pending storage image, a live shadow, a CPU publish, a label or a queued store");
+        return why;
+    }
+    const auto overlaps = [&](const std::shared_ptr<ShaderResources>& writer) { return writer != nullptr && writer->CopiedWritesOverlap(begin, bytes); };
+    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return MovedCount::CopiedWriter;
+    const auto drawWriters = DrawCopiedWriters();
+    if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return MovedCount::CopiedWriter;
+    if (bytes > context.limits.maxStorageBufferRange) return MovedCount::OverRange;
+    return MovedCount::Count;
+}
+
 bool ShaderResources::PreparedZonesClearBy(const PreparedBuffers& prepared, ZoneClear clear, void* tests) const {
     if ((prepared.forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared.forget) return false;
     for (const auto& entry : prepared.moved) {
@@ -9260,7 +9363,7 @@ bool ShaderResources::PreparedZonesClearBy(const PreparedBuffers& prepared, Zone
     return true;
 }
 
-bool ShaderResources::PreparedInPlaceHolds(const PreparedBuffers& prepared, const Recorder& recorder, bool& behind, CommitterTrustCheck* trust) const {
+bool ShaderResources::PreparedInPlaceHolds(const PreparedBuffers& prepared, const Recorder& recorder, bool& behind, CommitterTrustCheck* trust, std::optional<WriteValidation::Test> validation) const {
     if (!prepared.inPlace) return true;
     const auto refuse = [](MovedCount why) {
         noteMoved(why);
@@ -9271,6 +9374,7 @@ bool ShaderResources::PreparedInPlaceHolds(const PreparedBuffers& prepared, cons
     const bool trusted = RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter);
     if (trusted) NoteCommitterTrusted();
     const bool skipped = trusted || (trust != nullptr && trust->Skip());
+    const bool windowed = validation.has_value() && !skipped && !RuntimeSwitches::Set(RuntimeSwitch::InPlaceExact) && WriteValidation::Session() != 0;
     for (const auto& entry : prepared.moved) {
         if (entry.inPlace == VK_NULL_HANDLE) continue;
         if (skipped) {
@@ -9281,6 +9385,11 @@ bool ShaderResources::PreparedInPlaceHolds(const PreparedBuffers& prepared, cons
         if (guestMemory.WritesOverlap(entry.begin, entry.bytes)) {
             if (trust != nullptr) trust->Fail();
             return refuse(MovedCount::PreparedInPlaceWrites);
+        }
+        if (const auto answered = windowed ? inPlaceRefusalByWindows(recorder, entry.begin, entry.bytes, *validation) : std::optional<MovedCount>{}; answered.has_value()) {
+            if (*answered == MovedCount::Count) continue;
+            if (trust != nullptr && *answered != MovedCount::NotEligible && *answered != MovedCount::OverRange) trust->Fail();
+            return refuse(*answered);
         }
         if (const auto why = InPlaceRefusal(recorder, entry.begin, entry.bytes, InPlaceUser::DrawPrepared); why != MovedCount::Count) {
             if (trust != nullptr && why != MovedCount::NotEligible && why != MovedCount::OverRange) trust->Fail();
@@ -10326,7 +10435,7 @@ bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const
         for (const auto& item : prepared.selected) {
             if (item.moved || untouched || RuntimeSwitches::Set(RuntimeSwitch::XpCommitFloor) || RuntimeSwitches::Set(RuntimeSwitch::XpExpressFloor)) continue;
             const auto& allocation = allocations[item.allocation];
-            if (guestMemory.WritesOverlap(allocation.address, allocation.size) || recorder.PendingWriteOverlaps(allocation.address, allocation.size)) return failed();
+            if (guestMemory.WritesOverlap(allocation.address, allocation.size) || (guards != nullptr && guards->writes != nullptr ? guards->writes(guards->tests, allocation.address, allocation.size) : recorder.PendingWriteOverlaps(allocation.address, allocation.size))) return failed();
         }
     }
     selection = Selection::Taken;

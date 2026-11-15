@@ -80,6 +80,7 @@ void GuestArenaDisarmResident_nid_no_patch();
 void GuestArenaSetResidentFirst_nid_no_patch(bool on);
 void GuestArenaSetSortedHostRegions_nid_no_patch(bool on);
 std::uint64_t GuestArenaCleanForgetSerial_nid_no_patch();
+void GuestArenaSetCleanForgetHook_nid_no_patch(void (*hook)(std::uintptr_t start, std::uintptr_t end));
 bool GuestArenaAllClean_nid_no_patch(const std::uint64_t* pairs, std::size_t count);
 void GuestArenaArmingReport_nid_no_patch(std::uint64_t* out);
 // Diagnostic (APS5_FAULT_SITES): the code addresses of write faults on armed guest pages, with counts

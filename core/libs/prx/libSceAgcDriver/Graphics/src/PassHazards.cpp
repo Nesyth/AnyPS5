@@ -82,6 +82,7 @@ bool PassHazards::ReadsFollow(GuestRangeList first, GuestRangeList second) const
 }
 
 void PassHazards::CarryAttachments() {
+    ++serial;
     std::vector<Attachment> carried;
     carried.reserve(attachments.size());
     for (const auto& entry : attachments) {
@@ -111,8 +112,13 @@ void PassHazards::AddImages(std::span<const std::pair<VkImage, bool>> access) {
     for (const auto& [image, written] : access) {
         if (image == VK_NULL_HANDLE) continue;
         const auto it = std::find_if(images.begin(), images.end(), [&](const auto& seen) { return seen.first == image; });
-        if (it == images.end()) images.emplace_back(image, written);
-        else it->second = it->second || written;
+        if (it == images.end()) {
+            images.emplace_back(image, written);
+            ++serial;
+        } else if (written && !it->second) {
+            it->second = true;
+            ++serial;
+        }
     }
 }
 
@@ -125,6 +131,7 @@ void PassHazards::Add(const PassAccess& access, bool lazyReads) {
     } else {
         for (const auto& [begin, end] : access.reads) reads.Insert(begin, end);
     }
+    if (!access.writes.empty() || !access.writeOnly.empty() || !access.images.empty() || !access.attachments.empty() || access.anyWrites) ++serial;
     for (const auto& [begin, end] : access.writes) writes.Insert(begin, end);
     for (const auto& [begin, end] : access.writeOnly) writeOnly.Insert(begin, end);
     for (const auto& [image, written] : access.images) {
@@ -160,6 +167,7 @@ void PassHazards::SealWriteOnly() {
 }
 
 void PassHazards::Clear() {
+    ++serial;
     reads.Clear();
     pendingReads.clear();
     writes.Clear();
