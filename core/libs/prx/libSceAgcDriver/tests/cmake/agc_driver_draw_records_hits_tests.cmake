@@ -66,6 +66,15 @@ if(BUILD_TESTING)
     agc_add_env_test(agc_driver_draw_records_hits_express_commits_late agc_driver_draw_records_hits_tests
             ENV ${agcCommitFragmentsEnvironment} ${agcLateStackEnvironment} APS5_ASYNC_SUBMIT=1 APS5_DEFERRED_ENCODE=1 APS5_DIRECT_CLEAN_PROOFS=1 APS5_CLEAN_PRECISE_SERIALS=1 APS5_EXPRESS_COMMITS=1 APS5_VERIFY_EXPRESS_COMMITS=3)
     set_tests_properties(agc_driver_draw_records_hits_express_commits agc_driver_draw_records_hits_express_commits_verify agc_driver_draw_records_hits_express_commits_late PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDrawRecordsDifference};${agcStagePlansDifference};${agcDirectDrawsDifference};${agcDirectDrawsBuildDifference};${agcDirectBuffersDifference};${agcCommitBindingsDifference};${agcCommitFragmentsDifference};${agcExpressCommitsDifference}")
+    set(agcDrawTicketsDifference "\\[draw-tickets-verify\\] [-a-z ]+ differs:")
+    set(agcDrawTicketsEnvironment ${agcCommitFragmentsEnvironment} APS5_ASYNC_SUBMIT=1 APS5_DEFERRED_ENCODE=1 APS5_DIRECT_CLEAN_PROOFS=1 APS5_CLEAN_PRECISE_SERIALS=1 APS5_EXPRESS_COMMITS=1 APS5_RUN_FOLLOW=1 APS5_DIRECT_HANDOFF=1 APS5_DRAW_TICKETS=1)
+    agc_add_env_test(agc_driver_draw_records_hits_draw_tickets agc_driver_draw_records_hits_tests
+            ENV ${agcDrawTicketsEnvironment} APS5_VERIFY_DRAW_TICKETS=1 APS5_JOB_ALLOCATIONS=1 APS5_PIPELINE_STATS=1)
+    agc_add_env_test(agc_driver_draw_records_hits_draw_tickets_verify agc_driver_draw_records_hits_tests
+            ENV ${agcDrawTicketsEnvironment} APS5_TICKET_PREFETCH=1 APS5_VERIFY_DRAW_TICKETS=1 APS5_VERIFY_EXPRESS_COMMITS=3 APS5_VERIFY_COMMIT_FRAGMENTS=3 APS5_VERIFY_DIRECT_BUFFERS=3 APS5_VERIFY_DIRECT_INPUTS=3 APS5_VERIFY_DRAW_RECORDS=5)
+    agc_add_env_test(agc_driver_draw_records_hits_draw_tickets_late agc_driver_draw_records_hits_tests
+            ENV ${agcDrawTicketsEnvironment} ${agcLateStackEnvironment} APS5_FINISHER_DEPOSIT=1 APS5_IDLE_HIT_RELEASE=1 APS5_TICKET_PREFETCH=1 APS5_VERIFY_DRAW_TICKETS=2 APS5_VERIFY_EXPRESS_COMMITS=3)
+    set_tests_properties(agc_driver_draw_records_hits_draw_tickets agc_driver_draw_records_hits_draw_tickets_verify agc_driver_draw_records_hits_draw_tickets_late PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDrawRecordsDifference};${agcStagePlansDifference};${agcDirectDrawsDifference};${agcDirectDrawsBuildDifference};${agcDirectBuffersDifference};${agcCommitBindingsDifference};${agcCommitFragmentsDifference};${agcExpressCommitsDifference};${agcDrawTicketsDifference}")
     agc_add_env_test(agc_driver_draw_records_hits_inject agc_driver_draw_records_hits_tests ARGS --inject
             ENV ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1 ${agcLeanFrontEnvironment} APS5_DRAW_RECORDS=1 APS5_VERIFY_DRAW_RECORDS=1)
     agc_add_env_test(agc_driver_draw_records_hits_inject_commit agc_driver_draw_records_hits_tests ARGS --inject-commit

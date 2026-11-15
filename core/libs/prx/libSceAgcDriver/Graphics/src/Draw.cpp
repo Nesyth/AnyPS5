@@ -3914,6 +3914,19 @@ void keepExpressBindings(Recorder& recorder, std::shared_ptr<ShaderResources::Dr
     else keepFragmentBindings(recorder, bindings);
 }
 
+void keepExpressBindings(Recorder& recorder, std::shared_ptr<ShaderResources::DrawBindings>& bindings, std::span<const KeptOwner> owners) {
+    if (owners.empty()) {
+        keepExpressBindings(recorder, bindings);
+        return;
+    }
+    recorder.Keep(std::move(bindings));
+    if (RuntimeSwitches::Set(RuntimeSwitch::KeepBytesOnce)) {
+        for (const auto& kept : owners) recorder.KeepSnapshotBytes(kept.owner, kept.bytes);
+        return;
+    }
+    for (const auto& kept : owners) recorder.KeepBytes(kept.owner, kept.bytes);
+}
+
 namespace {
 
 bool samplesImage(const ShaderResources& resources, VkImage image) {
@@ -7885,6 +7898,10 @@ struct ExpressRunCensus {
     std::uint64_t shadowSkipped = 0;
     std::uint64_t staged = 0;
     std::array<std::uint64_t, 8> stageNs{};
+    std::array<std::uint64_t, static_cast<std::size_t>(FollowFormat::Count)> formatFollowNs{};
+    std::array<std::uint64_t, static_cast<std::size_t>(FollowFormat::Count)> formatFollowTimed{};
+    std::array<std::uint64_t, static_cast<std::size_t>(FollowFormat::Count)> formatStaged{};
+    std::array<std::array<std::uint64_t, 8>, static_cast<std::size_t>(FollowFormat::Count)> formatStageNs{};
     std::uint64_t refusingNs = 0;
     std::uint64_t refusingTimed = 0;
     std::uint64_t fallbackNs = 0;
@@ -8132,7 +8149,25 @@ void noteRunFollow(ExpressRun& run, bool followed) {
     std::array<double, 8> stages{};
     for (std::size_t index = 0; index < stages.size(); ++index) stages[index] = census.staged == 0 ? 0.0 : static_cast<double>(std::exchange(census.stageNs[index], 0)) / static_cast<double>(census.staged);
     census.staged = 0;
+    std::string byFormat;
+    constexpr auto ticketSlot = static_cast<std::size_t>(FollowFormat::Ticket);
+    constexpr auto prefetchedSlot = static_cast<std::size_t>(FollowFormat::PrefetchedTicket);
+    const bool ticketsSeen = census.formatFollowTimed[ticketSlot] + census.formatFollowTimed[prefetchedSlot] + census.formatStaged[ticketSlot] + census.formatStaged[prefetchedSlot] != 0;
+    for (std::size_t slot = 0; slot < census.formatFollowNs.size(); ++slot) {
+        static constexpr std::array<const char*, static_cast<std::size_t>(FollowFormat::Count)> FormatNames{"hits", "tickets", "prefetched tickets"};
+        const auto timedCount = census.formatFollowTimed[slot];
+        const auto stagedCount = census.formatStaged[slot];
+        const auto ns = per(census.formatFollowNs[slot], census.formatFollowTimed[slot]);
+        std::array<double, 8> formatStages{};
+        for (std::size_t index = 0; index < formatStages.size(); ++index) formatStages[index] = stagedCount == 0 ? 0.0 : static_cast<double>(std::exchange(census.formatStageNs[slot][index], 0)) / static_cast<double>(stagedCount);
+        census.formatStaged[slot] = 0;
+        if (!ticketsSeen) continue;
+        char item[512];
+        std::snprintf(item, sizeof(item), "%s%s: %.0f ns per follower (%llu timed); stages (%llu staged): checks %.0f, template %.0f, pass and inputs %.0f, zones and stores %.0f, keep bound and selection %.0f, staging and guest buffers %.0f, notes and keeps %.0f, splice and target notes %.0f", slot == 0 ? "" : "; ", FormatNames[slot], ns, static_cast<unsigned long long>(timedCount), static_cast<unsigned long long>(stagedCount), formatStages[0], formatStages[1], formatStages[2], formatStages[3], formatStages[4], formatStages[5], formatStages[6], formatStages[7]);
+        byFormat += item;
+    }
     std::fprintf(stderr, "[run-follow] %llu express commits followed a leader, %llu led a run; not followed: %s; runs ended by: %s; run lengths 1: %llu, 2-3: %llu, 4-7: %llu, 8-15: %llu, 16-31: %llu, 32+: %llu; carried across a dropped hold %llu (across non-draw items %llu), not carried %llu; runs kept across a non-follower commit %llu; followers with sampled images %llu; input ranges taken by the run's clear ranges %llu, pending reads already noted in the batch %llu, moved ranges taken by the shadow windows %llu; ns per follower %.0f (%.0f with its wrapper), per refused follow attempt %.0f; non-follower express commits appended %llu at %.0f ns, not appended %llu at %.0f ns; ns per non-follower item after a refused follow attempt %.0f to refuse and %.0f to commit, without an attempt %.0f to commit; run holds %llu at %.0f ns to take; ns per follower stage (1 in 64): checks %.0f, template %.0f, pass and inputs %.0f, zones and stores %.0f, keep bound and selection %.0f, staging and guest buffers %.0f, notes and keeps %.0f, splice and target notes %.0f; 1 in 8 timed\n", follows, leads, refused.empty() ? "none" : refused.c_str(), ended.empty() ? "none" : ended.c_str(), lengths[0], lengths[1], lengths[2], lengths[3], lengths[4], lengths[5], carried, carriedItems, notCarried, kept, imageFollowers, rangesSkipped, readsSkipped, shadowSkipped, follower, item, refusedAttempt, appendedCount, appendedCommit, fullCount, fullCommit, refusing, fallback, unled, static_cast<unsigned long long>(holdCount), hold, stages[0], stages[1], stages[2], stages[3], stages[4], stages[5], stages[6], stages[7]);
+    if (ticketsSeen) std::fprintf(stderr, "[run-follow] by format: %s\n", byFormat.c_str());
     std::array<unsigned long long, static_cast<std::size_t>(WindowFact::Count)> answers{};
     for (std::size_t index = 0; index < answers.size(); ++index) answers[index] = wide(census.windowAnswers[index]);
     const auto windowsClear = wide(census.windowsClear);
@@ -9126,6 +9161,10 @@ void NoteExpressFollowDue(bool due) {
 }
 
 bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers& prepared, PreparedInputs& preparedInputs, DrawFragment& fragment) {
+    return ExpressFollowCommit(context, state, draw, shaders, record, prepared.View(), preparedInputs.View(), fragment, {}, FollowFormat::Hit);
+}
+
+bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffersView& prepared, const PreparedInputsView& preparedInputs, DrawFragment& fragment, std::span<const KeptOwner> owners, FollowFormat format) {
     auto& run = expressRun();
     if (!run.led || run.dropped) return false;
     if (!RuntimeSwitches::Set(RuntimeSwitch::RunFollow)) {
@@ -9244,9 +9283,9 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
             templateMiss = missed;
         }
         if (first) mark(2);
-        if (!RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || prepared.plan == nullptr || prepared.plan != resources.DirectBufferPlan(shaders) || !context.drawInputsInPlace) return ExpressRunRefusal::Prepared;
+        if (!RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || prepared.plan == nullptr || prepared.plan != resources.DirectBufferPlan(shaders).get() || !context.drawInputsInPlace) return ExpressRunRefusal::Prepared;
         const std::size_t indexRanges = draw.indexed ? 1u : 0u;
-        if (preparedInputs.recipe.get() != recipe || preparedInputs.device != context.device || preparedInputs.state != &state || preparedInputs.draw != &draw || preparedInputs.shaders != shaders.data() || preparedInputs.stages != shaders.size() || preparedInputs.ranges.size() < indexRanges || (preparedInputs.forget & 1u) != 0 || forget != preparedInputs.forget || imports != preparedInputs.imports || mapping != preparedInputs.mapping) return ExpressRunRefusal::Inputs;
+        if (preparedInputs.recipe != recipe || preparedInputs.device != context.device || preparedInputs.state != &state || preparedInputs.draw != &draw || preparedInputs.shaders != shaders.data() || preparedInputs.stages != shaders.size() || preparedInputs.ranges.size() < indexRanges || (preparedInputs.forget & 1u) != 0 || forget != preparedInputs.forget || imports != preparedInputs.imports || mapping != preparedInputs.mapping) return ExpressRunRefusal::Inputs;
         if (!recorder->PassReadsFollow(express->reads, preparedInputs.inPlaceReads)) return ExpressRunRefusal::PassWrites;
         if (!recorder->PassImagesFollow(express->images, std::span<const std::pair<VkImage, bool>>(run.attachments.data(), run.targets))) return ExpressRunRefusal::ImageHazard;
         if (express->fenced && !recorder->PassFenced()) return ExpressRunRefusal::Fenced;
@@ -9332,7 +9371,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
         resume.depthChecked = recipe->hasDepth && state.depth.has_value();
         resume.depthGeneration = recorder->RenderPassGeneration();
         if (StorageTexture::DrawnLinearPending()) return late(ExpressRunRefusal::Linear);
-        if (!RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || record.verifyBuffers || prepared.plan == nullptr || prepared.plan != resources.DirectBufferPlan(shaders)) return late(ExpressRunRefusal::Prepared);
+        if (!RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || record.verifyBuffers || prepared.plan == nullptr || prepared.plan != resources.DirectBufferPlan(shaders).get()) return late(ExpressRunRefusal::Prepared);
         if (!RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || record.verifyInputs) return late(ExpressRunRefusal::Inputs);
     } else if (kind != 0) {
         if (const auto why = holds(false); why != ExpressRunRefusal::Count) return late(why);
@@ -9354,7 +9393,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     FollowGuards guards{run, *recorder};
     const ShaderResources::GuardTests guardTests{&followDepthGuards, &followMultisampleGuards, &guards};
     if (windows) keyRunGuardWindows(run, *recorder);
-    const auto selection = windows ? resources.FragmentSelectionHoldsBy(*recorder, prepared.moved, prepared, true, &guardTests) : resources.FragmentSelectionHolds(*recorder, prepared.moved, prepared, nullptr, true);
+    const auto selection = windows ? resources.FragmentSelectionHoldsBy(*recorder, prepared.moved, prepared, true, &guardTests) : resources.FragmentSelectionHolds(*recorder, prepared.moved, prepared, true);
     if (selection != ShaderResources::PreparedBuffers::Selection::Taken) return late(ExpressRunRefusal::Selection);
     mark(5);
     try {
@@ -9403,7 +9442,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
         record.touchedPresent = present;
     }
     countCache(&DrawProfile::cacheHits);
-    keepExpressBindings(*recorder, fragment.bindings);
+    keepExpressBindings(*recorder, fragment.bindings, owners);
     if (express->keptRecorder != recorderId || express->keptBatch != batch) {
         recorder->Keep(express->keep);
         for (const auto& owner : keep.multisample) {
@@ -9451,14 +9490,23 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     if (reproving) ++run.census.widerReproved;
     if (upload) ++run.census.widerUploads;
     if (intentOn && recipe->hasDepth && state.depth.has_value()) noteDepthIntent(ownIntent, run.depthApplied, true);
+    const auto formatSlot = static_cast<std::size_t>(format) < static_cast<std::size_t>(FollowFormat::Count) ? static_cast<std::size_t>(format) : std::size_t{0};
     if (staged) {
         mark(8);
-        for (std::size_t stage = 0; stage < run.census.stageNs.size(); ++stage) run.census.stageNs[stage] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(marks[stage + 1] - marks[stage]).count());
+        for (std::size_t stage = 0; stage < run.census.stageNs.size(); ++stage) {
+            const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(marks[stage + 1] - marks[stage]).count());
+            run.census.stageNs[stage] += ns;
+            run.census.formatStageNs[formatSlot][stage] += ns;
+        }
         ++run.census.staged;
+        ++run.census.formatStaged[formatSlot];
     }
     if (timed) {
-        run.census.followNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
+        const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
+        run.census.followNs += ns;
         ++run.census.followTimed;
+        run.census.formatFollowNs[formatSlot] += ns;
+        ++run.census.formatFollowTimed[formatSlot];
     }
     noteRunFollow(run, true);
     return true;

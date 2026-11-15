@@ -1,7 +1,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTickets.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -94,10 +97,18 @@ static_assert(static_cast<std::size_t>(Counter::RepeatUnmovedHazard) - static_ca
 static_assert(static_cast<std::size_t>(Counter::RepeatClassModes) - static_cast<std::size_t>(Counter::RepeatClassNotRecorded) + 2 == static_cast<std::size_t>(DrawRepeatClass::Count), "every repeat class refusal needs a counter");
 static_assert(static_cast<std::size_t>(Counter::RepeatDetailFmask) - static_cast<std::size_t>(Counter::RepeatDetailNotReusable) + 2 == static_cast<std::size_t>(DrawRepeatDetail::Count), "every repeat class condition needs a counter");
 
+constexpr std::size_t FormatCount = static_cast<std::size_t>(StepFormat::Count);
+constexpr std::size_t FormatSteps = static_cast<std::size_t>(Step::HandOff) + 1;
+constexpr std::size_t JobFields = 5;
+
 struct Block {
     std::array<std::atomic<std::uint64_t>, CounterCount> counters{};
     std::array<std::atomic<std::uint64_t>, StepCount> stepNanoseconds{};
     std::array<std::atomic<std::uint64_t>, StepCount> stepDraws{};
+    std::array<std::atomic<std::uint64_t>, FormatCount * FormatSteps> formatNanoseconds{};
+    std::array<std::atomic<std::uint64_t>, FormatCount * FormatSteps> formatStepDraws{};
+    std::array<std::atomic<std::uint64_t>, FormatCount> formatDraws{};
+    std::array<std::atomic<std::uint64_t>, FormatCount * JobFields> jobs{};
 };
 
 struct Registry {
@@ -121,6 +132,12 @@ void fold(Block& into, const Block& from) {
         bump(into.stepNanoseconds[index], from.stepNanoseconds[index].load(std::memory_order_relaxed));
         bump(into.stepDraws[index], from.stepDraws[index].load(std::memory_order_relaxed));
     }
+    for (std::size_t index = 0; index < FormatCount * FormatSteps; ++index) {
+        bump(into.formatNanoseconds[index], from.formatNanoseconds[index].load(std::memory_order_relaxed));
+        bump(into.formatStepDraws[index], from.formatStepDraws[index].load(std::memory_order_relaxed));
+    }
+    for (std::size_t index = 0; index < FormatCount; ++index) bump(into.formatDraws[index], from.formatDraws[index].load(std::memory_order_relaxed));
+    for (std::size_t index = 0; index < FormatCount * JobFields; ++index) bump(into.jobs[index], from.jobs[index].load(std::memory_order_relaxed));
 }
 
 struct BlockHolder {
@@ -162,6 +179,10 @@ struct Window {
     std::array<std::uint64_t, CounterCount> counters{};
     std::array<std::uint64_t, StepCount> stepNanoseconds{};
     std::array<std::uint64_t, StepCount> stepDraws{};
+    std::array<std::uint64_t, FormatCount * FormatSteps> formatNanoseconds{};
+    std::array<std::uint64_t, FormatCount * FormatSteps> formatStepDraws{};
+    std::array<std::uint64_t, FormatCount> formatDraws{};
+    std::array<std::uint64_t, FormatCount * JobFields> jobs{};
 };
 
 Window totals() {
@@ -174,6 +195,12 @@ Window totals() {
             now.stepNanoseconds[index] += block.stepNanoseconds[index].load(std::memory_order_relaxed);
             now.stepDraws[index] += block.stepDraws[index].load(std::memory_order_relaxed);
         }
+        for (std::size_t index = 0; index < FormatCount * FormatSteps; ++index) {
+            now.formatNanoseconds[index] += block.formatNanoseconds[index].load(std::memory_order_relaxed);
+            now.formatStepDraws[index] += block.formatStepDraws[index].load(std::memory_order_relaxed);
+        }
+        for (std::size_t index = 0; index < FormatCount; ++index) now.formatDraws[index] += block.formatDraws[index].load(std::memory_order_relaxed);
+        for (std::size_t index = 0; index < FormatCount * JobFields; ++index) now.jobs[index] += block.jobs[index].load(std::memory_order_relaxed);
     };
     add(kept.retired);
     for (const auto* block : kept.live) add(*block);
@@ -263,6 +290,34 @@ void AddStep(Step step, std::uint64_t nanoseconds) {
     bump(block.stepDraws[static_cast<std::size_t>(step)], 1);
 }
 
+bool JobAllocations() {
+    static const bool on = AgcDriver::HostAllocationCountsOn();
+    return on;
+}
+
+bool FormatLaps() {
+    return JobAllocations() || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DrawTickets);
+}
+
+void AddFormatDraw(StepFormat format, const std::uint64_t* nanoseconds, const bool* reached, const std::uint64_t* allocations, const std::uint64_t* frees, bool allocationsNoted) {
+    const auto slot = static_cast<std::size_t>(format);
+    if (slot >= FormatCount) return;
+    auto& block = own();
+    bump(block.formatDraws[slot], 1);
+    for (std::size_t step = 0; step < FormatSteps; ++step) {
+        if (!reached[step]) continue;
+        bump(block.formatNanoseconds[slot * FormatSteps + step], nanoseconds[step]);
+        bump(block.formatStepDraws[slot * FormatSteps + step], 1);
+    }
+    if (!allocationsNoted) return;
+    auto* const job = &block.jobs[slot * JobFields];
+    bump(job[0], 1);
+    bump(job[1], allocations[2] - allocations[0]);
+    bump(job[2], frees[2] - frees[0]);
+    bump(job[3], allocations[2] - allocations[1]);
+    bump(job[4], frees[2] - frees[1]);
+}
+
 void NoteClasses(std::size_t known, std::size_t bytes) {
     classesKnown.store(known, std::memory_order_relaxed);
     classBytes.store(bytes, std::memory_order_relaxed);
@@ -307,6 +362,12 @@ void Report(bool force) {
         since.stepNanoseconds[index] = current.stepNanoseconds[index] - reported.stepNanoseconds[index];
         since.stepDraws[index] = current.stepDraws[index] - reported.stepDraws[index];
     }
+    for (std::size_t index = 0; index < FormatCount * FormatSteps; ++index) {
+        since.formatNanoseconds[index] = current.formatNanoseconds[index] - reported.formatNanoseconds[index];
+        since.formatStepDraws[index] = current.formatStepDraws[index] - reported.formatStepDraws[index];
+    }
+    for (std::size_t index = 0; index < FormatCount; ++index) since.formatDraws[index] = current.formatDraws[index] - reported.formatDraws[index];
+    for (std::size_t index = 0; index < FormatCount * JobFields; ++index) since.jobs[index] = current.jobs[index] - reported.jobs[index];
     reported = current;
     printed.store(0, std::memory_order_relaxed);
     bufferPrinted.store(0, std::memory_order_relaxed);
@@ -336,6 +397,25 @@ void Report(bool force) {
     std::uint64_t splitDraws = 0;
     for (auto index = static_cast<std::size_t>(Step::BuffersPrepare); index < StepCount; ++index) splitDraws += since.stepDraws[index];
     if (splitDraws != 0) AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] split us per direct draw: buffers prepare %.2f, settle %.2f, place %.2f; hand-off fragment %.2f, commit %.2f\n", perDraw(Step::BuffersPrepare), perDraw(Step::BuffersSettle), perDraw(Step::BuffersPlace), perDraw(Step::Fragment), perDraw(Step::Commit));
+    if (since.formatDraws[static_cast<std::size_t>(StepFormat::Ticket)] != 0 || since.jobs[0] + since.jobs[JobFields] != 0) {
+        std::string byFormat;
+        constexpr std::array<const char*, FormatCount> FormatNames{"hits", "tickets"};
+        for (std::size_t slot = 0; slot < FormatCount; ++slot) {
+            const auto lap = [&](Step step) {
+                const auto index = slot * FormatSteps + static_cast<std::size_t>(step);
+                return since.formatStepDraws[index] == 0 ? 0.0 : static_cast<double>(since.formatNanoseconds[index]) / static_cast<double>(since.formatStepDraws[index]) / 1000.0;
+            };
+            double sum = 0.0;
+            for (std::size_t step = 0; step < FormatSteps; ++step) sum += lap(static_cast<Step>(step));
+            const auto* const job = &since.jobs[slot * JobFields];
+            const auto perJob = [&](std::size_t field) { return job[0] == 0 ? 0.0 : static_cast<double>(job[field]) / static_cast<double>(job[0]); };
+            char item[512];
+            std::snprintf(item, sizeof(item), "%s%s %llu sampled: us per direct draw request %.2f, invocation %.2f, walk %.2f, key %.2f, side %.2f, class %.2f, checks %.2f, buffers %.2f, inputs %.2f, hand-off %.2f (sum %.2f); per job (%llu with allocation counts) %.1f allocations and %.1f frees, %.1f and %.1f after the resolve", slot == 0 ? "" : "; ", FormatNames[slot], static_cast<unsigned long long>(since.formatDraws[slot]), lap(Step::Request), lap(Step::Invocation), lap(Step::Walk), lap(Step::Key), lap(Step::Side), lap(Step::Class), lap(Step::Checks), lap(Step::Buffers), lap(Step::Inputs), lap(Step::HandOff), sum, static_cast<unsigned long long>(job[0]), perJob(1), perJob(2), perJob(3), perJob(4));
+            byFormat += item;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] by format: %s\n", byFormat.c_str());
+    }
+    DrawTickets::Report();
     if (at(Counter::CensusHits) != 0) {
         const auto share = [&](Counter part, Counter whole) { return at(whole) == 0 ? 0.0 : 100.0 * static_cast<double>(at(part)) / static_cast<double>(at(whole)); };
         AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] repeat census: %llu hits, %llu ranges, %llu bytes; %.1f%% of bytes and %.1f%% of ranges repeat a range this thread uploaded with equal bytes; %.1f%% of hits repeat every slice\n",

@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -76,6 +77,7 @@ struct InPlaceIndices {
 };
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart);
 
+struct PreparedInputsView;
 struct PreparedInputs {
     enum class Refusal : std::uint8_t { None, NoRecipe, Shape, NotInPlace, Inaccessible, Thrown };
     struct Range {
@@ -105,7 +107,32 @@ struct PreparedInputs {
     std::vector<Range> ranges;
     std::size_t indirectRanges = 0;
     bool exactCapacity = false;
+    PreparedInputsView View() const;
 };
+struct PreparedInputsView {
+    const DrawRecipe* recipe = nullptr;
+    VkDevice device = VK_NULL_HANDLE;
+    const State* state = nullptr;
+    const Pm4::DrawParameters* draw = nullptr;
+    const CompiledShader* shaders = nullptr;
+    std::size_t stages = 0;
+    std::uint64_t forget = 0;
+    std::uint64_t imports = 0;
+    std::uint64_t mapping = 0;
+    std::uint64_t indexBytes = 0;
+    std::uint32_t maxIndex = 0;
+    std::size_t indirectRanges = 0;
+    std::span<const PreparedInputs::Range> ranges;
+    std::span<const std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
+};
+inline PreparedInputsView PreparedInputs::View() const {
+    return {recipe.get(), device, state, draw, shaders, stages, forget, imports, mapping, indexBytes, maxIndex, indirectRanges, ranges, inPlaceReads};
+}
+struct KeptOwner {
+    const void* owner = nullptr;
+    std::size_t bytes = 0;
+};
+enum class FollowFormat : std::uint8_t { Hit, Ticket, PrefetchedTicket, Count };
 bool PrepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, PreparedInputs& prepared);
 enum class InputsMemoOutcome : std::uint8_t { None, Hit, MissKey, MissSerial, Indirect };
 struct InputsMemoNote {
@@ -201,6 +228,7 @@ void NoteExpressNonFollower(bool attempted, std::uint64_t attemptNanoseconds, st
 void DropExpressFollowVerify();
 void NoteExpressFollowDue(bool due);
 bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffers& prepared, PreparedInputs& preparedInputs, DrawFragment& fragment);
+bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawRecordCommit& record, const ShaderResources::PreparedBuffersView& prepared, const PreparedInputsView& preparedInputs, DrawFragment& fragment, std::span<const KeptOwner> owners, FollowFormat format = FollowFormat::Hit);
 std::uint64_t ExpressVerifyEvery();
 enum class RepeatRefusal : std::uint8_t { NoBlock, NotSimple, VerifyDue, Shape, Objects, Batch, Pass, Epoch, ProofSerial, Pending, Depth, Target, Access, Stores, Linear, Buffers, Selection, DepthGuards, Inputs, Changed, MovedHazard, UnmovedHazard, Count };
 inline constexpr std::array<const char*, static_cast<std::size_t>(RepeatRefusal::Count)> RepeatRefusalNames{"no block", "not simple", "verify due", "shape", "objects", "another batch", "pass", "collect epoch", "proof serial", "pending stores", "depth surfaces", "target changed", "pass access", "queued stores", "drawn linear targets", "no prepared buffers", "selection", "depth guards", "inputs", "changed by the inputs", "moved-range hazard", "unmoved-range hazard"};

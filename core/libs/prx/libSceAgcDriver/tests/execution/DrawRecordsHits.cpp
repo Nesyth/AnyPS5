@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTickets.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StagePlanReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
@@ -1049,6 +1050,7 @@ void Direct(bool ring) {
     const bool buffers = RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers);
     const bool inputs = RuntimeSwitches::Set(RuntimeSwitch::DirectInputs);
     const bool repeat = RuntimeSwitches::Set(RuntimeSwitch::DirectRepeat);
+    const bool tickets = RuntimeSwitches::Set(RuntimeSwitch::DrawTickets);
     std::vector<State> cycled;
     for (std::uint32_t format = 0; format < RawFormats.size(); ++format) cycled.push_back({Kind::Format, format, 16, 3});
     const std::vector<std::pair<std::string, std::vector<State>>> sets{
@@ -1061,6 +1063,9 @@ void Direct(bool ring) {
         {"a buffer format word cycling", cycled},
     };
     const auto base = DirectTotals::Now();
+    namespace DrawTickets = AgcDriver::DriverDetail::DrawTickets;
+    const auto ticketsBase = DrawTickets::Total(DrawTickets::Counter::Made);
+    const auto eligibleBase = DrawTickets::Total(DrawTickets::Counter::Eligible);
     for (const auto& [name, states] : sets) {
         RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
         RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
@@ -1085,6 +1090,13 @@ void Direct(bool ring) {
             for (std::size_t index = 0; index < states.size(); ++index) Require(Render(states[index], DrawsPerSubmission) == today[index], "direct draws without repeat commits, " + name + ": submission " + std::to_string(index) + " rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before));
             RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, true);
         }
+        if (tickets) {
+            for (std::size_t index = 0; index < states.size(); ++index) {
+                RuntimeSwitches::Assign(RuntimeSwitch::DrawTickets, (index & 1u) != 0);
+                Require(Render(states[index], DrawsPerSubmission) == today[index], "direct draws with draw tickets switched every submission, " + name + ": submission " + std::to_string(index) + " rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before));
+            }
+            RuntimeSwitches::Assign(RuntimeSwitch::DrawTickets, true);
+        }
         for (std::size_t index = 0; index < states.size(); ++index) Require(Render(states[index], DrawsPerSubmission) == today[index], "direct draws, " + name + ": submission " + std::to_string(index) + " rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before));
         RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
         const auto after = DirectTotals::Now();
@@ -1106,6 +1118,12 @@ void Direct(bool ring) {
     const auto verified = now.Since(base, DirectCounter::VerifyChecked);
     if (DirectReport::VerifyEvery() == 1) Require(direct == 0 && verified != 0, "direct draws: with every direct job due for a verify, a class hit committed directly or none was verified" + DescribeDirect(now, base));
     else Require(direct != 0, "direct draws: no draw committed directly" + DescribeDirect(now, base));
+    if (tickets && DirectReport::VerifyEvery() != 1) {
+        const auto made = DrawTickets::Total(DrawTickets::Counter::Made) - ticketsBase;
+        const auto eligible = DrawTickets::Total(DrawTickets::Counter::Eligible) - eligibleBase;
+        std::cout << "direct draws: " << made << " of " << eligible << " direct hits at the commit crossed as draw tickets\n";
+        Require(made != 0, "direct draws: with draw tickets on, none of " + std::to_string(eligible) + " direct hits at the commit crossed to the committer as a ticket" + DescribeDirect(now, base));
+    }
     if (DirectReport::VerifyEvery() > 1) Require(verified != 0, "direct draws: the verify checked no class hit" + DescribeDirect(now, base));
     if (DirectReport::VerifyEvery() != 1 && DrawRecords::VerifyEvery() > 1) Require(now.commitChecks > base.commitChecks, "direct draws: the committer verify checked no direct hit" + DescribeDirect(now, base));
     if (inputs && DirectReport::VerifyEvery() != 1 && DrawRecords::VerifyEvery() != 1) {

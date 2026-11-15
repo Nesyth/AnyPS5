@@ -345,6 +345,7 @@ public:
     // stage, an address table, an object that is not reusable, or bindings MovedReadOnlyBuffers
     // refuses whatever the draw).
     const std::shared_ptr<const BufferPlan>& DirectBufferPlan(std::span<const CompiledShader> shaders) const;
+    struct PreparedBuffersView;
     // A draw's buffers as MovedReadOnlyBuffers and selectDrawSnapshots (movedOnly false) decide
     // them, without their hazard tests: the moved list (its words point into the draw's stages),
     // the selected allocations in ascending order with their guest ranges (moved data words: begin
@@ -390,6 +391,20 @@ public:
         std::uint8_t shortcuts = 0;
         std::uint32_t lookupsDeferred = 0;
         std::uint32_t lookupsForced = 0;
+        PreparedBuffersView View() const;
+    };
+    struct PreparedBuffersView {
+        const BufferPlan* plan = nullptr;
+        std::span<const MovedBuffer> moved;
+        std::span<const PreparedBuffers::Selected> selected;
+        std::span<const std::byte> blob;
+        std::uint64_t generation = 0;
+        std::uint64_t depthGuards = 0;
+        std::uint64_t forget = 0;
+        std::uint64_t imports = 0;
+        std::uint64_t mapping = 0;
+        bool inPlace = false;
+        bool aliasesClear = false;
     };
     enum class BindingTaken : std::uint8_t { None, Placed, Copied, OtherDevice, Count };
     enum class DynamicLeave : std::uint8_t { None, Refused, Prepared, Stages, HeapPipeline, Heap, Address, AfterBind, Addressed, Faults, Shape, Uniform, OtherType, Flags, NoStorage, Limit, PushHeld, OtherSet, First, Repeats, Pipeline, Rebound, Count };
@@ -499,12 +514,14 @@ public:
     ExpressMiss ExpressCurrentFollowing();
     void ExpressStage(Recorder& recorder);
     PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched = false) const;
+    PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffersView& prepared, bool untouched) const;
     struct GuardTests {
         bool (*depth)(void* tests, std::uint64_t address, std::uint64_t bytes) = nullptr;
         bool (*multisample)(void* tests, std::uint64_t address, std::uint64_t bytes) = nullptr;
         void* tests = nullptr;
     };
     PreparedBuffers::Selection FragmentSelectionHoldsBy(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, bool untouched, const GuardTests* guards) const;
+    PreparedBuffers::Selection FragmentSelectionHoldsBy(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffersView& prepared, bool untouched, const GuardTests* guards) const;
     void PushFragmentBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& bindings, const PushPlan& plan) const;
     void WriteFragmentSets(DrawBindings& result, std::span<const std::size_t> selected, std::int32_t pushedSet) const;
     struct FragmentPlanNote {
@@ -623,6 +640,7 @@ public:
     bool PreparedZonesClear(const PreparedBuffers& prepared, const Recorder& recorder) const;
     using ZoneClear = bool (*)(void* tests, std::uint64_t begin, std::size_t bytes, bool moved);
     bool PreparedZonesClearBy(const PreparedBuffers& prepared, ZoneClear clear, void* tests) const;
+    bool PreparedZonesClearBy(const PreparedBuffersView& prepared, ZoneClear clear, void* tests) const;
     bool PreparedInPlaceHolds(const PreparedBuffers& prepared, const Recorder& recorder, bool& behind) const;
     static void NotePreparedInPlaceTaken(const PreparedBuffers& prepared);
     static bool PreparedInPlaceOverlaps(const PreparedBuffers& prepared, std::uint64_t begin, std::uint64_t end);
@@ -1241,7 +1259,7 @@ private:
     // range's bytes (selectDrawSnapshots then selects), with the reason in `selection`. `binds`:
     // the draw binds it, so its snapshots count in the moved-upload tally and the capture trace.
     std::shared_ptr<DrawBindings> selectPreparedSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, std::vector<std::size_t>& selected, bool binds, PreparedBuffers::Selection& selection, BindingRoute* route = nullptr) const;
-    bool unmovedClear(const Recorder& recorder, const PreparedBuffers& prepared, BindingRoute* route) const;
+    bool unmovedClear(const Recorder& recorder, const PreparedBuffersView& prepared, BindingRoute* route) const;
     mutable std::uint64_t clearRecorder = 0;
     mutable std::uint64_t clearNote = 0;
     mutable std::size_t clearWrites = 0;
@@ -1328,6 +1346,7 @@ private:
     static std::uint64_t NextPlanSerial();
     std::uint64_t planSerial = NextPlanSerial();
     bool preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched = false, const GuardTests* guards = nullptr) const;
+    bool preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffersView& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched, const GuardTests* guards) const;
     void pushBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const;
     void writeOwnDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     mutable std::unique_ptr<PushPlan> pushPlan;
@@ -1484,6 +1503,10 @@ private:
     bool completed = false;
     std::chrono::steady_clock::time_point phaseStart;
 };
+
+inline ShaderResources::PreparedBuffersView ShaderResources::PreparedBuffers::View() const {
+    return {plan.get(), moved, selected, blob, generation, depthGuards, forget, imports, mapping, inPlace, aliasesClear};
+}
 
 // Built ShaderResources by the content the build consumed (see ShaderResources::ContentKey), so a
 // dispatch or recorded draw repeating an earlier one binds the earlier descriptor set instead of

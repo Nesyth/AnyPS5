@@ -223,6 +223,7 @@ struct DrawRecordHit {
     Graphics::ShaderResources::PreparedBuffers spareBuffers;
     Graphics::PreparedInputs spareInputs;
     bool pooled = false;
+    bool moveSides = false;
     std::shared_ptr<VulkanDevice> device;
     std::shared_ptr<const DrawDecode> decode;
     Graphics::DrawTraceContext trace{};
@@ -230,6 +231,19 @@ struct DrawRecordHit {
     std::uint64_t shape = 0;
     std::uint32_t queue = 0;
     std::uint32_t opcode = 0;
+};
+
+struct FollowParts {
+    bool direct = false;
+    std::uint64_t token = 0;
+    DrawRecordCommit& commit;
+    const Pm4::DrawParameters& parameters;
+    std::span<const Graphics::CompiledShader> stages;
+    const Graphics::ShaderResources::PreparedBuffersView* buffers = nullptr;
+    const Graphics::PreparedInputsView* inputs = nullptr;
+    DrawFragment* fragment = nullptr;
+    std::span<const Graphics::KeptOwner> owners;
+    Graphics::FollowFormat format = Graphics::FollowFormat::Hit;
 };
 
 namespace DrawRecordFlags {

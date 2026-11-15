@@ -8314,6 +8314,10 @@ bool ShaderResources::PreparedZonesClear(const PreparedBuffers& prepared, const 
 }
 
 bool ShaderResources::PreparedZonesClearBy(const PreparedBuffers& prepared, ZoneClear clear, void* tests) const {
+    return PreparedZonesClearBy(prepared.View(), clear, tests);
+}
+
+bool ShaderResources::PreparedZonesClearBy(const PreparedBuffersView& prepared, ZoneClear clear, void* tests) const {
     if ((prepared.forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared.forget) return false;
     for (const auto& entry : prepared.moved) {
         const auto& item = allocations[entry.allocation];
@@ -8981,7 +8985,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::selectDrawSnapsh
     return result;
 }
 
-bool ShaderResources::unmovedClear(const Recorder& recorder, const PreparedBuffers& prepared, BindingRoute* route) const {
+bool ShaderResources::unmovedClear(const Recorder& recorder, const PreparedBuffersView& prepared, BindingRoute* route) const {
     const bool stamps = route != nullptr && route->stamps;
     if (stamps && (clearRecorder != recorder.Id() || clearNote != recorder.WriteNoteCount() || clearWrites != guestMemory.Writes().size() || clearAllocations.size() != allocations.size())) {
         clearRecorder = recorder.Id();
@@ -9174,7 +9178,25 @@ ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHo
     return selection;
 }
 
+ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffersView& prepared, bool untouched) const {
+    auto selection = PreparedBuffers::Selection::Hazard;
+    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, nullptr, untouched, nullptr));
+    return selection;
+}
+
+ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHoldsBy(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffersView& prepared, bool untouched, const GuardTests* guards) const {
+    auto selection = PreparedBuffers::Selection::Hazard;
+    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, nullptr, untouched, guards));
+    return selection;
+}
+
 bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched, const GuardTests* guards) const {
+    if (!preparedSelectionHolds(recorder, moved, prepared.View(), selection, route, untouched, guards)) return false;
+    if (route != nullptr) route->selection = &prepared;
+    return true;
+}
+
+bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffersView& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched, const GuardTests* guards) const {
     using Selection = PreparedBuffers::Selection;
     selection = Selection::Hazard;
     const auto& plan = *prepared.plan;
@@ -9210,7 +9232,6 @@ bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const
         }
     }
     selection = Selection::Taken;
-    if (route != nullptr) route->selection = &prepared;
     return true;
 }
 

@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDraws.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTickets.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/LeanDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StagePlanReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -1562,6 +1563,64 @@ void Driver::commitRecordDraw(const LeanDrawJob& job, const LeanAnchor& anchor, 
     DrawPipeline::Queue0().Enqueue(std::move(commit), std::move(writes), 0, {}, std::move(reads), true);
 }
 
+bool Driver::commitTicketDraw(const LeanDrawJob& job, const LeanAnchor& anchor, DrawRecordHit& draft, TicketArena& arena) {
+    auto refusal = TicketFallback::Count;
+    auto* const ticket = FlattenTicket(arena, draft, job, anchor.device, refusal);
+    if (ticket == nullptr) {
+        DrawTickets::AddFallback(refusal);
+        if (draft.owner != nullptr) draft.record = static_cast<const DirectClass*>(draft.owner.get())->record;
+        const auto* const drafted = &draft.parameters;
+        auto hit = std::make_shared<DrawRecordHit>(std::move(draft));
+        if (hit->preparedInputs.has_value() && hit->preparedInputs->draw == drafted) hit->preparedInputs->draw = &hit->parameters;
+        commitRecordDraw(job, anchor, std::move(hit));
+        return false;
+    }
+    struct Abandon {
+        DrawTicket* held;
+        ~Abandon() {
+            if (held != nullptr) AbandonTicket(held);
+        }
+    } abandon{ticket};
+    auto writes = draft.record->writes;
+    DrawPipeline::Commit commit = [this, ticket] { commitTicket(ticket); };
+    const auto reads = ticket->Reads();
+    const auto lines = (ticket->followerBytes + 63u) / 64u;
+    abandon.held = nullptr;
+    DrawPipeline::Queue0().EnqueueTicket(std::move(commit), std::move(writes), reads, ticket, lines);
+    return true;
+}
+
+void Driver::commitTicket(void* held) {
+    auto& ticket = *static_cast<DrawTicket*>(held);
+    DrawPipeline::FollowEpoch(ticket.epoch);
+    GuestMemory::SetCurrentPacket(ticket.opcode, ticket.queue);
+    const bool following = ticket.device != nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow);
+    const bool attempted = following && Graphics::ExpressRunLed();
+    static std::uint32_t itemOrdinal = 0;
+    const bool timed = following && (++itemOrdinal & 7u) == 0;
+    const auto began = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (attempted) {
+        const bool prefetched = DrawPipeline::TicketPrefetched();
+        std::array<Graphics::KeptOwner, 2> recomputed{};
+        const auto owners = FollowerOwners(ticket, recomputed);
+        const auto buffers = ticket.BuffersView();
+        const auto inputs = ticket.InputsView();
+        const FollowParts parts{true, ticket.trace.token, *ticket.commit, ticket.parameters, ticket.Stages(), ticket.Has(DrawTicket::Buffers) ? &buffers : nullptr, ticket.Has(DrawTicket::Inputs) ? &inputs : nullptr, ticket.Has(DrawTicket::Fragment) ? &ticket.fragment : nullptr, owners, prefetched ? Graphics::FollowFormat::PrefetchedTicket : Graphics::FollowFormat::Ticket};
+        if (followCore(*ticket.device, ticket.queue, *ticket.state, parts)) {
+            DrawTickets::NoteCommit(true, prefetched);
+            return;
+        }
+    }
+    const auto committing = timed && attempted ? std::chrono::steady_clock::now() : began;
+    {
+        ThawedTicket thawed{ticket};
+        commitRecord(thawed.TakeDevice(), ticket.queue, *ticket.state, thawed.Hit(), ticket.trace, ticket.shape);
+    }
+    if (timed) Graphics::NoteExpressNonFollower(attempted, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(committing - began).count()), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - committing).count()));
+    DrawTickets::NoteCommit(false, false);
+    if (following) Graphics::DropExpressFollowVerify();
+}
+
 namespace {
 
 DrawRecords::Counter CommitMiss(Graphics::DrawRecipeMiss miss) {
@@ -1943,6 +2002,13 @@ bool ordinalDue(std::uint64_t ordinal, std::uint64_t every) {
 }
 
 bool Driver::followRecord(VulkanDevice& localDevice, std::uint32_t queue, const Graphics::State& graphics, DrawRecordHit& hit, const VulkanDevice::DrawTraceContext& trace) {
+    const auto buffers = hit.preparedBuffers.has_value() ? hit.preparedBuffers->View() : Graphics::ShaderResources::PreparedBuffersView{};
+    const auto inputs = hit.preparedInputs.has_value() ? hit.preparedInputs->View() : Graphics::PreparedInputsView{};
+    const FollowParts parts{hit.direct, trace.token, *hit.record->commit, hit.parameters, hit.stages, hit.preparedBuffers.has_value() ? &buffers : nullptr, hit.preparedInputs.has_value() ? &inputs : nullptr, hit.fragment.has_value() ? &*hit.fragment : nullptr, {}, Graphics::FollowFormat::Hit};
+    return followCore(localDevice, queue, graphics, parts);
+}
+
+bool Driver::followCore(VulkanDevice& localDevice, std::uint32_t queue, const Graphics::State& graphics, const FollowParts& parts) {
     using Refusal = Graphics::ExpressRunRefusal;
     static std::uint32_t timingOrdinal = 0;
     const bool timed = (++timingOrdinal & 7u) == 0;
@@ -1953,8 +2019,8 @@ bool Driver::followRecord(VulkanDevice& localDevice, std::uint32_t queue, const 
         Graphics::RefuseExpressFollow(why);
         return false;
     };
-    auto& commit = *hit.record->commit;
-    if (!hit.direct || trace.token != 0 || commit.recipe == nullptr || commit.writers != 1 || !commit.bufferPlanAsked || !commit.inputsRecipeAsked || !hit.fragment.has_value() || !hit.preparedBuffers.has_value() || !hit.preparedInputs.has_value()) return refuse(Refusal::NotDirect);
+    auto& commit = parts.commit;
+    if (!parts.direct || parts.token != 0 || commit.recipe == nullptr || commit.writers != 1 || !commit.bufferPlanAsked || !commit.inputsRecipeAsked || parts.fragment == nullptr || parts.buffers == nullptr || parts.inputs == nullptr) return refuse(Refusal::NotDirect);
     static const bool verifies = DrawRecords::VerifyEvery() != 0 || DirectDraws::BufferVerifyEvery() != 0 || DirectDraws::InputVerifyEvery() != 0 || Graphics::CommitFragmentsVerifyEvery() != 0 || Graphics::ExpressVerifyEvery() != 0;
     auto& ordinals = commitOrdinals;
     bool expressDue = false;
@@ -1974,7 +2040,7 @@ bool Driver::followRecord(VulkanDevice& localDevice, std::uint32_t queue, const 
     commit.verifyInputs = false;
     const auto attempts = Graphics::ExpressFollowAttempts();
     if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FollowWider)) Graphics::NoteExpressFollowDue(expressDue);
-    if (!localDevice.ExpressFollow(graphics, hit.parameters, hit.stages, commit, *hit.preparedBuffers, *hit.preparedInputs, *hit.fragment)) {
+    if (!localDevice.ExpressFollow(graphics, parts.parameters, parts.stages, commit, *parts.buffers, *parts.inputs, *parts.fragment, parts.owners, parts.format)) {
         if (Graphics::ExpressFollowAttempts() == attempts) return refuse(Refusal::Device);
         flushFollowTally(tally);
         return false;

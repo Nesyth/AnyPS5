@@ -177,6 +177,12 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(con
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> QueuedDrawReadRanges(const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    QueuedDrawReadRangesInto(draw, stages, ranges);
+    return ranges;
+}
+
+void QueuedDrawReadRangesInto(const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    ranges.clear();
     ranges.reserve(16);
     const auto add = [&](std::uint64_t begin, std::uint64_t bytes) {
         if (begin == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - begin) return;
@@ -187,7 +193,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> QueuedDrawReadRanges(const 
         add(draw.indirect->arguments, std::max<std::uint64_t>(draw.indirect->RangeBytes(), draw.indirect->recordBytes));
         if (draw.indirect->countIndirect) add(draw.indirect->countAddress, 4);
     }
-    if (stages.empty()) return ranges;
+    if (stages.empty()) return;
     for (const auto& stage : stages) {
         if (stage.program == nullptr) continue;
         for (const auto& binding : stage.program->bindings) {
@@ -201,7 +207,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> QueuedDrawReadRanges(const 
             }
         }
     }
-    if (stages.empty() || stages.front().program == nullptr) return ranges;
+    if (stages.empty() || stages.front().program == nullptr) return;
     for (const auto& attribute : Graphics::DrawVertexAttributes(stages.front())) {
         if (Graphics::NullVertexDescriptor(attribute)) continue;
         const auto address = attribute.resource.fields[0] | (static_cast<std::uint64_t>(attribute.resource.fields[1] & 0xffffu) << 32u);
@@ -214,7 +220,6 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> QueuedDrawReadRanges(const 
         }
         add(address, bytes);
     }
-    return ranges;
 }
 
 std::optional<WrittenBuffer> Driver::newestWriterLocked(std::uint64_t begin, std::uint64_t end) const {

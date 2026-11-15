@@ -219,6 +219,8 @@ enum class RuntimeSwitch : std::size_t {
     PendingFronts,
     InvocationSlotsWide,
     XpSkipDispatches,
+    DrawTickets,
+    TicketPrefetch,
     Count,
 };
 
