@@ -707,7 +707,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 || Graphics::HtileDepthClearAddress(code, userData, compute.numThreads) != 0
                 || Graphics::MatchHtileBufferMaskClear(code, userData, compute, packet, indirectArguments).has_value()
                 || Graphics::MatchHtileZmaskFixup(code, userData, compute, packet, indirectArguments).has_value();
-            if (sideEffects) DrawFinisher::Get().Drain();
+            if (sideEffects && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpNoPacketDrains)) DrawFinisher::Get().Drain();
         }
         if (indirectArguments == 0 && Graphics::TakeMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) {
             census.outcome = CensusOutcome::Clear;

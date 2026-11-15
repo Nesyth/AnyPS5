@@ -996,7 +996,7 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                 }
             }
             const bool beside = DrawFinisher::Overlap() && (opcode != 0x15 || dispatchBeside) && (queuesLabel || heldLabelWait || queuesSampleDump || keeps);
-            if (!beside) {
+            if (!beside && !LeanFront::SwitchSet(frontLatch, RuntimeSwitch::XpNoPacketDrains)) {
                 DrawFinisher::Get().Drain(true);
                 listVerdictKnown = false;
             }
