@@ -1,12 +1,14 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/IndirectDispatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 namespace AgcDriver::DriverDetail {
 
@@ -54,6 +56,20 @@ int Driver::indirectArgumentsPath(std::span<const std::uint32_t> packet, std::ui
     if ((packet.back() & 0x20u) != 0 && !gpuThreadDimensions) return IndirectThreadDimensions;
     if (arguments % 4 != 0) return IndirectMisaligned;
     return IndirectGpu;
+}
+
+bool Driver::argumentWaitWanted(std::span<const std::uint32_t> packet, const QueueState& queue, bool predicated, std::pair<std::uint64_t, std::uint64_t>& range) {
+    if (predicated || packet.size() < 2 || !DrawFinisher::Overlap() || !DrawFinisher::FrameFlow() || !deferredLabels().labels.empty()) return false;
+    std::uint64_t address = 0;
+    if (packet.size() == 4) {
+        address = packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u);
+    } else {
+        if (queue.dispatchIndirectBase == 0 || packet[1] > std::numeric_limits<std::uint64_t>::max() - queue.dispatchIndirectBase) return false;
+        address = queue.dispatchIndirectBase + packet[1];
+    }
+    if (address > std::numeric_limits<std::uint64_t>::max() - 12u || indirectArgumentsPath(packet, address) == IndirectGpu) return false;
+    range = {address, address + 12u};
+    return true;
 }
 
 Driver::IndirectSource& Driver::indirectSource() {

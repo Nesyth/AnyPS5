@@ -241,6 +241,7 @@ enum class RuntimeSwitch : std::size_t {
     DeepFlow,
     TailsAhead,
     FixupsByTurn,
+    FrameFlow,
     Count,
 };
 
@@ -298,6 +299,7 @@ public:
     explicit AbSchedule(Config config);
 
     Step AtPresent(std::uint64_t present, double seconds);
+    bool BeginDue(std::uint64_t present, double seconds) const;
 
     const Config& Settings() const { return config; }
 
@@ -314,6 +316,13 @@ private:
 bool AbConfigured();
 std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds);
 std::vector<std::string> AbAtPresent(std::uint64_t present);
+double AbClockSeconds();
+bool AbBeginDue(std::uint64_t present, double seconds);
+
+enum class FrameState : std::uint8_t { FlipSerial, ImportFloor };
+using FrameStateReader = void (*)(FrameState state);
+void SetFrameStateReader(FrameStateReader reader);
+void NoteFrameStateRead(FrameState state);
 
 }
 

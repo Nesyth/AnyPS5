@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketRules.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
@@ -198,6 +199,22 @@ private:
             Release();
             if (working) driver.finishFlipWork(0);
         }
+    };
+    struct FlipProbe {
+        std::uint64_t jobs = 0;
+        std::uint64_t items = 0;
+    };
+    struct FlipCommit {
+        std::shared_ptr<IFlipRequest> request;
+        std::shared_ptr<FrameTiming> frame;
+        std::uint64_t frameNumber = 0;
+        std::uint64_t serial = 0;
+        std::uint32_t cursor = 0;
+        bool header = false;
+        bool label = false;
+        std::array<std::uint32_t, 8> words{};
+        bool releases = false;
+        std::shared_ptr<FlipProbe> probe;
     };
     void stop();
     Driver();
@@ -580,6 +597,12 @@ private:
     void execute(const Submission& submission);
     void deliverGuestEopInterrupt(std::uint32_t queue, std::uint32_t context);
     void abAtFlip();
+    void abAtFlip(double seconds);
+    bool flipOrdered(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool predicated, PacketRules::FlipForm& form, double& abSeconds);
+    void queueOrderedFlip(FlipCommit commit);
+    void commitFlip(const FlipCommit& flip);
+    PacketRules::DmaForm dmaPacketForm(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue);
+    bool argumentWaitWanted(std::span<const std::uint32_t> packet, const QueueState& queue, bool predicated, std::pair<std::uint64_t, std::uint64_t>& range);
     static std::optional<std::uint32_t> releaseInterrupt(std::span<const std::uint32_t> packet, std::uint32_t opcode, bool carriesFlip);
     void markCompleted(std::uint64_t serial);
     static const std::atomic<std::uint64_t>*& workerQueued();

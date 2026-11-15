@@ -35,7 +35,7 @@ namespace {
 
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainNames{"packet", "flush", "labels", "capture", "indirect", "submission"};
 
-constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)> KindNames{"other", "draw", "indirect", "colormeta", "dispatch", "sampledump", "dmafill", "dmawrite", "dmacopy", "store", "endofpipe", "seal", "submitend", "completion", "bufferfill"};
+constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)> KindNames{"other", "draw", "indirect", "colormeta", "dispatch", "sampledump", "dmafill", "dmawrite", "dmacopy", "store", "endofpipe", "seal", "submitend", "completion", "bufferfill", "flip"};
 
 std::atomic<unsigned> runningCommitters{0};
 std::atomic<unsigned> runningFinishers{0};
@@ -999,6 +999,114 @@ void noteDeepDepth(std::uint64_t depth) {
 }
 }
 
+namespace {
+constexpr std::array<const char*, static_cast<std::size_t>(FrameKept::Count)> FrameKeptNames{"not latched", "ab phase", "sync flip", "timing log", "predicated", "label form", "deferred labels", "full loop segment end", "full loop settle", "front change", "exception", "indirect gpu", "index inconsistent", "dma copy", "dma to gds", "dma refused", "unknown chain limit", "exact index unsure", "worker dma, sample dump or note behind a flip"};
+constexpr std::array<const char*, static_cast<std::size_t>(FrameSite::Count)> FrameSiteNames{"ordered flip", "rendering wait", "segment end", "exit wait", "exit free", "argument wait", "write scan", "key scan", "queued scan", "dma beside", "register list wait", "resolved unknown jobs passed", "resolve wait"};
+static_assert(FrameKeptNames.back() != nullptr && FrameSiteNames.back() != nullptr, "every frame flow census entry needs a name");
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrameKept::Count)> frameKept{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrameSite::Count)> frameSites{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrameSite::Count)> frameSiteNs{};
+std::atomic<std::uint64_t> flipDistances{0};
+std::atomic<std::uint64_t> flipJobsSum{0};
+std::atomic<std::uint64_t> flipJobsHighest{0};
+std::atomic<std::uint64_t> flipItemsSum{0};
+std::atomic<std::uint64_t> flipItemsHighest{0};
+std::atomic<std::uint64_t> flipsInFlightSum{0};
+std::atomic<std::uint64_t> flipsInFlightHighest{0};
+
+void noteFrameHighest(std::atomic<std::uint64_t>& highest, std::uint64_t value) {
+    if (value > highest.load(std::memory_order_relaxed)) highest.store(value, std::memory_order_relaxed);
+}
+
+constexpr std::array<const char*, static_cast<std::size_t>(FrameCheck::Count)> FrameCheckNames{"flip order", "item order", "lifetime", "flip state", "dispatch arguments", "fallback scan", "segment end", "ab phase", "register list", "dma order"};
+static_assert(FrameCheckNames.back() != nullptr, "every frame flow check needs a name");
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrameCheck::Count)> frameCheckOrdinals{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrameCheck::Count)> frameChecked{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrameCheck::Count)> frameDiffering{};
+std::atomic<std::uint64_t> frameVerifyPrinted{0};
+std::atomic<std::int64_t> frameVerifyWindow{0};
+
+constexpr std::size_t TailKeptReasons = static_cast<std::size_t>(DeepKept::Count);
+constexpr std::size_t TailSiteReasons = static_cast<std::size_t>(DeepSite::Count);
+enum class TailExtra : std::uint32_t { RingRoom, QueueRoom, Exit, Resolve, Other, RenderingWait, RewindTail, NoSubmission, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(TailExtra::Count)> TailExtraNames{"finisher ring room", "committer queue room", "exit", "unknown writes resolving", "other", "rendering wait", "rewind tail release", "no submission"};
+static_assert(TailExtraNames.back() != nullptr, "every tail wait reason needs a name");
+constexpr std::size_t TailReasons = TailKeptReasons + TailSiteReasons + static_cast<std::size_t>(TailExtra::Count);
+std::array<std::atomic<std::uint64_t>, TailReasons> tailWaits{};
+std::array<std::atomic<std::uint64_t>, TailReasons> tailWaitNs{};
+struct TailReasonSlot {};
+using TailReason = HostThreadSlot<std::uint32_t, TailReasonSlot>;
+
+std::uint32_t tailIndex(TailExtra extra) {
+    return static_cast<std::uint32_t>(TailKeptReasons + TailSiteReasons + static_cast<std::size_t>(extra));
+}
+
+class TailWatch {
+public:
+    explicit TailWatch(bool active, std::optional<TailExtra> fixed = std::nullopt) {
+        if (!active || !pipelineStats() || !FinisherProducer::Get() || FinisherThread::Get()) return;
+        const auto& finisher = DrawFinisher::Get();
+        if (finisher.FlipsQueued() == finisher.FlipsCommitted()) return;
+        const auto held = TailReason::Get();
+        reason = fixed.has_value() ? tailIndex(*fixed) : held != 0 && held <= TailReasons ? held - 1u : tailIndex(TailExtra::Other);
+        start = std::chrono::steady_clock::now();
+    }
+    ~TailWatch() {
+        if (start == std::chrono::steady_clock::time_point{}) return;
+        tailWaits[reason].fetch_add(1, std::memory_order_relaxed);
+        tailWaitNs[reason].fetch_add(elapsedNs(start), std::memory_order_relaxed);
+    }
+    TailWatch(const TailWatch&) = delete;
+    TailWatch& operator=(const TailWatch&) = delete;
+
+private:
+    std::chrono::steady_clock::time_point start{};
+    std::uint32_t reason = 0;
+};
+
+std::mutex rawReadersMutex;
+std::vector<std::pair<const void*, std::uint64_t>> rawReaders;
+std::mutex flipJobsMutex;
+std::deque<std::uint64_t> flipJobs;
+std::atomic<std::uint32_t> flipJobsHeld{0};
+
+void frameStateRead(Graphics::FrameState state) {
+    if (flipJobsHeld.load(std::memory_order_acquire) == 0 || GuestMemory::OnProofThread()) return;
+    std::uint64_t oldest = 0;
+    {
+        const std::lock_guard lock(flipJobsMutex);
+        if (flipJobs.empty()) return;
+        oldest = flipJobs.front();
+    }
+    const char* what = state == Graphics::FrameState::FlipSerial ? "the texture flip serial" : "the import frame floor";
+    if (FinisherThread::Get()) {
+        const auto seq = FinisherSeq::Get();
+        const bool later = seq != 0 && seq >= oldest;
+        DrawFinisher::NoteFrameCheck(FrameCheck::FlipState, later, later ? "finisher job " + std::to_string(seq) + " read " + what + " before the flip queued ahead of job " + std::to_string(oldest) + " was committed" : std::string());
+        return;
+    }
+    if (FinisherProducer::Get()) {
+        DrawFinisher::NoteFrameCheck(FrameCheck::FlipState, true, std::string("the queue worker read ") + what + " before the flip queued ahead of job " + std::to_string(oldest) + " was committed");
+        return;
+    }
+    DrawFinisher::NoteFrameCheck(FrameCheck::FlipState, false, {});
+}
+}
+
+DrawFinisher::TailScope::TailScope(FrameTail cause) {
+    if (!pipelineStats() || !FinisherProducer::Get() || FinisherThread::Get()) return;
+    const auto& finisher = Get();
+    if (finisher.FlipsQueued() == finisher.FlipsCommitted()) return;
+    reason = tailIndex(cause == FrameTail::RenderingWait ? TailExtra::RenderingWait : cause == FrameTail::RewindTail ? TailExtra::RewindTail : TailExtra::NoSubmission);
+    start = std::chrono::steady_clock::now();
+}
+
+DrawFinisher::TailScope::~TailScope() {
+    if (start == std::chrono::steady_clock::time_point{}) return;
+    tailWaits[reason].fetch_add(1, std::memory_order_relaxed);
+    tailWaitNs[reason].fetch_add(elapsedNs(start), std::memory_order_relaxed);
+}
+
 bool DrawFinisher::aheadWait(std::span<const Range> ranges) {
     if (!FinisherAhead::Get() || !AheadBusy()) return false;
     if (deepRing.load(std::memory_order_acquire)) {
@@ -1153,18 +1261,9 @@ bool DrawFinisher::Deep() {
     return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DeepFlow) && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpFlow) && deepQueues();
 }
 
-namespace {
-constexpr std::array<std::uint32_t, 6> PacketWaitOpcodes{0x50u, 0x63u, 0x64u, 0x9fu, 0x3cu, 0x93u};
-struct PacketWaitTally {
-    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PendingCause::Count)> counts{};
-    std::atomic<std::uint64_t> nanoseconds{0};
-    std::atomic<std::uint64_t> ahead{0};
-};
-std::array<PacketWaitTally, PacketWaitOpcodes.size() + 1> packetWaits{};
-}
-
 void DrawFinisher::NoteDeepKept(DeepKept kept, std::uint32_t opcode) {
     if (!pipelineStats() || !Deep()) return;
+    TailReason::Set(static_cast<std::uint32_t>(kept) + 1u);
     if (!Busy() && DrawPipeline::Queue0().Outstanding() == 0) return;
     deepKept[static_cast<std::size_t>(kept)].fetch_add(1, std::memory_order_relaxed);
     if (kept == DeepKept::PacketVerdict) deepKeptVerdicts[std::min<std::uint32_t>(opcode, 256u)].fetch_add(1, std::memory_order_relaxed);
@@ -1172,6 +1271,7 @@ void DrawFinisher::NoteDeepKept(DeepKept kept, std::uint32_t opcode) {
 
 void DrawFinisher::NoteDeepSite(DeepSite site) {
     if (!pipelineStats() || !Deep()) return;
+    if (site != DeepSite::ItemsByTurn && site != DeepSite::ItemsWithReadsByTurn && site != DeepSite::FillByTurn) TailReason::Set(static_cast<std::uint32_t>(TailKeptReasons + static_cast<std::size_t>(site)) + 1u);
     deepSites[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -1221,20 +1321,6 @@ std::string DrawFinisher::DeepText() {
         std::snprintf(item, sizeof(item), "%s %s %llu (%llu)", index == 0 ? "" : ",", DeepLookupNames[index], take(deepAnswered[index]), take(deepFellBack[index]));
         text += item;
     }
-    text += "; packet waits by opcode (named writer/unknown writes/fallback drain, ms, jobs ahead on average):";
-    for (std::size_t index = 0; index < packetWaits.size(); ++index) {
-        auto& tally = packetWaits[index];
-        const auto writer = take(tally.counts[static_cast<std::size_t>(PendingCause::Writer)]);
-        const auto unknown = take(tally.counts[static_cast<std::size_t>(PendingCause::Unknown)]);
-        const auto fallback = take(tally.counts[static_cast<std::size_t>(PendingCause::Fallback)]);
-        const auto nanoseconds = take(tally.nanoseconds);
-        const auto ahead = take(tally.ahead);
-        if (writer + unknown + fallback == 0) continue;
-        char item[128];
-        if (index < PacketWaitOpcodes.size()) std::snprintf(item, sizeof(item), " 0x%02x %llu/%llu/%llu (%.1f ms, %.1f)", PacketWaitOpcodes[index], writer, unknown, fallback, static_cast<double>(nanoseconds) / 1e6, static_cast<double>(ahead) / static_cast<double>(writer + unknown + fallback));
-        else std::snprintf(item, sizeof(item), " other %llu/%llu/%llu (%.1f ms, %.1f)", writer, unknown, fallback, static_cast<double>(nanoseconds) / 1e6, static_cast<double>(ahead) / static_cast<double>(writer + unknown + fallback));
-        text += item;
-    }
     text += "; targeted waits by site (finisher jobs/committer items):";
     for (std::size_t index = 0; index < deepSiteJobWaits.size(); ++index) {
         char item[96];
@@ -1251,6 +1337,204 @@ std::string DrawFinisher::DeepText() {
     std::snprintf(tail, sizeof(tail), "; index overflows: finisher writes %llu, keys %llu, queued writes %llu; worker lookups scanned for an unsure index %llu; verify every %llu: checked %llu, differing %llu, conservative %llu", since[0], since[1], since[2], since[3], static_cast<unsigned long long>(deepVerifyEvery()), take(deepVerifyChecked), take(deepVerifyDiffering), take(deepVerifyConservative));
     text += tail;
     return text;
+}
+
+bool DrawFinisher::FrameFlowWanted() {
+    return Deep() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FrameFlow);
+}
+
+bool DrawFinisher::FrameFlow() {
+    const auto& finisher = Get();
+    return finisher.frameLatch.load(std::memory_order_acquire) && finisher.frameGeneration.load(std::memory_order_relaxed) == Graphics::RuntimeSwitches::Generation() && FrameFlowWanted();
+}
+
+bool DrawFinisher::FrameCensus() {
+    return pipelineStats();
+}
+
+void DrawFinisher::LatchFrameFlow() {
+    if (!FrameFlowWanted()) {
+        if (frameLatch.load(std::memory_order_relaxed)) frameLatch.store(false, std::memory_order_release);
+        return;
+    }
+    const auto generation = Graphics::RuntimeSwitches::Generation();
+    if (frameLatch.load(std::memory_order_relaxed) && frameGeneration.load(std::memory_order_relaxed) == generation) return;
+    FlushOpenRun();
+    if (Busy() || DrawPipeline::Queue0().Outstanding() != 0) return;
+    frameLatch.store(false, std::memory_order_relaxed);
+    frameGeneration.store(generation, std::memory_order_relaxed);
+    frameLatch.store(true, std::memory_order_release);
+}
+
+void DrawFinisher::NoteFrameKept(FrameKept kept) {
+    if (!pipelineStats()) return;
+    frameKept[static_cast<std::size_t>(kept)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t DrawFinisher::FrameVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_FRAME_FLOW");
+        const std::uint64_t value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        if (value != 0) Graphics::SetFrameStateReader(&frameStateRead);
+        return value;
+    }();
+    return every;
+}
+
+bool DrawFinisher::FrameVerifyDue(FrameCheck check) {
+    const auto every = FrameVerifyEvery();
+    return every != 0 && frameCheckOrdinals[static_cast<std::size_t>(check)].fetch_add(1, std::memory_order_relaxed) % every == 0;
+}
+
+void DrawFinisher::NoteFrameCheck(FrameCheck check, bool differs, const std::string& detail) {
+    const auto index = static_cast<std::size_t>(check);
+    frameChecked[index].fetch_add(1, std::memory_order_relaxed);
+    if (!differs) return;
+    frameDiffering[index].fetch_add(1, std::memory_order_relaxed);
+    const auto window = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (frameVerifyWindow.exchange(window, std::memory_order_relaxed) != window) frameVerifyPrinted.store(0, std::memory_order_relaxed);
+    if (frameVerifyPrinted.fetch_add(1, std::memory_order_relaxed) >= 8) return;
+    std::fprintf(stderr, "[frame-flow-verify] %s differs: %s\n", FrameCheckNames[index], detail.c_str());
+}
+
+void DrawFinisher::NoteFlipJobs(std::uint64_t jobs) {
+    if (FrameVerifyEvery() == 0) return;
+    const std::lock_guard lock(flipJobsMutex);
+    flipJobs.push_back(jobs);
+    flipJobsHeld.store(static_cast<std::uint32_t>(flipJobs.size()), std::memory_order_release);
+}
+
+void DrawFinisher::RetireFlipJobs() {
+    if (FrameVerifyEvery() == 0) return;
+    const std::lock_guard lock(flipJobsMutex);
+    if (!flipJobs.empty()) flipJobs.pop_front();
+    flipJobsHeld.store(static_cast<std::uint32_t>(flipJobs.size()), std::memory_order_release);
+}
+
+DrawFinisher::RawReaderHold::RawReaderHold(const void* owner) : submission(owner) {
+    const std::lock_guard lock(rawReadersMutex);
+    const auto found = std::find_if(rawReaders.begin(), rawReaders.end(), [owner](const auto& entry) { return entry.first == owner; });
+    if (found != rawReaders.end()) ++found->second;
+    else rawReaders.emplace_back(owner, 1u);
+}
+
+DrawFinisher::RawReaderHold::~RawReaderHold() {
+    Release();
+}
+
+void DrawFinisher::RawReaderHold::Release() {
+    if (!held.exchange(false, std::memory_order_acq_rel)) return;
+    const std::lock_guard lock(rawReadersMutex);
+    const auto owner = submission;
+    const auto found = std::find_if(rawReaders.begin(), rawReaders.end(), [owner](const auto& entry) { return entry.first == owner; });
+    if (found == rawReaders.end()) return;
+    if (--found->second != 0) return;
+    *found = rawReaders.back();
+    rawReaders.pop_back();
+}
+
+std::shared_ptr<DrawFinisher::RawReaderHold> DrawFinisher::HoldRawReader(const void* submission) {
+    if (FrameVerifyEvery() == 0 || !FrameFlowWanted()) return nullptr;
+    return std::make_shared<RawReaderHold>(submission);
+}
+
+void DrawFinisher::CheckRawReaders(const void* submission, const char* where) {
+    if (FrameVerifyEvery() == 0) return;
+    std::uint64_t holding = 0;
+    {
+        const std::lock_guard lock(rawReadersMutex);
+        const auto found = std::find_if(rawReaders.begin(), rawReaders.end(), [submission](const auto& entry) { return entry.first == submission; });
+        if (found != rawReaders.end()) holding = found->second;
+    }
+    NoteFrameCheck(FrameCheck::Lifetime, holding != 0, std::string(where) + ": " + std::to_string(holding) + " finisher jobs still hold a raw pointer to the submission");
+}
+
+std::string DrawFinisher::FrameText() {
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto ms = [](unsigned long long ns) { return static_cast<double>(ns) / 1e6; };
+    auto& finisher = Get();
+    std::array<unsigned long long, static_cast<std::size_t>(FrameSite::Count)> sites{};
+    std::array<unsigned long long, static_cast<std::size_t>(FrameSite::Count)> siteNs{};
+    for (std::size_t index = 0; index < sites.size(); ++index) {
+        sites[index] = take(frameSites[index]);
+        siteNs[index] = take(frameSiteNs[index]);
+    }
+    char head[320];
+    std::snprintf(head, sizeof(head), "switch %s, latch %s; flips ordered %llu (%.1f ms queueing them on the worker), queued %llu and committed %llu in all",
+        FrameFlowWanted() ? "set" : "unset", FrameFlow() ? "on" : "off", sites[0], ms(siteNs[0]), static_cast<unsigned long long>(finisher.FlipsQueued()), static_cast<unsigned long long>(finisher.FlipsCommitted()));
+    std::string text = head;
+    text += "; kept drains by reason:";
+    bool shown = false;
+    for (std::size_t index = 0; index < frameKept.size(); ++index) {
+        const auto count = take(frameKept[index]);
+        if (count == 0) continue;
+        char item[96];
+        std::snprintf(item, sizeof(item), "%s %s %llu", shown ? "," : "", FrameKeptNames[index], count);
+        text += item;
+        shown = true;
+    }
+    if (!shown) text += " none";
+    const auto distances = take(flipDistances);
+    const auto mean = [&](unsigned long long sum) { return distances == 0 ? 0.0 : static_cast<double>(sum) / static_cast<double>(distances); };
+    const auto jobsSum = take(flipJobsSum);
+    const auto itemsSum = take(flipItemsSum);
+    const auto flightSum = take(flipsInFlightSum);
+    char distance[320];
+    std::snprintf(distance, sizeof(distance), "; at an ordered flip packet (%llu): finisher jobs outstanding mean %.1f highest %llu, committer items mean %.1f highest %llu, flips in flight mean %.2f highest %llu",
+        distances, mean(jobsSum), take(flipJobsHighest), mean(itemsSum), take(flipItemsHighest), mean(flightSum), take(flipsInFlightHighest));
+    text += distance;
+    text += "; drains replaced (count, ms):";
+    shown = false;
+    for (std::size_t index = 1; index < sites.size(); ++index) {
+        if (sites[index] == 0) continue;
+        char item[112];
+        std::snprintf(item, sizeof(item), "%s %s %llu (%.2f ms)", shown ? "," : "", FrameSiteNames[index], sites[index], ms(siteNs[index]));
+        text += item;
+        shown = true;
+    }
+    if (!shown) text += " none";
+    text += "; worker waits with a flip in flight (count, ms):";
+    shown = false;
+    for (std::size_t index = 0; index < tailWaits.size(); ++index) {
+        const auto count = take(tailWaits[index]);
+        const auto ns = take(tailWaitNs[index]);
+        if (count == 0) continue;
+        const char* kind = index < TailKeptReasons ? "drain " : index < TailKeptReasons + TailSiteReasons ? "wait " : "";
+        const char* name = index < TailKeptReasons ? DeepKeptNames[index] : index < TailKeptReasons + TailSiteReasons ? DeepSiteNames[index - TailKeptReasons] : TailExtraNames[index - TailKeptReasons - TailSiteReasons];
+        char item[128];
+        std::snprintf(item, sizeof(item), "%s %s%s %llu (%.2f ms)", shown ? "," : "", kind, name, count, ms(ns));
+        text += item;
+        shown = true;
+    }
+    if (!shown) text += " none";
+    if (FrameVerifyEvery() != 0) {
+        char every[64];
+        std::snprintf(every, sizeof(every), "; verify every %llu (checked/differing):", static_cast<unsigned long long>(FrameVerifyEvery()));
+        text += every;
+        for (std::size_t index = 0; index < frameChecked.size(); ++index) {
+            char item[96];
+            std::snprintf(item, sizeof(item), "%s %s %llu/%llu", index == 0 ? "" : ",", FrameCheckNames[index], take(frameChecked[index]), take(frameDiffering[index]));
+            text += item;
+        }
+    }
+    return text;
+}
+
+void DrawFinisher::NoteFrameSite(FrameSite site, std::uint64_t ns) {
+    if (!pipelineStats()) return;
+    frameSites[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+    frameSiteNs[static_cast<std::size_t>(site)].fetch_add(ns, std::memory_order_relaxed);
+}
+
+void DrawFinisher::NoteFlipDistance(std::uint64_t jobs, std::uint64_t items, std::uint64_t inFlight) {
+    if (!pipelineStats()) return;
+    flipDistances.fetch_add(1, std::memory_order_relaxed);
+    flipJobsSum.fetch_add(jobs, std::memory_order_relaxed);
+    flipItemsSum.fetch_add(items, std::memory_order_relaxed);
+    flipsInFlightSum.fetch_add(inFlight, std::memory_order_relaxed);
+    noteFrameHighest(flipJobsHighest, jobs);
+    noteFrameHighest(flipItemsHighest, items);
+    noteFrameHighest(flipsInFlightHighest, inFlight);
 }
 
 void DrawFinisher::AwaitKeyed(std::uint64_t key, std::uint64_t shape, bool insertsOnly) {
@@ -1277,10 +1561,12 @@ void DrawFinisher::AwaitKeyed(std::uint64_t key, std::uint64_t shape, bool inser
     }
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
     retireLean();
-    const auto blocker = KeyBlocker(key, shape, insertsOnly);
+    auto blocker = KeyBlocker(key, shape, insertsOnly);
+    if (blocker == ~std::uint64_t{0} && FrameFlow()) blocker = keyScanBlocker(key, shape, insertsOnly);
     if (blocker == 0) return;
     noteDeepSiteWait(DeepSite::SameKey, true);
     if (blocker == ~std::uint64_t{0} || blocker >= nextSeq || !awaitProducerFront(blocker)) {
+        if (blocker != ~std::uint64_t{0} && blocker >= nextSeq && FrameFlow()) NoteFrameKept(FrameKept::IndexInconsistent);
         NoteDeepKept(DeepKept::Fallback);
         Drain();
     }
@@ -1296,53 +1582,194 @@ std::uint64_t DrawFinisher::KeyBlocker(std::uint64_t key, std::uint64_t shape, b
     return found.answer == DeepAnswer::Hit ? found.stamp : 0;
 }
 
-PendingWait DrawFinisher::AwaitPending(std::span<const Range> ranges, DeepSite site) {
+void DrawFinisher::AwaitPending(std::span<const Range> ranges, DeepSite site) {
     NoteDeepSite(site);
     FlushOpenRun();
-    PendingWait waited;
-    if (!Busy() || OnFinisherThread()) return waited;
+    if (!Busy() || OnFinisherThread()) return;
     if (!FinisherProducer::Get() || !ringMode.load(std::memory_order_acquire) || !deepRing.load(std::memory_order_relaxed)) {
         Drain();
-        waited.cause = PendingCause::Fallback;
-        return waited;
+        return;
     }
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
     for (;;) {
         retireLean();
         const auto front = frontSeq.load(std::memory_order_acquire);
         const auto found = deepWrites->Newest(ranges, front);
+        std::uint64_t blocker = 0;
+        bool scanned = false;
         if (found.answer == DeepAnswer::Unsure) {
             noteDeepTotal(DeepCount::WorkerFallbacks);
-            NoteDeepKept(DeepKept::Fallback);
-            Drain();
-            if (waited.cause == PendingCause::None) waited.cause = PendingCause::Fallback;
-            return waited;
+            if (!FrameFlow()) {
+                NoteDeepKept(DeepKept::Fallback);
+                Drain();
+                return;
+            }
+            blocker = scanBlocker(ranges, FrameSite::WriteScan);
+            scanned = true;
+        } else {
+            blocker = found.answer == DeepAnswer::Hit ? found.stamp : std::uint64_t{0};
+            const auto unknown = lastUnknown.load(std::memory_order_relaxed);
+            if (unknown >= front) blocker = std::max(blocker, unknown);
         }
-        const auto writer = found.answer == DeepAnswer::Hit ? found.stamp : std::uint64_t{0};
-        auto blocker = writer;
-        const auto unknown = lastUnknown.load(std::memory_order_relaxed);
-        if (unknown >= front) blocker = std::max(blocker, unknown);
-        if (blocker == 0) return waited;
-        if (waited.cause == PendingCause::None) {
-            waited.cause = blocker == writer ? PendingCause::Writer : PendingCause::Unknown;
-            waited.ahead = blocker >= front ? blocker - front + 1 : 0;
-        }
+        if (blocker == 0) return;
         noteDeepSiteWait(site, true);
         if (blocker >= nextSeq || !awaitProducerFront(blocker)) {
+            if (blocker >= nextSeq && FrameFlow()) NoteFrameKept(FrameKept::IndexInconsistent);
             NoteDeepKept(DeepKept::Fallback);
             Drain();
-            return waited;
+            return;
         }
+        if (scanned) verifyScanned(ranges, blocker);
     }
 }
 
-void DrawFinisher::NotePacketWait(std::uint32_t opcode, const PendingWait& waited, std::uint64_t nanoseconds) {
-    if (!pipelineStats() || waited.cause == PendingCause::None) return;
-    const auto found = std::find(PacketWaitOpcodes.begin(), PacketWaitOpcodes.end(), opcode);
-    auto& tally = packetWaits[static_cast<std::size_t>(found - PacketWaitOpcodes.begin())];
-    tally.counts[static_cast<std::size_t>(waited.cause)].fetch_add(1, std::memory_order_relaxed);
-    tally.nanoseconds.fetch_add(nanoseconds, std::memory_order_relaxed);
-    tally.ahead.fetch_add(waited.ahead, std::memory_order_relaxed);
+DrawFinisher::ExactFound DrawFinisher::exactPending(std::span<const Range> ranges) {
+    constexpr std::uint32_t ResolveSteps = 64;
+    ExactFound result;
+    const auto front = frontSeq.load(std::memory_order_acquire);
+    const auto found = deepWrites->Newest(ranges, front);
+    if (found.answer == DeepAnswer::Unsure) {
+        result.unsure = true;
+        return result;
+    }
+    if (found.answer == DeepAnswer::Hit) result.blocker = found.stamp;
+    const auto newest = lastUnknown.load(std::memory_order_relaxed);
+    std::uint32_t steps = 0;
+    for (auto unknown = newest; unknown != 0 && unknown >= front;) {
+        if (++steps > ResolveSteps) {
+            result.limited = true;
+            result.blocker = std::max(result.blocker, newest);
+            break;
+        }
+        const auto& slot = leanSlot(unknown);
+        if (slot.resolved.load(std::memory_order_acquire) != 1) result.unresolved = std::max(result.unresolved, unknown);
+        else if (rangesOverlap(slot.resolvedWrites, ranges)) result.blocker = std::max(result.blocker, unknown);
+        else ++result.skipped;
+        const auto before = slot.unknownBefore;
+        if (before >= unknown) break;
+        unknown = before;
+    }
+    return result;
+}
+
+bool DrawFinisher::awaitResolved(std::uint64_t job) {
+    auto& slot = leanSlot(job);
+    const auto done = [&] { return frontSeq.load(std::memory_order_seq_cst) > job || slot.resolved.load(std::memory_order_seq_cst) == 1; };
+    if (done()) return true;
+    const TailWatch watch(true, TailExtra::Resolve);
+    const auto start = pipelineStats() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    {
+        const ThreadReport::WorkerStateScope draining(ThreadReport::WorkerState::DrainFinisher, ThreadReport::Enabled() && ThreadReport::OnQueue0Worker());
+        if (!SpinUntil(HandoffSpinWindow() * 2, done)) {
+            resolveWaiters.fetch_add(1, std::memory_order_seq_cst);
+            frontWaiters.fetch_add(1, std::memory_order_seq_cst);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            {
+                auto lock = lockFor(mutex);
+                turnWake.wait(lock, [&] { return closing || done(); });
+            }
+            frontWaiters.fetch_sub(1, std::memory_order_relaxed);
+            resolveWaiters.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+    if (start != std::chrono::steady_clock::time_point{}) NoteFrameSite(FrameSite::ResolveWait, elapsedNs(start));
+    retireLean();
+    rethrowLeanFailure();
+    return done();
+}
+
+void DrawFinisher::AwaitExactPending(std::span<const Range> ranges, DeepSite site, FrameSite timed) {
+    if (!FrameFlow() || !FinisherProducer::Get() || OnFinisherThread() || !ringMode.load(std::memory_order_acquire) || !deepRing.load(std::memory_order_relaxed)) {
+        AwaitPending(ranges, site);
+        return;
+    }
+    NoteDeepSite(site);
+    FlushOpenRun();
+    if (!Busy()) return;
+    if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
+    const auto start = FrameCensus() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    bool waited = false;
+    bool passed = false;
+    for (;;) {
+        retireLean();
+        const auto found = exactPending(ranges);
+        if (found.unsure) {
+            noteDeepTotal(DeepCount::WorkerFallbacks);
+            const auto blocker = scanBlocker(ranges, FrameSite::WriteScan);
+            if (blocker == 0) break;
+            waited = true;
+            noteDeepSiteWait(site, true);
+            if (blocker >= nextSeq || !awaitProducerFront(blocker)) {
+                if (blocker >= nextSeq) NoteFrameKept(FrameKept::IndexInconsistent);
+                NoteDeepKept(DeepKept::Fallback);
+                Drain();
+                break;
+            }
+            verifyScanned(ranges, blocker);
+            continue;
+        }
+        if (found.limited) NoteFrameKept(FrameKept::ResolveLimit);
+        passed = passed || found.skipped != 0;
+        if (found.blocker != 0) {
+            waited = true;
+            noteDeepSiteWait(site, true);
+            if (found.blocker >= nextSeq || !awaitProducerFront(found.blocker)) {
+                if (found.blocker >= nextSeq) NoteFrameKept(FrameKept::IndexInconsistent);
+                NoteDeepKept(DeepKept::Fallback);
+                Drain();
+                break;
+            }
+            continue;
+        }
+        if (found.unresolved != 0) {
+            waited = true;
+            if (!awaitResolved(found.unresolved)) {
+                NoteDeepKept(DeepKept::Fallback);
+                Drain();
+                break;
+            }
+            continue;
+        }
+        break;
+    }
+    if (passed) NoteFrameSite(FrameSite::ResolvedSkip);
+    if (waited && start != std::chrono::steady_clock::time_point{}) NoteFrameSite(timed, elapsedNs(start));
+}
+
+std::uint64_t DrawFinisher::scanBlocker(std::span<const Range> ranges, FrameSite site) {
+    const auto start = FrameCensus() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto front = frontSeq.load(std::memory_order_acquire);
+    std::uint64_t blocker = 0;
+    for (auto seq = front; seq < nextSeq; ++seq) {
+        const auto& slot = leanSlot(seq);
+        if (slot.pending.unknown || slot.batch || rangesOverlap(slot.pending.writes, ranges)) blocker = seq;
+    }
+    NoteFrameSite(site, start == std::chrono::steady_clock::time_point{} ? 0 : elapsedNs(start));
+    return blocker;
+}
+
+std::uint64_t DrawFinisher::keyScanBlocker(std::uint64_t key, std::uint64_t shape, bool insertsOnly) {
+    const auto start = FrameCensus() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto front = frontSeq.load(std::memory_order_acquire);
+    std::uint64_t blocker = 0;
+    for (auto seq = front; seq < nextSeq; ++seq) {
+        const auto& slot = leanSlot(seq);
+        const auto& held = slot.pending;
+        if (slot.batch || ((held.key == PublishedKeys::AnyKey || held.key == key || (shape != 0 && held.shape == shape)) && (held.inserts || !insertsOnly))) blocker = seq;
+    }
+    NoteFrameSite(FrameSite::KeyScan, start == std::chrono::steady_clock::time_point{} ? 0 : elapsedNs(start));
+    return blocker;
+}
+
+void DrawFinisher::verifyScanned(std::span<const Range> ranges, std::uint64_t blocker) {
+    if (!FrameVerifyDue(FrameCheck::FallbackScan)) return;
+    const auto front = frontSeq.load(std::memory_order_acquire);
+    std::uint64_t again = 0;
+    for (auto seq = front; seq < nextSeq; ++seq) {
+        const auto& slot = leanSlot(seq);
+        if (slot.pending.unknown || slot.batch || rangesOverlap(slot.pending.writes, ranges)) again = seq;
+    }
+    NoteFrameCheck(FrameCheck::FallbackScan, again != 0, "a scan after the wait for job " + std::to_string(blocker) + " still finds writer " + std::to_string(again) + " at front " + std::to_string(front));
 }
 
 std::uint64_t DrawFinisher::DeepTotal(DeepCount count) {
@@ -1404,6 +1831,7 @@ DeepFound DrawFinisher::scanKeys(std::uint64_t key, std::uint64_t shape, bool in
 bool DrawFinisher::awaitProducerFront(std::uint64_t job) {
     const auto passed = [&] { return frontSeq.load(std::memory_order_seq_cst) > job; };
     if (passed()) return true;
+    const TailWatch watch(true);
     const auto start = ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
     {
         const ThreadReport::WorkerStateScope draining(ThreadReport::WorkerState::DrainFinisher, start != ThreadReport::Clock::time_point{} && ThreadReport::OnQueue0Worker());
@@ -1671,6 +2099,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         return;
     }
     if (jobs.size() >= depth && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
+    const TailWatch watch(jobs.size() >= depth, TailExtra::RingRoom);
     const auto roomStart = jobs.size() >= depth && ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
     std::optional<ThreadReport::WorkerStateScope> room;
     if (roomStart != ThreadReport::Clock::time_point{} && ThreadReport::OnQueue0Worker()) room.emplace(ThreadReport::WorkerState::RoomFinisher);
@@ -1860,6 +2289,7 @@ void DrawFinisher::awaitLeanRoom(bool helping) {
         return;
     }
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
+    const TailWatch watch(true, TailExtra::RingRoom);
     const auto roomStart = ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
     std::optional<ThreadReport::WorkerStateScope> room;
     if (roomStart != ThreadReport::Clock::time_point{} && ThreadReport::OnQueue0Worker()) room.emplace(ThreadReport::WorkerState::RoomFinisher);
@@ -1972,6 +2402,8 @@ void DrawFinisher::publishLean(LeanSlot& slot) {
     const auto seq = nextSeq;
     if (deepRing.load(std::memory_order_relaxed)) {
         slot.counted = false;
+        slot.resolved.store(0, std::memory_order_relaxed);
+        if (!slot.resolvedWrites.empty()) slot.resolvedWrites.clear();
         slot.unknownBefore = lastUnknown.load(std::memory_order_relaxed);
         const auto live = frontSeq.load(std::memory_order_acquire);
         const auto& held = slot.pending;
@@ -2084,8 +2516,10 @@ void DrawFinisher::runLean(std::uint64_t seq, std::chrono::steady_clock::time_po
         while (std::chrono::steady_clock::now() < until) {}
     }
     std::exception_ptr error;
+    bool ran = false;
     try {
         if (!leanFailed.load(std::memory_order_acquire)) {
+            ran = true;
             if (slot.runner != nullptr) slot.runner(slot.payload.data());
             else slot.closure();
         }
@@ -2112,8 +2546,25 @@ void DrawFinisher::runLean(std::uint64_t seq, std::chrono::steady_clock::time_po
         leanFailed.store(true, std::memory_order_release);
     }
     const bool deposited = !slot.deposits.empty();
+    const bool resolving = slot.pending.unknown && !slot.batch && deepRing.load(std::memory_order_relaxed) && FrameFlowWanted();
+    if (resolving) {
+        auto& resolved = slot.resolvedWrites;
+        resolved.clear();
+        for (const auto& held : slot.deposits) {
+            resolved.insert(resolved.end(), held.item.writes.begin(), held.item.writes.end());
+            if (held.item.labelAddress != 0 && !held.item.labelBytes.empty()) resolved.emplace_back(held.item.labelAddress, held.item.labelAddress + held.item.labelBytes.size());
+        }
+        slot.resolved.store(ran && error == nullptr ? 1 : 2, std::memory_order_seq_cst);
+    }
     FinisherDeposits::Set(false);
     slot.state.store(deposited ? LeanDeposited : LeanDone, std::memory_order_seq_cst);
+    if (resolving) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (resolveWaiters.load(std::memory_order_relaxed) != 0) {
+            const auto lock = lockFor(mutex);
+            turnWake.notify_all();
+        }
+    }
     const auto forwardNs = advanceLeanFront();
     if (forwardNs != 0 && lastEnd != ThreadReport::Clock::time_point{}) lastEnd += std::chrono::nanoseconds(forwardNs);
 }
@@ -2476,6 +2927,7 @@ void DrawFinisher::Settle() {
     FlushOpenRun();
     if (!Busy() || OnFinisherThread()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher settle under the GPU lock");
+    const TailWatch watch(true);
     if (ringMode.load(std::memory_order_acquire)) {
         awaitLeanIdle();
         if (FinisherProducer::Get()) retireLean();
@@ -2487,11 +2939,47 @@ void DrawFinisher::Settle() {
     --idleWaiters;
 }
 
+bool DrawFinisher::AwaitRawReaders() {
+    FlushOpenRun();
+    if (!Busy() || OnFinisherThread()) return false;
+    if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher settle under the GPU lock");
+    if (!ringMode.load(std::memory_order_acquire)) {
+        auto lock = lockFor(mutex);
+        if (jobs.empty()) return false;
+        ++idleWaiters;
+        idle.wait(lock, [&] { return jobs.empty(); });
+        --idleWaiters;
+        return true;
+    }
+    const auto reader = rawReader;
+    const auto passed = [&] { return frontSeq.load(std::memory_order_seq_cst) > reader; };
+    if (reader == 0 || passed()) {
+        if (FinisherProducer::Get()) retireLean();
+        return false;
+    }
+    {
+        const TailWatch watch(true, TailExtra::Exit);
+        const ThreadReport::WorkerStateScope draining(ThreadReport::WorkerState::DrainFinisher, ThreadReport::Enabled() && ThreadReport::OnQueue0Worker());
+        if (!SpinUntil(HandoffSpinWindow() * 2, passed)) {
+            frontWaiters.fetch_add(1, std::memory_order_seq_cst);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            {
+                auto lock = lockFor(mutex);
+                turnWake.wait(lock, [&] { return closing || passed(); });
+            }
+            frontWaiters.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+    if (FinisherProducer::Get()) retireLean();
+    return true;
+}
+
 void DrawFinisher::Drain(bool helping) {
     if (OnFinisherThread()) return;
     FlushOpenRun();
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
     const auto drainStart = ThreadReport::Enabled() && Busy() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
+    const TailWatch watch(Busy());
     const ThreadReport::WorkerStateScope draining(ThreadReport::WorkerState::DrainFinisher, drainStart != ThreadReport::Clock::time_point{} && ThreadReport::OnQueue0Worker());
     if (helping) helpLean([&] { return outstanding.load(std::memory_order_acquire) != 0; }, false);
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
@@ -2657,15 +3145,63 @@ void DrawPipeline::EnqueueLabelRun(Commit commit, std::vector<Range> writes, std
     enqueue(std::move(item));
 }
 
+void DrawPipeline::EnqueueFlip(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
+    Item item;
+    item.commit = std::move(commit);
+    item.writes = std::move(writes);
+    item.labelAddress = labelAddress;
+    item.labelBytes = std::move(labelBytes);
+    item.kind = CommitKind::Flip;
+    item.quiet = true;
+    enqueue(std::move(item));
+}
+
 namespace {
 struct ItemTurnSlot {};
 using ItemTurn = HostThreadSlot<bool, ItemTurnSlot>;
 std::atomic<std::uint64_t> itemsByTurn{0};
+struct FlipCommitSlot {};
+using FlipCommitting = HostThreadSlot<bool, FlipCommitSlot>;
+}
+
+DrawPipeline::FlipCommitScope::FlipCommitScope() : previous(FlipCommitting::Get()) {
+    FlipCommitting::Set(true);
+}
+
+DrawPipeline::FlipCommitScope::~FlipCommitScope() {
+    FlipCommitting::Set(previous);
+}
+
+namespace {
+struct OrderProbeSlot {};
+using OrderProbing = HostThreadSlot<std::uint32_t, OrderProbeSlot>;
+}
+
+DrawPipeline::OrderProbe::OrderProbe(FrameCheck check) : previous(OrderProbing::Get()) {
+    OrderProbing::Set(static_cast<std::uint32_t>(check) + 1u);
+}
+
+DrawPipeline::OrderProbe::~OrderProbe() {
+    OrderProbing::Set(previous);
 }
 
 void DrawPipeline::enqueue(Item item) {
     if (!DrawFinisher::OnFinisherThread()) DrawFinisher::Get().FlushOpenRun();
-    if (depositVerifyEvery() != 0) item.order = orderKey();
+    if (const auto probe = OrderProbing::Get(); probe != 0 && !DrawFinisher::OnFinisherThread()) {
+        OrderProbing::Set(0);
+        const auto check = static_cast<FrameCheck>(probe - 1u);
+        const auto jobs = DrawFinisher::Get().Issued();
+        const auto before = enqueuedItems.load(std::memory_order_acquire);
+        item.commit = [this, inner = std::move(item.commit), check, jobs, before] {
+            const auto front = DrawFinisher::Get().Front();
+            const auto retiredNow = Retired();
+            char text[256];
+            std::snprintf(text, sizeof(text), "an item queued with the finisher at job %llu and %llu committer items before it committed with the front at %llu and %llu items retired", static_cast<unsigned long long>(jobs), static_cast<unsigned long long>(before), static_cast<unsigned long long>(front), static_cast<unsigned long long>(retiredNow));
+            DrawFinisher::NoteFrameCheck(check, front < jobs || retiredNow < before, text);
+            inner();
+        };
+    }
+    if (depositVerifyEvery() != 0 || (DrawFinisher::FrameVerifyEvery() != 0 && DrawFinisher::FrameFlow())) item.order = orderKey();
     if (DrawFinisher::OnFinisherThread()) {
         auto& finisher = DrawFinisher::Get();
         if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FinisherDeposit) && finisher.deposit(*this, item)) return;
@@ -2732,6 +3268,7 @@ void DrawPipeline::queueItem(Item item) {
     const auto roomLimit = DrawFinisher::Flow() || (DrawFinisher::Deep() && deepQueue.load(std::memory_order_relaxed)) ? DrawFinisher::LeanSlots : deepQueues() ? std::max<std::size_t>(Depth(), 32) : Depth();
     if (items.size() >= roomLimit) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
+        const TailWatch watch(true, TailExtra::QueueRoom);
         const auto start = std::chrono::steady_clock::now();
         const ThreadReport::WorkerStateScope room(ThreadReport::WorkerState::RoomCommitter, ThreadReport::OnQueue0Worker());
         resumeAt = roomLimit - 1;
@@ -2822,6 +3359,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
     if (pipelineStats()) AgcDriver::ProfilePrint_nid_no_patch("[xp-flow] 10 s, %s; committer queue: highest %zu items, mean %.2f items ahead of an enqueued one\n", DrawFinisher::FlowText().c_str(), deepestItems, queued);
     if (pipelineStats()) AgcDriver::ProfilePrint_nid_no_patch("[deep-flow] 10 s, %s; committer queue: latch %s, highest %zu items\n", DrawFinisher::DeepText().c_str(), deepQueue.load(std::memory_order_relaxed) ? "on" : "off", deepestItems);
+    if (pipelineStats()) AgcDriver::ProfilePrint_nid_no_patch("[frame-flow] 10 s, %s\n", DrawFinisher::FrameText().c_str());
     deepestItems = 0;
     if (const auto encoded = Graphics::CommandEncoders::TotalsText(); !encoded.empty()) AgcDriver::ProfilePrint_nid_no_patch("[encode] (cumulative): %s\n", encoded.c_str());
     AgcDriver::ProfilePrint_nid_no_patch("[indirect-draws] (cumulative): %s\n", Graphics::IndirectDrawTotalsText().c_str());
@@ -2884,7 +3422,7 @@ void DrawPipeline::run() {
     bool taken = false;
     auto previousKind = CommitKind::Count;
     const auto takeFront = [&] {
-        if (depositVerifyEvery() != 0) verifyOrder(items.front().order);
+        if (depositVerifyEvery() != 0 || (DrawFinisher::FrameVerifyEvery() != 0 && DrawFinisher::FrameFlow())) verifyOrder(items.front().order);
         commit = stopped ? nullptr : &items.front().commit;
         isDraw = items.front().draw;
         quietItem = items.front().quiet;
@@ -3002,12 +3540,15 @@ void DrawPipeline::run() {
 }
 
 void DrawPipeline::verifyOrder(std::uint64_t order) {
-    if (order == 0 || DrawFinisher::Get().closed.load(std::memory_order_acquire) || ++orderOrdinal % depositVerifyEvery() != 0) return;
+    const auto every = depositVerifyEvery() != 0 ? depositVerifyEvery() : DrawFinisher::FrameVerifyEvery();
+    if (order == 0 || every == 0 || DrawFinisher::Get().closed.load(std::memory_order_acquire) || ++orderOrdinal % every != 0) return;
     orderChecks.fetch_add(1, std::memory_order_relaxed);
-    if (order <= verifiedOrder) {
+    const bool differs = order <= verifiedOrder;
+    if (differs && depositVerifyEvery() != 0) {
         orderDifferences.fetch_add(1, std::memory_order_relaxed);
         noteDepositDifference("item order differs: the committer took an item of " + orderText(order) + " after an item of " + orderText(verifiedOrder));
     }
+    if (DrawFinisher::FrameVerifyEvery() != 0) DrawFinisher::NoteFrameCheck(FrameCheck::ItemOrder, differs, differs ? "the committer took an item of " + orderText(order) + " after an item of " + orderText(verifiedOrder) : std::string());
     verifiedOrder = order;
 }
 
@@ -3043,6 +3584,7 @@ void DrawPipeline::drainAll(DrainReason reason, std::uint32_t opcode) {
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     if (finisherBusy) DrawFinisher::Get().Drain();
     if (!Busy()) return;
+    const TailWatch watch(true);
     const ThreadReport::WorkerStateScope draining(ThreadReport::WorkerState::DrainCommitter, ThreadReport::OnQueue0Worker());
     const auto start = std::chrono::steady_clock::now();
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
@@ -3096,20 +3638,29 @@ void DrawPipeline::AwaitWriters(std::span<const Range> ranges, DrainReason reaso
                 finisher.retireLean();
                 const auto front = finisher.frontSeq.load(std::memory_order_acquire);
                 const auto found = finisher.deepWrites->Newest(ranges, front);
+                std::uint64_t blocker = 0;
+                bool scanned = false;
                 if (found.answer == DeepAnswer::Unsure) {
                     noteDeepTotal(DrawFinisher::DeepCount::WorkerFallbacks);
-                    fallback();
-                    return;
-                }
-                const auto unknown = finisher.lastUnknown.load(std::memory_order_relaxed);
-                auto blocker = found.answer == DeepAnswer::Hit ? found.stamp : std::uint64_t{0};
-                if (unknown >= front) blocker = std::max(blocker, unknown);
-                if (blocker != 0) {
-                    noteDeepSiteWait(site, true);
-                    if (blocker >= finisher.nextSeq || !finisher.awaitProducerFront(blocker)) {
+                    if (!DrawFinisher::FrameFlow()) {
                         fallback();
                         return;
                     }
+                    blocker = finisher.scanBlocker(ranges, FrameSite::WriteScan);
+                    scanned = true;
+                } else {
+                    const auto unknown = finisher.lastUnknown.load(std::memory_order_relaxed);
+                    blocker = found.answer == DeepAnswer::Hit ? found.stamp : std::uint64_t{0};
+                    if (unknown >= front) blocker = std::max(blocker, unknown);
+                }
+                if (blocker != 0) {
+                    noteDeepSiteWait(site, true);
+                    if (blocker >= finisher.nextSeq || !finisher.awaitProducerFront(blocker)) {
+                        if (blocker >= finisher.nextSeq && DrawFinisher::FrameFlow()) DrawFinisher::NoteFrameKept(FrameKept::IndexInconsistent);
+                        fallback();
+                        return;
+                    }
+                    if (scanned) finisher.verifyScanned(ranges, blocker);
                     continue;
                 }
             } else if (finisher.PendingOverlapsAny(ranges)) {
@@ -3119,10 +3670,13 @@ void DrawPipeline::AwaitWriters(std::span<const Range> ranges, DrainReason reaso
             }
         }
         if (deepQueue.load(std::memory_order_acquire)) {
-            const auto found = deepQueued(ranges, retiredItems.load(std::memory_order_acquire) + 1);
+            auto found = deepQueued(ranges, retiredItems.load(std::memory_order_acquire) + 1);
             if (found.answer == DeepAnswer::Unsure) {
-                fallback();
-                return;
+                if (!DrawFinisher::FrameFlow()) {
+                    fallback();
+                    return;
+                }
+                found = scanQueued(ranges);
             }
             if (found.answer != DeepAnswer::Hit) return;
             noteDeepSiteWait(site, false);
@@ -3137,9 +3691,112 @@ void DrawPipeline::AwaitWriters(std::span<const Range> ranges, DrainReason reaso
     }
 }
 
+DeepFound DrawPipeline::scanQueued(std::span<const Range> ranges) {
+    const auto start = DrawFinisher::FrameCensus() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    DeepFound found;
+    {
+        const auto lock = lockFor(mutex);
+        found = newestQueued(ranges);
+    }
+    DrawFinisher::NoteFrameSite(FrameSite::QueuedScan, start == std::chrono::steady_clock::time_point{} ? 0 : elapsedNs(start));
+    return found;
+}
+
+bool DrawPipeline::AwaitExactWriters(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode, DeepSite site, FrameSite timed, FrameCheck check) {
+    auto& finisher = DrawFinisher::Get();
+    if (!DrawFinisher::FrameFlow() || DrawFinisher::OnFinisherThread() || !FinisherProducer::Get() || !deepQueue.load(std::memory_order_acquire)) return false;
+    finisher.FlushOpenRun();
+    const bool ring = finisher.ringMode.load(std::memory_order_acquire) && finisher.deepRing.load(std::memory_order_relaxed);
+    if (DrawFinisher::Overlap() && DrawFinisher::Busy() && !ring) return false;
+    DrawFinisher::NoteDeepSite(site);
+    if ((DrawFinisher::Busy() || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline wait under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
+    const auto start = DrawFinisher::FrameCensus() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    bool waited = false;
+    bool passed = false;
+    const auto counted = [&] {
+        if (waited) return;
+        waited = true;
+        drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
+        reasonRequests[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    };
+    const auto gaveUp = [](FrameKept why) {
+        DrawFinisher::NoteFrameKept(why);
+        return false;
+    };
+    for (;;) {
+        if (DrawFinisher::Overlap() && DrawFinisher::Busy()) {
+            finisher.retireLean();
+            const auto found = finisher.exactPending(ranges);
+            if (found.unsure) return gaveUp(FrameKept::ExactUnsure);
+            if (found.limited) DrawFinisher::NoteFrameKept(FrameKept::ResolveLimit);
+            passed = passed || found.skipped != 0;
+            if (found.blocker != 0) {
+                counted();
+                noteDeepSiteWait(site, true);
+                if (found.blocker >= finisher.nextSeq) return gaveUp(FrameKept::IndexInconsistent);
+                if (!finisher.awaitProducerFront(found.blocker)) return gaveUp(FrameKept::ExactUnsure);
+                continue;
+            }
+            if (found.unresolved != 0) {
+                counted();
+                if (!finisher.awaitResolved(found.unresolved)) return gaveUp(FrameKept::ExactUnsure);
+                continue;
+            }
+        }
+        if (!deepQueue.load(std::memory_order_acquire)) return gaveUp(FrameKept::ExactUnsure);
+        auto queued = deepQueued(ranges, retiredItems.load(std::memory_order_acquire) + 1);
+        if (queued.answer == DeepAnswer::Unsure) queued = scanQueued(ranges);
+        if (queued.answer == DeepAnswer::Hit) {
+            counted();
+            noteDeepSiteWait(site, false);
+            if (!awaitRetired(queued.stamp - 1)) return gaveUp(FrameKept::ExactUnsure);
+            continue;
+        }
+        break;
+    }
+    if (passed) DrawFinisher::NoteFrameSite(FrameSite::ResolvedSkip);
+    if (waited && start != std::chrono::steady_clock::time_point{}) DrawFinisher::NoteFrameSite(timed, elapsedNs(start));
+    if (DrawFinisher::FrameVerifyDue(check)) verifyExactBytes(ranges, reason, opcode, check);
+    return true;
+}
+
+void DrawPipeline::verifyExactBytes(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode, FrameCheck check) {
+    std::size_t total = 0;
+    for (const auto& [begin, end] : ranges) total += static_cast<std::size_t>(end - begin);
+    if (total == 0 || total > (std::size_t{1} << 20u) || ranges.empty()) return;
+    const auto readAll = [&] {
+        std::vector<std::byte> bytes(total);
+        std::size_t at = 0;
+        for (const auto& [begin, end] : ranges) {
+            const auto size = static_cast<std::size_t>(end - begin);
+            GuestMemory::Read(begin, std::span<std::byte>(bytes).subspan(at, size));
+            at += size;
+        }
+        return bytes;
+    };
+    std::vector<std::byte> before;
+    std::vector<std::byte> after;
+    try {
+        before = readAll();
+    } catch (const std::exception&) {
+        return;
+    }
+    drainAll(reason, opcode);
+    try {
+        after = readAll();
+    } catch (const std::exception&) {
+        return;
+    }
+    char text[256];
+    std::snprintf(text, sizeof(text), "the %zu bytes at 0x%llx the worker read beside the pipeline (opcode 0x%02x) differ from the bytes after a full drain", total, static_cast<unsigned long long>(ranges.front().first), opcode);
+    DrawFinisher::NoteFrameCheck(check, before != after, text);
+}
+
 bool DrawPipeline::awaitRetired(std::uint64_t item) {
     const auto passed = [&] { return retiredItems.load(std::memory_order_acquire) > item; };
-    if (passed() || SpinUntil(HandoffSpinWindow(), passed)) return true;
+    if (passed()) return true;
+    const TailWatch watch(true);
+    if (SpinUntil(HandoffSpinWindow(), passed)) return true;
     const ThreadReport::WorkerStateScope waiting(ThreadReport::WorkerState::DrainCommitter, ThreadReport::OnQueue0Worker());
     auto lock = lockFor(mutex);
     ++retireWaiters;
@@ -3232,7 +3889,7 @@ std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
 
 bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     static const bool unordered = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr;
-    if (bytes == 0 || unordered) return false;
+    if (bytes == 0 || unordered || FlipCommitting::Get()) return false;
     if (FinisherDeposits::Get() && DrawFinisher::Get().depositsRead(address, bytes)) return true;
     if (DrawFinisher::Get().ParkedReadsOverlap(address, bytes)) return true;
     auto& pipeline = Queue0();

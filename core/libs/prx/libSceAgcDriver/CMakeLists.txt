@@ -834,6 +834,8 @@ set(agcLeanFrontEnvironment APS5_LEAN_FRONT=1 APS5_VERIFY_LEAN_FRONT=2)
 set(agcLeanFrontDifference "\\[lean-front-verify\\] [-a-z ]+ differs:")
 set(agcDeepFlowEnvironment APS5_DEEP_FLOW=1 APS5_VERIFY_DEEP_FLOW=1)
 set(agcDeepFlowDifference "\\[deep-flow-verify\\] [-a-z ]+ differs:")
+set(agcFrameFlowEnvironment APS5_FRAME_FLOW=1 APS5_VERIFY_FRAME_FLOW=1)
+set(agcFrameFlowDifference "\\[frame-flow-verify\\] [-a-z ]+ differs:")
 
 function(agc_add_draw_pipeline_test agcTestName)
     set(agcPipelineEnvironment ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1)
@@ -862,6 +864,9 @@ function(agc_add_deep_flow_test agcTestName)
     agc_add_env_test(${agcTestName}_deep_flow ${agcTestName}_tests
             ENV ${agcPipelineEnvironment} ${agcLateStackEnvironment} ${agcLeanFrontEnvironment} ${agcDeepFlowEnvironment})
     set_tests_properties(${agcTestName}_deep_flow PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDeepFlowDifference}")
+    agc_add_env_test(${agcTestName}_frame_flow ${agcTestName}_tests
+            ENV ${agcPipelineEnvironment} ${agcLateStackEnvironment} ${agcLeanFrontEnvironment} ${agcDeepFlowEnvironment} ${agcFrameFlowEnvironment})
+    set_tests_properties(${agcTestName}_frame_flow PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDeepFlowDifference};${agcFrameFlowDifference}")
 endfunction()
 
 set(agcDrawRecordsDifference "\\[draw-records-verify\\] [-a-z ]+ differs:")

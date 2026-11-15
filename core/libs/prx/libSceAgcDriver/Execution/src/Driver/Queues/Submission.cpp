@@ -555,6 +555,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
 void Driver::awaitRewindTail(const Submission& stalled, FrontMode front) {
     std::atomic_ref<std::uint32_t> control(*const_cast<std::uint32_t*>(stalled.rewindTail - 1));
     if ((control.load(std::memory_order_acquire) & Pm4::RewindValid) != 0) return;
+    const DrawFinisher::TailScope standing(FrameTail::RewindTail);
     noteWaitBlocked(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1), true);
     struct BlockedWait {
         Driver& driver;

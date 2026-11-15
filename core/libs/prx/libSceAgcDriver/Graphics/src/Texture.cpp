@@ -5301,6 +5301,7 @@ bool StorageTexture::RenoteInPass(std::uint64_t recorder, std::uint64_t pass, st
     if (!ProbeRenote(recorder, pass, slice, count).renote) return false;
     const auto& note = passNote;
     ++writes;
+    NoteFrameStateRead(FrameState::FlipSerial);
     if (const auto flip = flipSerial.load(std::memory_order_relaxed); flip != writtenFlip) {
         const bool occasional = flip - writtenFlip > OccasionalWriteFlips;
         writtenOccasionally = occasional;
@@ -5351,6 +5352,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     ++writes;
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    NoteFrameStateRead(FrameState::FlipSerial);
     if (const auto flip = flipSerial.load(std::memory_order_relaxed); writes == 1u || flip != writtenFlip) {
         const bool occasional = writes == 1u || flip - writtenFlip > OccasionalWriteFlips;
         writtenOccasionally = occasional;

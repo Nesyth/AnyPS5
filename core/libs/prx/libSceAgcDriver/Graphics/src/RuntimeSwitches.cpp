@@ -247,6 +247,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_DEEP_FLOW",
     "APS5_TAILS_AHEAD",
     "APS5_FIXUPS_BY_TURN",
+    "APS5_FRAME_FLOW",
 };
 static_assert(SwitchNames.back() != nullptr, "every runtime switch needs a name");
 
@@ -494,6 +495,7 @@ struct SwitchValues {
             std::getenv("APS5_DEEP_FLOW") != nullptr,
             std::getenv("APS5_TAILS_AHEAD") != nullptr,
             std::getenv("APS5_FIXUPS_BY_TURN") != nullptr,
+            std::getenv("APS5_FRAME_FLOW") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }
@@ -633,6 +635,14 @@ AbSchedule::Step AbSchedule::AtPresent(std::uint64_t present, double seconds) {
     return {};
 }
 
+bool AbSchedule::BeginDue(std::uint64_t present, double seconds) const {
+    if (!started) {
+        const double first = firstSeconds.value_or(seconds);
+        return config.startSeconds.has_value() ? seconds - first >= *config.startSeconds : present >= config.startPresent;
+    }
+    return seconds - phaseStart >= config.phaseSeconds;
+}
+
 namespace {
 
 struct AbState {
@@ -710,6 +720,30 @@ std::vector<std::string> AbAtPresent(std::uint64_t present) {
     auto& state = Ab();
     std::lock_guard lock(state.mutex);
     return abAtPresent(state, present, std::chrono::duration<double>(std::chrono::steady_clock::now() - state.origin).count());
+}
+
+double AbClockSeconds() {
+    auto& state = Ab();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - state.origin).count();
+}
+
+bool AbBeginDue(std::uint64_t present, double seconds) {
+    if (!AbConfigured()) return false;
+    auto& state = Ab();
+    std::lock_guard lock(state.mutex);
+    return state.schedule.has_value() && state.schedule->BeginDue(present, seconds);
+}
+
+namespace {
+std::atomic<FrameStateReader> frameStateReader{nullptr};
+}
+
+void SetFrameStateReader(FrameStateReader reader) {
+    frameStateReader.store(reader, std::memory_order_release);
+}
+
+void NoteFrameStateRead(FrameState state) {
+    if (const auto reader = frameStateReader.load(std::memory_order_acquire); reader != nullptr) reader(state);
 }
 
 }

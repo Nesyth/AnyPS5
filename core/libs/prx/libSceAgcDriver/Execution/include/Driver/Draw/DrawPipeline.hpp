@@ -82,12 +82,11 @@ struct LabelRun {
 };
 
 enum class DeepSite : std::uint32_t { PacketVerdict, Predication, IndirectArguments, FillInputs, FillByTurn, DispatchReads, LateDispatchReads, Decode, HeapStages, Variant, WriteEvidence, ShaderCode, SameKey, EarlierKey, ItemsByTurn, ItemsWithReadsByTurn, PacketFinisher, Count };
-enum class PendingCause : std::uint32_t { None, Writer, Unknown, Fallback, Count };
-struct PendingWait {
-    PendingCause cause = PendingCause::None;
-    std::uint64_t ahead = 0;
-};
 enum class DeepKept : std::uint32_t { Flip, RenderingWait, Wait, WorkerLabel, PacketVerdict, SegmentEnd, Submission, Settle, DeferredLabels, WorkerDraw, WorkerDispatch, MetadataPass, WorkerNote, Relocation, IndirectCpu, DispatchNotPipelined, Fallback, Shutdown, Other, NoteNotCandidate, NoteMultisampleClear, NoteMemoryValueFill, NoteHtileDepthClear, NoteHtileMaskClear, NoteHtileZmaskFixup, NoteDepthControl, Count };
+enum class FrameKept : std::uint32_t { NotLatched, AbPhase, SyncFlip, TimingLog, Predicated, LabelForm, DeferredLabels, FullLoopSegmentEnd, FullLoopSettle, FrontChange, Exception, IndirectGpu, IndexInconsistent, DmaCopy, DmaGds, DmaRefused, ResolveLimit, ExactUnsure, WorkerBehindFlip, Count };
+enum class FrameSite : std::uint32_t { OrderedFlip, RenderingWait, SegmentEnd, ExitWait, ExitFree, ArgumentWait, WriteScan, KeyScan, QueuedScan, DmaBeside, ListWait, ResolvedSkip, ResolveWait, Count };
+enum class FrameCheck : std::uint32_t { FlipOrder, ItemOrder, Lifetime, FlipState, DispatchArguments, FallbackScan, SegmentEnd, AbPhase, ListBytes, DmaOrder, Count };
+enum class FrameTail : std::uint32_t { RenderingWait, RewindTail, NoSubmission, Count };
 
 class DrawPipeline {
 public:
@@ -107,7 +106,7 @@ public:
     };
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
     enum class QueuedWrite : std::uint8_t { None, Stored, Unknown };
-    enum class CommitKind : std::uint8_t { Other, Draw, IndirectDraw, ColorMetadata, Dispatch, SampleDump, DmaFill, DmaWrite, DmaCopy, Store, EndOfPipe, Seal, SubmitEnd, Completion, BufferFill, Count };
+    enum class CommitKind : std::uint8_t { Other, Draw, IndirectDraw, ColorMetadata, Dispatch, SampleDump, DmaFill, DmaWrite, DmaCopy, Store, EndOfPipe, Seal, SubmitEnd, Completion, BufferFill, Flip, Count };
 
     static DrawPipeline& Queue0();
     static std::size_t Depth();
@@ -123,9 +122,31 @@ public:
     void EnqueueLabelRun(Commit commit, std::vector<Range> writes, std::shared_ptr<const LabelRun> run);
     void EnqueueQuiet(Commit commit);
     void EnqueueKept(Commit commit, std::vector<Range> writes, std::vector<Range> reads, std::shared_ptr<const void> keep);
+    void EnqueueFlip(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes);
+    class FlipCommitScope {
+    public:
+        FlipCommitScope();
+        ~FlipCommitScope();
+        FlipCommitScope(const FlipCommitScope&) = delete;
+        FlipCommitScope& operator=(const FlipCommitScope&) = delete;
+
+    private:
+        bool previous;
+    };
+    class OrderProbe {
+    public:
+        explicit OrderProbe(FrameCheck check);
+        ~OrderProbe();
+        OrderProbe(const OrderProbe&) = delete;
+        OrderProbe& operator=(const OrderProbe&) = delete;
+
+    private:
+        std::uint32_t previous;
+    };
     static void NoteDrawKey(std::uint64_t key, std::uint64_t shape);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void AwaitWriters(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode, DeepSite site);
+    bool AwaitExactWriters(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode, DeepSite site, FrameSite timed, FrameCheck check);
     bool DeepQueue() const { return deepQueue.load(std::memory_order_acquire); }
     void Stop();
     void ReleaseRetired();
@@ -138,6 +159,7 @@ public:
     Watch WatchWrites();
     bool WrittenSince(const Watch& watch, const std::vector<Range>& reads);
     std::uint64_t Retired() const { return retiredItems.load(std::memory_order_acquire); }
+    std::uint64_t Enqueued() const { return enqueuedItems.load(std::memory_order_acquire); }
     void NoteDecodeDrain() { decodeDrains.fetch_add(1, std::memory_order_relaxed); }
     std::uint64_t DecodeDrains() const { return decodeDrains.load(std::memory_order_relaxed); }
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
@@ -183,6 +205,8 @@ private:
     DeepFound deepQueued(std::span<const Range> ranges, std::uint64_t live) const;
     bool deepQueuedWithin(std::span<const Range> ranges, std::uint64_t from, std::uint64_t to) const;
     DeepFound newestQueued(std::span<const Range> ranges) const;
+    DeepFound scanQueued(std::span<const Range> ranges);
+    void verifyExactBytes(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode, FrameCheck check);
     void verifyQueued(std::uint32_t lookup, std::span<const Range> ranges);
     void noteDeepReads(const std::vector<Range>& reads, std::uint64_t stamp);
     bool readsMaybe(std::uint64_t address, std::size_t bytes) const;
@@ -295,8 +319,7 @@ public:
     static bool Deep();
     bool DeepRing() const { return deepRing.load(std::memory_order_acquire); }
     void AwaitKeyed(std::uint64_t key, std::uint64_t shape, bool insertsOnly);
-    PendingWait AwaitPending(std::span<const Range> ranges, DeepSite site);
-    static void NotePacketWait(std::uint32_t opcode, const PendingWait& waited, std::uint64_t nanoseconds);
+    void AwaitPending(std::span<const Range> ranges, DeepSite site);
     static void NoteDeepKept(DeepKept kept, std::uint32_t opcode = 0x100);
     static void NoteDeepSite(DeepSite site);
     static std::string DeepText();
@@ -338,6 +361,56 @@ public:
     static bool AheadOfTurn();
     static bool DeferRelease(std::array<std::shared_ptr<const void>, 3>& held) noexcept;
     static std::uint64_t TakeDeepestRelease();
+    static bool FrameFlowWanted();
+    static bool FrameFlow();
+    static bool FrameCensus();
+    bool FrameLatch() const { return frameLatch.load(std::memory_order_acquire); }
+    void LatchFrameFlow();
+    static void NoteFrameKept(FrameKept kept);
+    static void NoteFrameSite(FrameSite site, std::uint64_t ns = 0);
+    static void NoteFlipDistance(std::uint64_t jobs, std::uint64_t items, std::uint64_t inFlight);
+    static std::size_t OutstandingJobs() { return outstanding.load(std::memory_order_acquire); }
+    void NoteFlipQueued() { flipsQueued.fetch_add(1, std::memory_order_acq_rel); }
+    void NoteFlipSeq(std::uint64_t seq) { lastFlipSeq.store(seq, std::memory_order_release); }
+    void NoteFlipCommitted() { flipsCommitted.fetch_add(1, std::memory_order_acq_rel); }
+    std::uint64_t FlipsQueued() const { return flipsQueued.load(std::memory_order_acquire); }
+    std::uint64_t FlipsCommitted() const { return flipsCommitted.load(std::memory_order_acquire); }
+    std::uint64_t LastFlipSeq() const { return lastFlipSeq.load(std::memory_order_acquire); }
+    void NoteRawReader() { rawReader = nextSeq - 1; }
+    std::uint64_t RawReader() const { return rawReader; }
+    bool AwaitRawReaders();
+    void AwaitExactPending(std::span<const Range> ranges, DeepSite site, FrameSite timed);
+    static std::uint64_t FrameVerifyEvery();
+    static bool FrameVerifyDue(FrameCheck check);
+    static void NoteFrameCheck(FrameCheck check, bool differs, const std::string& detail);
+    static std::string FrameText();
+    static void NoteFlipJobs(std::uint64_t jobs);
+    static void RetireFlipJobs();
+    class RawReaderHold {
+    public:
+        explicit RawReaderHold(const void* submission);
+        ~RawReaderHold();
+        RawReaderHold(const RawReaderHold&) = delete;
+        RawReaderHold& operator=(const RawReaderHold&) = delete;
+        void Release();
+
+    private:
+        const void* submission;
+        std::atomic<bool> held{true};
+    };
+    static std::shared_ptr<RawReaderHold> HoldRawReader(const void* submission);
+    static void CheckRawReaders(const void* submission, const char* where);
+    class TailScope {
+    public:
+        explicit TailScope(FrameTail cause);
+        ~TailScope();
+        TailScope(const TailScope&) = delete;
+        TailScope& operator=(const TailScope&) = delete;
+
+    private:
+        std::chrono::steady_clock::time_point start{};
+        std::uint32_t reason = 0;
+    };
 
 private:
     friend class DrawPipeline;
@@ -359,6 +432,8 @@ private:
         bool batch = false;
         bool counted = true;
         std::uint64_t unknownBefore = 0;
+        std::atomic<std::uint8_t> resolved{0};
+        std::vector<Range> resolvedWrites;
         std::shared_ptr<const void> answer;
         Job closure;
         Pending pending;
@@ -412,6 +487,18 @@ private:
     void releaseAllRetiredHits();
     void verifiedIdleWait(std::unique_lock<std::mutex>& lock, const std::function<bool()>& ready);
     bool aheadWait(std::span<const Range> ranges);
+    struct ExactFound {
+        bool unsure = false;
+        bool limited = false;
+        std::uint64_t blocker = 0;
+        std::uint64_t unresolved = 0;
+        std::uint64_t skipped = 0;
+    };
+    ExactFound exactPending(std::span<const Range> ranges);
+    bool awaitResolved(std::uint64_t job);
+    std::uint64_t scanBlocker(std::span<const Range> ranges, FrameSite site);
+    std::uint64_t keyScanBlocker(std::uint64_t key, std::uint64_t shape, bool insertsOnly);
+    void verifyScanned(std::span<const Range> ranges, std::uint64_t blocker);
     inline static std::atomic<std::size_t> outstanding{0};
     inline static std::atomic<bool> runOpen{false};
     RunFlusher openRun = nullptr;
@@ -461,6 +548,13 @@ private:
     std::unique_ptr<StampedKeys> deepShapes;
     std::atomic<bool> deepIndexed{false};
     std::atomic<std::uint64_t> lastUnknown{0};
+    std::atomic<bool> frameLatch{false};
+    std::atomic<std::uint64_t> frameGeneration{0};
+    std::uint64_t rawReader = 0;
+    std::atomic<std::uint64_t> flipsQueued{0};
+    std::atomic<std::uint64_t> flipsCommitted{0};
+    std::atomic<std::uint64_t> lastFlipSeq{0};
+    std::atomic<std::uint32_t> resolveWaiters{0};
     std::vector<Range> openRunWrites;
     mutable std::mutex verifySlots;
     std::uint64_t leanRetired = 1;

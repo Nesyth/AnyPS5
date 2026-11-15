@@ -378,6 +378,22 @@ bool Driver::enqueueSampleDumpPacket(std::span<const std::uint32_t> packet, std:
     return true;
 }
 
+PacketRules::DmaForm Driver::dmaPacketForm(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue) {
+    using PacketRules::DmaForm;
+    if (opcode != 0x50 || queue != 0 || packet.size() < 7 || !DrawPipeline::Active() || !deferredLabels().labels.empty()) return DmaForm::Refused;
+    const auto source = Pm4::DmaSource(packet);
+    const auto destination = Pm4::DmaDestination(packet);
+    if (destination == Pm4::DmaSelectGds || source == Pm4::DmaSelectGds) return DmaForm::Gds;
+    if (source != Pm4::DmaSourceData) return DmaForm::Copy;
+    constexpr std::size_t immediateLimit = std::size_t{16} << 20u;
+    constexpr std::size_t gpuStoreLimit = 65536;
+    const std::size_t bytes = Pm4::DmaBytes(packet);
+    const auto address = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
+    if (bytes > gpuStoreLimit) return address % 16 == 0 && bytes % 16 == 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes, true) && device.Load() ? DmaForm::Queues : DmaForm::Refused;
+    if (destination == Pm4::DmaDestinationNowhere || bytes == 0 || bytes > immediateLimit || address % 4 != 0 || bytes % 4 != 0) return DmaForm::Refused;
+    return GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes, true) ? DmaForm::Queues : DmaForm::Refused;
+}
+
 bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, const QueueState& state) {
     if (opcode != 0x50 || queue != 0 || packet.size() < 7 || !DrawPipeline::Active() || !deferredLabels().labels.empty()) return false;
     const auto source = ((packet[1] >> 29u) & 3u) | ((packet[6] >> 24u) & 4u) | ((packet[6] >> 25u) & 8u);

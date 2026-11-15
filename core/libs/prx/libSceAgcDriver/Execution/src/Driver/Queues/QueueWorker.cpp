@@ -238,7 +238,11 @@ void Driver::run(std::uint32_t id) noexcept {
                 };
 
                 std::optional<ThreadReport::WorkerStateScope> waiting;
-                if (id == 0 && !ready()) waiting.emplace(ThreadReport::WorkerState::NoSubmission);
+                std::optional<DrawFinisher::TailScope> standing;
+                if (id == 0 && !ready()) {
+                    waiting.emplace(ThreadReport::WorkerState::NoSubmission);
+                    standing.emplace(FrameTail::NoSubmission);
+                }
                 while (!ready()) {
                     if (!completionsPending() || (id != 0 && Graphics::Recorder::PendingCompletionLabels() == 0)) {
                         const auto idleEpochAtCheck = idleEpoch.load(std::memory_order_acquire);
@@ -277,6 +281,7 @@ void Driver::run(std::uint32_t id) noexcept {
                     lock.lock();
                 }
                 waiting.reset();
+                standing.reset();
                 timing.Mark("idle_and_completion_poll");
                 rethrowFailure();
                 if (stopping || shutdownToken.stop_requested() || pending.empty()) {

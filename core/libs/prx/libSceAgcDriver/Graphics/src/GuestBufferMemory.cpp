@@ -1835,6 +1835,7 @@ bool mirrorStandsIn(const HostImport& entry) {
 }
 
 bool hasFrameHistory(const HostImports& state) {
+    NoteFrameStateRead(FrameState::ImportFloor);
     return state.previousFrameFloor != 0;
 }
 

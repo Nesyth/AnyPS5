@@ -746,6 +746,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 } else {
                     DrawFinisher::NoteDeepKept(noted ? noteKind() : DeepKept::WorkerNote);
                     DrawFinisher::Get().Drain();
+                    if (DrawFinisher::Get().FlipsQueued() != DrawFinisher::Get().FlipsCommitted() && DrawPipeline::Queue0().Busy()) {
+                        DrawFinisher::NoteFrameKept(FrameKept::WorkerBehindFlip);
+                        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+                    }
                 }
             }
         }

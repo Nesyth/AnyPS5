@@ -25,6 +25,9 @@ std::size_t verdictRanges(std::span<const std::uint32_t> packet, std::uint32_t h
 bool awaitVerdictWriters(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode);
 bool awaitVerdictFinisherWriters(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode);
 void awaitPredicationWriters(std::uint64_t address, std::size_t bytes, std::uint32_t opcode);
+enum class FlipForm : std::uint8_t { Header, EopLabel, EopNothing, Kept };
+enum class DmaForm : std::uint8_t { Queues, Copy, Gds, Refused };
+FlipForm flipForm(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode);
 bool sealsWriteOnly(std::span<const std::uint32_t> packet, std::uint32_t opcode);
 bool& drawnSinceSeal();
 void dumpQueue(const Submission& submission);

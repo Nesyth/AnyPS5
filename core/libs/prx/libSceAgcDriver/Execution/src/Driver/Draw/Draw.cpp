@@ -893,7 +893,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             sink->dataEntry = dataEntry;
             sink->device = localDevice.get();
         }
-        DrawFinisher::Get().Enqueue([this, tailHolder] {
+        const auto rawHold = DrawFinisher::HoldRawReader(&submission);
+        DrawFinisher::Get().Enqueue([this, tailHolder, rawHold] {
+            struct ReaderDone {
+                const std::shared_ptr<DrawFinisher::RawReaderHold>& hold;
+                ~ReaderDone() {
+                    if (hold != nullptr) hold->Release();
+                }
+            } readerDone{rawHold};
             auto& job = *tailHolder;
             checkSegmentSlot(job, "started");
             DrawPipeline::FollowEpoch(job.epoch);
@@ -911,6 +918,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
             checkSegmentSlot(job, "finished");
         }, std::move(held));
+        DrawFinisher::Get().NoteRawReader();
         timing.Mark("draw_handed_off");
         return drawn();
     }

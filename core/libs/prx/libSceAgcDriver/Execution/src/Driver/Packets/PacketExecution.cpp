@@ -16,9 +16,12 @@
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <shared_mutex>
 #include <stdexcept>
@@ -194,12 +197,21 @@ std::size_t verdictRanges(std::span<const std::uint32_t> packet, std::uint32_t h
     }
 }
 
+namespace {
+
+bool registerLoad(std::uint32_t opcode) {
+    return opcode == 0x63 || opcode == 0x64 || opcode == 0x9f;
+}
+
+}
+
 bool awaitVerdictWriters(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode) {
     std::array<std::pair<std::uint64_t, std::uint64_t>, 3> ranges{};
     const auto count = verdictRanges(packet, header, opcode, ranges);
     if (count != 0) {
         auto& pipeline = DrawPipeline::Queue0();
         const std::span<const DrawPipeline::Range> asked(ranges.data(), count);
+        if (registerLoad(opcode) && DrawFinisher::FrameFlow() && pipeline.AwaitExactWriters(asked, DrawPipeline::DrainReason::Packet, opcode, DeepSite::PacketVerdict, FrameSite::ListWait, FrameCheck::ListBytes)) return true;
         while (pipeline.Busy() && pipeline.OverlapsAny(asked)) pipeline.AwaitWriters(asked, DrawPipeline::DrainReason::Packet, opcode, DeepSite::PacketVerdict);
     }
     return keepsDrawPipeline(packet, header, opcode);
@@ -209,9 +221,9 @@ bool awaitVerdictFinisherWriters(std::span<const std::uint32_t> packet, std::uin
     std::array<std::pair<std::uint64_t, std::uint64_t>, 3> ranges{};
     const auto count = verdictRanges(packet, header, opcode, ranges);
     if (count == 0) return keepsDrawPipeline(packet, header, opcode);
-    const auto begin = std::chrono::steady_clock::now();
-    const auto waited = DrawFinisher::Get().AwaitPending(std::span<const DrawFinisher::Range>(ranges.data(), count), DeepSite::PacketFinisher);
-    if (waited.cause != PendingCause::None) DrawFinisher::NotePacketWait(opcode, waited, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count()));
+    const std::span<const DrawFinisher::Range> asked(ranges.data(), count);
+    if (registerLoad(opcode) && DrawFinisher::FrameFlow()) DrawFinisher::Get().AwaitExactPending(asked, DeepSite::PacketFinisher, FrameSite::ListWait);
+    else DrawFinisher::Get().AwaitPending(asked, DeepSite::PacketFinisher);
     return true;
 }
 
@@ -224,6 +236,17 @@ void awaitPredicationWriters(std::uint64_t address, std::size_t bytes, std::uint
     const DrawPipeline::Range range{address, address + bytes};
     do pipeline.AwaitWriters({&range, 1}, DrawPipeline::DrainReason::Packet, opcode, DeepSite::Predication);
     while (pipeline.Busy() && pipeline.Overlaps(address, bytes));
+}
+
+FlipForm flipForm(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode) {
+    if (header == FlipPacketHeader) return FlipForm::Header;
+    if (opcode != 0x49 || packet.size() != 8) return FlipForm::Kept;
+    if (const auto label = Pm4::DecodeLabelWrite(packet)) {
+        const auto bytes = label->Bytes();
+        return DeferLabels() && bytes.size() <= DeferredLabel::Capacity && bytes.size() % 4 == 0 && label->address % 4 == 0 ? FlipForm::EopLabel : FlipForm::Kept;
+    }
+    const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
+    return storesNothing ? FlipForm::EopNothing : FlipForm::Kept;
 }
 
 bool sealsWriteOnly(std::span<const std::uint32_t> packet, std::uint32_t opcode) {
@@ -281,6 +304,142 @@ void Driver::abAtFlip() {
     if (!lines.empty()) ThreadReport::Phase();
 }
 
+void Driver::abAtFlip(double seconds) {
+    std::vector<std::string> lines;
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        lines = Graphics::AbAtPresent(flipsCounted.load(), seconds);
+    }
+    if (DrawFinisher::FrameVerifyDue(FrameCheck::AbPhase)) {
+        const bool begins = std::any_of(lines.begin(), lines.end(), [](const std::string& line) { return line.find(" begins at present ") != std::string::npos || line.find("in-run A/B:") != std::string::npos; });
+        DrawFinisher::NoteFrameCheck(FrameCheck::AbPhase, begins, "an A/B phase began at the ordered flip of present " + std::to_string(flipsCounted.load()) + ", where the pipeline is not quiescent");
+    }
+    for (const auto& line : lines) AgcDriver::ProfilePrint_nid_no_patch("%s", line.c_str());
+    if (!lines.empty()) ThreadReport::Phase();
+}
+
+bool Driver::flipOrdered(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool predicated, PacketRules::FlipForm& form, double& abSeconds) {
+    form = PacketRules::FlipForm::Kept;
+    abSeconds = 0;
+    if (!DrawFinisher::FrameFlowWanted()) return false;
+    static const bool syncFlip = std::getenv("APS5_SYNC_FLIP") != nullptr || std::getenv("APS5_DRAIN_ALL") != nullptr;
+    const auto kept = [](FrameKept reason) {
+        DrawFinisher::NoteFrameKept(reason);
+        return false;
+    };
+    if (predicated) return kept(FrameKept::Predicated);
+    if (syncFlip) return kept(FrameKept::SyncFlip);
+    if (APS5_ENABLE_TIMING_LOG) return kept(FrameKept::TimingLog);
+    if (!deferredLabels().labels.empty()) return kept(FrameKept::DeferredLabels);
+    form = PacketRules::flipForm(packet, header, opcode);
+    if (form == PacketRules::FlipForm::Kept) return kept(FrameKept::LabelForm);
+    if (Graphics::AbConfigured()) {
+        abSeconds = Graphics::AbClockSeconds();
+        if (Graphics::AbBeginDue(flipsCounted.load() + 1, abSeconds)) return kept(FrameKept::AbPhase);
+    }
+    if (!DrawFinisher::FrameFlow()) DrawFinisher::Get().LatchFrameFlow();
+    if (!DrawFinisher::FrameFlow()) return kept(FrameKept::NotLatched);
+    return true;
+}
+
+void Driver::queueOrderedFlip(FlipCommit commit) {
+    const auto start = DrawFinisher::FrameCensus() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::vector<DrawPipeline::Range> writes;
+    std::uint64_t labelAddress = 0;
+    std::vector<std::byte> labelBytes;
+    if (commit.label) {
+        const auto label = Pm4::DecodeLabelWrite(commit.words);
+        require(label.has_value(), "AGC driver: the label of an ordered flip decodes to no label write");
+        const auto bytes = label->Bytes();
+        writes.emplace_back(label->address, label->address + bytes.size());
+        if ((commit.words[2] >> 29u) != 3u) {
+            labelAddress = label->address;
+            labelBytes.assign(bytes.begin(), bytes.end());
+        }
+    }
+    auto& finisher = DrawFinisher::Get();
+    auto& pipeline = DrawPipeline::Queue0();
+    finisher.FlushOpenRun();
+    if (start != std::chrono::steady_clock::time_point{}) DrawFinisher::NoteFlipDistance(DrawFinisher::OutstandingJobs(), pipeline.Outstanding(), finisher.FlipsQueued() - finisher.FlipsCommitted());
+    const auto issued = finisher.Issued();
+    if (DrawFinisher::FrameVerifyDue(FrameCheck::FlipOrder)) {
+        auto probe = std::make_shared<FlipProbe>();
+        probe->jobs = issued;
+        probe->items = pipeline.Enqueued();
+        commit.probe = std::move(probe);
+    }
+    DrawFinisher::NoteFlipJobs(issued);
+    finisher.NoteFlipQueued();
+    pipeline.EnqueueFlip([this, flip = std::move(commit)] { commitFlip(flip); }, std::move(writes), labelAddress, std::move(labelBytes));
+    const auto after = finisher.Issued();
+    finisher.NoteFlipSeq(after != issued ? after - 1 : 0);
+    if (start != std::chrono::steady_clock::time_point{}) DrawFinisher::NoteFrameSite(FrameSite::OrderedFlip, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+}
+
+void Driver::commitFlip(const FlipCommit& flip) {
+    struct Settled {
+        bool flipJobs = true;
+        ~Settled() {
+            if (flipJobs) DrawFinisher::RetireFlipJobs();
+            DrawFinisher::Get().NoteFlipCommitted();
+        }
+    } settled;
+    try {
+        const DrawPipeline::FlipCommitScope committing;
+        GuestMemory::SetCurrentPacket(flip.header ? 0xffffu : 0x49u, 0);
+        if (flip.probe != nullptr) {
+            const auto front = DrawFinisher::Get().Front();
+            const auto retiredNow = DrawPipeline::Queue0().Retired();
+            char text[256];
+            std::snprintf(text, sizeof(text), "the flip of frame %llu queued with the finisher at job %llu and %llu committer items before it committed with the front at %llu and %llu items retired", static_cast<unsigned long long>(flip.frameNumber), static_cast<unsigned long long>(flip.probe->jobs), static_cast<unsigned long long>(flip.probe->items), static_cast<unsigned long long>(front), static_cast<unsigned long long>(retiredNow));
+            DrawFinisher::NoteFrameCheck(FrameCheck::FlipOrder, front < flip.probe->jobs || retiredNow < flip.probe->items, text);
+        }
+        if (flip.header) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            static_cast<void>(Graphics::StorageTexture::StoreSmallPending("flip"));
+        }
+        std::uint64_t batchesAtFlip = 0, unsignaledAtFlip = 0;
+        Graphics::StorageTexture::NoteFlip();
+        {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            const auto localDevice = device.Load();
+            if (localDevice != nullptr) static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("flip"));
+            if (flip.label) {
+                const auto label = Pm4::DecodeLabelWrite(flip.words);
+                require(label.has_value(), "AGC driver: the label of an ordered flip decodes to no label write");
+                const auto bytes = label->Bytes();
+                auto& deferred = deferredLabels();
+                require(deferred.labels.empty(), "AGC driver: the committer holds deferred labels at an ordered flip");
+                deferred.since = std::chrono::steady_clock::now();
+                auto& entry = deferred.labels.emplace_back();
+                entry.address = label->address;
+                entry.size = bytes.size();
+                std::memcpy(entry.bytes.data(), bytes.data(), bytes.size());
+                ++queuedLabels;
+            }
+            if (!recordLabelsForPacket(localDevice.get(), 0) && localDevice != nullptr) localDevice->SubmitRecorded(true, Graphics::Recorder::SubmitReason::Flip);
+            if (localDevice != nullptr) localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
+        }
+        Graphics::NoteHostImportFrame();
+        DrawFinisher::RetireFlipJobs();
+        settled.flipJobs = false;
+        if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
+        flipBatchesUnsignaled += unsignaledAtFlip;
+        flip.frame->NoteFlipBatches(batchesAtFlip, unsignaledAtFlip);
+        CaptureTrace::Log("flip frame=%llu submission=%llu offset=%zu batch=%llu unsignaled=%llu", static_cast<unsigned long long>(flip.frameNumber), static_cast<unsigned long long>(flip.serial), static_cast<std::size_t>(flip.cursor), static_cast<unsigned long long>(batchesAtFlip), static_cast<unsigned long long>(unsignaledAtFlip));
+        if (flip.releases) releaseFlipHold();
+        flip.request->GpuReady(flip.frame);
+    } catch (const ProcessShutdown&) {
+        throw;
+    } catch (...) {
+        flip.request->Fail(std::current_exception());
+        throw;
+    }
+}
+
 std::optional<std::uint32_t> Driver::releaseInterrupt(std::span<const std::uint32_t> packet, std::uint32_t opcode, bool carriesFlip) {
     if (opcode != 0x49 || carriesFlip || packet.size() < 3) return std::nullopt;
     const auto interruptSelect = (packet[2] >> 24u) & 7u;
@@ -296,9 +455,15 @@ bool Driver::endSegment(const Submission& submission, FlipHold& flipHold, bool p
     const auto switchSet = [&](Graphics::RuntimeSwitch id) { return front == FrontMode::Lean ? LeanFront::SwitchSet(frontLatch, id) : Graphics::RuntimeSwitches::Set(id); };
     static const bool orderedCompletion = std::getenv("APS5_PIPELINE_DRAIN_SUBMISSIONS") == nullptr && std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
     const bool streamEnd = submission.queue == 0 && pipelined && orderedCompletion && !submission.progress && submission.rewindTail != nullptr && deferredLabels().labels.empty() && (std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0 && switchSet(Graphics::RuntimeSwitch::XpStreamSegments);
+    const bool frameFlow = submission.queue == 0 && DrawFinisher::FrameFlow();
     if (submission.queue == 0 && !streamEnd) {
-        DrawFinisher::NoteDeepKept(DeepKept::SegmentEnd);
-        DrawFinisher::Get().Drain();
+        if (Lean && frameFlow) {
+            DrawFinisher::NoteFrameSite(FrameSite::SegmentEnd);
+        } else {
+            if (frameFlow && DrawFinisher::Busy()) DrawFinisher::NoteFrameKept(FrameKept::FullLoopSegmentEnd);
+            DrawFinisher::NoteDeepKept(DeepKept::SegmentEnd);
+            DrawFinisher::Get().Drain();
+        }
     }
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
@@ -325,6 +490,8 @@ bool Driver::endSegment(const Submission& submission, FlipHold& flipHold, bool p
         return true;
     }
     if (pipelined && orderedCompletion && deferredLabels().labels.empty()) {
+        std::optional<DrawPipeline::OrderProbe> probe;
+        if (Lean && frameFlow && DrawFinisher::FrameVerifyDue(FrameCheck::SegmentEnd)) probe.emplace(FrameCheck::SegmentEnd);
         if (submission.rewindTail == nullptr) {
             flipHold.working = false;
             deferCompletion(submission);
@@ -404,7 +571,12 @@ void Driver::execute(const Submission& submission) {
     const auto switchSet = [&](Graphics::RuntimeSwitch id) { return front == FrontMode::Lean ? LeanFront::SwitchSet(frontLatch, id) : Graphics::RuntimeSwitches::Set(id); };
     static const bool orderedWaits = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
     DrawPipeline::Active() = pipelined;
+    if (pipelined && DrawFinisher::FrameFlowWanted() && DrawFinisher::Busy()) {
+        DrawFinisher::NoteFrameKept(FrameKept::FrontChange);
+        DrawFinisher::Get().Drain();
+    }
     if (pipelined && DrawFinisher::Get().Adopt(false)) leanDraws.ReleaseDevice();
+    if (pipelined) DrawFinisher::Get().LatchFrameFlow();
     struct PipelineDrain {
         bool pipelined;
         ~PipelineDrain() {
@@ -485,6 +657,7 @@ void Driver::execute(const Submission& submission) {
         bool queue0;
         ~SettleFinisher() {
             if (!queue0) return;
+            if (DrawFinisher::FrameFlow() && DrawFinisher::Busy()) DrawFinisher::NoteFrameKept(FrameKept::FullLoopSettle);
             DrawFinisher::NoteDeepKept(DeepKept::Settle);
             DrawFinisher::Get().Settle();
         }
@@ -513,19 +686,39 @@ void Driver::execute(const Submission& submission) {
             cursor = nextCursor;
             continue;
         }
+        PacketRules::FlipForm flipKind = PacketRules::FlipForm::Kept;
+        double abSeconds = 0;
+        const bool orderedFlip = pipelined && (header == FlipPacketHeader || opcode == 0x49) && submission.flips.contains(cursor) && flipOrdered(packet, header, opcode, predicated, flipKind, abSeconds);
+        const bool orderedWait = pipelined && header == RenderingWaitPacketHeader && !predicated && DrawFinisher::FrameFlow();
+        const bool ordered = orderedFlip || orderedWait;
+        bool dmaBeside = false;
+        DrawPipeline::Range argumentRange{};
+        const bool argumentWait = pipelined && opcode == 0x16 && argumentWaitWanted(packet, queue, predicated, argumentRange);
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
             const bool queuesLabel = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && labelPacketQueues(packet, opcode);
             const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);
             const bool queuesSampleDump = pipelined && !predicated && (switchSet(Graphics::RuntimeSwitch::BesideSampleDumps) || DrawFinisher::Flow() || DrawFinisher::Deep()) && sampleDumpQueues(packet, opcode, submission.queue);
-            bool beside = DrawFinisher::Overlap() && opcode != 0x15 && (queuesLabel || heldLabelWait || queuesSampleDump || keepsDrawPipeline(packet, header, opcode));
+            if (pipelined && !predicated && opcode == 0x50 && DrawFinisher::Overlap() && DrawFinisher::FrameFlow()) {
+                const auto form = dmaPacketForm(packet, opcode, submission.queue);
+                dmaBeside = form == PacketRules::DmaForm::Queues;
+                if (dmaBeside) DrawFinisher::NoteFrameSite(FrameSite::DmaBeside);
+                else if (form == PacketRules::DmaForm::Copy) DrawFinisher::NoteFrameKept(FrameKept::DmaCopy);
+                else if (form == PacketRules::DmaForm::Gds) DrawFinisher::NoteFrameKept(FrameKept::DmaGds);
+            }
+            bool beside = DrawFinisher::Overlap() && opcode != 0x15 && (queuesLabel || heldLabelWait || queuesSampleDump || dmaBeside || keepsDrawPipeline(packet, header, opcode));
             if (!beside && pipelined && DrawFinisher::Overlap() && opcode != 0x15 && DrawFinisher::Deep() && asksVerdict()) beside = awaitVerdictFinisherWriters(packet, header, opcode);
-            if (!beside && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::PacketFinisher)) {
+            if (!beside && argumentWait) {
+                DrawFinisher::Get().AwaitExactPending({&argumentRange, 1}, DeepSite::IndirectArguments, FrameSite::ArgumentWait);
+                beside = true;
+            }
+            if (!beside && !ordered && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::PacketFinisher)) {
+                if (opcode == 0x16 && DrawFinisher::FrameFlow()) DrawFinisher::NoteFrameKept(FrameKept::IndirectGpu);
                 noteKept();
                 DrawFinisher::Get().Drain();
             }
             if (DrawFinisher::Overlap()) {
-                DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Packet, !beside);
-                if (!beside) DrawFinisher::NoteDrainedOpcode(header == FlipPacketHeader ? 0xffu : opcode, keepsDrawPipeline(packet, header, opcode));
+                DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Packet, !beside && !ordered);
+                if (!beside && !ordered) DrawFinisher::NoteDrainedOpcode(header == FlipPacketHeader ? 0xffu : opcode, keepsDrawPipeline(packet, header, opcode));
             }
         }
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
@@ -533,11 +726,30 @@ void Driver::execute(const Submission& submission) {
         if (submission.queue != 0 && Graphics::Recorder::DispatchOverlapEnabled()) noteRingPacket(submission.queue, submission.serial, opcode, header);
         PerformanceTimer timing("Driver.Packet");
         if (!predicated) noteLabelIssue(packet, submission.queue);
+        std::optional<DrawPipeline::OrderProbe> dmaProbe;
+        if (dmaBeside && DrawFinisher::FrameVerifyDue(FrameCheck::DmaOrder)) dmaProbe.emplace(FrameCheck::DmaOrder);
         if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && (enqueueLabelPacket(packet, opcode, submission.queue, releaseInterrupt(packet, opcode, false)) || enqueueDmaPacket(packet, opcode, submission.queue, queue) || enqueueConstantRamDump(packet, opcode, submission.queue, queue) || enqueueSampleDumpPacket(packet, opcode, submission.queue))) {
             traceLabel(packet, submission.queue);
             recent.Record(cursor);
             cursor = nextCursor;
             continue;
+        }
+        dmaProbe.reset();
+        if (dmaBeside) {
+            DrawFinisher::NoteFrameKept(FrameKept::DmaRefused);
+            if (DrawFinisher::Busy()) {
+                bool beside = keepsDrawPipeline(packet, header, opcode);
+                if (!beside && DrawFinisher::Deep() && asksVerdict()) beside = awaitVerdictFinisherWriters(packet, header, opcode);
+                if (!beside) {
+                    noteKept();
+                    DrawFinisher::Get().Drain();
+                }
+            }
+        }
+        if (pipelined && (opcode == 0x50 || (opcode == 0x46 && Pm4::SampleDump(packet))) && DrawFinisher::Get().FlipsQueued() != DrawFinisher::Get().FlipsCommitted() && DrawPipeline::Queue0().Busy()) {
+            DrawFinisher::NoteFrameKept(FrameKept::WorkerBehindFlip);
+            noteKept();
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         }
         if (pipelined && !predicated && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && orderedWaits && DrawPipeline::Queue0().Busy()) {
             const auto awaitedBytes = Pm4::WaitAwaitedBytes(packet);
@@ -562,9 +774,10 @@ void Driver::execute(const Submission& submission) {
             }
         }
         timing.Mark("pipeline_prepare");
-        if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode) && !(DrawFinisher::Deep() && asksVerdict() && awaitVerdictWriters(packet, header, opcode))) {
+        if (pipelined && !ordered && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode) && !(DrawFinisher::Deep() && asksVerdict() && awaitVerdictWriters(packet, header, opcode)) && !(argumentWait && DrawPipeline::Queue0().AwaitExactWriters({&argumentRange, 1}, DrawPipeline::DrainReason::Indirect, 0x16, DeepSite::IndirectArguments, FrameSite::ArgumentWait, FrameCheck::DispatchArguments))) {
             const bool ordersFrame = header == FlipPacketHeader || header == RenderingWaitPacketHeader || submission.flips.contains(cursor) || opcode == 0x3c || opcode == 0x93 || opcode == 0x49 || opcode == 0x37;
             if (ordersFrame || !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::PacketCommitter)) {
+                if (opcode == 0x16 && !argumentWait && DrawFinisher::FrameFlow()) DrawFinisher::NoteFrameKept(FrameKept::IndirectGpu);
                 noteKept();
                 DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
             }
@@ -630,7 +843,13 @@ void Driver::execute(const Submission& submission) {
         if (profilePackets) packetProfile.flushMs += std::chrono::duration<double, std::milli>(packetTimer.start - flushStart).count();
 
         bool wroteOnGpu = false, endOfPipeInterrupt = false, interruptDeferred = false, drawPacket = false, sampleDump = false;
-        const bool drains = preparePacketMemory(submission, queue, packet, header, opcode, releaseInterrupt(packet, opcode, submission.flips.contains(cursor)), wroteOnGpu, endOfPipeInterrupt, interruptDeferred, drawPacket, sampleDump);
+        bool drains = false;
+        if (orderedFlip) {
+            wroteOnGpu = flipKind == PacketRules::FlipForm::EopLabel;
+            if (flipKind == PacketRules::FlipForm::EopNothing) ++noOpLabels;
+        } else {
+            drains = preparePacketMemory(submission, queue, packet, header, opcode, releaseInterrupt(packet, opcode, submission.flips.contains(cursor)), wroteOnGpu, endOfPipeInterrupt, interruptDeferred, drawPacket, sampleDump);
+        }
         traceLabel(packet, submission.queue);
         timing.Mark("prepare_memory");
 
@@ -647,7 +866,34 @@ void Driver::execute(const Submission& submission) {
         if (!waitPacket) ++packetsInFlight;
         recent.Record(cursor);
         if (header == RenderingWaitPacketHeader) {
+            const auto waitStart = orderedWait && DrawFinisher::FrameCensus() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (orderedWait) DrawFinisher::Get().FlushOpenRun();
+            const DrawFinisher::TailScope standing(FrameTail::RenderingWait);
             timed(&WorkerProfile::waitMs, [&] { submission.renderingWaits.at(cursor)->Wait(); });
+            if (orderedWait) DrawFinisher::NoteFrameSite(FrameSite::RenderingWait, waitStart == std::chrono::steady_clock::time_point{} ? 0 : static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count()));
+        } else if (orderedFlip) {
+            if (deviceUse.owns_lock()) deviceUse.unlock();
+            CheckFailure();
+            ++flipsCounted;
+            if (Graphics::AbConfigured()) abAtFlip(abSeconds);
+            timing.Mark("flip_flush");
+            timing.FinishPacket(submission.serial, cursor, 0xffffu, count);
+            const auto frameNumber = ++frameSerial;
+            auto frame = std::make_shared<FrameTiming>(frameNumber);
+            const auto now = FrameTiming::Clock::now();
+            frame->IncludeSubmission(submission.serial, now, now, now, true);
+            frame->SetFlip(submission.serial, cursor, now, now);
+            FlipCommit commit;
+            commit.request = submission.flips.at(cursor);
+            commit.frame = std::move(frame);
+            commit.frameNumber = frameNumber;
+            commit.serial = submission.serial;
+            commit.cursor = static_cast<std::uint32_t>(cursor);
+            commit.header = flipKind == PacketRules::FlipForm::Header;
+            commit.label = flipKind == PacketRules::FlipForm::EopLabel;
+            std::copy_n(packet.begin(), std::min(packet.size(), commit.words.size()), commit.words.begin());
+            commit.releases = std::exchange(flipHold.held, false);
+            queueOrderedFlip(std::move(commit));
         } else if (submission.flips.contains(cursor)) {
             if (opcode == 0x49) {
                 if (!wroteOnGpu) {
@@ -688,6 +934,7 @@ void Driver::execute(const Submission& submission) {
             CaptureTrace::Log("flip frame=%llu submission=%llu offset=%zu batch=%llu unsignaled=%llu", static_cast<unsigned long long>(frameSerial.load()), static_cast<unsigned long long>(submission.serial), cursor, static_cast<unsigned long long>(batchesAtFlip), static_cast<unsigned long long>(unsignaledAtFlip));
             flipHold.Release();
             submission.flips.at(cursor)->GpuReady(frame);
+            if (pipelined) DrawFinisher::Get().LatchFrameFlow();
         } else if (opcode == 0x15 || opcode == 0x16) {
             packetCounters.CountDispatch();
             landPendingWaits(submission.queue);

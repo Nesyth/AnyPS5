@@ -11,4 +11,8 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_linear_target_completion_points_sync_flip agc_driver_linear_target_completion_points_unpipelined PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    agc_add_env_test(agc_driver_linear_target_completion_points_frame_flow agc_driver_linear_target_completion_points_tests
+            ARGS --flip --label
+            ENV ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1 ${agcLateStackEnvironment} ${agcLeanFrontEnvironment} ${agcDeepFlowEnvironment} ${agcFrameFlowEnvironment} TIMEOUT 60)
+    set_tests_properties(agc_driver_linear_target_completion_points_frame_flow PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDeepFlowDifference};${agcFrameFlowDifference}")
 endif()

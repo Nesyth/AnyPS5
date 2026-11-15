@@ -657,6 +657,7 @@ void Driver::checkFlush(const Submission& submission, std::size_t cursor, const 
 
 void Driver::releaseSegmentSlot(SegmentSlot& slot) {
     if (slot.prepared) {
+        DrawFinisher::CheckRawReaders(&slot.own, "a lean segment slot released");
         recycleLeanTail(slot.own);
         auto labelWrites = std::move(slot.own.labelWrites);
         labelWrites.clear();
@@ -725,12 +726,24 @@ void Driver::executeLean(const Submission& first) {
         }
     } held{*this, {}};
     struct SettleFinisher {
+        const Submission* first;
         ~SettleFinisher() {
+            if (DrawFinisher::FrameFlow()) {
+                if (std::uncaught_exceptions() == 0) {
+                    const auto start = DrawFinisher::FrameCensus() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    const bool waited = DrawFinisher::Get().AwaitRawReaders();
+                    if (waited) LeanFront::AddOnWorker(Counter::SettlesWaited);
+                    DrawFinisher::NoteFrameSite(waited ? FrameSite::ExitWait : FrameSite::ExitFree, !waited || start == std::chrono::steady_clock::time_point{} ? 0 : static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+                    DrawFinisher::CheckRawReaders(first, "the submission at the exit of the lean loop");
+                    return;
+                }
+                DrawFinisher::NoteFrameKept(FrameKept::Exception);
+            }
             if (DrawFinisher::Busy()) LeanFront::AddOnWorker(Counter::SettlesWaited);
             DrawFinisher::NoteDeepKept(DeepKept::Settle);
             DrawFinisher::Get().Settle();
         }
-    } settleFinisher;
+    } settleFinisher{&first};
     struct PacketProfileStorage {};
     LeanRun run{HostThreadLocal<PacketProfile, PacketProfileStorage>(), PacketCounters::ThisThread(), {}, packetEpoch(), false, 0};
     run.gate.everyPacket = everyPacketFlush();
@@ -756,6 +769,10 @@ void Driver::executeLean(const Submission& first) {
         const auto front = latchFront(stalled.queue, false);
         awaitRewindTail(stalled, front);
         if (front != FrontMode::Lean) {
+            if (DrawFinisher::FrameFlowWanted() && DrawFinisher::Busy()) {
+                DrawFinisher::NoteFrameKept(FrameKept::FrontChange);
+                DrawFinisher::Get().Drain();
+            }
             Submission tail{};
             const auto retiredTakes = prepareTail(stalled, tail, front, ring, nullptr, false);
             if (rewindTiming) rewindTiming->Finish();
@@ -812,6 +829,7 @@ void Driver::runLeanSegment(const Submission& submission, QueueState& queue, Seg
     clearResolvedAhead();
     gateOpened() = true;
     prepareLeanDraws();
+    DrawFinisher::Get().LatchFrameFlow();
     if (!slot.table.built) {
         scanSegment(submission, slot.table, false, nullptr, LeanFront::SwitchSet(frontLatch, Graphics::RuntimeSwitch::PacketClassTable));
         markOutputs(submission, slot.table);
@@ -985,6 +1003,11 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
             }
         }
         if (plainDone != 0) packetsDone.fetch_add(std::exchange(plainDone, 0), std::memory_order_seq_cst);
+        PacketRules::FlipForm flipKind = PacketRules::FlipForm::Kept;
+        double abSeconds = 0;
+        const bool orderedFlip = flip && flipOrdered(packet, header, opcode, predicated, flipKind, abSeconds);
+        const bool orderedWait = entry.Has(LeanPacket::RenderingWait) && !predicated && DrawFinisher::FrameFlow();
+        const bool ordered = orderedFlip || orderedWait;
         const auto pipelineVerdict = [&] {
             switch (entry.pipeline) {
                 case LeanPacket::Pipeline::Keeps: return true;
@@ -994,13 +1017,23 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
         };
         bool listVerdict = false;
         bool listVerdictKnown = false;
+        bool dmaBeside = false;
+        DrawPipeline::Range argumentRange{};
+        const bool argumentWait = opcode == 0x16 && argumentWaitWanted(packet, queue, predicated, argumentRange);
         if (DrawFinisher::Busy() && !entry.Has(LeanPacket::KeepsFinisher)) {
             const bool queuesLabel = !predicated && !entry.Has(LeanPacket::FlipHeader) && !entry.Has(LeanPacket::RenderingWait) && !flip && (opcode == 0x49 || opcode == 0x37) && labelPacketQueues(packet, opcode);
             const bool heldLabelWait = !predicated && orderedWaits() && entry.Has(LeanPacket::Wait) && !entry.Has(LeanPacket::RenderingWait) && PacketRules::waitTakesPendingLabel(packet);
             const bool queuesSampleDump = !predicated && opcode == 0x46 && (LeanFront::SwitchSet(frontLatch, RuntimeSwitch::BesideSampleDumps) || DrawFinisher::Flow() || DrawFinisher::Deep()) && sampleDumpQueues(packet, opcode, submission.queue);
+            if (!predicated && opcode == 0x50 && DrawFinisher::Overlap() && DrawFinisher::FrameFlow()) {
+                const auto form = dmaPacketForm(packet, opcode, submission.queue);
+                dmaBeside = form == PacketRules::DmaForm::Queues;
+                if (dmaBeside) DrawFinisher::NoteFrameSite(FrameSite::DmaBeside);
+                else if (form == PacketRules::DmaForm::Copy) DrawFinisher::NoteFrameKept(FrameKept::DmaCopy);
+                else if (form == PacketRules::DmaForm::Gds) DrawFinisher::NoteFrameKept(FrameKept::DmaGds);
+            }
             bool keeps = false;
             const bool dispatchBeside = opcode == 0x15 && (LeanFront::SwitchSet(frontLatch, RuntimeSwitch::DispatchBeside) || DrawFinisher::Flow() || DrawFinisher::Deep());
-            if (DrawFinisher::Overlap() && (opcode != 0x15 || dispatchBeside) && !queuesLabel && !heldLabelWait && !queuesSampleDump) {
+            if (DrawFinisher::Overlap() && (opcode != 0x15 || dispatchBeside) && !queuesLabel && !heldLabelWait && !queuesSampleDump && !dmaBeside) {
                 keeps = pipelineVerdict();
                 const bool awaited = !keeps && DrawFinisher::Deep() && asksVerdict() && PacketRules::awaitVerdictFinisherWriters(packet, header, opcode);
                 if (entry.pipeline == LeanPacket::Pipeline::AsksLists) {
@@ -1008,16 +1041,21 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                     listVerdictKnown = !awaited;
                 }
                 keeps = keeps || awaited;
+                if (!keeps && argumentWait) {
+                    DrawFinisher::Get().AwaitExactPending({&argumentRange, 1}, DeepSite::IndirectArguments, FrameSite::ArgumentWait);
+                    keeps = true;
+                }
             }
-            const bool beside = DrawFinisher::Overlap() && (opcode != 0x15 || dispatchBeside) && (queuesLabel || heldLabelWait || queuesSampleDump || keeps);
-            if (!beside && !LeanFront::SwitchSet(frontLatch, RuntimeSwitch::XpNoPacketDrains) && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::PacketFinisher)) {
+            const bool beside = DrawFinisher::Overlap() && (opcode != 0x15 || dispatchBeside) && (queuesLabel || heldLabelWait || queuesSampleDump || dmaBeside || keeps);
+            if (!beside && !ordered && !LeanFront::SwitchSet(frontLatch, RuntimeSwitch::XpNoPacketDrains) && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::PacketFinisher)) {
+                if (opcode == 0x16 && DrawFinisher::FrameFlow()) DrawFinisher::NoteFrameKept(FrameKept::IndirectGpu);
                 noteKept();
                 DrawFinisher::Get().Drain(true);
                 listVerdictKnown = false;
             }
             if (DrawFinisher::Overlap()) {
-                DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Packet, !beside);
-                if (!beside) DrawFinisher::NoteDrainedOpcode(entry.Has(LeanPacket::FlipHeader) ? 0xffu : opcode, pipelineVerdict());
+                DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Packet, !beside && !ordered);
+                if (!beside && !ordered) DrawFinisher::NoteDrainedOpcode(entry.Has(LeanPacket::FlipHeader) ? 0xffu : opcode, pipelineVerdict());
             }
         }
         if constexpr (Timers) {
@@ -1120,6 +1158,8 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                     }
                 }
             }
+            std::optional<DrawPipeline::OrderProbe> dmaProbe;
+            if (dmaBeside && DrawFinisher::FrameVerifyDue(FrameCheck::DmaOrder)) dmaProbe.emplace(FrameCheck::DmaOrder);
             if (enqueueLabelPacket(packet, opcode, submission.queue, releaseInterrupt(packet, opcode, false)) || enqueueDmaPacket(packet, opcode, submission.queue, queue) || enqueueConstantRamDump(packet, opcode, submission.queue, queue) || enqueueSampleDumpPacket(packet, opcode, submission.queue)) {
                 if (!entry.Has(LeanPacket::Enqueues)) LeanFront::NoteDifference(LeanFront::Field::PacketTable, where(submission, cursor) + ": today's code queued the packet beside the pipeline, the packet table skips that check");
                 if (verifyPacket) LeanFront::NoteChecked(LeanFront::Item::Packet);
@@ -1135,6 +1175,18 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                 index = next;
                 continue;
             }
+        }
+        if (dmaBeside) {
+            DrawFinisher::NoteFrameKept(FrameKept::DmaRefused);
+            if (DrawFinisher::Busy() && !pipelineVerdict() && !(DrawFinisher::Deep() && asksVerdict() && PacketRules::awaitVerdictFinisherWriters(packet, header, opcode)) && !LeanFront::SwitchSet(frontLatch, RuntimeSwitch::XpNoPacketDrains)) {
+                noteKept();
+                DrawFinisher::Get().Drain(true);
+            }
+        }
+        if ((opcode == 0x50 || (opcode == 0x46 && Pm4::SampleDump(packet))) && DrawFinisher::Get().FlipsQueued() != DrawFinisher::Get().FlipsCommitted() && DrawPipeline::Queue0().Busy()) {
+            DrawFinisher::NoteFrameKept(FrameKept::WorkerBehindFlip);
+            noteKept();
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         }
         if (!predicated && entry.Has(LeanPacket::Wait) && !entry.Has(LeanPacket::RenderingWait) && orderedWaits() && DrawPipeline::Queue0().Busy()) {
             const auto awaitedBytes = Pm4::WaitAwaitedBytes(packet);
@@ -1174,8 +1226,10 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                 keeps = listVerdictKnown ? listVerdict : pipelineVerdict();
             }
             if (!keeps && DrawFinisher::Deep() && asksVerdict()) keeps = PacketRules::awaitVerdictWriters(packet, header, opcode);
+            if (!keeps && argumentWait) keeps = DrawPipeline::Queue0().AwaitExactWriters({&argumentRange, 1}, DrawPipeline::DrainReason::Indirect, 0x16, DeepSite::IndirectArguments, FrameSite::ArgumentWait, FrameCheck::DispatchArguments);
             const bool ordersFrame = entry.Has(LeanPacket::FlipHeader) || entry.Has(LeanPacket::RenderingWait) || flip || entry.Has(LeanPacket::Wait) || opcode == 0x49 || opcode == 0x37;
-            if (!keeps && (ordersFrame || !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::PacketCommitter))) {
+            if (!keeps && !ordered && (ordersFrame || !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::PacketCommitter))) {
+                if (opcode == 0x16 && !argumentWait && DrawFinisher::FrameFlow()) DrawFinisher::NoteFrameKept(FrameKept::IndirectGpu);
                 noteKept();
                 DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, entry.Has(LeanPacket::FlipHeader) ? 0xffu : opcode);
             }
@@ -1263,7 +1317,10 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
         };
 
         bool wroteOnGpu = false, endOfPipeInterrupt = false, interruptDeferred = false, drawPacket = false, sampleDump = false, drains = false;
-        if (entry.Has(LeanPacket::Memory) || verifyPacket) {
+        if (orderedFlip) {
+            wroteOnGpu = flipKind == PacketRules::FlipForm::EopLabel;
+            if (flipKind == PacketRules::FlipForm::EopNothing) ++noOpLabels;
+        } else if (entry.Has(LeanPacket::Memory) || verifyPacket) {
             drains = preparePacketMemory(submission, queue, packet, header, opcode, releaseInterrupt(packet, opcode, flip), wroteOnGpu, endOfPipeInterrupt, interruptDeferred, drawPacket, sampleDump);
             if (!entry.Has(LeanPacket::Memory) && (drains || wroteOnGpu || endOfPipeInterrupt || interruptDeferred || sampleDump || drawPacket != entry.Has(LeanPacket::Draw))) {
                 LeanFront::NoteDifference(LeanFront::Field::PacketTable, where(submission, cursor) + ": today's packet memory step acted on a packet the packet table skips it for");
@@ -1287,7 +1344,38 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
         if (!waitPacket) ++packetsInFlight;
         recent.Record(cursor);
         if (entry.Has(LeanPacket::RenderingWait)) {
+            const auto waitStart = orderedWait && DrawFinisher::FrameCensus() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (orderedWait) DrawFinisher::Get().FlushOpenRun();
+            const DrawFinisher::TailScope standing(FrameTail::RenderingWait);
             timedWork(&WorkerProfile::waitMs, [&] { submission.renderingWaits.at(cursor)->Wait(); });
+            if (orderedWait) DrawFinisher::NoteFrameSite(FrameSite::RenderingWait, waitStart == std::chrono::steady_clock::time_point{} ? 0 : static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count()));
+        } else if (orderedFlip) {
+            if (deviceUse.owns_lock()) deviceUse.unlock();
+            CheckFailure();
+            ++flipsCounted;
+            if (Graphics::AbConfigured()) {
+                abAtFlip(abSeconds);
+                run.gate.capGeneration = Graphics::RuntimeSwitches::Generation();
+                run.gate.cap = batchCap();
+            }
+            timing.Mark("flip_flush");
+            timing.FinishPacket(submission.serial, cursor, 0xffffu, count);
+            const auto frameNumber = ++frameSerial;
+            auto frame = std::make_shared<FrameTiming>(frameNumber);
+            const auto now = FrameTiming::Clock::now();
+            frame->IncludeSubmission(submission.serial, now, now, now, true);
+            frame->SetFlip(submission.serial, cursor, now, now);
+            FlipCommit commit;
+            commit.request = submission.flips.at(cursor);
+            commit.frame = std::move(frame);
+            commit.frameNumber = frameNumber;
+            commit.serial = submission.serial;
+            commit.cursor = static_cast<std::uint32_t>(cursor);
+            commit.header = flipKind == PacketRules::FlipForm::Header;
+            commit.label = flipKind == PacketRules::FlipForm::EopLabel;
+            std::copy_n(packet.begin(), std::min(packet.size(), commit.words.size()), commit.words.begin());
+            commit.releases = std::exchange(flipHold.held, false);
+            queueOrderedFlip(std::move(commit));
         } else if (flip) {
             if (opcode == 0x49) {
                 if (!wroteOnGpu) {
@@ -1329,6 +1417,7 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
             if (report) CaptureTrace::Log("flip frame=%llu submission=%llu offset=%zu batch=%llu unsignaled=%llu", static_cast<unsigned long long>(frameSerial.load()), static_cast<unsigned long long>(submission.serial), cursor, static_cast<unsigned long long>(batchesAtFlip), static_cast<unsigned long long>(unsignaledAtFlip));
             flipHold.Release();
             submission.flips.at(cursor)->GpuReady(frame);
+            DrawFinisher::Get().LatchFrameFlow();
         } else if (opcode == 0x15 || opcode == 0x16) {
             packetCounters.CountDispatch();
             landPendingWaits(submission.queue);
