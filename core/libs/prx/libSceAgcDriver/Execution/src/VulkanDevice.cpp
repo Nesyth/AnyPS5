@@ -6121,12 +6121,18 @@ void NoteCommitItem(const CommitTrace& trace, std::uint64_t ns) {
 }
 
 struct MovedWritesVerify {
-    std::atomic<std::uint64_t> seen{0}, checked{0}, differing{0}, printed{0};
+    std::atomic<std::uint64_t> seen{0}, checked{0}, differing{0}, printed{0}, incomparable{0};
 };
 
 MovedWritesVerify& MovedWritesChecks() {
     static MovedWritesVerify verify;
     return verify;
+}
+
+Graphics::HostImportsProof MovedImportsAtRecord(const Graphics::Context& context, const std::optional<std::vector<Graphics::ShaderResources::MovedBuffer>>& moved) {
+    static const bool captured = VerifyEvery("APS5_VERIFY_DISPATCH_MOVED_WRITES") != 0 || VerifyEvery("APS5_VERIFY_DISPATCH_COMMIT_LEAN") != 0;
+    if (!captured || !moved.has_value() || std::ranges::none_of(*moved, [](const Graphics::ShaderResources::MovedBuffer& entry) { return entry.inPlace != VK_NULL_HANDLE; })) return {};
+    return Graphics::HostImportsIdentity(context);
 }
 
 void reportRecipes() {
@@ -6324,6 +6330,7 @@ struct RecordedDispatch {
     const ResourceCache::Key* key = nullptr;
     std::vector<Graphics::ShaderResources::MovedBuffer> readMoves{};
     bool lean = false;
+    Graphics::HostImportsProof movedImports{};
 };
 
 struct DispatchCompletion {
@@ -6346,6 +6353,7 @@ struct DispatchCompletion {
     bool movesRecipe = false;
     std::vector<Graphics::ShaderResources::MovedBuffer> readMoves{};
     bool lean = false;
+    Graphics::HostImportsProof movedImports{};
 };
 
 namespace {
@@ -6372,8 +6380,9 @@ void verifyMovedWrites(const RecordedDispatch& record) {
     auto& verify = MovedWritesChecks();
     if (verify.seen.fetch_add(1, std::memory_order_relaxed) % every != 0) return;
     std::vector<std::string> differences;
+    std::size_t incomparable = 0;
     try {
-        if (record.bindings == nullptr || !record.moved.empty()) differences = record.resources->VerifyMovedWrites(*record.shader, record.moved);
+        if (record.bindings == nullptr || !record.moved.empty()) differences = record.resources->VerifyMovedWrites(*record.shader, record.moved, &record.movedImports, &incomparable);
         if (!writesKey) {
             differences.emplace_back("written buffers moved under a template key that keeps their addresses");
         } else {
@@ -6389,23 +6398,25 @@ void verifyMovedWrites(const RecordedDispatch& record) {
     }
     const auto checked = verify.checked.fetch_add(1, std::memory_order_relaxed) + 1;
     if (!differences.empty()) verify.differing.fetch_add(1, std::memory_order_relaxed);
+    if (incomparable != 0) verify.incomparable.fetch_add(incomparable, std::memory_order_relaxed);
     for (const auto& difference : differences) {
         if (verify.printed.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[dispatch-moved-writes-verify] program 0x%llx: %s\n", static_cast<unsigned long long>(record.programAddress), difference.c_str());
     }
-    if (checked % 4096 == 0) std::fprintf(stderr, "[dispatch-moved-writes-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(verify.differing.load(std::memory_order_relaxed)));
+    if (checked % 4096 == 0) std::fprintf(stderr, "[dispatch-moved-writes-verify] %llu checked, %llu differing; %llu in-place views whose import lookup was not compared: the import table was reconciled, lost an import or went stale between the record and the check\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(verify.differing.load(std::memory_order_relaxed)), static_cast<unsigned long long>(verify.incomparable.load(std::memory_order_relaxed)));
 }
 
 void verifyCommitLean(const RecordedDispatch& record, const Graphics::Recorder& recorder) {
     static const std::uint64_t every = VerifyEvery("APS5_VERIFY_DISPATCH_COMMIT_LEAN");
     if (every == 0 || !record.lean || record.resources == nullptr || record.shader == nullptr) return;
-    static std::atomic<std::uint64_t> seen{0}, checked{0}, differing{0}, printed{0};
+    static std::atomic<std::uint64_t> seen{0}, checked{0}, differing{0}, printed{0}, notCompared{0};
     if (seen.fetch_add(1, std::memory_order_relaxed) % every != 0) return;
     std::vector<std::string> differences;
+    std::size_t incomparable = 0;
     try {
         const auto& moves = record.moved.empty() ? record.readMoves : record.moved;
-        if (record.bindings == nullptr || !moves.empty()) differences = record.resources->VerifyMovedWrites(*record.shader, moves);
+        if (record.bindings == nullptr || !moves.empty()) differences = record.resources->VerifyMovedWrites(*record.shader, moves, &record.movedImports, &incomparable);
         if (std::ranges::any_of(record.moved, [](const Graphics::ShaderResources::MovedBuffer& entry) { return entry.inPlace != VK_NULL_HANDLE && !entry.written; })) {
-            for (auto& text : record.resources->VerifyInPlaceReads(record.moved, recorder)) differences.push_back(std::move(text));
+            for (auto& text : record.resources->VerifyInPlaceReads(record.moved, recorder, &record.movedImports, &incomparable)) differences.push_back(std::move(text));
         }
         if (record.key != nullptr) {
             const bool writes = MovedWritesKey(*record.key);
@@ -6423,10 +6434,11 @@ void verifyCommitLean(const RecordedDispatch& record, const Graphics::Recorder& 
     }
     const auto count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
     if (!differences.empty()) differing.fetch_add(1, std::memory_order_relaxed);
+    if (incomparable != 0) notCompared.fetch_add(incomparable, std::memory_order_relaxed);
     for (const auto& difference : differences) {
         if (printed.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[dispatch-commit-lean-verify] program 0x%llx: %s\n", static_cast<unsigned long long>(record.programAddress), difference.c_str());
     }
-    if (count % 4096 == 0) std::fprintf(stderr, "[dispatch-commit-lean-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differing.load(std::memory_order_relaxed)));
+    if (count % 4096 == 0) std::fprintf(stderr, "[dispatch-commit-lean-verify] %llu checked, %llu differing; %llu in-place views whose import lookup was not compared: the import table was reconciled, lost an import or went stale between the record and the check\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differing.load(std::memory_order_relaxed)), static_cast<unsigned long long>(notCompared.load(std::memory_order_relaxed)));
 }
 
 void verifyMovedRuns(const RecordedDispatch& record, std::span<const std::array<std::uint64_t, 3>> accesses) {
@@ -7526,6 +7538,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     int reusedMoves = 0;
     std::vector<Graphics::ShaderResources::MovedBuffer> movedList;
     std::vector<Graphics::ShaderResources::MovedBuffer> readMoveList;
+    Graphics::HostImportsProof movedImports{};
     // The batches the pre-sync (PrepareDispatch) waited for are reaped first: their completions
     // (CPU write-backs) land before stage B or a cached object's Revalidate reads, and the flush
     // hook then finds nothing pending over their surfaces.
@@ -7646,6 +7659,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                     auto& moves = DispatchMoves();
                     Graphics::ShaderResources::MoveProof proof;
                     auto moved = cached->MovedDispatchBuffers(shaders[0], state->recorder.get(), DispatchMoveBytes(), proof, writesEntry, CommitLeanOn());
+                    movedImports = MovedImportsAtRecord(context, moved);
                     moves.checked.fetch_add(1, std::memory_order_relaxed);
                     if (moved.has_value() && threadGroup != std::array<std::uint32_t, 3>{}) {
                         const auto data = cached->shaderDataAllocation(shaders[0]);
@@ -7823,6 +7837,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     DispatchCompletion completion{context, shaders, pushStages, pushBytes, objects, resources, contentKey, cacheable, fromCache, revalidateMs, overlay, lookupsBefore, timer, timing, groupsText};
     completion.moved = std::move(movedList);
     completion.readMoves = std::move(readMoveList);
+    completion.movedImports = movedImports;
     completion.movesRecipe = overlay != nullptr && DispatchMovedRecipesOn();
     completion.lean = leanRecord;
     return recordCompletedDispatch(shader, x, y, z, arguments, programAddress, recipeOut, threadGroup, htileClear, completion);
@@ -7858,6 +7873,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     record.moved = std::move(completion.moved);
     record.readMoves = std::move(completion.readMoves);
     record.lean = completion.lean;
+    record.movedImports = completion.movedImports;
     if (lap.trace != nullptr && record.lean) lap.trace->lean = true;
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
@@ -8046,9 +8062,11 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     std::shared_ptr<Graphics::ShaderResources::DrawBindings> overlay;
     std::array<std::byte, Graphics::PipelinePushConstantBytes> livePush{};
     bool leanRecord = BesideKey(recipe.key);
+    Graphics::HostImportsProof movedImports{};
     if (recipe.moves) {
         Graphics::ShaderResources::MoveProof proof;
         auto found = hit->resources->MovedDispatchBuffers(shaders[0], state->recorder.get(), DispatchMoveBytes(), proof, DispatchMovedWritesOn() && MovedWritesKey(recipe.key), CommitLeanOn());
+        movedImports = MovedImportsAtRecord(context, found);
         if (found.has_value() && threadGroup != std::array<std::uint32_t, 3>{}) {
             const auto data = hit->resources->shaderDataAllocation(shaders[0]);
             if (data.has_value() && std::ranges::any_of(*found, [&](const Graphics::ShaderResources::MovedBuffer& entry) { return entry.allocation == *data; })) found.reset();
@@ -8093,6 +8111,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     record.moved = std::move(moved);
     record.key = &recipe.key;
     record.lean = leanRecord;
+    record.movedImports = movedImports;
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
     lap.Step(CommitStep::Setup);

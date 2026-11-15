@@ -9101,6 +9101,30 @@ void noteZoneCensus(bool countsClear, bool testsBusy) {
     std::fprintf(stderr, "[zone-census] per 2^20 moved ranges: %llu clear by the zone counts and by the tests, %llu clear by the counts but busy by the tests (unsound), %llu busy by the counts but clear by the tests, %llu busy by both\n", wide(counts[0]), wide(counts[1]), wide(counts[2]), wide(counts[3]));
 }
 
+struct InPlaceExactCensus {
+    static constexpr std::size_t Users = static_cast<std::size_t>(ShaderResources::InPlaceUser::Count);
+    std::array<std::atomic<std::uint64_t>, Users> passed{};
+    std::array<std::atomic<std::uint64_t>, Users> refused{};
+    std::atomic<std::int64_t> window{-1};
+};
+
+void noteInPlaceExact(ShaderResources::InPlaceUser user, bool refused) {
+    if (!movedCensus() || user >= ShaderResources::InPlaceUser::Count) return;
+    static InPlaceExactCensus census;
+    const auto index = static_cast<std::size_t>(user);
+    census.passed[index].fetch_add(1, std::memory_order_relaxed);
+    if (refused) census.refused[index].fetch_add(1, std::memory_order_relaxed);
+    const std::int64_t window = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (census.window.exchange(window, std::memory_order_relaxed) == window) return;
+    std::array<unsigned long long, InPlaceExactCensus::Users> tested{};
+    std::array<unsigned long long, InPlaceExactCensus::Users> stricter{};
+    for (std::size_t at = 0; at < InPlaceExactCensus::Users; ++at) {
+        tested[at] = static_cast<unsigned long long>(census.passed[at].exchange(0, std::memory_order_relaxed));
+        stricter[at] = static_cast<unsigned long long>(census.refused[at].exchange(0, std::memory_order_relaxed));
+    }
+    std::fprintf(stderr, "[in-place-exact] 10 s, APS5_IN_PLACE_EXACT set: ranges today's in-place test passed, and of them refused by the stricter test for a storage image whose write-back to guest memory was in progress on another thread: moved buffers of draw template hits (APS5_MOVED_IN_PLACE) %llu, refused %llu; written buffers of dispatches (APS5_DISPATCH_MOVED_WRITES) %llu, refused %llu; ranges of prepared draws committed in place %llu, refused %llu\n", tested[0], stricter[0], tested[1], stricter[1], tested[2], stricter[2]);
+}
+
 }
 
 bool ShaderResources::movedRangesClear(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::size_t>> ranges, MoveTicket* ticket, bool accessible, std::vector<InPlaceRange>* inPlace, MovedCount* why) const {
@@ -9147,19 +9171,26 @@ bool ShaderResources::movedRangesClear(Recorder& recorder, std::span<const std::
     return true;
 }
 
-ShaderResources::MovedCount ShaderResources::InPlaceRefusal(const Recorder& recorder, std::uint64_t begin, std::size_t bytes) const {
-    if (heapStage || addressedBuffers || usesBda || rebound) return MovedCount::NotEligible;
-    if (PendingStorageOverlaps(begin, bytes, nullptr)) return MovedCount::InPlaceStorage;
-    if (AnyShadowedOverlaps(begin, bytes)) return MovedCount::InPlaceShadowed;
-    if (CpuPublishPendingOverlaps(begin, bytes)) return MovedCount::CpuPublish;
-    if (recorder.PendingLabelIn(begin, bytes) || recorder.CompletionLabelIn(begin, bytes)) return MovedCount::Label;
-    if (recorder.QueuedStoreOverlaps(begin, bytes) || recorder.QueuedKeyStoreOverlaps(begin, bytes)) return MovedCount::QueuedStore;
-    const auto overlaps = [&](const std::shared_ptr<ShaderResources>& writer) { return writer != nullptr && writer->CopiedWritesOverlap(begin, bytes); };
-    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return MovedCount::CopiedWriter;
-    const auto drawWriters = DrawCopiedWriters();
-    if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return MovedCount::CopiedWriter;
-    if (bytes > context.limits.maxStorageBufferRange) return MovedCount::OverRange;
-    return MovedCount::Count;
+ShaderResources::MovedCount ShaderResources::InPlaceRefusal(const Recorder& recorder, std::uint64_t begin, std::size_t bytes, InPlaceUser user) const {
+    const auto today = [&] {
+        if (heapStage || addressedBuffers || usesBda || rebound) return MovedCount::NotEligible;
+        if (PendingStorageOverlaps(begin, bytes, nullptr)) return MovedCount::InPlaceStorage;
+        if (AnyShadowedOverlaps(begin, bytes)) return MovedCount::InPlaceShadowed;
+        if (CpuPublishPendingOverlaps(begin, bytes)) return MovedCount::CpuPublish;
+        if (recorder.PendingLabelIn(begin, bytes) || recorder.CompletionLabelIn(begin, bytes)) return MovedCount::Label;
+        if (recorder.QueuedStoreOverlaps(begin, bytes) || recorder.QueuedKeyStoreOverlaps(begin, bytes)) return MovedCount::QueuedStore;
+        const auto overlaps = [&](const std::shared_ptr<ShaderResources>& writer) { return writer != nullptr && writer->CopiedWritesOverlap(begin, bytes); };
+        if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return MovedCount::CopiedWriter;
+        const auto drawWriters = DrawCopiedWriters();
+        if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return MovedCount::CopiedWriter;
+        if (bytes > context.limits.maxStorageBufferRange) return MovedCount::OverRange;
+        return MovedCount::Count;
+    }();
+    if (today != MovedCount::Count || !RuntimeSwitches::Set(RuntimeSwitch::InPlaceExact)) return today;
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> span{{{begin, begin + bytes}}};
+    const bool flushing = StorageTexture::AnyPendingOverlaps(span);
+    noteInPlaceExact(user, flushing);
+    return flushing ? MovedCount::InPlaceStorage : MovedCount::Count;
 }
 
 bool ShaderResources::takeMovedInPlace(const Recorder& recorder, std::uint64_t begin, std::size_t bytes, InPlaceRange& out) const {
@@ -9167,7 +9198,7 @@ bool ShaderResources::takeMovedInPlace(const Recorder& recorder, std::uint64_t b
         noteMoved(why);
         return false;
     };
-    if (const auto why = InPlaceRefusal(recorder, begin, bytes); why != MovedCount::Count) return refuse(why);
+    if (const auto why = InPlaceRefusal(recorder, begin, bytes, InPlaceUser::DrawMoved); why != MovedCount::Count) return refuse(why);
     const auto* import = HostImportFor(context, begin, bytes);
     if (import == nullptr) return refuse(MovedCount::NoImport);
     if (begin < import->base || begin + bytes > import->base + import->bytes) return refuse(MovedCount::OverRange);
@@ -9251,7 +9282,7 @@ bool ShaderResources::PreparedInPlaceHolds(const PreparedBuffers& prepared, cons
             if (trust != nullptr) trust->Fail();
             return refuse(MovedCount::PreparedInPlaceWrites);
         }
-        if (const auto why = InPlaceRefusal(recorder, entry.begin, entry.bytes); why != MovedCount::Count) {
+        if (const auto why = InPlaceRefusal(recorder, entry.begin, entry.bytes, InPlaceUser::DrawPrepared); why != MovedCount::Count) {
             if (trust != nullptr && why != MovedCount::NotEligible && why != MovedCount::OverRange) trust->Fail();
             return refuse(why);
         }
@@ -9342,7 +9373,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedD
         entry.bytes = bytes;
         entry.written = true;
         if (recorder != nullptr) {
-            if (InPlaceRefusal(*recorder, begin, bytes) != MovedCount::Count) return MoveRefusal::WrittenInPlace;
+            if (InPlaceRefusal(*recorder, begin, bytes, InPlaceUser::DispatchWritten) != MovedCount::Count) return MoveRefusal::WrittenInPlace;
             const auto* import = HostImportFor(context, begin, bytes);
             if (import == nullptr || begin < import->base || begin + bytes > import->base + import->bytes) return MoveRefusal::WrittenInPlace;
             const auto offset = HostImportOffset(*import, begin);
@@ -9566,7 +9597,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::MovedInPla
     return reads;
 }
 
-std::vector<std::string> ShaderResources::VerifyMovedWrites(const CompiledShader& shader, std::span<const MovedBuffer> moved) const {
+std::vector<std::string> ShaderResources::VerifyMovedWrites(const CompiledShader& shader, std::span<const MovedBuffer> moved, const HostImportsProof* recordedImports, std::size_t* incomparable) const {
     std::vector<std::string> differences;
     const auto note = [&](const char* what, std::uint32_t binding, std::uint32_t element, std::uint64_t recordedBegin, std::uint64_t recordedEnd, std::uint64_t expectedBegin, std::uint64_t expectedEnd) {
         char text[256];
@@ -9610,7 +9641,14 @@ std::vector<std::string> ShaderResources::VerifyMovedWrites(const CompiledShader
             if (entry->begin != begin || entry->begin + entry->bytes != end) note("in-place view", binding.binding, element, entry->begin, entry->begin + entry->bytes, begin, end);
             if (std::find(reads.begin(), reads.end(), std::pair<std::uint64_t, std::uint64_t>{entry->begin, entry->begin + entry->bytes}) == reads.end()) note("read list", binding.binding, element, 0, 0, begin, end);
             const auto* import = ExistingHostImportFor(context, entry->begin, entry->bytes);
-            if (import == nullptr || import->buffer != entry->inPlace || HostImportOffset(*import, entry->begin) != entry->importOffset) note("import", binding.binding, element, entry->importOffset, 0, import != nullptr ? HostImportOffset(*import, entry->begin) : 0, 0);
+            if (import != nullptr && import->buffer == entry->inPlace && HostImportOffset(*import, entry->begin) == entry->importOffset) continue;
+            if (recordedImports != nullptr && !HostImportsUnchanged(context, *recordedImports)) {
+                if (incomparable != nullptr) ++*incomparable;
+                continue;
+            }
+            if (import == nullptr) note("import: no import serves the in-place view, offsets", binding.binding, element, entry->importOffset, 0, 0, 0);
+            else if (import->buffer != entry->inPlace) note("import: another import serves the in-place view, offsets", binding.binding, element, entry->importOffset, 0, HostImportOffset(*import, entry->begin), 0);
+            else note("import: the recorded import at another offset", binding.binding, element, entry->importOffset, 0, HostImportOffset(*import, entry->begin), 0);
         }
     }
     for (const auto& entry : moved) {
@@ -9622,7 +9660,7 @@ std::vector<std::string> ShaderResources::VerifyMovedWrites(const CompiledShader
     return differences;
 }
 
-std::vector<std::string> ShaderResources::VerifyInPlaceReads(std::span<const MovedBuffer> moved, const Recorder& recorder) const {
+std::vector<std::string> ShaderResources::VerifyInPlaceReads(std::span<const MovedBuffer> moved, const Recorder& recorder, const HostImportsProof* recordedImports, std::size_t* incomparable) const {
     std::vector<std::string> differences;
     const auto note = [&](const char* what, const MovedBuffer& entry, std::uint64_t recorded, std::uint64_t fresh) {
         char text[256];
@@ -9646,7 +9684,10 @@ std::vector<std::string> ShaderResources::VerifyInPlaceReads(std::span<const Mov
         const auto first = entry.address & ~std::uint64_t{3};
         const auto last = first == entry.address ? entry.address + entry.size : (entry.address + entry.size + 3) & ~std::uint64_t{3};
         const auto* import = ExistingHostImportFor(context, first, static_cast<std::size_t>(last - first));
-        if (import == nullptr) {
+        const bool importsMoved = (import == nullptr || import->buffer != entry.inPlace) && recordedImports != nullptr && !HostImportsUnchanged(context, *recordedImports);
+        if (importsMoved) {
+            if (incomparable != nullptr) ++*incomparable;
+        } else if (import == nullptr) {
             premise("no import serves the range a fresh build binds", "", entry);
         } else {
             const auto offset = HostImportOffset(*import, entry.address);

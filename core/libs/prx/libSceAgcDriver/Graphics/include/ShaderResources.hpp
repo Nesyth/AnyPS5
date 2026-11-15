@@ -337,7 +337,8 @@ public:
     static const char* MovedCountName(MovedCount count);
     static constexpr std::size_t MovedCountArms = 4;
     static std::array<std::uint64_t, static_cast<std::size_t>(MovedCount::Count)> TakeMovedCounts(std::size_t arm);
-    MovedCount InPlaceRefusal(const Recorder& recorder, std::uint64_t begin, std::size_t bytes) const;
+    enum class InPlaceUser : std::uint8_t { DrawMoved, DispatchWritten, DrawPrepared, Count };
+    MovedCount InPlaceRefusal(const Recorder& recorder, std::uint64_t begin, std::size_t bytes, InPlaceUser user = InPlaceUser::Count) const;
     void BindFragmentOwnSets(VkCommandBuffer commands, VkPipelineLayout layout) const;
     // What MovedReadOnlyBuffers and selectDrawSnapshots read from this object to decide a draw's
     // buffers, copied by value once so a finisher thread can make that decision from the plan, the
@@ -696,8 +697,8 @@ public:
     static const char* MovableWritesRefusalName(std::size_t refusal);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> MovedGpuWrites(std::span<const MovedBuffer> moved) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> MovedInPlaceReads(std::span<const MovedBuffer> moved) const;
-    std::vector<std::string> VerifyMovedWrites(const CompiledShader& shader, std::span<const MovedBuffer> moved) const;
-    std::vector<std::string> VerifyInPlaceReads(std::span<const MovedBuffer> moved, const Recorder& recorder) const;
+    std::vector<std::string> VerifyMovedWrites(const CompiledShader& shader, std::span<const MovedBuffer> moved, const HostImportsProof* recordedImports = nullptr, std::size_t* incomparable = nullptr) const;
+    std::vector<std::string> VerifyInPlaceReads(std::span<const MovedBuffer> moved, const Recorder& recorder, const HostImportsProof* recordedImports = nullptr, std::size_t* incomparable = nullptr) const;
     enum class NotReusable : std::uint8_t { None, HtileClear, CopiedWrites, LeaseOrTable, MultisampleSources, PerUseTextures, DataBuffers, NoImportSerial, Count };
     NotReusable NotReusableReason() const { return notReusable; }
     static std::size_t MaxDrawSnapshotBytes();

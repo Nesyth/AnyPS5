@@ -234,6 +234,7 @@ enum class RuntimeSwitch : std::size_t {
     LabelRuns,
     DispatchCommitLean,
     RecordHeavyDraws,
+    InPlaceExact,
     Count,
 };
 
