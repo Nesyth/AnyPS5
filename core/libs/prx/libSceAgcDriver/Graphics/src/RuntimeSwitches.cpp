@@ -227,6 +227,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_XP_SKIP_DISPATCHES",
     "APS5_XP_TRUST_FINISHER",
     "APS5_XP_TRUST_COMMITTER",
+    "APS5_XP_DISPATCH_NO_COMMIT",
 };
 static_assert(SwitchNames.back() != nullptr, "every runtime switch needs a name");
 
@@ -454,6 +455,7 @@ struct SwitchValues {
             std::getenv("APS5_XP_SKIP_DISPATCHES") != nullptr,
             std::getenv("APS5_XP_TRUST_FINISHER") != nullptr,
             std::getenv("APS5_XP_TRUST_COMMITTER") != nullptr,
+            std::getenv("APS5_XP_DISPATCH_NO_COMMIT") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

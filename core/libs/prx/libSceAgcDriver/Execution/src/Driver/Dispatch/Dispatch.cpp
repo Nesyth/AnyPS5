@@ -752,6 +752,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dispatch, [this, localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, attach, prepareThreads, dataHit, epoch, htileClearCompletion, htileMask, itemFixup = DispatchMissItemsEnabled() ? htileFixup : std::nullopt] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
+            if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpDispatchNoCommit)) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                recordLabelsForPacket(localDevice.get(), queueId);
+                return;
+            }
             const auto& compiledCommit = *result;
             const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
             try {

@@ -221,6 +221,7 @@ enum class RuntimeSwitch : std::size_t {
     XpSkipDispatches,
     XpTrustFinisher,
     XpTrustCommitter,
+    XpDispatchNoCommit,
     Count,
 };
 
