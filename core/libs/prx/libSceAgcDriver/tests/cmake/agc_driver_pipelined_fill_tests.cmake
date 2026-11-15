@@ -1,5 +1,6 @@
 if(BUILD_TESTING)
     agc_add_draw_pipeline_test(agc_driver_pipelined_fill LATE)
+    agc_add_deep_flow_test(agc_driver_pipelined_fill)
 endif()
 
 if(BUILD_TESTING)

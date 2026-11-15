@@ -67,6 +67,23 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeOrderedVertexStageInfo(std::span<c
     };
     if (!DrawPipeline::Active()) return decode();
     auto& queue = DrawPipeline::Queue0();
+    if (DrawFinisher::Deep()) {
+        for (unsigned round = 0;; ++round) {
+            const auto watch = queue.WatchWrites();
+            auto info = decode();
+            if (watch.items == 0 && !queue.Busy() && queue.Retired() == watch.retired) return info;
+            std::vector<DrawPipeline::Range> ranges;
+            ranges.reserve(reads.size());
+            for (const auto& read : reads) ranges.emplace_back(read.address, read.address + read.size);
+            if (!queue.WrittenSince(watch, ranges)) return info;
+            queue.NoteDecodeDrain();
+            if (round != 0) break;
+            queue.AwaitWriters(ranges, DrawPipeline::DrainReason::Capture, 0x100, DeepSite::Decode);
+        }
+        DrawFinisher::NoteDeepKept(DeepKept::Fallback);
+        queue.Drain(DrawPipeline::DrainReason::Capture);
+        return decode();
+    }
     const auto watch = queue.WatchWrites();
     auto info = decode();
     if (watch.items == 0 && !queue.Busy() && queue.Retired() == watch.retired) return info;

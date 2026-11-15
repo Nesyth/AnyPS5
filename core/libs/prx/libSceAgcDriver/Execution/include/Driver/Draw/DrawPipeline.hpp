@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_DRAWPIPELINE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_DRAWPIPELINE_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DeepIndex.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -80,6 +81,9 @@ struct LabelRun {
     Lookup Find(std::uint64_t address, std::size_t size, std::uint64_t& value) const;
 };
 
+enum class DeepSite : std::uint32_t { PacketVerdict, Predication, IndirectArguments, FillInputs, FillByTurn, DispatchReads, LateDispatchReads, Decode, HeapStages, Variant, WriteEvidence, ShaderCode, SameKey, EarlierKey, ItemsByTurn, ItemsWithReadsByTurn, PacketFinisher, Count };
+enum class DeepKept : std::uint32_t { Flip, RenderingWait, Wait, WorkerLabel, PacketVerdict, SegmentEnd, Submission, Settle, DeferredLabels, WorkerDraw, WorkerDispatch, MetadataPass, WorkerNote, Relocation, IndirectCpu, DispatchNotPipelined, Fallback, Shutdown, Other, Count };
+
 class DrawPipeline {
 public:
     using Commit = std::function<void()>;
@@ -91,6 +95,10 @@ public:
         bool snapshot = false;
         std::uint32_t snapshotCount = 0;
         std::array<Range, PublishedRanges::Capacity> snapshotWrites{};
+        std::uint64_t enqueued = 0;
+        bool deep = false;
+        bool verified = false;
+        std::vector<Range> verifyWrites;
     };
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
     enum class QueuedWrite : std::uint8_t { None, Stored, Unknown };
@@ -112,6 +120,8 @@ public:
     void EnqueueKept(Commit commit, std::vector<Range> writes, std::vector<Range> reads, std::shared_ptr<const void> keep);
     static void NoteDrawKey(std::uint64_t key, std::uint64_t shape);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
+    void AwaitWriters(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode, DeepSite site);
+    bool DeepQueue() const { return deepQueue.load(std::memory_order_acquire); }
     void Stop();
     void ReleaseRetired();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
@@ -151,6 +161,7 @@ private:
         std::shared_ptr<const void> keep;
         std::shared_ptr<const LabelRun> labelRun;
         bool counted = true;
+        std::uint64_t parked = 0;
     };
     DrawPipeline() = default;
     void enqueue(Item item);
@@ -160,6 +171,17 @@ private:
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
     void countWrites(const std::vector<Range>& writes, bool added);
+    bool awaitRetired(std::uint64_t item);
+    void latchDeepQueue(bool deep);
+    void drainAll(DrainReason reason, std::uint32_t opcode);
+    bool queuedOverlap(std::span<const Range> ranges);
+    DeepFound deepQueued(std::span<const Range> ranges, std::uint64_t live) const;
+    bool deepQueuedWithin(std::span<const Range> ranges, std::uint64_t from, std::uint64_t to) const;
+    DeepFound newestQueued(std::span<const Range> ranges) const;
+    void verifyQueued(std::uint32_t lookup, std::span<const Range> ranges);
+    void noteDeepReads(const std::vector<Range>& reads, std::uint64_t stamp);
+    bool readsMaybe(std::uint64_t address, std::size_t bytes) const;
+    void verifyHeldReads(std::uint64_t address, std::size_t bytes);
 
     std::mutex mutex;
     std::condition_variable wake;
@@ -179,6 +201,16 @@ private:
     std::uint64_t verifiedOrder = 0;
     std::uint64_t orderOrdinal = 0;
     std::uint32_t idleWaiters = 0;
+    std::uint32_t retireWaiters = 0;
+    std::atomic<bool> deepQueue{false};
+    static constexpr std::size_t ReadRegionSlots = 4096;
+    std::unique_ptr<StampedRanges> deepStores;
+    std::unique_ptr<StampedRanges> deepOthers;
+    std::unique_ptr<std::array<std::atomic<std::uint64_t>, ReadRegionSlots>> readRegions;
+    std::atomic<bool> deepIndexed{false};
+    std::atomic<std::uint64_t> wideReads{0};
+    std::atomic<std::uint64_t> readsLive{1};
+    std::atomic<std::uint64_t> deepEpoch{0};
     std::size_t resumeAt = 0;
     bool committerWaiting = false;
     bool stopped = false;
@@ -255,6 +287,16 @@ public:
     static bool FlowSkips(FlowSite site);
     static void NoteFlowLookup(FlowLookup lookup);
     static std::string FlowText();
+    static bool Deep();
+    bool DeepRing() const { return deepRing.load(std::memory_order_acquire); }
+    void AwaitKeyed(std::uint64_t key, std::uint64_t shape, bool insertsOnly);
+    void AwaitPending(std::span<const Range> ranges, DeepSite site);
+    static void NoteDeepKept(DeepKept kept, std::uint32_t opcode = 0x100);
+    static void NoteDeepSite(DeepSite site);
+    static std::string DeepText();
+    enum class DeepCount : std::uint32_t { WriteOverflows, KeyOverflows, QueuedOverflows, WorkerFallbacks, IndexFull, Count };
+    static std::uint64_t DeepTotal(DeepCount count);
+    std::uint64_t KeyBlocker(std::uint64_t key, std::uint64_t shape, bool insertsOnly);
     static std::string DrainText();
     static void NoteDrainedOpcode(std::uint32_t opcode, bool besideCommits);
     static DrawFinisher& Get();
@@ -310,6 +352,7 @@ private:
         LeanRetirer retirer = nullptr;
         bool batch = false;
         bool counted = true;
+        std::uint64_t unknownBefore = 0;
         std::shared_ptr<const void> answer;
         Job closure;
         Pending pending;
@@ -344,6 +387,12 @@ private:
     void retireLean();
     void rethrowLeanFailure();
     void fitLeanSpan();
+    void latchDeepRing(bool deep);
+    DeepAnswer deepPendingHit(std::span<const Range> ranges);
+    DeepFound keysBefore(std::uint64_t key, std::uint64_t shape, bool insertsOnly, std::uint64_t live, std::uint64_t before) const;
+    DeepFound scanWrites(std::span<const Range> ranges, std::uint64_t from, std::uint64_t to) const;
+    DeepFound scanKeys(std::uint64_t key, std::uint64_t shape, bool insertsOnly, std::uint64_t from, std::uint64_t to) const;
+    bool awaitProducerFront(std::uint64_t job);
     void awaitLeanRoom(bool helping = false);
     void awaitLeanIdle();
     bool takeHelped(std::uint64_t& seq);
@@ -400,6 +449,14 @@ private:
     std::atomic<std::uint64_t> leanTake{1};
     std::atomic<std::uint64_t> leanTail{1};
     std::atomic<std::uint64_t> leanMask{NarrowLeanSlots - 1};
+    std::atomic<bool> deepRing{false};
+    std::unique_ptr<StampedRanges> deepWrites;
+    std::unique_ptr<StampedKeys> deepKeys;
+    std::unique_ptr<StampedKeys> deepShapes;
+    std::atomic<bool> deepIndexed{false};
+    std::atomic<std::uint64_t> lastUnknown{0};
+    std::vector<Range> openRunWrites;
+    mutable std::mutex verifySlots;
     std::uint64_t leanRetired = 1;
     std::unique_ptr<std::array<LeanSlot, LeanSlots>> lean;
     std::mutex parkedReadsMutex;

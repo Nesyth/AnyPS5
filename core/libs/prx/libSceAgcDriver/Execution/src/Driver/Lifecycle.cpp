@@ -191,6 +191,7 @@ void Driver::stop() {
         if (worker.thread.joinable()) worker.thread.join();
     }
     try {
+        DrawFinisher::NoteDeepKept(DeepKept::Shutdown);
         DrawFinisher::Get().Drain();
     } catch (...) {
     }

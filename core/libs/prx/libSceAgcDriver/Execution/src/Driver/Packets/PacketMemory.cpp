@@ -365,7 +365,7 @@ bool Driver::enqueueSampleDumpPacket(std::span<const std::uint32_t> packet, std:
             if (!wrote) dumpSampleCounters(address);
         }, {{address, address + Pm4::SampleDumpBytes}});
     };
-    if ((Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::BesideSampleDumps) || DrawFinisher::Flow()) && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
+    if ((Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::BesideSampleDumps) || DrawFinisher::Flow() || DrawFinisher::Deep()) && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
         DrawFinisher::Pending held;
         held.unknown = false;
         held.writes = {{address, address + Pm4::SampleDumpBytes}};

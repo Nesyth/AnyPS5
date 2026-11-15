@@ -445,7 +445,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto& indirect = *drawParameters.indirect;
         auto& pipeline = DrawPipeline::Queue0();
         const bool overlaps = pipeline.Busy() && (pipeline.Overlaps(indirect.arguments, static_cast<std::size_t>(std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes))) || (indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4)));
-        if (!pipelinedIndirect || (overlaps && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Indirect))) pipeline.Drain(DrawPipeline::DrainReason::Indirect);
+        if (pipelinedIndirect && overlaps && DrawFinisher::Deep()) {
+            const std::array<DrawPipeline::Range, 2> arguments{{{indirect.arguments, indirect.arguments + static_cast<std::size_t>(std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes))}, {indirect.countAddress, indirect.countAddress + 4}}};
+            const std::span<const DrawPipeline::Range> asked(arguments.data(), indirect.countIndirect ? 2 : 1);
+            do pipeline.AwaitWriters(asked, DrawPipeline::DrainReason::Indirect, 0x100, DeepSite::IndirectArguments);
+            while (pipeline.Busy() && pipeline.OverlapsAny(asked));
+        } else if (!pipelinedIndirect || (overlaps && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Indirect))) {
+            pipeline.Drain(DrawPipeline::DrainReason::Indirect);
+        }
     }
     auto& traceIndirect = tail.traceIndirect;
     const auto prechecked = precheckDraw(queue, submission, packetOffset, packet, drawParameters, rejected, traceIndirect);
@@ -507,7 +514,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::shared_ptr<const DrawRelocation> relocation;
         bool aliasFirst = false;
         if (drawRelocationEnabled()) {
-            if (DrawFinisher::Busy() && drawRelocationPending.key != 0 && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Relocation)) DrawFinisher::Get().Drain();
+            if (DrawFinisher::Busy() && drawRelocationPending.key != 0 && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Relocation)) {
+                DrawFinisher::NoteDeepKept(DeepKept::Relocation);
+                DrawFinisher::Get().Drain();
+            }
             drawIdentity = drawIdentityKey(queue, *submission.shaders);
             std::lock_guard cacheLock(drawCacheMutex);
             learnPendingRelocation();
@@ -540,7 +550,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
             const bool drain = !DrawFinisher::Overlap() || (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpReplay) && DrawFinisher::Get().PendingKey(drawKey, shapeMatters ? shapeKey : 0));
             speculativeMiss = drain && DrawFinisher::Overlap() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SpeculativeLookup);
-            if (drain && !speculativeMiss) DrawFinisher::Get().Drain();
+            if (drain && !speculativeMiss) {
+                if (DrawFinisher::Overlap() && DrawFinisher::Deep()) DrawFinisher::Get().AwaitKeyed(drawKey, shapeMatters ? shapeKey : 0, Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PreciseLookupDrain));
+                else DrawFinisher::Get().Drain();
+            }
             if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Lookup, drain && !speculativeMiss);
         }
         std::unique_lock cacheLock(drawCacheMutex);
@@ -903,6 +916,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     noteFinisherHandOff(false);
     if (DrawFinisher::Busy()) {
+        DrawFinisher::NoteDeepKept(DeepKept::WorkerDraw);
         DrawFinisher::Get().Drain();
         if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Kept, true);
     }
@@ -1001,7 +1015,8 @@ void Driver::finishLeanDraw(const LeanDrawJob& job, const LeanAnchor& anchor) {
                 speculativeMiss = wait && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SpeculativeLookup);
                 if (wait && !speculativeMiss) {
                     LeanFront::Add(LeanFront::Counter::SameKeyWaits);
-                    DrawFinisher::Get().AwaitTurn();
+                    if (DrawFinisher::Deep()) DrawFinisher::Get().AwaitKeyed(drawKey, shapeMatters ? shapeKey : 0, precise);
+                    else DrawFinisher::Get().AwaitTurn();
                 }
             }
             const auto* recordSink = DrawRecordSinkSlot::Get();
@@ -1200,7 +1215,9 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     const bool pipelined = tail.pipelined;
     static const bool pipelinedIndirect = std::getenv("APS5_NO_PIPELINED_INDIRECT") == nullptr;
     const auto drainBeforeInline = [&] {
-        if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+        if (!pipelined || !DrawPipeline::Queue0().Busy()) return;
+        DrawFinisher::NoteDeepKept(DeepKept::WorkerDraw);
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
     };
     auto& traceIndirect = tail.traceIndirect;
     const auto dumpTarget = tail.dumpTarget;
@@ -1517,7 +1534,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         for (const auto& read : reads) memory.push_back({read.address, read.Bytes()});
     }
 
-    if (tail.queue != nullptr && pipelined && !deferredLabels().labels.empty()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Labels);
+    if (tail.queue != nullptr && pipelined && !deferredLabels().labels.empty()) {
+        DrawFinisher::NoteDeepKept(DeepKept::DeferredLabels);
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Labels);
+    }
     if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(*tail.queue, packet, submission, packetOffset, rejected);
 
     bool rectListBuilt = false;
@@ -1607,7 +1627,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         require(tail.queue != nullptr || (drawParameters.indirect && DrawFinisher::OnFinisherThread()), "the draw finisher reached a draw it cannot commit through the pipeline");
         if (gpuLock.owns_lock()) return;
         phaseTiming.Phase(DrawRowVectors);
-        if (DrawFinisher::OnFinisherThread()) DrawFinisher::Get().AwaitTurn();
+        if (DrawFinisher::OnFinisherThread()) {
+            if (DrawFinisher::Get().AheadBusy()) DrawFinisher::NoteDeepKept(DeepKept::IndirectCpu);
+            DrawFinisher::Get().AwaitTurn();
+        }
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
         timing.Mark("gpu_mutex_wait");
@@ -1624,8 +1647,12 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     };
     if (drawParameters.indirect && indirectCpu) {
         if (tail.readsAfterTurn && DrawFinisher::OnFinisherThread()) {
+            if (DrawFinisher::Get().AheadBusy()) DrawFinisher::NoteDeepKept(DeepKept::IndirectCpu);
             DrawFinisher::Get().AwaitTurn();
-            if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+            if (DrawPipeline::Queue0().Busy()) {
+                DrawFinisher::NoteDeepKept(DeepKept::IndirectCpu);
+                DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+            }
         }
 
         const auto indirect = *drawParameters.indirect;

@@ -249,6 +249,13 @@ namespace {
 void drainPendingInputWrites(std::uint32_t queueId, std::initializer_list<std::pair<std::uint64_t, std::size_t>> inputs) {
     if (queueId != 0 || !DrawPipeline::Active()) return;
     auto& pipeline = DrawPipeline::Queue0();
+    if (DrawFinisher::Deep()) {
+        for (const auto& [address, bytes] : inputs) {
+            const DrawPipeline::Range range{address, address + bytes};
+            while (pipeline.Overlaps(address, bytes)) pipeline.AwaitWriters({&range, 1}, DrawPipeline::DrainReason::Capture, 0x15, DeepSite::FillInputs);
+        }
+        return;
+    }
     for (const auto& [address, bytes] : inputs) {
         if (!pipeline.Overlaps(address, bytes)) continue;
         if (!DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Capture)) pipeline.Drain(DrawPipeline::DrainReason::Capture, 0x15);

@@ -167,7 +167,12 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
         auto& pipeline = DrawPipeline::Queue0();
         if (pipeline.Busy() && pipeline.OverlapsAny(variant.runs)) {
             if (!knownValueVerify() && QueuedWritesOver(pipeline, regions) == QueuedOverlap::Stored) return EntryOutcome::QueuedStores;
-            if (!DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Capture)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+            if (DrawFinisher::Deep()) {
+                do pipeline.AwaitWriters(variant.runs, DrawPipeline::DrainReason::Capture, 0x100, DeepSite::Variant);
+                while (pipeline.Busy() && pipeline.OverlapsAny(variant.runs));
+            } else if (!DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Capture)) {
+                pipeline.Drain(DrawPipeline::DrainReason::Capture);
+            }
         }
     }
     const bool masked = live != nullptr && (!variant.dataPositions.empty() || (addresses && !variant.addressPositions.empty()));

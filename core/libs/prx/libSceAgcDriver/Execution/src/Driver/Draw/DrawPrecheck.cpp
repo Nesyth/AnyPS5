@@ -104,7 +104,10 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
             DrawPipeline::CountPipelinedMetadataPass();
             return DrawVerdict::Drawn;
         }
-        if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
+        if (DrawPipeline::Active()) {
+            DrawFinisher::NoteDeepKept(DeepKept::MetadataPass);
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
+        }
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
@@ -119,7 +122,10 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
         return draw(copyDraw, packet, submission, packetOffset, rejected);
     }
     if (const auto control = Graphics::DecodeDepthRenderControl(queue); control && Graphics::DepthRenderControlDrains(*control)) {
-        if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
+        if (DrawPipeline::Active()) {
+            DrawFinisher::NoteDeepKept(DeepKept::WorkerNote);
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
+        }
         Graphics::NoteDepthRenderControl(*control);
     }
     if (Graphics::DepthResummarizeDrawsNothing(queue)) return DrawVerdict::Nothing;

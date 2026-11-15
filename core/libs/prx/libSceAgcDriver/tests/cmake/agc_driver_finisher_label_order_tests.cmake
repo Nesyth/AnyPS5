@@ -1,5 +1,6 @@
 if(BUILD_TESTING)
     agc_add_draw_pipeline_test(agc_driver_finisher_label_order LATE)
+    agc_add_deep_flow_test(agc_driver_finisher_label_order)
 endif()
 
 if(BUILD_TESTING)

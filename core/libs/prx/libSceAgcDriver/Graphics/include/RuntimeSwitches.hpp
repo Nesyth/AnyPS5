@@ -238,6 +238,7 @@ enum class RuntimeSwitch : std::size_t {
     XpNoPacketDrains,
     XpJobReplay,
     XpFlow,
+    DeepFlow,
     Count,
 };
 

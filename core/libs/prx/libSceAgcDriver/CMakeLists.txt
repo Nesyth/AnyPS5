@@ -400,6 +400,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/HeapStages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawDecode.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawLookup.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DeepIndex.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPipeline.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRecords.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/StagePlans.cpp
@@ -831,6 +832,8 @@ set(agcLateStackEnvironment
         APS5_HOST_PREFETCH=1)
 set(agcLeanFrontEnvironment APS5_LEAN_FRONT=1 APS5_VERIFY_LEAN_FRONT=2)
 set(agcLeanFrontDifference "\\[lean-front-verify\\] [-a-z ]+ differs:")
+set(agcDeepFlowEnvironment APS5_DEEP_FLOW=1 APS5_VERIFY_DEEP_FLOW=1)
+set(agcDeepFlowDifference "\\[deep-flow-verify\\] [-a-z ]+ differs:")
 
 function(agc_add_draw_pipeline_test agcTestName)
     set(agcPipelineEnvironment ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1)
@@ -852,6 +855,13 @@ function(agc_add_draw_pipeline_test agcTestName)
                 ENV ${agcPipelineEnvironment} ${agcLateStackEnvironment} ${agcLeanFrontEnvironment})
         set_tests_properties(${agcTestName}_lean_front_late PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference}")
     endif()
+endfunction()
+
+function(agc_add_deep_flow_test agcTestName)
+    set(agcPipelineEnvironment ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1)
+    agc_add_env_test(${agcTestName}_deep_flow ${agcTestName}_tests
+            ENV ${agcPipelineEnvironment} ${agcLateStackEnvironment} ${agcLeanFrontEnvironment} ${agcDeepFlowEnvironment})
+    set_tests_properties(${agcTestName}_deep_flow PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDeepFlowDifference}")
 endfunction()
 
 set(agcDrawRecordsDifference "\\[draw-records-verify\\] [-a-z ]+ differs:")

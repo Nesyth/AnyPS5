@@ -49,6 +49,15 @@ bool dumpsDispatchProgram(std::uint64_t address) {
     return watched != nullptr && std::strtoull(watched, nullptr, 0) == address;
 }
 
+bool awaitRegionWriters(std::span<const ShaderRecompiler::MemoryRegion> regions, DeepSite site) {
+    std::vector<DrawPipeline::Range> ranges;
+    ranges.reserve(regions.size());
+    for (const auto& region : regions) ranges.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+    auto& pipeline = DrawPipeline::Queue0();
+    while (pipeline.Busy() && pipeline.OverlapsAny(ranges)) pipeline.AwaitWriters(ranges, DrawPipeline::DrainReason::Packet, 0x15, site);
+    return true;
+}
+
 enum class ItemFallback : std::size_t { Miss, Reads, NoRecipe, Writes, Verify, Count };
 constexpr std::array<const char*, static_cast<std::size_t>(ItemFallback::Count)> ItemFallbackNames{"miss", "reads", "no recipe", "writes", "verify"};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ItemFallback::Count)> itemFallbacks{};
@@ -697,9 +706,24 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!partialLastGroup && indirectArguments == 0 && (MatchDwordPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchConstantDwordFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchClampedGlobalFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchMemoryValueBufferFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
         if (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
     } else {
-        if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread() && (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchBeside) || DrawFinisher::Flow())) {
+        if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread() && (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchBeside) || DrawFinisher::Flow() || DrawFinisher::Deep())) {
             const auto code = std::span(snapshot.code).subspan(codeOffset);
-            const bool sideEffects = !pipelineCandidate
+            const bool deep = DrawFinisher::Deep();
+            const auto fills = [&] {
+                return (!partialLastGroup && matchesFillKernel(code, userData, compute))
+                    || (!partialLastGroup && indirectArguments == 0 && (MatchDwordPatternFill(packet, code, userData, compute) || MatchConstantDwordFill(packet, code, userData, compute) || MatchClampedGlobalFill(packet, code, userData, compute) || MatchMemoryValueBufferFill(packet, code, userData, compute)));
+            };
+            const auto notes = [&] {
+                return !pipelineCandidate
+                    || (indirectArguments == 0 && Graphics::MatchMultisampledSingleClear(code, userData, compute.numThreads))
+                    || (indirectArguments == 0 && (packet[4] & 0x20u) == 0 && Graphics::MatchMemoryValueFill(code, userData, compute.numThreads, {packet[1], packet[2], packet[3]}).has_value())
+                    || Graphics::HtileDepthClearAddress(code, userData, compute.numThreads) != 0
+                    || Graphics::MatchHtileBufferMaskClear(code, userData, compute, packet, indirectArguments).has_value()
+                    || Graphics::MatchHtileZmaskFixup(code, userData, compute, packet, indirectArguments).has_value();
+            };
+            const bool noted = deep && notes();
+            const bool filledOnly = deep && !noted && fills();
+            const bool sideEffects = deep ? noted || filledOnly : !pipelineCandidate
                 || (indirectArguments == 0 && Graphics::MatchMultisampledSingleClear(code, userData, compute.numThreads))
                 || (!partialLastGroup && matchesFillKernel(code, userData, compute))
                 || (!partialLastGroup && indirectArguments == 0 && (MatchDwordPatternFill(packet, code, userData, compute) || MatchConstantDwordFill(packet, code, userData, compute) || MatchClampedGlobalFill(packet, code, userData, compute) || MatchMemoryValueBufferFill(packet, code, userData, compute)))
@@ -707,7 +731,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 || Graphics::HtileDepthClearAddress(code, userData, compute.numThreads) != 0
                 || Graphics::MatchHtileBufferMaskClear(code, userData, compute, packet, indirectArguments).has_value()
                 || Graphics::MatchHtileZmaskFixup(code, userData, compute, packet, indirectArguments).has_value();
-            if (sideEffects && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpNoPacketDrains) && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Dispatch)) DrawFinisher::Get().Drain();
+            if (sideEffects && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpNoPacketDrains) && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Dispatch)) {
+                if (filledOnly) {
+                    DrawFinisher::NoteDeepSite(DeepSite::FillByTurn);
+                } else {
+                    DrawFinisher::NoteDeepKept(DeepKept::WorkerNote);
+                    DrawFinisher::Get().Drain();
+                }
+            }
         }
         if (indirectArguments == 0 && Graphics::TakeMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) {
             census.outcome = CensusOutcome::Clear;
@@ -724,7 +755,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (resolvedAhead().empty()) gateOpened() = true;
             return;
         }
-        if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (DrawPipeline::Active() && !pipelineCandidate) {
+            DrawFinisher::NoteDeepKept(DeepKept::WorkerDispatch);
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        }
         if (dumpsDispatchProgram(address)) {
             static std::atomic<unsigned> programDumps{0};
             if (programDumps.fetch_add(1, std::memory_order_relaxed) < 3) {
@@ -983,9 +1017,13 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         } else {
             readsClear = std::none_of(reads.begin(), reads.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
             if (!readsClear && DrawFinisher::FlowSkips(DrawFinisher::FlowSite::DispatchReads)) readsClear = true;
+            if (!readsClear && DrawFinisher::Deep()) readsClear = awaitRegionWriters(reads, DeepSite::DispatchReads);
             if (!readsClear) NoteItemFallback(ItemFallback::Reads);
         }
-        if (!readsClear && !lateItem && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!readsClear && !lateItem && DrawPipeline::Queue0().Busy()) {
+            DrawFinisher::NoteDeepKept(DeepKept::WorkerDispatch);
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        }
         ReportDispatchItems(profile);
     }
     if (fromAhead) {
@@ -1031,7 +1069,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         } else {
             NoteItemFallback(ItemFallback::NoRecipe);
         }
-        if (!pipelined && !recipeLess && !lateItem && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!pipelined && !recipeLess && !lateItem && DrawPipeline::Queue0().Busy()) {
+            DrawFinisher::NoteDeepKept(DeepKept::WorkerDispatch);
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        }
     }
     std::uint64_t forgetAtCapture = 0;
     if (cached) {
@@ -1234,13 +1275,17 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         pipelined = false;
         itemWrites.clear();
         itemNotPlain.fetch_add(1, std::memory_order_relaxed);
-        if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (DrawPipeline::Queue0().Busy()) {
+            DrawFinisher::NoteDeepKept(DeepKept::WorkerDispatch);
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        }
     }
     if (lateItem || recipeLess) {
         bool queued = plain;
         if (queued && lateItem) {
             queued = std::none_of(captured.begin(), captured.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
             if (!queued && DrawFinisher::FlowSkips(DrawFinisher::FlowSite::DispatchReads)) queued = true;
+            if (!queued && DrawFinisher::Deep()) queued = awaitRegionWriters(captured, DeepSite::LateDispatchReads);
             if (!queued) NoteItemFallback(ItemFallback::Reads);
         } else if (!plain) {
             NoteItemFallback(lateItem ? ItemFallback::Miss : ItemFallback::NoRecipe);
@@ -1251,8 +1296,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             pipelined = bounded;
             if (!bounded) NoteItemFallback(ItemFallback::Writes);
         }
-        if (pipelined) (lateItem ? (relocatedHit ? itemRelocated : itemMisses) : itemRecipeLess).fetch_add(1, std::memory_order_relaxed);
-        else if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (pipelined) {
+            (lateItem ? (relocatedHit ? itemRelocated : itemMisses) : itemRecipeLess).fetch_add(1, std::memory_order_relaxed);
+        } else if (DrawPipeline::Queue0().Busy()) {
+            DrawFinisher::NoteDeepKept(DeepKept::WorkerDispatch);
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        }
     }
     if (pipelined) {
         runCaptureCheckHook();

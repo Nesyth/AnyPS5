@@ -1029,6 +1029,11 @@ using ExpectedWords = std::vector<std::pair<std::uint64_t, std::uint32_t>>;
 void syncPipelinedWrites(std::uint64_t address, std::size_t bytes) {
     if (!DrawPipeline::Active()) return;
     auto& pipeline = DrawPipeline::Queue0();
+    if (DrawFinisher::Deep()) {
+        const DrawPipeline::Range range{address, address + bytes};
+        while (pipeline.Busy() && pipeline.Overlaps(address, bytes)) pipeline.AwaitWriters({&range, 1}, DrawPipeline::DrainReason::Capture, 0x100, DeepSite::HeapStages);
+        return;
+    }
     if (pipeline.Busy() && pipeline.Overlaps(address, bytes) && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Capture)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
 }
 

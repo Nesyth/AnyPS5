@@ -226,6 +226,14 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();
         if (pipeline.Busy()) queued = pipeline.StoredBytes(address, bytes, known.size() == bytes ? known : std::span<std::byte>{});
+        if (queued == DrawPipeline::QueuedWrite::Unknown && DrawFinisher::Deep()) {
+            const DrawPipeline::Range range{address, address + bytes};
+            for (unsigned round = 0; round < 2 && queued == DrawPipeline::QueuedWrite::Unknown; ++round) {
+                pipeline.AwaitWriters({&range, 1}, DrawPipeline::DrainReason::Capture, 0x100, DeepSite::WriteEvidence);
+                queued = pipeline.Busy() ? pipeline.StoredBytes(address, bytes, known.size() == bytes ? known : std::span<std::byte>{}) : DrawPipeline::QueuedWrite::None;
+            }
+            if (queued == DrawPipeline::QueuedWrite::Unknown) DrawFinisher::NoteDeepKept(DeepKept::Fallback);
+        }
         if (queued == DrawPipeline::QueuedWrite::Stored && known.size() == bytes) {
             if (!knownValueVerify()) return Policy::KnownValue;
             pipeline.Drain(DrawPipeline::DrainReason::Capture);

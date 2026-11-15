@@ -415,6 +415,93 @@ bool countRange(std::vector<std::pair<DrawPipeline::Range, std::uint32_t>>& coun
 }
 }
 
+namespace {
+enum class DeepLookup : std::uint32_t { PendingWrites, PendingLabel, PendingKey, EarlierKey, AheadWrites, QueuedWrites, StoredBytes, QueuedLabel, Watch, HeldReads, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(DeepLookup::Count)> DeepLookupNames{"pending writes", "pending label", "pending key", "earlier key", "ahead writes", "queued writes", "stored bytes", "queued label", "watch", "held reads"};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DeepLookup::Count)> deepAnswered{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DeepLookup::Count)> deepFellBack{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DeepLookup::Count)> deepVerifyOrdinals{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DeepSite::Count)> deepSiteJobWaits{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DeepSite::Count)> deepSiteItemWaits{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawFinisher::DeepCount::Count)> deepTotals{};
+std::array<std::uint64_t, 4> deepTotalsReported{};
+std::atomic<std::uint64_t> deepTurnWrites{0};
+std::atomic<std::uint64_t> deepTurnSkipped{0};
+std::atomic<std::uint64_t> deepTurnConservative{0};
+std::atomic<std::uint64_t> deepTurnFull{0};
+std::atomic<std::uint64_t> deepTurnUnknown{0};
+std::atomic<std::uint64_t> deepVerifyChecked{0};
+std::atomic<std::uint64_t> deepVerifyDiffering{0};
+std::atomic<std::uint64_t> deepVerifyConservative{0};
+std::atomic<std::uint64_t> deepVerifyPrinted{0};
+std::atomic<std::int64_t> deepVerifyWindow{0};
+
+std::uint64_t deepVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_DEEP_FLOW");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+bool deepVerifyDue(DeepLookup lookup) {
+    const auto every = deepVerifyEvery();
+    return every != 0 && deepVerifyOrdinals[static_cast<std::size_t>(lookup)].fetch_add(1, std::memory_order_relaxed) % every == 0;
+}
+
+void noteDeepLookup(DeepLookup lookup, bool fellBack) {
+    if (!pipelineStats()) return;
+    (fellBack ? deepFellBack : deepAnswered)[static_cast<std::size_t>(lookup)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void noteDeepTotal(DrawFinisher::DeepCount count) {
+    deepTotals[static_cast<std::size_t>(count)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void noteDeepSiteWait(DeepSite site, bool job) {
+    if (!pipelineStats()) return;
+    (job ? deepSiteJobWaits : deepSiteItemWaits)[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+}
+
+bool rangesOverlap(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const std::pair<std::uint64_t, std::uint64_t>> reads) {
+    for (const auto& [first, last] : writes) {
+        for (const auto& [begin, end] : reads) {
+            if (begin < last && first < end) return true;
+        }
+    }
+    return false;
+}
+
+DeepFound deepLater(const DeepFound& left, const DeepFound& right) {
+    if (left.answer == DeepAnswer::Unsure || right.answer == DeepAnswer::Unsure) return {DeepAnswer::Unsure};
+    if (right.answer != DeepAnswer::Hit) return left;
+    if (left.answer != DeepAnswer::Hit || right.stamp > left.stamp) return right;
+    return left;
+}
+
+void noteDeepVerify(DeepLookup lookup, const DeepFound& index, const DeepFound& scan, bool stamped, std::uint64_t front, std::uint64_t asker, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    deepVerifyChecked.fetch_add(1, std::memory_order_relaxed);
+    const bool hit = index.answer == DeepAnswer::Hit;
+    const bool found = scan.answer == DeepAnswer::Hit;
+    const bool differs = (!hit && found) || (stamped && hit && found && scan.stamp > index.stamp);
+    if (!differs) {
+        if ((hit && !found) || (stamped && hit && found && index.stamp > scan.stamp)) deepVerifyConservative.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    deepVerifyDiffering.fetch_add(1, std::memory_order_relaxed);
+    const auto window = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (deepVerifyWindow.exchange(window, std::memory_order_relaxed) != window) deepVerifyPrinted.store(0, std::memory_order_relaxed);
+    if (deepVerifyPrinted.fetch_add(1, std::memory_order_relaxed) >= 8) return;
+    const auto wide = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    const auto range = ranges.empty() ? std::pair<std::uint64_t, std::uint64_t>{} : ranges.front();
+    std::fprintf(stderr, "[deep-flow-verify] %s differs: index %s %llu, scan %s %llu; front %llu, asker %llu, range %llx..%llx\n", DeepLookupNames[static_cast<std::size_t>(lookup)], hit ? "hit" : "clear", wide(index.stamp), found ? "hit" : "clear", wide(scan.stamp), wide(front), wide(asker), wide(range.first), wide(range.second));
+}
+
+std::size_t readRegionSlot(std::uint64_t region) {
+    return static_cast<std::size_t>((region * 0x9E3779B97F4A7C15ull) >> 52u);
+}
+}
+
 void PublishedRanges::Publish(std::span<const std::pair<Range, std::uint32_t>> entries, std::uint32_t unknownHeld) {
     const auto before = seq.load(std::memory_order_relaxed);
     seq.store(before + 1, std::memory_order_relaxed);
@@ -579,8 +666,9 @@ PublishedKeys::Answer PublishedKeys::FindBefore(std::uint64_t key, std::uint64_t
             continue;
         }
         const auto first = head.load(std::memory_order_relaxed);
-        const auto last = std::min(tail.load(std::memory_order_relaxed), before);
-        const bool fits = first > last || last - first <= Capacity;
+        const auto pushed = tail.load(std::memory_order_relaxed);
+        const auto last = std::min(pushed, before);
+        const bool fits = (first > last || last - first <= Capacity) && pushed >= first && pushed - first <= Capacity;
         bool hit = false;
         for (auto number = first; fits && number < last && !hit; ++number) {
             const auto slot = static_cast<std::size_t>(number % Capacity) * 3;
@@ -634,8 +722,14 @@ bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
     }
     const bool ring = ringMode.load(std::memory_order_acquire);
     if (ring) retireLean();
+    const bool deep = ring && deepRing.load(std::memory_order_relaxed);
+    if (deep) {
+        const Range range{begin, end};
+        if (const auto answer = deepPendingHit({&range, 1}); answer != DeepAnswer::Unsure) return answer == DeepAnswer::Hit;
+        if (rangesOverlap(openRunWrites, {&range, 1})) return true;
+    }
     const bool flow = Flow();
-    if (lockless() || flow) {
+    if (!deep && (lockless() || flow)) {
         const Range range{begin, end};
         const auto answer = published.Overlaps({&range, 1}, nullptr, nullptr, flow);
         if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Hit;
@@ -675,7 +769,8 @@ DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std:
     const bool ring = ringMode.load(std::memory_order_acquire);
     if (ring) retireLean();
     const bool flow = Flow();
-    if (lockless() || flow) {
+    const bool deep = ring && deepRing.load(std::memory_order_relaxed);
+    if (!deep && (lockless() || flow)) {
         const Range range{address, end};
         if (published.Overlaps({&range, 1}, nullptr, nullptr, flow) == PublishedRanges::Answer::Clear) return LabelLookup::NotHeld;
     }
@@ -689,6 +784,29 @@ DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std:
         std::memcpy(&value, held.labelBytes.data() + (address - held.labelAddress), bytes);
         return LabelLookup::Value;
     };
+    if (deep) {
+        const Range range{address, end};
+        const auto front = frontSeq.load(std::memory_order_acquire);
+        const auto unknown = lastUnknown.load(std::memory_order_relaxed);
+        const auto found = deepWrites->Newest({&range, 1}, front);
+        if (found.answer != DeepAnswer::Unsure && (found.answer != DeepAnswer::Hit || found.stamp < nextSeq)) {
+            const bool byUnknown = unknown >= front && (found.answer != DeepAnswer::Hit || unknown > found.stamp);
+            if (deepVerifyDue(DeepLookup::PendingLabel)) noteDeepVerify(DeepLookup::PendingLabel, byUnknown ? DeepFound{DeepAnswer::Hit, unknown} : found, scanWrites({&range, 1}, frontSeq.load(std::memory_order_acquire), nextSeq), true, front, 0, {&range, 1});
+            if (byUnknown) {
+                noteDeepLookup(DeepLookup::PendingLabel, false);
+                return LabelLookup::Unknown;
+            }
+            if (found.answer != DeepAnswer::Hit) {
+                noteDeepLookup(DeepLookup::PendingLabel, false);
+                return LabelLookup::NotHeld;
+            }
+            if (const auto answer = lookup(leanSlot(found.stamp).pending)) {
+                noteDeepLookup(DeepLookup::PendingLabel, false);
+                return *answer;
+            }
+        }
+        noteDeepLookup(DeepLookup::PendingLabel, true);
+    }
     if (ring) {
         const auto front = frontSeq.load(std::memory_order_acquire);
         for (auto seq = nextSeq; seq-- > front;) {
@@ -708,8 +826,13 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
     if (!FinisherProducer::Get()) return aheadWait(ranges);
     const bool ring = ringMode.load(std::memory_order_acquire);
     if (ring) retireLean();
+    const bool deep = ring && deepRing.load(std::memory_order_relaxed);
+    if (deep) {
+        if (const auto answer = deepPendingHit(ranges); answer != DeepAnswer::Unsure) return answer == DeepAnswer::Hit;
+        if (rangesOverlap(openRunWrites, ranges)) return true;
+    }
     const bool flow = Flow();
-    if (lockless() || flow) {
+    if (!deep && (lockless() || flow)) {
         const auto answer = published.Overlaps(ranges, nullptr, nullptr, flow);
         if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Hit;
         if (flow) {
@@ -751,6 +874,16 @@ bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
     const bool precise = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PreciseLookupDrain);
     const bool ring = ringMode.load(std::memory_order_acquire);
     if (ring) retireLean();
+    if (ring && deepRing.load(std::memory_order_relaxed)) {
+        const auto front = frontSeq.load(std::memory_order_acquire);
+        const auto found = keysBefore(key, shape, precise, front, ~std::uint64_t{0});
+        noteDeepLookup(DeepLookup::PendingKey, found.answer == DeepAnswer::Unsure);
+        if (found.answer != DeepAnswer::Unsure) {
+            if (deepVerifyDue(DeepLookup::PendingKey)) noteDeepVerify(DeepLookup::PendingKey, found, scanKeys(key, shape, precise, frontSeq.load(std::memory_order_acquire), nextSeq), true, front, 0, {});
+            return found.answer == DeepAnswer::Hit;
+        }
+        return scanKeys(key, shape, precise, frontSeq.load(std::memory_order_acquire), nextSeq).answer == DeepAnswer::Hit;
+    }
     if (lockless()) {
         const auto answer = keys.Find(key, shape, precise);
         if (answer != PublishedKeys::Answer::Unsure) return answer == PublishedKeys::Answer::Hit;
@@ -772,6 +905,17 @@ PublishedKeys::Answer DrawFinisher::KeyBefore(std::uint64_t key, std::uint64_t s
     if (Flow()) {
         NoteFlowLookup(FlowLookup::EarlierKey);
         return PublishedKeys::Answer::Clear;
+    }
+    if (deepRing.load(std::memory_order_acquire)) {
+        const auto front = frontSeq.load(std::memory_order_acquire);
+        const auto found = keysBefore(key, shape, insertsOnly, front, seq);
+        noteDeepLookup(DeepLookup::EarlierKey, found.answer == DeepAnswer::Unsure);
+        if (found.answer == DeepAnswer::Unsure) return PublishedKeys::Answer::Unsure;
+        if (deepVerifyDue(DeepLookup::EarlierKey)) {
+            const std::lock_guard lock(verifySlots);
+            noteDeepVerify(DeepLookup::EarlierKey, found, scanKeys(key, shape, insertsOnly, frontSeq.load(std::memory_order_acquire), seq), true, front, seq, {});
+        }
+        return found.answer == DeepAnswer::Hit ? PublishedKeys::Answer::Hit : PublishedKeys::Answer::Clear;
     }
     return keys.FindBefore(key, shape, insertsOnly, seq);
 }
@@ -837,8 +981,64 @@ void noteRingDepth(std::uint64_t depth) {
 }
 }
 
+namespace {
+constexpr std::array<const char*, static_cast<std::size_t>(DeepKept::Count)> DeepKeptNames{"flip", "rendering wait", "wait", "worker label", "packet verdict", "segment end", "submission", "settle", "deferred labels", "worker draw", "worker dispatch", "metadata pass", "worker note", "relocation", "indirect cpu", "dispatch not pipelined", "fallback", "shutdown", "other"};
+constexpr std::array<const char*, static_cast<std::size_t>(DeepSite::Count)> DeepSiteNames{"packet verdict", "predication", "indirect arguments", "fill inputs", "fill by turn", "dispatch reads", "late dispatch reads", "decode", "heap stages", "variant", "write evidence", "shader code", "same key", "earlier key", "items by turn", "items with reads by turn", "packet finisher"};
+static_assert(DeepKeptNames.back() != nullptr && DeepSiteNames.back() != nullptr, "every deep flow census entry needs a name");
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DeepKept::Count)> deepKept{};
+std::array<std::atomic<std::uint64_t>, 257> deepKeptVerdicts{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DeepSite::Count)> deepSites{};
+std::atomic<std::uint64_t> deepDepthHighest{0};
+std::atomic<std::uint64_t> deepDepthSum{0};
+std::atomic<std::uint64_t> deepDepthSamples{0};
+
+void noteDeepDepth(std::uint64_t depth) {
+    deepDepthSum.fetch_add(depth, std::memory_order_relaxed);
+    deepDepthSamples.fetch_add(1, std::memory_order_relaxed);
+    if (depth > deepDepthHighest.load(std::memory_order_relaxed)) deepDepthHighest.store(depth, std::memory_order_relaxed);
+}
+}
+
 bool DrawFinisher::aheadWait(std::span<const Range> ranges) {
     if (!FinisherAhead::Get() || !AheadBusy()) return false;
+    if (deepRing.load(std::memory_order_acquire)) {
+        const auto seq = FinisherSeq::Get();
+        const auto front = frontSeq.load(std::memory_order_acquire);
+        const auto found = deepWrites->Before(ranges, front, seq);
+        if (found.answer == DeepAnswer::Unsure) {
+            noteDeepLookup(DeepLookup::AheadWrites, true);
+            noteDeepTotal(DeepCount::IndexFull);
+            if (pipelineStats()) deepTurnFull.fetch_add(1, std::memory_order_relaxed);
+            noteTurnWait(PublishedRanges::Answer::Unsure, false, ranges, {});
+            LeanFront::Add(LeanFront::Counter::AheadWaits);
+            AwaitTurn();
+            return false;
+        }
+        noteDeepLookup(DeepLookup::AheadWrites, false);
+        const auto unknown = leanSlot(seq).unknownBefore;
+        const bool byUnknown = unknown >= front && (found.answer != DeepAnswer::Hit || unknown >= found.stamp);
+        const auto blocker = byUnknown ? unknown : found.answer == DeepAnswer::Hit ? found.stamp : std::uint64_t{0};
+        if (deepVerifyDue(DeepLookup::AheadWrites)) {
+            const std::lock_guard lock(verifySlots);
+            noteDeepVerify(DeepLookup::AheadWrites, blocker == 0 ? DeepFound{} : DeepFound{DeepAnswer::Hit, blocker}, scanWrites(ranges, frontSeq.load(std::memory_order_acquire), seq), true, front, seq, ranges);
+        }
+        if (blocker == 0) return false;
+        if (pipelineStats()) {
+            if (byUnknown) {
+                deepTurnUnknown.fetch_add(1, std::memory_order_relaxed);
+            } else if (found.conservative) {
+                deepTurnConservative.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                deepTurnWrites.fetch_add(1, std::memory_order_relaxed);
+                deepTurnSkipped.fetch_add(seq - 1 - blocker, std::memory_order_relaxed);
+            }
+        }
+        noteTurnWait(PublishedRanges::Answer::Hit, byUnknown, ranges, found.range);
+        LeanFront::Add(LeanFront::Counter::AheadWaits);
+        if (blocker + 1 >= seq) AwaitTurn();
+        else awaitFrontPast(blocker);
+        return false;
+    }
     Range pendingHit{};
     bool unknownHeld = false;
     auto answer = published.Overlaps(ranges, &pendingHit, &unknownHeld);
@@ -947,6 +1147,243 @@ std::string DrawFinisher::FlowText() {
         site(FlowSite::PacketFinisher), site(FlowSite::PacketCommitter), site(FlowSite::Predication), site(FlowSite::Dispatch), site(FlowSite::DispatchReads), site(FlowSite::Indirect), site(FlowSite::Relocation), site(FlowSite::Capture),
         lookup(FlowLookup::SameKey), lookup(FlowLookup::EarlierKey), lookup(FlowLookup::PendingWrites), lookup(FlowLookup::QueuedWrites), lookup(FlowLookup::HeldReads), lookup(FlowLookup::Watch), crowded, unknown, kept);
     return text;
+}
+
+bool DrawFinisher::Deep() {
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DeepFlow) && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpFlow) && deepQueues();
+}
+
+void DrawFinisher::NoteDeepKept(DeepKept kept, std::uint32_t opcode) {
+    if (!pipelineStats() || !Deep()) return;
+    if (!Busy() && DrawPipeline::Queue0().Outstanding() == 0) return;
+    deepKept[static_cast<std::size_t>(kept)].fetch_add(1, std::memory_order_relaxed);
+    if (kept == DeepKept::PacketVerdict) deepKeptVerdicts[std::min<std::uint32_t>(opcode, 256u)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void DrawFinisher::NoteDeepSite(DeepSite site) {
+    if (!pipelineStats() || !Deep()) return;
+    deepSites[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string DrawFinisher::DeepText() {
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto samples = take(deepDepthSamples);
+    const auto sum = take(deepDepthSum);
+    const auto highest = take(deepDepthHighest);
+    char head[320];
+    std::snprintf(head, sizeof(head), "switch %s, ring latch %s, ring span %llu slots; outstanding finisher jobs at a publish: highest %llu, mean %.1f over %llu jobs",
+        Deep() ? "set" : "unset", Get().deepRing.load(std::memory_order_relaxed) ? "on" : "off", static_cast<unsigned long long>(Get().leanMask.load(std::memory_order_relaxed) + 1), highest, samples == 0 ? 0.0 : static_cast<double>(sum) / static_cast<double>(samples), samples);
+    std::string text = head;
+    const auto list = [&](const char* title, auto& counts, const auto& names) {
+        text += title;
+        for (std::size_t index = 0; index < counts.size(); ++index) {
+            char item[96];
+            std::snprintf(item, sizeof(item), "%s %s %llu", index == 0 ? "" : ",", names[index], take(counts[index]));
+            text += item;
+        }
+    };
+    list("; drains kept:", deepKept, DeepKeptNames);
+    text += "; kept packet verdicts by opcode:";
+    bool shown = false;
+    for (int round = 0; round < 6; ++round) {
+        std::size_t top = 0;
+        for (std::size_t index = 1; index < deepKeptVerdicts.size(); ++index) {
+            if (deepKeptVerdicts[index].load(std::memory_order_relaxed) > deepKeptVerdicts[top].load(std::memory_order_relaxed)) top = index;
+        }
+        const auto count = take(deepKeptVerdicts[top]);
+        if (count == 0) break;
+        char item[48];
+        std::snprintf(item, sizeof(item), " 0x%02zx x%llu", top, count);
+        text += item;
+        shown = true;
+    }
+    if (!shown) text += " none";
+    for (auto& count : deepKeptVerdicts) count.store(0, std::memory_order_relaxed);
+    list("; ordered or awaited instead of drained:", deepSites, DeepSiteNames);
+    const auto writes = take(deepTurnWrites);
+    const auto skipped = take(deepTurnSkipped);
+    char turns[320];
+    std::snprintf(turns, sizeof(turns), "; turn waits of jobs ahead: a write over the read %llu (%.1f jobs skipped on average), conservative turn %llu, index full %llu, unknown writes %llu", writes, writes == 0 ? 0.0 : static_cast<double>(skipped) / static_cast<double>(writes), take(deepTurnConservative), take(deepTurnFull), take(deepTurnUnknown));
+    text += turns;
+    text += "; lookups answered by the index (fallbacks to the scan):";
+    for (std::size_t index = 0; index < deepAnswered.size(); ++index) {
+        char item[96];
+        std::snprintf(item, sizeof(item), "%s %s %llu (%llu)", index == 0 ? "" : ",", DeepLookupNames[index], take(deepAnswered[index]), take(deepFellBack[index]));
+        text += item;
+    }
+    text += "; targeted waits by site (finisher jobs/committer items):";
+    for (std::size_t index = 0; index < deepSiteJobWaits.size(); ++index) {
+        char item[96];
+        std::snprintf(item, sizeof(item), "%s %s %llu/%llu", index == 0 ? "" : ",", DeepSiteNames[index], take(deepSiteJobWaits[index]), take(deepSiteItemWaits[index]));
+        text += item;
+    }
+    const std::array<std::uint64_t, 4> totals{DeepTotal(DeepCount::WriteOverflows), DeepTotal(DeepCount::KeyOverflows), DeepTotal(DeepCount::QueuedOverflows), DeepTotal(DeepCount::WorkerFallbacks)};
+    std::array<unsigned long long, 4> since{};
+    for (std::size_t index = 0; index < totals.size(); ++index) {
+        since[index] = static_cast<unsigned long long>(totals[index] - deepTotalsReported[index]);
+        deepTotalsReported[index] = totals[index];
+    }
+    char tail[320];
+    std::snprintf(tail, sizeof(tail), "; index overflows: finisher writes %llu, keys %llu, queued writes %llu; worker lookups scanned for an unsure index %llu; verify every %llu: checked %llu, differing %llu, conservative %llu", since[0], since[1], since[2], since[3], static_cast<unsigned long long>(deepVerifyEvery()), take(deepVerifyChecked), take(deepVerifyDiffering), take(deepVerifyConservative));
+    text += tail;
+    return text;
+}
+
+void DrawFinisher::AwaitKeyed(std::uint64_t key, std::uint64_t shape, bool insertsOnly) {
+    if (OnFinisherThread()) {
+        NoteDeepSite(DeepSite::EarlierKey);
+        const auto seq = FinisherSeq::Get();
+        if (seq == 0 || !deepRing.load(std::memory_order_acquire)) {
+            AwaitTurn();
+            return;
+        }
+        const auto blocker = KeyBlocker(key, shape, insertsOnly);
+        if (blocker == 0) return;
+        noteDeepSiteWait(DeepSite::EarlierKey, true);
+        if (blocker == ~std::uint64_t{0} || blocker + 1 >= seq) AwaitTurn();
+        else awaitFrontPast(blocker);
+        return;
+    }
+    NoteDeepSite(DeepSite::SameKey);
+    FlushOpenRun();
+    if (!Busy()) return;
+    if (!FinisherProducer::Get() || !ringMode.load(std::memory_order_acquire) || !deepRing.load(std::memory_order_relaxed)) {
+        Drain();
+        return;
+    }
+    if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
+    retireLean();
+    const auto blocker = KeyBlocker(key, shape, insertsOnly);
+    if (blocker == 0) return;
+    noteDeepSiteWait(DeepSite::SameKey, true);
+    if (blocker == ~std::uint64_t{0} || blocker >= nextSeq || !awaitProducerFront(blocker)) {
+        NoteDeepKept(DeepKept::Fallback);
+        Drain();
+    }
+}
+
+std::uint64_t DrawFinisher::KeyBlocker(std::uint64_t key, std::uint64_t shape, bool insertsOnly) {
+    if (!deepRing.load(std::memory_order_acquire)) return ~std::uint64_t{0};
+    const auto seq = FinisherSeq::Get();
+    const auto front = frontSeq.load(std::memory_order_acquire);
+    if (seq != 0 && front >= seq) return 0;
+    const auto found = keysBefore(key, shape, insertsOnly, front, seq != 0 ? seq : ~std::uint64_t{0});
+    if (found.answer == DeepAnswer::Unsure) return ~std::uint64_t{0};
+    return found.answer == DeepAnswer::Hit ? found.stamp : 0;
+}
+
+void DrawFinisher::AwaitPending(std::span<const Range> ranges, DeepSite site) {
+    NoteDeepSite(site);
+    FlushOpenRun();
+    if (!Busy() || OnFinisherThread()) return;
+    if (!FinisherProducer::Get() || !ringMode.load(std::memory_order_acquire) || !deepRing.load(std::memory_order_relaxed)) {
+        Drain();
+        return;
+    }
+    if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
+    for (;;) {
+        retireLean();
+        const auto front = frontSeq.load(std::memory_order_acquire);
+        const auto found = deepWrites->Newest(ranges, front);
+        if (found.answer == DeepAnswer::Unsure) {
+            noteDeepTotal(DeepCount::WorkerFallbacks);
+            NoteDeepKept(DeepKept::Fallback);
+            Drain();
+            return;
+        }
+        auto blocker = found.answer == DeepAnswer::Hit ? found.stamp : std::uint64_t{0};
+        const auto unknown = lastUnknown.load(std::memory_order_relaxed);
+        if (unknown >= front) blocker = std::max(blocker, unknown);
+        if (blocker == 0) return;
+        noteDeepSiteWait(site, true);
+        if (blocker >= nextSeq || !awaitProducerFront(blocker)) {
+            NoteDeepKept(DeepKept::Fallback);
+            Drain();
+            return;
+        }
+    }
+}
+
+std::uint64_t DrawFinisher::DeepTotal(DeepCount count) {
+    auto& finisher = Get();
+    auto& pipeline = DrawPipeline::Queue0();
+    const bool ring = finisher.deepIndexed.load(std::memory_order_acquire);
+    const bool queue = pipeline.deepIndexed.load(std::memory_order_acquire);
+    switch (count) {
+        case DeepCount::WriteOverflows: return ring ? finisher.deepWrites->Overflows() : 0;
+        case DeepCount::KeyOverflows: return ring ? finisher.deepKeys->Overflows() + finisher.deepShapes->Overflows() : 0;
+        case DeepCount::QueuedOverflows: return queue ? pipeline.deepStores->Overflows() + pipeline.deepOthers->Overflows() : 0;
+        default: return deepTotals[std::min<std::size_t>(static_cast<std::size_t>(count), deepTotals.size() - 1)].load(std::memory_order_relaxed);
+    }
+}
+
+DeepAnswer DrawFinisher::deepPendingHit(std::span<const Range> ranges) {
+    const auto front = frontSeq.load(std::memory_order_acquire);
+    const auto unknown = lastUnknown.load(std::memory_order_relaxed);
+    auto found = deepWrites->Newest(ranges, front);
+    if (found.answer == DeepAnswer::Unsure) {
+        noteDeepTotal(DeepCount::WorkerFallbacks);
+        noteDeepLookup(DeepLookup::PendingWrites, true);
+        return unknown >= front ? DeepAnswer::Hit : DeepAnswer::Unsure;
+    }
+    if (unknown >= front && (found.answer != DeepAnswer::Hit || unknown > found.stamp)) found = {DeepAnswer::Hit, unknown};
+    noteDeepLookup(DeepLookup::PendingWrites, false);
+    if (deepVerifyDue(DeepLookup::PendingWrites)) {
+        auto scan = scanWrites(ranges, frontSeq.load(std::memory_order_acquire), nextSeq);
+        if (rangesOverlap(openRunWrites, ranges)) scan = {DeepAnswer::Hit, nextSeq};
+        noteDeepVerify(DeepLookup::PendingWrites, found, scan, true, front, 0, ranges);
+    }
+    return found.answer;
+}
+
+DeepFound DrawFinisher::keysBefore(std::uint64_t key, std::uint64_t shape, bool insertsOnly, std::uint64_t live, std::uint64_t before) const {
+    auto found = deepLater(deepKeys->BeforeAny(insertsOnly, live, before), deepKeys->Before(key, insertsOnly, live, before));
+    if (shape != 0) found = deepLater(found, deepShapes->Before(shape, insertsOnly, live, before));
+    return found;
+}
+
+DeepFound DrawFinisher::scanWrites(std::span<const Range> ranges, std::uint64_t from, std::uint64_t to) const {
+    DeepFound scan;
+    for (auto seq = from; seq < to; ++seq) {
+        const auto& held = (*lean)[SlotIndex(seq)].pending;
+        if (held.unknown || rangesOverlap(held.writes, ranges)) scan = {DeepAnswer::Hit, seq};
+    }
+    return scan;
+}
+
+DeepFound DrawFinisher::scanKeys(std::uint64_t key, std::uint64_t shape, bool insertsOnly, std::uint64_t from, std::uint64_t to) const {
+    DeepFound scan;
+    for (auto seq = from; seq < to; ++seq) {
+        const auto& held = (*lean)[SlotIndex(seq)].pending;
+        if ((held.key == PublishedKeys::AnyKey || held.key == key || (shape != 0 && held.shape == shape)) && (held.inserts || !insertsOnly)) scan = {DeepAnswer::Hit, seq};
+    }
+    return scan;
+}
+
+bool DrawFinisher::awaitProducerFront(std::uint64_t job) {
+    const auto passed = [&] { return frontSeq.load(std::memory_order_seq_cst) > job; };
+    if (passed()) return true;
+    const auto start = ThreadReport::Enabled() ? ThreadReport::Clock::now() : ThreadReport::Clock::time_point{};
+    {
+        const ThreadReport::WorkerStateScope draining(ThreadReport::WorkerState::DrainFinisher, start != ThreadReport::Clock::time_point{} && ThreadReport::OnQueue0Worker());
+        if (!SpinUntil(HandoffSpinWindow() * 2, passed)) {
+            frontWaiters.fetch_add(1, std::memory_order_seq_cst);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            {
+                auto lock = lockFor(mutex);
+                turnWake.wait(lock, [&] { return closing || passed(); });
+            }
+            frontWaiters.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+    if (start != ThreadReport::Clock::time_point{}) {
+        const bool worker = ThreadReport::OnQueue0Worker();
+        ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherDrains : ThreadReport::Count::OtherDrains, 1);
+        ThreadReport::Add(worker ? ThreadReport::Count::WorkerFinisherDrainNs : ThreadReport::Count::OtherDrainNs, ThreadReport::Nanoseconds(start, ThreadReport::Clock::now()));
+    }
+    retireLean();
+    rethrowLeanFailure();
+    return passed();
 }
 
 bool DrawFinisher::OnFinisherThread() {
@@ -1142,6 +1579,11 @@ void DrawFinisher::FlushOpenRun() {
 }
 
 void DrawFinisher::HoldOpenRunWrite(const Range& range) {
+    if (deepRing.load(std::memory_order_relaxed)) {
+        deepWrites->Insert({&range, 1}, nextSeq, frontSeq.load(std::memory_order_acquire));
+        openRunWrites.push_back(range);
+        return;
+    }
     if (countRange(pendingWrites, range, true)) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
 }
 
@@ -1164,6 +1606,8 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
             return;
         }
         auto& slot = leanSlot(nextSeq);
+        std::unique_lock<std::mutex> verifying;
+        if (deepVerifyEvery() != 0) verifying = std::unique_lock<std::mutex>(verifySlots);
         slot.runner = nullptr;
         slot.retirer = nullptr;
         slot.batch = false;
@@ -1259,13 +1703,15 @@ bool DrawFinisher::Adopt(bool ring) {
         published.PublishUnknownJobs(unknownSeqs);
         published.Publish(pendingWrites, 0u);
     }
+    const bool deep = ring && Deep();
     if (ring) {
         if (lean == nullptr) lean = std::make_unique<std::array<LeanSlot, LeanSlots>>();
-        leanMask.store((Flow() ? LeanSlots : NarrowLeanSlots) - 1, std::memory_order_seq_cst);
+        leanMask.store((Flow() || deep ? LeanSlots : NarrowLeanSlots) - 1, std::memory_order_seq_cst);
         leanTake.store(nextSeq, std::memory_order_seq_cst);
         leanTail.store(nextSeq, std::memory_order_seq_cst);
         leanRetired = nextSeq;
     }
+    if (deepRing.load(std::memory_order_relaxed) != deep) latchDeepRing(deep);
     frontSeq.store(nextSeq, std::memory_order_release);
     leanFailed.store(false, std::memory_order_release);
     ringMode.store(ring, std::memory_order_release);
@@ -1343,17 +1789,30 @@ void DrawFinisher::helpLean(TWaiting&& waiting, bool room) {
 }
 
 void DrawFinisher::fitLeanSpan() {
-    const std::uint64_t wanted = Flow() ? LeanSlots : NarrowLeanSlots;
-    if (leanMask.load(std::memory_order_relaxed) + 1 == wanted || outstanding.load(std::memory_order_seq_cst) != 0) return;
+    const bool deep = Deep();
+    const std::uint64_t wanted = Flow() || deep ? LeanSlots : NarrowLeanSlots;
+    if ((leanMask.load(std::memory_order_relaxed) + 1 == wanted && deepRing.load(std::memory_order_relaxed) == deep) || outstanding.load(std::memory_order_seq_cst) != 0) return;
     retireLean();
     if (leanRetired != nextSeq) return;
     leanMask.store(wanted - 1, std::memory_order_seq_cst);
+    if (deepRing.load(std::memory_order_relaxed) != deep) latchDeepRing(deep);
+}
+
+void DrawFinisher::latchDeepRing(bool deep) {
+    if (deep && deepWrites == nullptr) {
+        deepWrites = std::make_unique<StampedRanges>();
+        deepKeys = std::make_unique<StampedKeys>();
+        deepShapes = std::make_unique<StampedKeys>();
+        deepIndexed.store(true, std::memory_order_release);
+    }
+    openRunWrites.clear();
+    deepRing.store(deep, std::memory_order_seq_cst);
 }
 
 void DrawFinisher::awaitLeanRoom(bool helping) {
     static_assert(PublishedKeys::Capacity <= NarrowLeanSlots && 16 <= NarrowLeanSlots && NarrowLeanSlots <= LeanSlots && (NarrowLeanSlots & (NarrowLeanSlots - 1)) == 0 && (LeanSlots & (LeanSlots - 1)) == 0, "the finisher ring must hold the deepest finisher queue, in a power-of-two number of slots");
     fitLeanSpan();
-    const std::uint64_t depth = Flow() && leanMask.load(std::memory_order_relaxed) + 1 == LeanSlots ? LeanSlots : finisherDepth();
+    const std::uint64_t depth = (Flow() || (Deep() && deepRing.load(std::memory_order_relaxed))) && leanMask.load(std::memory_order_relaxed) + 1 == LeanSlots ? LeanSlots : finisherDepth();
     const auto full = [&] { return nextSeq - frontSeq.load(std::memory_order_seq_cst) >= depth && !closed.load(std::memory_order_acquire); };
     if (!full()) {
         retireLean();
@@ -1470,20 +1929,37 @@ bool DrawFinisher::parkInSlot(unsigned index) {
 
 void DrawFinisher::publishLean(LeanSlot& slot) {
     const auto seq = nextSeq;
-    slot.counted = slot.batch || !Flow() || (pendingWrites.size() <= PublishedRanges::Capacity && unknownSeqs.size() <= PublishedRanges::UnknownCapacity);
-    if (!slot.batch && slot.counted && slot.pending.unknown) {
-        unknownSeqs.push_back(seq);
-        published.PublishUnknownJobs(unknownSeqs);
+    if (deepRing.load(std::memory_order_relaxed)) {
+        slot.counted = false;
+        slot.unknownBefore = lastUnknown.load(std::memory_order_relaxed);
+        const auto live = frontSeq.load(std::memory_order_acquire);
+        const auto& held = slot.pending;
+        if (slot.batch) openRunWrites.clear();
+        else if (held.unknown) lastUnknown.store(seq, std::memory_order_release);
+        else deepWrites->Insert(held.writes, seq, live);
+        if (held.key == PublishedKeys::AnyKey) deepKeys->InsertAny(seq, held.inserts, live);
+        else deepKeys->Insert(held.key, seq, held.inserts, live);
+        if (held.shape != 0) deepShapes->Insert(held.shape, seq, held.inserts, live);
+    } else {
+        slot.counted = slot.batch || !Flow() || (pendingWrites.size() <= PublishedRanges::Capacity && unknownSeqs.size() <= PublishedRanges::UnknownCapacity);
+        if (!slot.batch && slot.counted && slot.pending.unknown) {
+            unknownSeqs.push_back(seq);
+            published.PublishUnknownJobs(unknownSeqs);
+        }
+        if (!slot.batch && slot.counted && countPending(slot.pending, true)) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
+        keys.Push(seq, slot.pending.key, slot.pending.shape, slot.pending.inserts);
     }
-    if (!slot.batch && slot.counted && countPending(slot.pending, true)) published.Publish(pendingWrites, pendingUnknown != 0 ? 1u : 0u);
-    keys.Push(seq, slot.pending.key, slot.pending.shape, slot.pending.inserts);
     slot.seq.store(seq, std::memory_order_relaxed);
     slot.state.store(LeanReady, std::memory_order_relaxed);
     outstanding.fetch_add(1, std::memory_order_acq_rel);
     nextSeq = seq + 1;
     issued.store(nextSeq, std::memory_order_relaxed);
     leanTail.store(nextSeq, std::memory_order_seq_cst);
-    if (pipelineStats()) noteRingDepth(nextSeq - frontSeq.load(std::memory_order_relaxed));
+    if (pipelineStats()) {
+        const auto depth = nextSeq - frontSeq.load(std::memory_order_relaxed);
+        noteRingDepth(depth);
+        noteDeepDepth(depth);
+    }
     unsigned wanted = 1u;
     for (unsigned index = 1; index <= extra.size(); ++index) wanted |= finisherTakes(index) ? 1u << index : 0u;
     if ((started.load(std::memory_order_acquire) & wanted) != wanted) {
@@ -1514,6 +1990,8 @@ std::byte* DrawFinisher::ReserveLean() {
 
 void DrawFinisher::PublishLean(LeanRunner runner, std::span<const Range> writes, std::uint64_t key, std::uint64_t shape, LeanRetirer retirer, bool batch) {
     auto& slot = leanSlot(nextSeq);
+    std::unique_lock<std::mutex> verifying;
+    if (deepVerifyEvery() != 0) verifying = std::unique_lock<std::mutex>(verifySlots);
     slot.runner = runner;
     slot.retirer = retirer;
     slot.batch = batch;
@@ -1668,8 +2146,15 @@ void DrawFinisher::forwardMerged(std::vector<Deposit>& deposits, std::size_t& se
         merged.parts = static_cast<std::uint32_t>(last - first);
         auto parts = std::make_shared<std::vector<DrawPipeline::Item>>();
         parts->reserve(last - first);
+        struct UnparkParts {
+            std::vector<std::uint64_t> ids;
+            ~UnparkParts() {
+                for (const auto id : ids) DrawFinisher::Get().UnparkReads(id);
+            }
+        } unparkParts;
         for (std::size_t at = first; at < last; ++at) {
             auto& item = deposits[at].item;
+            if (item.parked != 0) unparkParts.ids.push_back(std::exchange(item.parked, 0));
             for (const auto& range : item.writes) {
                 if (std::find(merged.writes.begin(), merged.writes.end(), range) == merged.writes.end()) merged.writes.push_back(range);
             }
@@ -1710,6 +2195,9 @@ void DrawFinisher::forwardOwn(std::uint64_t seq) {
     try {
         forwardMerged(deposits, sent);
     } catch (...) {
+        for (auto& held : deposits) {
+            if (held.item.parked != 0) UnparkReads(std::exchange(held.item.parked, 0));
+        }
         count();
         throw;
     }
@@ -1730,6 +2218,9 @@ bool DrawFinisher::forwardLean(LeanSlot& slot, std::uint64_t seq, std::uint64_t&
         forwardMerged(slot.deposits, sent);
     } catch (...) {
         error = std::current_exception();
+        for (auto& held : slot.deposits) {
+            if (held.item.parked != 0) UnparkReads(std::exchange(held.item.parked, 0));
+        }
     }
     slot.deposits.clear();
     forwardedItems.fetch_add(sent, std::memory_order_relaxed);
@@ -2141,8 +2632,9 @@ void DrawPipeline::enqueue(Item item) {
     }
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) {
         const bool flow = DrawFinisher::Flow();
-        const bool dispatchTurn = item.kind == CommitKind::Dispatch && (flow || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchBeside));
-        if ((item.reads.empty() || dispatchTurn || flow) && !ItemTurn::Get() && FinisherProducer::Get() && DrawFinisher::Overlap() && !GuestMemory::GpuMutex().HeldByThisThread() && (dispatchTurn || flow || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ItemsByTurn))) {
+        const bool deep = DrawFinisher::Deep();
+        const bool dispatchTurn = item.kind == CommitKind::Dispatch && (flow || deep || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchBeside));
+        if ((item.reads.empty() || dispatchTurn || flow || deep) && !ItemTurn::Get() && FinisherProducer::Get() && DrawFinisher::Overlap() && !GuestMemory::GpuMutex().HeldByThisThread() && (dispatchTurn || flow || deep || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ItemsByTurn))) {
             DrawFinisher::Pending held;
             held.unknown = false;
             held.writes = item.writes;
@@ -2150,9 +2642,12 @@ void DrawPipeline::enqueue(Item item) {
             held.labelBytes = item.labelBytes;
             held.labelRun = item.labelRun;
             itemsByTurn.fetch_add(1, std::memory_order_relaxed);
+            if (deep) DrawFinisher::NoteDeepSite(item.reads.empty() ? DeepSite::ItemsByTurn : DeepSite::ItemsWithReadsByTurn);
             const auto parked = item.reads.empty() || flow ? std::uint64_t{0} : DrawFinisher::Get().ParkReads(item.reads);
+            if (deep) item.parked = parked;
+            const auto unparkAtRun = deep ? std::uint64_t{0} : parked;
             auto shared = std::make_shared<Item>(std::move(item));
-            DrawFinisher::Get().Enqueue([this, shared, parked] {
+            DrawFinisher::Get().Enqueue([this, shared, parked = unparkAtRun] {
                 struct Scope {
                     bool previous = ItemTurn::Get();
                     std::uint64_t parked;
@@ -2166,12 +2661,19 @@ void DrawPipeline::enqueue(Item item) {
             }, std::move(held));
             return;
         }
+        DrawFinisher::NoteDeepKept(DeepKept::Other);
         DrawFinisher::Get().Drain();
     }
     queueItem(std::move(item));
 }
 
 void DrawPipeline::queueItem(Item item) {
+    struct Unpark {
+        std::uint64_t id;
+        ~Unpark() {
+            if (id != 0) DrawFinisher::Get().UnparkReads(id);
+        }
+    } unpark{std::exchange(item.parked, 0)};
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
@@ -2186,7 +2688,7 @@ void DrawPipeline::queueItem(Item item) {
         item.commit();
         return;
     }
-    const auto roomLimit = DrawFinisher::Flow() ? DrawFinisher::LeanSlots : deepQueues() ? std::max<std::size_t>(Depth(), 32) : Depth();
+    const auto roomLimit = DrawFinisher::Flow() || (DrawFinisher::Deep() && deepQueue.load(std::memory_order_relaxed)) ? DrawFinisher::LeanSlots : deepQueues() ? std::max<std::size_t>(Depth(), 32) : Depth();
     if (items.size() >= roomLimit) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
@@ -2207,11 +2709,22 @@ void DrawPipeline::queueItem(Item item) {
         }
         rethrowFailure();
     }
+    if (items.empty()) {
+        const bool deep = DrawFinisher::Deep();
+        if (deepQueue.load(std::memory_order_relaxed) != deep) latchDeepQueue(deep);
+    }
     depthSum += items.size();
     ++enqueued;
     heldReadRanges.fetch_add(item.reads.size(), std::memory_order_relaxed);
-    item.counted = !DrawFinisher::Flow() || queuedWrites.size() <= PublishedRanges::Capacity;
-    if (item.counted) countWrites(item.writes, true);
+    if (deepQueue.load(std::memory_order_relaxed)) {
+        item.counted = false;
+        const auto stamp = enqueuedItems.load(std::memory_order_relaxed) + 1;
+        (item.store ? *deepStores : *deepOthers).Insert(item.writes, stamp, retiredItems.load(std::memory_order_relaxed) + 1);
+        if (!item.reads.empty()) noteDeepReads(item.reads, stamp);
+    } else {
+        item.counted = !DrawFinisher::Flow() || queuedWrites.size() <= PublishedRanges::Capacity;
+        if (item.counted) countWrites(item.writes, true);
+    }
     enqueuedItems.fetch_add(1, std::memory_order_release);
     items.push_back(std::move(item));
     if (pipelineStats()) deepestItems = std::max(deepestItems, items.size());
@@ -2267,6 +2780,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     if (depositVerifyEvery() != 0) AgcDriver::ProfilePrint_nid_no_patch("[finisher-deposit-verify] 10 s: every %llu; items checked %llu, out of order %llu; drains checked %llu, with deposits left %llu\n", static_cast<unsigned long long>(depositVerifyEvery()), static_cast<unsigned long long>(orderChecks.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(orderDifferences.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drainChecks.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drainDifferences.exchange(0, std::memory_order_relaxed)));
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
     if (pipelineStats()) AgcDriver::ProfilePrint_nid_no_patch("[xp-flow] 10 s, %s; committer queue: highest %zu items, mean %.2f items ahead of an enqueued one\n", DrawFinisher::FlowText().c_str(), deepestItems, queued);
+    if (pipelineStats()) AgcDriver::ProfilePrint_nid_no_patch("[deep-flow] 10 s, %s; committer queue: latch %s, highest %zu items\n", DrawFinisher::DeepText().c_str(), deepQueue.load(std::memory_order_relaxed) ? "on" : "off", deepestItems);
     deepestItems = 0;
     if (const auto encoded = Graphics::CommandEncoders::TotalsText(); !encoded.empty()) AgcDriver::ProfilePrint_nid_no_patch("[encode] (cumulative): %s\n", encoded.c_str());
     AgcDriver::ProfilePrint_nid_no_patch("[indirect-draws] (cumulative): %s\n", Graphics::IndirectDrawTotalsText().c_str());
@@ -2415,7 +2929,8 @@ void DrawPipeline::run() {
         const bool mergedTake = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow) && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollowPlainLoop);
         {
             const auto lock = lockFor(mutex);
-            retiredItems.fetch_add(1, std::memory_order_release);
+            const auto retiredNow = retiredItems.fetch_add(1, std::memory_order_release) + 1;
+            if (readsLive.load(std::memory_order_relaxed) < retiredNow + 1) readsLive.store(retiredNow + 1, std::memory_order_release);
             if (items.front().counted) countWrites(items.front().writes, false);
             const auto kindIndex = static_cast<std::size_t>(items.front().kind);
             kindCommits[kindIndex].fetch_add(itemParts, std::memory_order_relaxed);
@@ -2431,7 +2946,7 @@ void DrawPipeline::run() {
             if (failed) ++commitErrors;
             if (fatal != nullptr && failure == nullptr) failure = fatal;
             outstanding.fetch_sub(1, std::memory_order_release);
-            if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
+            if ((idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) || retireWaiters != 0) idle.notify_all();
             keepRun = runHold.has_value() && !stopped && !closing && !items.empty() && items.front().draw && ++runLength < LeanRunCap && idleWaiters == 0;
             if (!keepRun) ended = stopped || closing ? Graphics::ExpressRunEnd::Stop : items.empty() ? Graphics::ExpressRunEnd::NotQueued : !items.front().draw ? Graphics::ExpressRunEnd::NotDraw : runLength >= LeanRunCap ? Graphics::ExpressRunEnd::Cap : Graphics::ExpressRunEnd::IdleWaiter;
             if (mergedTake && !items.empty()) {
@@ -2479,6 +2994,10 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     else DrawFinisher::Get().FlushOpenRun();
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
     reasonRequests[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    drainAll(reason, opcode);
+}
+
+void DrawPipeline::drainAll(DrainReason reason, std::uint32_t opcode) {
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     if (finisherBusy) DrawFinisher::Get().Drain();
@@ -2504,6 +3023,168 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     rethrowFailure();
 }
 
+void DrawPipeline::AwaitWriters(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode, DeepSite site) {
+    DrawFinisher::NoteDeepSite(site);
+    auto& finisher = DrawFinisher::Get();
+    const bool onFinisher = DrawFinisher::OnFinisherThread();
+    if (!onFinisher && !FinisherProducer::Get()) {
+        Drain(reason, opcode);
+        return;
+    }
+    if (!onFinisher) finisher.FlushOpenRun();
+    drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
+    reasonRequests[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    const bool finisherBusy = !onFinisher && DrawFinisher::Busy();
+    if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline wait under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
+    const auto fallback = [&] {
+        DrawFinisher::NoteDeepKept(DeepKept::Fallback);
+        if (onFinisher) finisher.AwaitTurn();
+        drainAll(reason, opcode);
+    };
+    for (;;) {
+        if (onFinisher) {
+            if (FinisherDeposits::Get() && finisher.depositsWrite(ranges)) {
+                noteDeepSiteWait(site, true);
+                finisher.AwaitTurn();
+                continue;
+            }
+            if (DrawFinisher::Overlap() && FinisherAhead::Get()) static_cast<void>(finisher.aheadWait(ranges));
+            else finisher.AwaitTurn();
+        } else if (DrawFinisher::Overlap() && DrawFinisher::Busy()) {
+            if (finisher.ringMode.load(std::memory_order_acquire) && finisher.deepRing.load(std::memory_order_relaxed)) {
+                finisher.retireLean();
+                const auto front = finisher.frontSeq.load(std::memory_order_acquire);
+                const auto found = finisher.deepWrites->Newest(ranges, front);
+                if (found.answer == DeepAnswer::Unsure) {
+                    noteDeepTotal(DrawFinisher::DeepCount::WorkerFallbacks);
+                    fallback();
+                    return;
+                }
+                const auto unknown = finisher.lastUnknown.load(std::memory_order_relaxed);
+                auto blocker = found.answer == DeepAnswer::Hit ? found.stamp : std::uint64_t{0};
+                if (unknown >= front) blocker = std::max(blocker, unknown);
+                if (blocker != 0) {
+                    noteDeepSiteWait(site, true);
+                    if (blocker >= finisher.nextSeq || !finisher.awaitProducerFront(blocker)) {
+                        fallback();
+                        return;
+                    }
+                    continue;
+                }
+            } else if (finisher.PendingOverlapsAny(ranges)) {
+                noteDeepSiteWait(site, true);
+                finisher.Drain();
+                continue;
+            }
+        }
+        if (deepQueue.load(std::memory_order_acquire)) {
+            const auto found = deepQueued(ranges, retiredItems.load(std::memory_order_acquire) + 1);
+            if (found.answer == DeepAnswer::Unsure) {
+                fallback();
+                return;
+            }
+            if (found.answer != DeepAnswer::Hit) return;
+            noteDeepSiteWait(site, false);
+            if (!awaitRetired(found.stamp - 1)) {
+                fallback();
+                return;
+            }
+            continue;
+        }
+        if (queuedOverlap(ranges)) fallback();
+        return;
+    }
+}
+
+bool DrawPipeline::awaitRetired(std::uint64_t item) {
+    const auto passed = [&] { return retiredItems.load(std::memory_order_acquire) > item; };
+    if (passed() || SpinUntil(HandoffSpinWindow(), passed)) return true;
+    const ThreadReport::WorkerStateScope waiting(ThreadReport::WorkerState::DrainCommitter, ThreadReport::OnQueue0Worker());
+    auto lock = lockFor(mutex);
+    ++retireWaiters;
+    idle.wait(lock, [&] { return closing || passed(); });
+    --retireWaiters;
+    rethrowFailure();
+    return passed();
+}
+
+void DrawPipeline::latchDeepQueue(bool deep) {
+    if (deep && deepStores == nullptr) {
+        deepStores = std::make_unique<StampedRanges>();
+        deepOthers = std::make_unique<StampedRanges>();
+        readRegions = std::make_unique<std::array<std::atomic<std::uint64_t>, ReadRegionSlots>>();
+        deepIndexed.store(true, std::memory_order_release);
+    }
+    deepEpoch.fetch_add(1, std::memory_order_seq_cst);
+    deepQueue.store(deep, std::memory_order_seq_cst);
+}
+
+DeepFound DrawPipeline::deepQueued(std::span<const Range> ranges, std::uint64_t live) const {
+    return deepLater(deepStores->Newest(ranges, live), deepOthers->Newest(ranges, live));
+}
+
+bool DrawPipeline::deepQueuedWithin(std::span<const Range> ranges, std::uint64_t from, std::uint64_t to) const {
+    return deepStores->Within(ranges, from, to) || deepOthers->Within(ranges, from, to);
+}
+
+DeepFound DrawPipeline::newestQueued(std::span<const Range> ranges) const {
+    const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
+    for (std::size_t index = items.size(); index-- > 0;) {
+        if (rangesOverlap(items[index].writes, ranges)) return {DeepAnswer::Hit, retiredNow + index + 1};
+    }
+    return {};
+}
+
+void DrawPipeline::verifyQueued(std::uint32_t lookup, std::span<const Range> ranges) {
+    const auto lock = lockFor(mutex);
+    if (!deepQueue.load(std::memory_order_relaxed)) return;
+    const auto live = retiredItems.load(std::memory_order_relaxed) + 1;
+    const auto found = deepQueued(ranges, live);
+    if (found.answer == DeepAnswer::Unsure) return;
+    noteDeepVerify(static_cast<DeepLookup>(lookup), found, newestQueued(ranges), true, live, 0, ranges);
+}
+
+void DrawPipeline::noteDeepReads(const std::vector<Range>& reads, std::uint64_t stamp) {
+    for (const auto& read : reads) {
+        std::uint64_t first = 0;
+        std::uint64_t last = 0;
+        if (!StampedRanges::Regions(read, StampedRanges::QueryRegions, first, last)) {
+            wideReads.store(stamp, std::memory_order_release);
+            continue;
+        }
+        for (auto region = first; region <= last; ++region) (*readRegions)[readRegionSlot(region)].store(stamp, std::memory_order_release);
+    }
+}
+
+bool DrawPipeline::readsMaybe(std::uint64_t address, std::size_t bytes) const {
+    const auto live = readsLive.load(std::memory_order_acquire);
+    if (wideReads.load(std::memory_order_acquire) >= live) return true;
+    std::uint64_t first = 0;
+    std::uint64_t last = 0;
+    if (!StampedRanges::Regions({address, address + bytes}, StampedRanges::QueryRegions, first, last)) return true;
+    for (auto region = first; region <= last; ++region) {
+        if ((*readRegions)[readRegionSlot(region)].load(std::memory_order_acquire) >= live) return true;
+    }
+    return false;
+}
+
+void DrawPipeline::verifyHeldReads(std::uint64_t address, std::size_t bytes) {
+    const auto lock = lockFor(mutex);
+    if (!deepQueue.load(std::memory_order_relaxed)) return;
+    const auto end = address + bytes;
+    const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
+    DeepFound scan;
+    for (std::size_t index = items.size(); index-- > 0 && scan.answer != DeepAnswer::Hit;) {
+        for (const auto& [begin, limit] : items[index].reads) {
+            if (address >= limit || begin >= end) continue;
+            scan = {DeepAnswer::Hit, retiredNow + index + 1};
+            break;
+        }
+    }
+    const Range range{address, end};
+    noteDeepVerify(DeepLookup::HeldReads, readsMaybe(address, bytes) ? DeepFound{DeepAnswer::Hit} : DeepFound{}, scan, false, readsLive.load(std::memory_order_relaxed), 0, {&range, 1});
+}
+
 std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
     return Queue0().drainRequests[std::min<std::uint32_t>(opcode, 0x100)].load(std::memory_order_relaxed);
 }
@@ -2513,12 +3194,18 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || unordered) return false;
     if (FinisherDeposits::Get() && DrawFinisher::Get().depositsRead(address, bytes)) return true;
     if (DrawFinisher::Get().ParkedReadsOverlap(address, bytes)) return true;
+    auto& pipeline = Queue0();
+    if (pipeline.deepQueue.load(std::memory_order_acquire)) {
+        const bool maybe = pipeline.readsMaybe(address, bytes);
+        noteDeepLookup(DeepLookup::HeldReads, maybe);
+        if (deepVerifyDue(DeepLookup::HeldReads)) pipeline.verifyHeldReads(address, bytes);
+        if (!maybe) return false;
+    }
     if (DrawFinisher::Flow()) {
         DrawFinisher::NoteFlowLookup(DrawFinisher::FlowLookup::HeldReads);
         return false;
     }
     const auto end = address + bytes;
-    auto& pipeline = Queue0();
     const auto lock = lockFor(pipeline.mutex);
     heldReadQueries.fetch_add(1, std::memory_order_relaxed);
     for (const auto& item : pipeline.items) {
@@ -2537,7 +3224,10 @@ std::uint64_t DrawPipeline::HeldReadQueries() {
 
 void DrawPipeline::ReleaseRunningReads() {
     const auto lock = lockFor(mutex);
-    if (!items.empty()) items.front().reads.clear();
+    if (items.empty()) return;
+    items.front().reads.clear();
+    const auto live = retiredItems.load(std::memory_order_relaxed) + 2;
+    if (readsLive.load(std::memory_order_relaxed) < live) readsLive.store(live, std::memory_order_release);
 }
 
 std::uint64_t DrawPipeline::DrainRequestsByReason(DrainReason reason) {
@@ -2557,25 +3247,46 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
         if (lookup == DrawFinisher::LabelLookup::Unknown) return std::nullopt;
     }
     const auto end = address + bytes;
+    const Range range{address, end};
+    const auto writesOver = [&](const Item& item) { return std::any_of(item.writes.begin(), item.writes.end(), [&](const Range& write) { return address < write.second && write.first < end; }); };
+    const auto valueOf = [&](const Item& item) -> std::optional<std::uint64_t> {
+        if (item.labelRun != nullptr) {
+            std::uint64_t held = 0;
+            if (item.labelRun->Find(address, bytes, held) != LabelRun::Lookup::Value) return std::nullopt;
+            return held;
+        }
+        if (item.labelBytes.empty() || address < item.labelAddress || end > item.labelAddress + item.labelBytes.size()) return std::nullopt;
+        std::uint64_t value = 0;
+        std::memcpy(&value, item.labelBytes.data() + (address - item.labelAddress), bytes);
+        return value;
+    };
+    const auto newestValue = [&]() -> std::optional<std::uint64_t> {
+        for (auto item = items.rbegin(); item != items.rend(); ++item) {
+            if (writesOver(*item)) return valueOf(*item);
+        }
+        return std::nullopt;
+    };
+    if (deepQueue.load(std::memory_order_acquire)) {
+        const std::span<const Range> asked(&range, 1);
+        if (deepVerifyDue(DeepLookup::QueuedLabel)) verifyQueued(static_cast<std::uint32_t>(DeepLookup::QueuedLabel), asked);
+        const auto queued = deepQueued(asked, retiredItems.load(std::memory_order_acquire) + 1);
+        noteDeepLookup(DeepLookup::QueuedLabel, queued.answer == DeepAnswer::Unsure);
+        if (queued.answer == DeepAnswer::Clear) return std::nullopt;
+        const auto lock = lockFor(mutex);
+        const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
+        const auto held = deepQueued(asked, retiredNow + 1);
+        if (held.answer == DeepAnswer::Clear) return std::nullopt;
+        if (held.answer == DeepAnswer::Hit && held.stamp > retiredNow) {
+            const auto at = static_cast<std::size_t>(held.stamp - 1 - retiredNow);
+            if (at < items.size() && writesOver(items[at])) return valueOf(items[at]);
+        }
+        return newestValue();
+    }
     if (lockless() || DrawFinisher::Flow()) {
-        const Range range{address, end};
         if (published.Overlaps({&range, 1}) == PublishedRanges::Answer::Clear) return std::nullopt;
     }
     const auto lock = lockFor(mutex);
-    for (auto item = items.rbegin(); item != items.rend(); ++item) {
-        const bool overlaps = std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
-        if (!overlaps) continue;
-        if (item->labelRun != nullptr) {
-            std::uint64_t held = 0;
-            if (item->labelRun->Find(address, bytes, held) != LabelRun::Lookup::Value) return std::nullopt;
-            return held;
-        }
-        if (item->labelBytes.empty() || address < item->labelAddress || end > item->labelAddress + item->labelBytes.size()) return std::nullopt;
-        std::uint64_t value = 0;
-        std::memcpy(&value, item->labelBytes.data() + (address - item->labelAddress), bytes);
-        return value;
-    }
-    return std::nullopt;
+    return newestValue();
 }
 
 DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out) {
@@ -2585,8 +3296,57 @@ DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::
         if (DrawFinisher::Get().depositsWrite({&range, 1})) return QueuedWrite::Unknown;
     }
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) return QueuedWrite::Unknown;
+    const Range range{address, end};
+    const auto writesOver = [&](const Item& item) { return std::any_of(item.writes.begin(), item.writes.end(), [&](const Range& write) { return address < write.second && write.first < end; }); };
+    const auto storedFrom = [&](const Item& item) {
+        if (out.size() != bytes || address < item.labelAddress || end > item.labelAddress + item.labelBytes.size()) return QueuedWrite::Unknown;
+        std::memcpy(out.data(), item.labelBytes.data() + (address - item.labelAddress), bytes);
+        return QueuedWrite::Stored;
+    };
+    const auto newestStored = [&] {
+        auto answer = QueuedWrite::None;
+        for (auto item = items.rbegin(); item != items.rend(); ++item) {
+            if (!writesOver(*item)) continue;
+            if (!item->store) return QueuedWrite::Unknown;
+            if (out.empty()) {
+                answer = QueuedWrite::Stored;
+                continue;
+            }
+            return storedFrom(*item);
+        }
+        return answer;
+    };
+    if (deepQueue.load(std::memory_order_acquire)) {
+        const std::span<const Range> asked(&range, 1);
+        if (deepVerifyDue(DeepLookup::StoredBytes)) verifyQueued(static_cast<std::uint32_t>(DeepLookup::StoredBytes), asked);
+        const auto live = retiredItems.load(std::memory_order_acquire) + 1;
+        const auto others = deepOthers->Newest(asked, live);
+        const auto stores = deepStores->Newest(asked, live);
+        const bool sure = others.answer != DeepAnswer::Unsure && stores.answer != DeepAnswer::Unsure;
+        noteDeepLookup(DeepLookup::StoredBytes, !sure);
+        if (sure) {
+            const bool other = others.answer == DeepAnswer::Hit;
+            const bool store = stores.answer == DeepAnswer::Hit;
+            if (!other && !store) return QueuedWrite::None;
+            if (out.empty()) return other ? QueuedWrite::Unknown : QueuedWrite::Stored;
+            if (other && (!store || others.stamp > stores.stamp)) return QueuedWrite::Unknown;
+        }
+        const auto lock = lockFor(mutex);
+        const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
+        const auto heldOthers = deepOthers->Newest(asked, retiredNow + 1);
+        const auto heldStores = deepStores->Newest(asked, retiredNow + 1);
+        if (heldOthers.answer != DeepAnswer::Unsure && heldStores.answer != DeepAnswer::Unsure) {
+            const bool other = heldOthers.answer == DeepAnswer::Hit;
+            const bool store = heldStores.answer == DeepAnswer::Hit;
+            if (!other && !store) return QueuedWrite::None;
+            if (out.empty()) return other ? QueuedWrite::Unknown : QueuedWrite::Stored;
+            if (other && (!store || heldOthers.stamp > heldStores.stamp)) return QueuedWrite::Unknown;
+            const auto at = static_cast<std::size_t>(heldStores.stamp - 1 - retiredNow);
+            if (heldStores.stamp > retiredNow && at < items.size() && items[at].store && writesOver(items[at])) return storedFrom(items[at]);
+        }
+        return newestStored();
+    }
     if (lockless() || DrawFinisher::Flow()) {
-        const Range range{address, end};
         const auto queued = published.Overlaps({&range, 1});
         if (queued == PublishedRanges::Answer::Clear) return QueuedWrite::None;
         if (queued == PublishedRanges::Answer::Unsure && DrawFinisher::Flow()) {
@@ -2594,20 +3354,8 @@ DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::
             return QueuedWrite::None;
         }
     }
-    auto answer = QueuedWrite::None;
     const auto lock = lockFor(mutex);
-    for (auto item = items.rbegin(); item != items.rend(); ++item) {
-        if (std::none_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; })) continue;
-        if (!item->store) return QueuedWrite::Unknown;
-        if (out.empty()) {
-            answer = QueuedWrite::Stored;
-            continue;
-        }
-        if (out.size() != bytes || address < item->labelAddress || end > item->labelAddress + item->labelBytes.size()) return QueuedWrite::Unknown;
-        std::memcpy(out.data(), item->labelBytes.data() + (address - item->labelAddress), bytes);
-        return QueuedWrite::Stored;
-    }
-    return answer;
+    return newestStored();
 }
 
 void DrawPipeline::countWrites(const std::vector<Range>& writes, bool added) {
@@ -2620,7 +3368,39 @@ DrawPipeline::Watch DrawPipeline::WatchWrites() {
     if (!Busy()) return {Retired(), 0, {}};
     const bool own = FinisherDeposits::Get();
     const bool flow = DrawFinisher::Flow();
-    if ((lockless() || flow) && !own) {
+    bool raced = false;
+    if (deepQueue.load(std::memory_order_acquire)) {
+        const auto epoch = deepEpoch.load(std::memory_order_acquire);
+        Watch watch;
+        const auto enqueuedBefore = enqueuedItems.load(std::memory_order_acquire);
+        watch.retired = retiredItems.load(std::memory_order_acquire);
+        if (deepQueue.load(std::memory_order_acquire) && deepEpoch.load(std::memory_order_acquire) == epoch) {
+            watch.items = enqueuedBefore > watch.retired ? static_cast<std::size_t>(enqueuedBefore - watch.retired) : 0;
+            watch.enqueued = enqueuedBefore;
+            watch.deep = true;
+            if (deepVerifyDue(DeepLookup::Watch)) {
+                const auto lock = lockFor(mutex);
+                if (deepQueue.load(std::memory_order_relaxed) && deepEpoch.load(std::memory_order_relaxed) == epoch) {
+                    watch.retired = retiredItems.load(std::memory_order_relaxed);
+                    watch.enqueued = enqueuedItems.load(std::memory_order_relaxed);
+                    watch.items = items.size();
+                    for (const auto& item : items) watch.verifyWrites.insert(watch.verifyWrites.end(), item.writes.begin(), item.writes.end());
+                    watch.verified = true;
+                }
+            }
+            if (own) {
+                for (const auto& held : DrawFinisher::Get().ownDeposits()) {
+                    ++watch.items;
+                    watch.writes.insert(watch.writes.end(), held.item.writes.begin(), held.item.writes.end());
+                }
+            }
+            noteDeepLookup(DeepLookup::Watch, false);
+            return watch;
+        }
+        noteDeepLookup(DeepLookup::Watch, true);
+        raced = true;
+    }
+    if ((lockless() || flow) && !own && !raced) {
         Watch watch;
         const auto enqueuedBefore = enqueuedItems.load(std::memory_order_acquire);
         const bool copied = published.Copy(watch.snapshotWrites, watch.snapshotCount);
@@ -2660,30 +3440,44 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
     if (FinisherDeposits::Get() && DrawFinisher::Get().depositsWrite(reads)) return true;
     const auto watched = watch.snapshot ? std::span<const Range>(watch.snapshotWrites.data(), watch.snapshotCount) : std::span<const Range>(watch.writes);
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(reads)) return true;
-    if (lockless() || DrawFinisher::Flow()) {
+    const auto since = [&](std::uint64_t retiredNow) {
+        if (retiredNow == watch.retired) return false;
+        if (retiredNow - watch.retired > watch.items) return true;
+        if (!watch.deep) return overlaps(watched);
+        const bool within = deepQueuedWithin(reads, watch.retired + 1, watch.enqueued + 1);
+        if (watch.verified) noteDeepVerify(DeepLookup::Watch, within ? DeepFound{DeepAnswer::Hit} : DeepFound{}, overlaps(watch.verifyWrites) ? DeepFound{DeepAnswer::Hit} : DeepFound{}, false, watch.retired, watch.enqueued, reads);
+        return within || overlaps(watched);
+    };
+    if (deepQueue.load(std::memory_order_acquire)) {
+        const auto queued = deepQueued(reads, retiredItems.load(std::memory_order_acquire) + 1);
+        if (queued.answer == DeepAnswer::Hit) return true;
+        if (queued.answer == DeepAnswer::Clear) return since(retiredItems.load(std::memory_order_acquire));
+    } else if (lockless() || DrawFinisher::Flow()) {
         const auto queued = published.Overlaps(reads);
         if (queued == PublishedRanges::Answer::Hit) return true;
         if (queued == PublishedRanges::Answer::Clear || DrawFinisher::Flow()) {
             if (queued != PublishedRanges::Answer::Clear) DrawFinisher::NoteFlowLookup(DrawFinisher::FlowLookup::QueuedWrites);
-            const auto retiredNow = retiredItems.load(std::memory_order_acquire);
-            if (retiredNow == watch.retired) return false;
-            return retiredNow - watch.retired > watch.items || overlaps(watched);
+            return since(retiredItems.load(std::memory_order_acquire));
         }
     }
     const auto lock = lockFor(mutex);
     if (std::any_of(items.begin(), items.end(), [&](const Item& item) { return overlaps(item.writes); })) return true;
-    const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
-    if (retiredNow == watch.retired) return false;
-    return retiredNow - watch.retired > watch.items || overlaps(watched);
+    return since(retiredItems.load(std::memory_order_relaxed));
 }
 
 bool DrawPipeline::Busy() const {
     return (FinisherProducer::Get() && DrawFinisher::Busy() && DrawFinisher::Overlap()) || outstanding.load(std::memory_order_acquire) != 0 || DrawFinisher::AheadOfTurn() || FinisherDeposits::Get();
 }
 
-bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
-    if (FinisherDeposits::Get() && DrawFinisher::Get().depositsWrite(ranges)) return true;
-    if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(ranges)) return true;
+bool DrawPipeline::queuedOverlap(std::span<const Range> ranges) {
+    if (deepQueue.load(std::memory_order_acquire)) {
+        if (deepVerifyDue(DeepLookup::QueuedWrites)) verifyQueued(static_cast<std::uint32_t>(DeepLookup::QueuedWrites), ranges);
+        const auto found = deepQueued(ranges, retiredItems.load(std::memory_order_acquire) + 1);
+        noteDeepLookup(DeepLookup::QueuedWrites, found.answer == DeepAnswer::Unsure);
+        if (found.answer != DeepAnswer::Unsure) return found.answer == DeepAnswer::Hit;
+        const auto lock = lockFor(mutex);
+        return newestQueued(ranges).answer == DeepAnswer::Hit;
+    }
     if (lockless() || DrawFinisher::Flow()) {
         const auto answer = published.Overlaps(ranges);
         if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Hit;
@@ -2701,27 +3495,18 @@ bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uin
     return false;
 }
 
+bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    if (FinisherDeposits::Get() && DrawFinisher::Get().depositsWrite(ranges)) return true;
+    if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(ranges)) return true;
+    return queuedOverlap(ranges);
+}
+
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
-    if (FinisherDeposits::Get()) {
-        const Range range{address, end};
-        if (DrawFinisher::Get().depositsWrite({&range, 1})) return true;
-    }
+    const Range range{address, end};
+    if (FinisherDeposits::Get() && DrawFinisher::Get().depositsWrite({&range, 1})) return true;
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) return true;
-    if (lockless() || DrawFinisher::Flow()) {
-        const Range range{address, end};
-        const auto answer = published.Overlaps({&range, 1});
-        if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Hit;
-        if (DrawFinisher::Flow()) {
-            DrawFinisher::NoteFlowLookup(DrawFinisher::FlowLookup::QueuedWrites);
-            return false;
-        }
-    }
-    const auto lock = lockFor(mutex);
-    for (const auto& [range, count] : queuedWrites) {
-        if (address < range.second && range.first < end) return true;
-    }
-    return false;
+    return queuedOverlap({&range, 1});
 }
 
 }
