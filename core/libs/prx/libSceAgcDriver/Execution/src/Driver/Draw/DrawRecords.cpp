@@ -901,6 +901,11 @@ void DrawRecordView::Capture(std::span<const Graphics::CompiledShader> shaders, 
         view.variant = shader.program->variantId;
         view.stage = static_cast<std::uint32_t>(shader.stage);
         view.pushOffset = shader.pushConstantOffset;
+        if (shader.program->PipelineVariantId() == 0) {
+            const auto identity = shader.program->Identity();
+            view.moduleLow = identity.low;
+            view.moduleHigh = identity.high;
+        }
         for (const auto& binding : shader.program->bindings) {
             const auto& words = Graphics::DrawGuestWords(shader, binding);
             view.bindings.insert(view.bindings.end(), {static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.descriptorSet, binding.binding, binding.count, static_cast<std::uint32_t>(words.size())});
@@ -1980,6 +1985,7 @@ bool Driver::followRecord(VulkanDevice& localDevice, std::uint32_t queue, const 
         return false;
     }
     if (++tally.followed >= 64) flushFollowTally(tally);
+    if (graphics.rectList) DirectDraws::Add(DirectDraws::Counter::RectListsFollowed);
     if (verifies) {
         if (DrawRecords::VerifyEvery() != 0) ++ordinals.record;
         if (DirectDraws::BufferVerifyEvery() != 0) ++ordinals.buffers;
@@ -2034,6 +2040,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     auto& ordinal = commitOrdinals.record;
     const auto every = DrawRecords::VerifyEvery();
     const bool verify = commit.recipe != nullptr && every != 0 && ++ordinal % every == 0;
+    if (hit.direct && graphics.rectList) DirectDraws::Add(commit.recipe == nullptr ? DirectDraws::Counter::RectListsCommitFirst : DirectDraws::Counter::RectListsCommitRecipe);
     if (commit.recipe == nullptr) {
         DrawRecords::AddOnCommitter(Counter::CommitFirst);
         if (hit.direct) DirectDraws::Add(DirectDraws::Counter::CommitFirst);
@@ -2196,7 +2203,9 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     }
     std::shared_ptr<const DrawRecipe> built;
     const auto& record = *hit.record;
-    localDevice->Draw(graphics, hit.parameters, hit.stages, hit.snapshots, &built, tracePtr, shape, record.contentKey.empty() ? nullptr : &record.contentKey, fragmentOutputs ? &*fragmentOutputs : nullptr, true);
+    const auto* keyWords = hit.addressed ? (hit.contentKey.empty() ? nullptr : &hit.contentKey) : record.contentKey.empty() ? nullptr : &record.contentKey;
+    if (hit.addressed) DirectDraws::Add(DirectDraws::Counter::AddressedCommits);
+    localDevice->Draw(graphics, hit.parameters, hit.stages, hit.snapshots, &built, tracePtr, shape, keyWords, fragmentOutputs ? &*fragmentOutputs : nullptr, true);
     DrawCommitViewSlot::Set(nullptr);
     bool differs = false;
     if (verify) {
@@ -2370,6 +2379,7 @@ bool Driver::compareRecordAnswer(const LeanDrawJob& job, const DrawRecord& recor
         noteDifference(field, at + ": " + detail);
         differs = true;
     };
+    const bool modules = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectRectLists) || job.shape->decode->state.rectList;
     if (answer.stages.size() != today.stages.size()) {
         note(Field::Variants, "the record has " + std::to_string(answer.stages.size()) + " stages, today's draw " + std::to_string(today.stages.size()));
     } else {
@@ -2382,6 +2392,7 @@ bool Driver::compareRecordAnswer(const LeanDrawJob& job, const DrawRecord& recor
             if (kept.bindings != now.bindings) note(Field::Bindings, stage + bindingDifference(kept.bindings, now.bindings));
             if (kept.vertexAttributes != now.vertexAttributes) note(Field::VertexAttributes, stage + firstDifference(kept.vertexAttributes, now.vertexAttributes));
             if (kept.views != now.views) note(Field::ImageViews, stage + "the record holds " + std::to_string(kept.views.size()) + " registered image views, today's draw " + std::to_string(now.views.size()));
+            if (modules && (kept.moduleLow != now.moduleLow || kept.moduleHigh != now.moduleHigh)) note(Field::Variants, stage + "the record's generated module " + hex(kept.moduleLow) + ":" + hex(kept.moduleHigh) + ", today's " + hex(now.moduleLow) + ":" + hex(now.moduleHigh));
         }
     }
     if (answer.pushed != today.pushed || answer.push != today.push) {
@@ -2398,7 +2409,7 @@ bool Driver::compareRecordAnswer(const LeanDrawJob& job, const DrawRecord& recor
     if (answer.writes != today.writes) note(Field::WriteTemplates, "the record holds " + std::to_string(answer.writes.size()) + " write ranges, today's draw writes " + std::to_string(today.writes.size()));
     if (answer.contentKey != today.contentKey) note(Field::ContentKeys, firstDifference(answer.contentKey, today.contentKey));
     if (record.vertexLayout != sink.vertexLayout) note(Field::VertexLayouts, firstDifference(record.vertexLayout, sink.vertexLayout));
-    if (record.plan != nullptr && record.plan->addressed && answer.snapshotWords != today.snapshotWords) note(Field::Snapshots, "the record's snapshots cover " + std::to_string(answer.snapshotWords.size()) + " words, today's " + std::to_string(today.snapshotWords.size()) + "; " + firstDifference(answer.snapshotWords, today.snapshotWords));
+    if (((record.plan != nullptr && record.plan->addressed) || answer.addressed) && answer.snapshotWords != today.snapshotWords) note(Field::Snapshots, "the record's snapshots cover " + std::to_string(answer.snapshotWords.size()) + " words, today's " + std::to_string(today.snapshotWords.size()) + "; " + firstDifference(answer.snapshotWords, today.snapshotWords));
     if (!today.snapshotWords.empty()) {
         const auto unread = [&](std::uint64_t address) {
             const auto found = std::lower_bound(today.snapshotWords.begin(), today.snapshotWords.end(), std::pair<std::uint64_t, std::uint32_t>{address, 0u});

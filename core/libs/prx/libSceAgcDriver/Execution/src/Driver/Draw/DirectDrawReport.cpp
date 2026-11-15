@@ -77,7 +77,12 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "verified with a merged settle", "differing with a merged settle", "memory changed with a merged settle", "unwatched with a merged settle",
     "verified with exact capacities", "differing with exact capacities", "memory changed with exact capacities", "unwatched with exact capacities",
     "inputs verified with exact capacities", "inputs differing with exact capacities",
-    "merged settles rechecked per range", "merged settles refused per range"
+    "merged settles rechecked per range", "merged settles refused per range",
+    "rect list GPU-indirect", "rect list programs", "rect list rectangle not prepared",
+    "rect-list draws", "rect-list direct", "rect-list shape", "rect-list class new", "rect-list verify", "rect-list other reasons", "rect verify checked", "rect verify differing", "rect first commits", "rect commits with a recipe", "rect follows",
+    "addressed draws served", "addressed commits", "addressed snapshot regions", "addressed snapshot bytes",
+    "addressed: switch off", "addressed: stores through an address", "addressed: a read across a program region", "addressed: later reason",
+    "addressed classes built", "addressed classes refused", "addressed verify checked", "addressed verify differing"
 };
 static_assert(static_cast<std::size_t>(Counter::ExpressReprovedStaging) - static_cast<std::size_t>(Counter::ExpressReprovedNotProved) == static_cast<std::size_t>(Graphics::ShaderResources::ExpressMiss::Staging) - static_cast<std::size_t>(Graphics::ShaderResources::ExpressMiss::NotProved), "every reason an express commit reproves its template needs a counter");
 static_assert(static_cast<std::size_t>(Counter::BindingsLeftUnpushedRebound) - static_cast<std::size_t>(Counter::BindingsLeftUnpushedRefused) + 2 == static_cast<std::size_t>(Graphics::ShaderResources::DynamicLeave::Count), "every way an unpushed draw leaves the dynamic route needs a counter");
@@ -187,6 +192,8 @@ std::atomic<std::uint64_t> printed{0};
 std::atomic<std::uint64_t> bufferPrinted{0};
 std::atomic<std::uint64_t> repeatPrinted{0};
 std::atomic<std::uint64_t> bindingsPrinted{0};
+std::atomic<std::uint64_t> rectPrinted{0};
+std::atomic<std::uint64_t> addressedPrinted{0};
 std::atomic<std::uint64_t> classesKnown{0};
 std::atomic<std::uint64_t> classBytes{0};
 std::atomic<std::uint64_t> stagesKnown{0};
@@ -247,6 +254,22 @@ std::uint64_t RepeatVerifyEvery() {
     return every;
 }
 
+std::uint64_t RectVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_DIRECT_RECT_LISTS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+std::uint64_t AddressedVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_DIRECT_ADDRESSED");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
 void NoteRepeatDifference(std::string_view field, std::string_view detail) {
     if (repeatPrinted.fetch_add(1, std::memory_order_relaxed) < PrintedPerWindow) std::fprintf(stderr, "[direct-repeat-verify] %.*s differs: %.*s\n", static_cast<int>(field.size()), field.data(), static_cast<int>(detail.size()), detail.data());
 }
@@ -283,8 +306,16 @@ void NoteDifference(Field field, std::string_view detail) {
     if (printed.fetch_add(1, std::memory_order_relaxed) < PrintedPerWindow) std::fprintf(stderr, "[direct-draws-verify] %s %s differs: %.*s\n", DrawRecords::ItemName(Item::Fetch), DrawRecords::FieldName(field), static_cast<int>(detail.size()), detail.data());
 }
 
+void NoteAddressedDifference(Field field, std::string_view detail) {
+    if (addressedPrinted.fetch_add(1, std::memory_order_relaxed) < PrintedPerWindow) std::fprintf(stderr, "[direct-addressed-verify] %s %s differs: %.*s\n", DrawRecords::ItemName(Item::Fetch), DrawRecords::FieldName(field), static_cast<int>(detail.size()), detail.data());
+}
+
 void NoteBuildDifference(Field field, std::string_view detail) {
     if (buildDifferences[static_cast<std::size_t>(field)].fetch_add(1, std::memory_order_relaxed) < BuildLinesPerReason) std::fprintf(stderr, "[direct-draws-build] %s %s differs: %.*s\n", DrawRecords::ItemName(Item::Fetch), DrawRecords::FieldName(field), static_cast<int>(detail.size()), detail.data());
+}
+
+void NoteRectDifference(Field field, std::string_view detail) {
+    if (rectPrinted.fetch_add(1, std::memory_order_relaxed) < PrintedPerWindow) std::fprintf(stderr, "[direct-rect-lists-verify] %s %s differs: %.*s\n", DrawRecords::ItemName(Item::Fetch), DrawRecords::FieldName(field), static_cast<int>(detail.size()), detail.data());
 }
 
 void NoteBufferDifference(std::string_view what, std::string_view detail) {
@@ -321,6 +352,8 @@ void Report(bool force) {
     bufferPrinted.store(0, std::memory_order_relaxed);
     repeatPrinted.store(0, std::memory_order_relaxed);
     bindingsPrinted.store(0, std::memory_order_relaxed);
+    rectPrinted.store(0, std::memory_order_relaxed);
+    addressedPrinted.store(0, std::memory_order_relaxed);
     const auto& counts = since.counters;
     const auto at = [&](Counter counter) { return counts[static_cast<std::size_t>(counter)]; };
     const auto draws = at(Counter::Draws);
@@ -367,7 +400,35 @@ void Report(bool force) {
         for (auto index = static_cast<std::size_t>(first); index <= static_cast<std::size_t>(last); ++index) total += counts[index];
         return total;
     };
-    if (sum(Counter::ShapeIndirect, Counter::ShapeIndirectCpu) != 0) AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] shape fallbacks: %llu%s\n", static_cast<unsigned long long>(sum(Counter::ShapeIndirect, Counter::ShapeIndirectCpu)), reasons(counts, Counter::ShapeIndirect, Counter::ShapeIndirectCpu).c_str());
+    {
+        const auto shapes = sum(Counter::ShapeIndirect, Counter::ShapeIndirectCpu) + sum(Counter::ShapeRectIndirect, Counter::ShapeRectUnprepared);
+        auto shapeReasons = reasons(counts, Counter::ShapeIndirect, Counter::ShapeIndirectCpu);
+        const auto rectReasons = reasons(counts, Counter::ShapeRectIndirect, Counter::ShapeRectUnprepared);
+        if (!rectReasons.empty()) shapeReasons = shapeReasons.empty() ? rectReasons : shapeReasons.substr(0, shapeReasons.size() - 1) + ", " + rectReasons.substr(2);
+        if (shapes != 0) AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] shape fallbacks: %llu%s\n", static_cast<unsigned long long>(shapes), shapeReasons.c_str());
+    }
+    if (sum(Counter::RectListsSeen, Counter::RectListsFollowed) != 0) {
+        const auto rectSeen = at(Counter::RectListsSeen);
+        const auto rectDirect = at(Counter::RectListsDirect);
+        const auto rectFallbacks = sum(Counter::RectListsShape, Counter::RectListsOther);
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] rect lists: %llu draws, %llu direct (%.1f%%), %llu fallback (shape %llu, class new %llu, verify %llu, other reasons %llu); rect verify %llu checked, %llu differing; record commits %llu first, %llu with a recipe; follows %llu\n",
+            static_cast<unsigned long long>(rectSeen), static_cast<unsigned long long>(rectDirect), rectSeen != 0 ? 100.0 * static_cast<double>(rectDirect) / static_cast<double>(rectSeen) : 0.0,
+            static_cast<unsigned long long>(rectFallbacks), static_cast<unsigned long long>(at(Counter::RectListsShape)), static_cast<unsigned long long>(at(Counter::RectListsClassNew)), static_cast<unsigned long long>(at(Counter::RectListsVerify)), static_cast<unsigned long long>(at(Counter::RectListsOther)),
+            static_cast<unsigned long long>(at(Counter::RectListsVerifyChecked)), static_cast<unsigned long long>(at(Counter::RectListsVerifyDiffering)),
+            static_cast<unsigned long long>(at(Counter::RectListsCommitFirst)), static_cast<unsigned long long>(at(Counter::RectListsCommitRecipe)), static_cast<unsigned long long>(at(Counter::RectListsFollowed)));
+    }
+    if (sum(Counter::AddressedServed, Counter::AddressedVerifyDiffering) != 0) {
+        const auto served = at(Counter::AddressedServed);
+        const auto refusedAddressed = at(Counter::AddressedSwitchOff) + at(Counter::AddressedStores) + at(Counter::AddressedOverlap);
+        AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] addressed stages: %llu draws served direct, %llu committed through today's draw call (%.1f snapshot regions, %.2f KiB of snapshots per served draw); on today's path %llu for an addressed stage (switch off %llu, stores through an address %llu, a read across a program region %llu) and %llu for a later reason; classes %llu built, %llu refused; verify %llu checked, %llu differing\n",
+            static_cast<unsigned long long>(served), static_cast<unsigned long long>(at(Counter::AddressedCommits)),
+            served != 0 ? static_cast<double>(at(Counter::AddressedSnapshotRegions)) / static_cast<double>(served) : 0.0,
+            served != 0 ? static_cast<double>(at(Counter::AddressedSnapshotBytes)) / 1024.0 / static_cast<double>(served) : 0.0,
+            static_cast<unsigned long long>(refusedAddressed), static_cast<unsigned long long>(at(Counter::AddressedSwitchOff)), static_cast<unsigned long long>(at(Counter::AddressedStores)), static_cast<unsigned long long>(at(Counter::AddressedOverlap)),
+            static_cast<unsigned long long>(at(Counter::AddressedLater)),
+            static_cast<unsigned long long>(at(Counter::AddressedClassesBuilt)), static_cast<unsigned long long>(at(Counter::AddressedClassesRefused)),
+            static_cast<unsigned long long>(at(Counter::AddressedVerifyChecked)), static_cast<unsigned long long>(at(Counter::AddressedVerifyDiffering)));
+    }
     if (at(Counter::IndirectHits) != 0 || at(Counter::BuffersInPlace) != 0 || at(Counter::ExpressIndirectCaptured) != 0 || at(Counter::ExpressIndirectNotCaptured) != 0) AgcDriver::ProfilePrint_nid_no_patch("[direct-draws] GPU-indirect hits %llu, their express states %llu captured, %llu not; finisher preparations with a moved buffer in place %llu (%llu ranges)\n", static_cast<unsigned long long>(at(Counter::IndirectHits)), static_cast<unsigned long long>(at(Counter::ExpressIndirectCaptured)), static_cast<unsigned long long>(at(Counter::ExpressIndirectNotCaptured)), static_cast<unsigned long long>(at(Counter::BuffersInPlace)), static_cast<unsigned long long>(at(Counter::BuffersInPlaceRanges)));
     {
         static std::array<std::uint64_t, 2> writersReported{};

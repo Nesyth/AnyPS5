@@ -225,6 +225,8 @@ enum class RuntimeSwitch : std::size_t {
     TemplateKeeps,
     DepthCheckLean,
     DispatchRelocateTrials,
+    DirectRectLists,
+    DirectAddressed,
     Count,
 };
 

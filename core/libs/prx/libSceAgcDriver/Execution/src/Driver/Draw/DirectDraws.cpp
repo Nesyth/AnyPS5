@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <span>
@@ -64,6 +65,14 @@ bool trusted() {
         held = 0;
     }
     return true;
+}
+
+bool rectVerifyDue() {
+    const auto every = DirectDraws::RectVerifyEvery();
+    if (every == 0) return false;
+    struct RectVerifyStorage {};
+    auto& ordinal = HostThreadLocal<std::uint64_t, RectVerifyStorage>();
+    return ++ordinal % every == 0 && !trusted();
 }
 
 // Why a direct draw's read ranges were not settled (the three tests of RangesSettled, in its order), counted
@@ -124,7 +133,11 @@ std::optional<Counter> DirectShapeRefusal(const LeanDrawJob& job) {
     const auto& state = decode.state;
     if (job.parameters.indirect && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectGpuIndirect)) return Counter::ShapeIndirect;
     if (state.quadList) return Counter::ShapeQuadList;
-    if (state.rectList) return Counter::ShapeRectList;
+    if (state.rectList) {
+        if (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectRectLists)) return Counter::ShapeRectList;
+        if (job.parameters.indirect) return Counter::ShapeRectIndirect;
+        if (decode.programs.size() != 2 || decode.roles.size() != 2 || decode.programs[0].binary.stage != Stage::Vertex || decode.programs[1].binary.stage != Stage::Fragment) return Counter::ShapeRectPrograms;
+    }
     if (state.stages.path != Graphics::ShaderPath::Vertex) return Counter::ShapePath;
     if (state.stages.mesh) return Counter::ShapeMesh;
     if (state.stages.tessellation || state.stages.tessellationGeometry) return Counter::ShapeTessellation;
@@ -827,6 +840,7 @@ DirectClassKey DirectClassKey::For(const LeanDrawJob& job, const DirectStages& r
     key.count = static_cast<std::uint32_t>(resolved.stages.size());
     for (std::size_t i = 0; i < resolved.stages.size(); ++i) key.stages[i] = resolved.stages[i].Shared().get();
     key.indirect = IndirectClassWord(resolved.indirect);
+    key.generated = resolved.rectControl;
     if (!ExactClassKeys()) return key;
     key.indexAddress = parameters.indexAddress;
     key.indexCount = parameters.indexCount;
@@ -848,6 +862,7 @@ std::uint64_t DirectClassKey::Probe() const {
     mix((static_cast<std::uint64_t>(count) << 1u) | (indexed ? 1u : 0u));
     for (std::uint32_t i = 0; i < count && i < MaxStages; ++i) mix(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(stages[i])));
     if (indirect != 0) mix(indirect);
+    if (generated != nullptr) mix(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(generated)));
     return probe ^ (probe >> 29u);
 }
 
@@ -890,6 +905,7 @@ bool DirectClassStore::Refuse(const DirectClass& found, Counter reason) {
     refused->key = found.key;
     refused->probe = found.probe;
     refused->stages = found.stages;
+    refused->generated = found.generated;
     refused->refusal = reason;
     std::lock_guard lock(mutex);
     const auto held = classes.find(found.key);
@@ -957,7 +973,7 @@ std::uint64_t DirectStores::Follow(std::uint64_t serial) {
     auto live = Graphics::RuntimeSwitches::Snapshot();
     // Switches that change only what the committer does with a hit, or only dispatch packets,
     // leave the stages and classes as they are, so an in-run A/B of one keeps the stores.
-    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic, Graphics::RuntimeSwitch::CommitFragments, Graphics::RuntimeSwitch::ExpressCommits, Graphics::RuntimeSwitch::XpStreamSegments, Graphics::RuntimeSwitch::XpNoEagerStore, Graphics::RuntimeSwitch::LabelOrderedStores, Graphics::RuntimeSwitch::DeeperRing, Graphics::RuntimeSwitch::BesideSampleDumps, Graphics::RuntimeSwitch::DispatchBeside, Graphics::RuntimeSwitch::FaultFragments, Graphics::RuntimeSwitch::StageMemo, Graphics::RuntimeSwitch::KeepFaultSlots, Graphics::RuntimeSwitch::SiblingFinishers, Graphics::RuntimeSwitch::FastSettle, Graphics::RuntimeSwitch::XpSlowFinisher, Graphics::RuntimeSwitch::XpSlowCommitter, Graphics::RuntimeSwitch::XpSlowWorker, Graphics::RuntimeSwitch::XpExpressFloor, Graphics::RuntimeSwitch::LeanExpress, Graphics::RuntimeSwitch::XpAppendCommits, Graphics::RuntimeSwitch::PreciseSettle, Graphics::RuntimeSwitch::AppendCommits, Graphics::RuntimeSwitch::StageMemoPatchVertex, Graphics::RuntimeSwitch::StageMemoPatchBuffers, Graphics::RuntimeSwitch::StageMemoPatchData, Graphics::RuntimeSwitch::RunFollow, Graphics::RuntimeSwitch::TurnWaitsByJob, Graphics::RuntimeSwitch::ExpressKeepState, Graphics::RuntimeSwitch::StageMemoFront, Graphics::RuntimeSwitch::StageMemoAdmitThird, Graphics::RuntimeSwitch::CommitStamps, Graphics::RuntimeSwitch::PassReadsOnce, Graphics::RuntimeSwitch::ReapThrottle, Graphics::RuntimeSwitch::OcclusionWindows, Graphics::RuntimeSwitch::ExpressPassStamps, Graphics::RuntimeSwitch::PassBarriersMerged, Graphics::RuntimeSwitch::LabelReadbackMemo, Graphics::RuntimeSwitch::ExpressTargetUploads, Graphics::RuntimeSwitch::DrawRuns, Graphics::RuntimeSwitch::LargeBatches, Graphics::RuntimeSwitch::ReplayStateDedupe, Graphics::RuntimeSwitch::RunFollowNoCarry, Graphics::RuntimeSwitch::RunFollowPlainLoop, Graphics::RuntimeSwitch::FinisherParkSlots, Graphics::RuntimeSwitch::ListHooksOnce, Graphics::RuntimeSwitch::DispatchEnvOnce, Graphics::RuntimeSwitch::PlainRegisterPackets, Graphics::RuntimeSwitch::UserWordBlocks, Graphics::RuntimeSwitch::XpDeviceUploads, Graphics::RuntimeSwitch::XpDepthLayouts, Graphics::RuntimeSwitch::XpTargetRestarts, Graphics::RuntimeSwitch::TargetRestarts, Graphics::RuntimeSwitch::MovedInPlace, Graphics::RuntimeSwitch::IndirectInPass, Graphics::RuntimeSwitch::FragmentOwnSets, Graphics::RuntimeSwitch::DirectBuffersInPlace, Graphics::RuntimeSwitch::DirectGpuIndirect, Graphics::RuntimeSwitch::ExpressGpuIndirect, Graphics::RuntimeSwitch::RegisterRuns, Graphics::RuntimeSwitch::ListRegisterPackets, Graphics::RuntimeSwitch::PacketClassTable, Graphics::RuntimeSwitch::RangeMemo, Graphics::RuntimeSwitch::PendingIndexKept, Graphics::RuntimeSwitch::FillImageIndex, Graphics::RuntimeSwitch::WatchedReaps, Graphics::RuntimeSwitch::DeferredBatchStamps, Graphics::RuntimeSwitch::StageViews, Graphics::RuntimeSwitch::StageMemoLeanStores, Graphics::RuntimeSwitch::SettleSerial, Graphics::RuntimeSwitch::FragmentPlans, Graphics::RuntimeSwitch::BufferBlobAppend, Graphics::RuntimeSwitch::ShapePrologue, Graphics::RuntimeSwitch::DirectHandoff, Graphics::RuntimeSwitch::InputsMemo, Graphics::RuntimeSwitch::WorkerHelps, Graphics::RuntimeSwitch::DispatchMovedWrites, Graphics::RuntimeSwitch::DispatchRelocate, Graphics::RuntimeSwitch::DispatchMovedRecipes, Graphics::RuntimeSwitch::StageMemoPatchMerged, Graphics::RuntimeSwitch::StageMemoChained, Graphics::RuntimeSwitch::StageMemoAdmitWays, Graphics::RuntimeSwitch::StageMemoInvocationWays, Graphics::RuntimeSwitch::ImportSnapshots, Graphics::RuntimeSwitch::FollowWindows, Graphics::RuntimeSwitch::KeepBindingsMoved, Graphics::RuntimeSwitch::FollowWider, Graphics::RuntimeSwitch::ExpressDepthIntent, Graphics::RuntimeSwitch::LazyInPlaceImports, Graphics::RuntimeSwitch::PreparedCapacity, Graphics::RuntimeSwitch::MergedSettle, Graphics::RuntimeSwitch::IdleHitRelease, Graphics::RuntimeSwitch::FragmentParkedSets, Graphics::RuntimeSwitch::UnlockedStamps, Graphics::RuntimeSwitch::WriteSnapshotFronts, Graphics::RuntimeSwitch::PendingFronts, Graphics::RuntimeSwitch::InvocationSlotsWide, Graphics::RuntimeSwitch::XpTrustFinisher, Graphics::RuntimeSwitch::XpTrustCommitter, Graphics::RuntimeSwitch::TemplateKeeps, Graphics::RuntimeSwitch::DepthCheckLean, Graphics::RuntimeSwitch::DispatchRelocateTrials}) live.Assign(id, false);
+    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic, Graphics::RuntimeSwitch::CommitFragments, Graphics::RuntimeSwitch::ExpressCommits, Graphics::RuntimeSwitch::XpStreamSegments, Graphics::RuntimeSwitch::XpNoEagerStore, Graphics::RuntimeSwitch::LabelOrderedStores, Graphics::RuntimeSwitch::DeeperRing, Graphics::RuntimeSwitch::BesideSampleDumps, Graphics::RuntimeSwitch::DispatchBeside, Graphics::RuntimeSwitch::FaultFragments, Graphics::RuntimeSwitch::StageMemo, Graphics::RuntimeSwitch::KeepFaultSlots, Graphics::RuntimeSwitch::SiblingFinishers, Graphics::RuntimeSwitch::FastSettle, Graphics::RuntimeSwitch::XpSlowFinisher, Graphics::RuntimeSwitch::XpSlowCommitter, Graphics::RuntimeSwitch::XpSlowWorker, Graphics::RuntimeSwitch::XpExpressFloor, Graphics::RuntimeSwitch::LeanExpress, Graphics::RuntimeSwitch::XpAppendCommits, Graphics::RuntimeSwitch::PreciseSettle, Graphics::RuntimeSwitch::AppendCommits, Graphics::RuntimeSwitch::StageMemoPatchVertex, Graphics::RuntimeSwitch::StageMemoPatchBuffers, Graphics::RuntimeSwitch::StageMemoPatchData, Graphics::RuntimeSwitch::RunFollow, Graphics::RuntimeSwitch::TurnWaitsByJob, Graphics::RuntimeSwitch::ExpressKeepState, Graphics::RuntimeSwitch::StageMemoFront, Graphics::RuntimeSwitch::StageMemoAdmitThird, Graphics::RuntimeSwitch::CommitStamps, Graphics::RuntimeSwitch::PassReadsOnce, Graphics::RuntimeSwitch::ReapThrottle, Graphics::RuntimeSwitch::OcclusionWindows, Graphics::RuntimeSwitch::ExpressPassStamps, Graphics::RuntimeSwitch::PassBarriersMerged, Graphics::RuntimeSwitch::LabelReadbackMemo, Graphics::RuntimeSwitch::ExpressTargetUploads, Graphics::RuntimeSwitch::DrawRuns, Graphics::RuntimeSwitch::LargeBatches, Graphics::RuntimeSwitch::ReplayStateDedupe, Graphics::RuntimeSwitch::RunFollowNoCarry, Graphics::RuntimeSwitch::RunFollowPlainLoop, Graphics::RuntimeSwitch::FinisherParkSlots, Graphics::RuntimeSwitch::ListHooksOnce, Graphics::RuntimeSwitch::DispatchEnvOnce, Graphics::RuntimeSwitch::PlainRegisterPackets, Graphics::RuntimeSwitch::UserWordBlocks, Graphics::RuntimeSwitch::XpDeviceUploads, Graphics::RuntimeSwitch::XpDepthLayouts, Graphics::RuntimeSwitch::XpTargetRestarts, Graphics::RuntimeSwitch::TargetRestarts, Graphics::RuntimeSwitch::MovedInPlace, Graphics::RuntimeSwitch::IndirectInPass, Graphics::RuntimeSwitch::FragmentOwnSets, Graphics::RuntimeSwitch::DirectBuffersInPlace, Graphics::RuntimeSwitch::DirectGpuIndirect, Graphics::RuntimeSwitch::ExpressGpuIndirect, Graphics::RuntimeSwitch::RegisterRuns, Graphics::RuntimeSwitch::ListRegisterPackets, Graphics::RuntimeSwitch::PacketClassTable, Graphics::RuntimeSwitch::RangeMemo, Graphics::RuntimeSwitch::PendingIndexKept, Graphics::RuntimeSwitch::FillImageIndex, Graphics::RuntimeSwitch::WatchedReaps, Graphics::RuntimeSwitch::DeferredBatchStamps, Graphics::RuntimeSwitch::StageViews, Graphics::RuntimeSwitch::StageMemoLeanStores, Graphics::RuntimeSwitch::SettleSerial, Graphics::RuntimeSwitch::FragmentPlans, Graphics::RuntimeSwitch::BufferBlobAppend, Graphics::RuntimeSwitch::ShapePrologue, Graphics::RuntimeSwitch::DirectHandoff, Graphics::RuntimeSwitch::InputsMemo, Graphics::RuntimeSwitch::WorkerHelps, Graphics::RuntimeSwitch::DispatchMovedWrites, Graphics::RuntimeSwitch::DispatchRelocate, Graphics::RuntimeSwitch::DispatchMovedRecipes, Graphics::RuntimeSwitch::StageMemoPatchMerged, Graphics::RuntimeSwitch::StageMemoChained, Graphics::RuntimeSwitch::StageMemoAdmitWays, Graphics::RuntimeSwitch::StageMemoInvocationWays, Graphics::RuntimeSwitch::ImportSnapshots, Graphics::RuntimeSwitch::FollowWindows, Graphics::RuntimeSwitch::KeepBindingsMoved, Graphics::RuntimeSwitch::FollowWider, Graphics::RuntimeSwitch::ExpressDepthIntent, Graphics::RuntimeSwitch::LazyInPlaceImports, Graphics::RuntimeSwitch::PreparedCapacity, Graphics::RuntimeSwitch::MergedSettle, Graphics::RuntimeSwitch::IdleHitRelease, Graphics::RuntimeSwitch::FragmentParkedSets, Graphics::RuntimeSwitch::UnlockedStamps, Graphics::RuntimeSwitch::WriteSnapshotFronts, Graphics::RuntimeSwitch::PendingFronts, Graphics::RuntimeSwitch::InvocationSlotsWide, Graphics::RuntimeSwitch::XpTrustFinisher, Graphics::RuntimeSwitch::XpTrustCommitter, Graphics::RuntimeSwitch::TemplateKeeps, Graphics::RuntimeSwitch::DepthCheckLean, Graphics::RuntimeSwitch::DispatchRelocateTrials, Graphics::RuntimeSwitch::DirectRectLists, Graphics::RuntimeSwitch::DirectAddressed}) live.Assign(id, false);
     if (!tagged || deviceSerial != serial || !(live == switches)) {
         tagged = true;
         deviceSerial = serial;
@@ -3039,6 +3055,108 @@ void prologueWords(const DrawUserWords& words, const DrawProgram& program, std::
     for (std::uint32_t i = 0; i < userCount; ++i) out.push_back(words.Value(program.userDataBase + i));
 }
 
+constexpr std::uint64_t CapturePageBytes = 0x1000u;
+
+std::optional<Counter> addressedRefusal(const DirectStage& stage) {
+    if (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectAddressed)) return Counter::AddressedSwitchOff;
+    if (stage.donor->bdaStores) return Counter::AddressedStores;
+    return std::nullopt;
+}
+
+struct AddressedVerifyStorage {};
+
+bool addressedVerifyDue() {
+    const auto every = DirectDraws::AddressedVerifyEvery();
+    if (every == 0) return false;
+    auto& ordinal = HostThreadLocal<std::uint64_t, AddressedVerifyStorage>();
+    return ++ordinal % every == 0;
+}
+
+int addressedProgramWord(std::span<const Graphics::GuestMemorySnapshot> program, std::uint64_t address) {
+    constexpr std::uint64_t word = sizeof(std::uint32_t);
+    if (program.empty() || address + word <= program.front().address || address >= program.back().address + program.back().bytes.size()) return 0;
+    const auto next = std::upper_bound(program.begin(), program.end(), address, [](std::uint64_t value, const Graphics::GuestMemorySnapshot& region) { return value < region.address; });
+    if (next != program.begin()) {
+        const auto& previous = *std::prev(next);
+        const auto offset = address - previous.address;
+        if (offset < previous.bytes.size()) return previous.bytes.size() - offset < word ? -1 : 1;
+    }
+    if (next != program.end() && next->address - address < word) return -1;
+    return 0;
+}
+
+struct AddressedWordsStorage {};
+struct AddressedProgramStorage {};
+struct AddressedRunsStorage {};
+
+std::optional<Counter> addressedSnapshots(const DirectStages& resolved, DrawRecordHit& hit) {
+    auto& pairs = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint32_t>>, AddressedWordsStorage>();
+    auto& program = HostThreadLocal<std::vector<Graphics::GuestMemorySnapshot>, AddressedProgramStorage>();
+    auto& runs = HostThreadLocal<std::vector<Graphics::GuestMemorySnapshot>, AddressedRunsStorage>();
+    pairs.clear();
+    program.clear();
+    runs.clear();
+    for (const auto& stage : resolved.stages) {
+        const auto& values = stage.Values();
+        std::size_t at = 0;
+        for (const auto& [begin, end] : stage.Ranges()) {
+            for (auto address = begin; address < end; address += sizeof(std::uint32_t)) {
+                if (at == values.size()) return Counter::FallbackWalk;
+                pairs.emplace_back(address, values[at++]);
+            }
+        }
+    }
+    std::sort(pairs.begin(), pairs.end());
+    pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
+    for (std::size_t index = 1; index < pairs.size(); ++index) {
+        if (pairs[index].first == pairs[index - 1].first) return Counter::FallbackTornReads;
+    }
+    for (const auto& region : resolved.memory) program.push_back({region.guestAddress, region.bytes});
+    std::stable_sort(program.begin(), program.end(), [](const Graphics::GuestMemorySnapshot& left, const Graphics::GuestMemorySnapshot& right) { return left.address < right.address; });
+    hit.words.assign(1, {});
+    auto& words = hit.words.front();
+    words.reserve(pairs.size());
+    std::uint64_t runBegin = 0;
+    std::size_t runFirst = 0;
+    bool open = false;
+    const auto close = [&] {
+        if (open) runs.push_back({runBegin, std::as_bytes(std::span<const std::uint32_t>(words.data() + runFirst, words.size() - runFirst))});
+        open = false;
+    };
+    for (const auto& [address, value] : pairs) {
+        const auto served = addressedProgramWord(program, address);
+        if (served < 0) {
+            DirectDraws::Add(Counter::AddressedOverlap);
+            return Counter::FallbackAddressed;
+        }
+        if (served > 0) continue;
+        if (!open || address != runBegin + (words.size() - runFirst) * sizeof(std::uint32_t) || address % CapturePageBytes == 0) {
+            close();
+            runBegin = address;
+            runFirst = words.size();
+            open = true;
+        }
+        words.push_back(value);
+    }
+    close();
+    const auto count = resolved.stages.size();
+    hit.decodeReads.assign(count, {});
+    std::size_t decoded = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        hit.decodeReads[i] = resolved.DecodeReads(i);
+        decoded += hit.decodeReads[i].size();
+    }
+    auto& snapshots = hit.snapshots;
+    snapshots.clear();
+    snapshots.reserve(program.size() + runs.size() + decoded);
+    std::merge(program.begin(), program.end(), runs.begin(), runs.end(), std::back_inserter(snapshots), [](const Graphics::GuestMemorySnapshot& left, const Graphics::GuestMemorySnapshot& right) { return left.address < right.address; });
+    for (const auto& reads : hit.decodeReads) {
+        for (const auto& read : reads) snapshots.push_back({read.address, read.Bytes()});
+    }
+    hit.addressed = true;
+    return std::nullopt;
+}
+
 void refreshStages(const LeanDrawJob& job, DirectStages& resolved) {
     if (resolved.refreshed) return;
     resolved.decode = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::LeanPrepare) ? refreshedDecode(job.shape->decode, job.words) : LeanRefreshedDecode(*job.shape->decode, job.words);
@@ -3100,6 +3218,9 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
     const auto lap = [&](Step step) {
         if (clock != nullptr) clock->Lap(step);
     };
+    resolved.rect.reset();
+    resolved.rectControl = nullptr;
+    resolved.addressed = false;
     const auto* const prologue = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ShapePrologue) ? &shapePrologue(job) : nullptr;
     if (prologue == nullptr || !prologueDirect(job, *prologue)) {
         if (const auto shape = DirectShapeRefusal(job)) {
@@ -3220,7 +3341,13 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
                     memoMissed = true;
                 }
                 if (outcome == StageMemoOutcome::Inputs && memo->inputsTag) DirectDraws::Add(Counter::StageMemoInputsOlderTag);
-                if (outcome == StageMemoOutcome::Hit) {
+                const bool addressedRefused = outcome == StageMemoOutcome::Hit && stage.Shared()->addressed && addressedRefusal(*stage.Shared()).has_value();
+                if (addressedRefused) {
+                    stage.shared.reset();
+                    stage.capture.reset();
+                    stage.Unview();
+                }
+                if (outcome == StageMemoOutcome::Hit && !addressedRefused) {
                     const auto every = stageMemoVerifyEvery();
                     if (memo->patched) DirectDraws::Add(Counter::StageMemoPatched);
                     if (memo->merged) DirectDraws::Add(Counter::StageMemoMerged);
@@ -3328,7 +3455,12 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
         }
         const auto& donor = *stage.shared->donor;
         if (donor.gpuResolvedImages || donor.deviceImageTables) return Counter::FallbackHeap;
-        if (stage.shared->addressed) return Counter::FallbackAddressed;
+        if (stage.shared->addressed) {
+            if (const auto refused = addressedRefusal(*stage.shared)) {
+                DirectDraws::Add(*refused);
+                return Counter::FallbackAddressed;
+            }
+        }
         if (snapshot.srtPoison.size() + snapshot.nullRootReads != donor.poisonedSrtReads) return Counter::FallbackPoisoned;
         lap(Step::Key);
 
@@ -3370,6 +3502,21 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
         if (resolveCensus()) noteStageCensus(*invocation, *stage.Capture(), reads, resolved.DecodeReads(i));
         lap(Step::Side);
     }
+    if (graphics.rectList) {
+        if (count != 2) {
+            DirectDraws::Add(Counter::ShapeRectPrograms);
+            return Counter::FallbackShape;
+        }
+        const auto& vertex = *resolved.stages[0].Shared()->donor;
+        const auto& fragment = *resolved.stages[1].Shared()->donor;
+        resolved.rect = PreparedRectangleShaders(*shape.decode->programs[0].snapshot, vertex.variantId, fragment.variantId);
+        if (resolved.rect == nullptr) {
+            DirectDraws::Add(Counter::ShapeRectUnprepared);
+            return Counter::FallbackShape;
+        }
+        resolved.rectControl = graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT ? &resolved.rect->lastVertexControl : &resolved.rect->control;
+    }
+    resolved.addressed = std::ranges::any_of(resolved.stages, [](const DirectResolvedStage& stage) { return stage.Shared()->addressed; });
     if (!resolved.viewing || !layoutFromEntry(resolved)) {
         for (std::size_t i = 0; i < count; ++i) {
             if (resolved.stages[i].vertexView != nullptr) resolved.vertexInfos[i] = *resolved.stages[i].vertexView;
@@ -3413,7 +3560,7 @@ std::optional<Counter> Driver::assembleDirectHit(const LeanDrawJob& job, DirectS
     hit.sides.resize(count);
     hit.captures.resize(count);
     hit.stages.clear();
-    hit.stages.reserve(count);
+    hit.stages.reserve(resolved.rect != nullptr ? count + 2u : count);
     bool entryReads = resolved.viewing;
     for (std::size_t i = 0; i < count; ++i) {
         auto& stage = resolved.stages[i];
@@ -3427,6 +3574,10 @@ std::optional<Counter> Driver::assembleDirectHit(const LeanDrawJob& job, DirectS
         if (stage.pin != nullptr) hit.captures[i] = std::shared_ptr<const ShaderRecompiler::ResourceCapture>(std::move(stage.pin), stage.Capture().get());
         else hit.captures[i] = stage.Capture();
         hit.stages.push_back({stage.stage, stage.Shared()->donor.get(), stage.pushOffset, &hit.captures[i]->snapshot.registeredImages, side});
+    }
+    if (resolved.rect != nullptr) {
+        const std::array<Graphics::CompiledShader, 2> generated{{{Stage::TessellationControl, resolved.rectControl, 0u}, {Stage::TessellationEvaluation, &resolved.rect->evaluation, 0u}}};
+        hit.stages.insert(hit.stages.begin() + 1, generated.begin(), generated.end());
     }
     hit.parameters = job.parameters;
     const auto& front = *resolved.stages.front().Shared()->donor;
@@ -3478,6 +3629,7 @@ std::optional<Counter> Driver::assembleDirectHit(const LeanDrawJob& job, DirectS
         }
     }
     if (recordQueuedLabelsAfterCapture(job.queue, checksTrusted ? std::span<const ShaderRecompiler::MemoryRegion>() : regions)) return Counter::FallbackLabels;
+    if (resolved.addressed) return addressedSnapshots(resolved, hit);
     return std::nullopt;
 }
 
@@ -3487,6 +3639,10 @@ const DrawRecordSink* Driver::finishDirectAnswer(const LeanDrawJob& job, const L
         answer.Capture(hit.stages, hit.parameters);
         answer.reads = hit.reads;
         answer.contentKey = anchor.device->DrawContentKey(resolved.decode->state, hit.parameters, hit.stages);
+        if (hit.addressed) {
+            answer.addressed = true;
+            answer.CaptureSnapshots(hit.snapshots);
+        }
         answered = true;
     } catch (const std::exception&) {
     }
@@ -3512,6 +3668,7 @@ void Driver::buildDirectClass(const LeanDrawJob& job, const LeanAnchor& anchor, 
     entry->key = key;
     entry->probe = probe;
     for (std::size_t i = 0; i < resolved.stages.size(); ++i) entry->stages[i] = resolved.stages[i].Shared();
+    entry->generated = resolved.rect;
     if (!sink.queued) {
         entry->refusal = Counter::RefusedNotQueued;
     } else if (sink.writes != job.shape->writes) {
@@ -3529,6 +3686,7 @@ void Driver::buildDirectClass(const LeanDrawJob& job, const LeanAnchor& anchor, 
     bool installed = false;
     DirectStores::Get().classes.Install(std::move(entry), resolved.tag, installed);
     if (installed) DirectDraws::Add(outcome);
+    if (installed && resolved.addressed) DirectDraws::Add(outcome == Counter::ClassesBuilt ? Counter::AddressedClassesBuilt : Counter::AddressedClassesRefused);
 }
 
 void Driver::verifyDirectHit(const LeanDrawJob& job, const LeanAnchor& anchor, const DirectClass& found, const DirectStages& resolved, const DrawRecordHit& hit) {
@@ -3544,9 +3702,36 @@ void Driver::verifyDirectHit(const LeanDrawJob& job, const LeanAnchor& anchor, c
     if (DirectStores::Get().classes.Refuse(found, Counter::RefusedVerify)) DirectDraws::Add(Counter::RefusedVerify);
 }
 
+void Driver::verifyDirectRectList(const LeanDrawJob& job, const LeanAnchor& anchor, const DirectClass& found, const DirectStages& resolved, const DrawRecordHit& hit) {
+    DrawRecordView answer;
+    const auto* today = finishDirectAnswer(job, anchor, resolved, hit, answer);
+    if (today == nullptr) return;
+    DirectDraws::Add(Counter::RectListsVerifyChecked);
+    const auto& record = *found.record;
+    answer.writes = record.writes;
+    answer.fragmentOutputs = record.fragmentOutputs;
+    if (!compareRecordAnswer(job, record, answer, *today, &DirectDraws::NoteRectDifference, &DirectDraws::NoteAllowed)) return;
+    DirectDraws::Add(Counter::RectListsVerifyDiffering);
+    if (DirectStores::Get().classes.Refuse(found, Counter::RefusedVerify)) DirectDraws::Add(Counter::RefusedVerify);
+}
+
+void Driver::verifyAddressedHit(const LeanDrawJob& job, const LeanAnchor& anchor, const DirectClass& found, const DirectStages& resolved, const DrawRecordHit& hit) {
+    DrawRecordView answer;
+    const auto* today = finishDirectAnswer(job, anchor, resolved, hit, answer);
+    if (today == nullptr) return;
+    DirectDraws::Add(Counter::AddressedVerifyChecked);
+    const auto& record = *found.record;
+    answer.writes = record.writes;
+    answer.fragmentOutputs = record.fragmentOutputs;
+    if (!compareRecordAnswer(job, record, answer, *today, &DirectDraws::NoteAddressedDifference, &DirectDraws::NoteAllowed)) return;
+    DirectDraws::Add(Counter::AddressedVerifyDiffering);
+    if (DirectStores::Get().classes.Refuse(found, Counter::RefusedVerify)) DirectDraws::Add(Counter::RefusedVerify);
+}
+
 void Driver::finishDirectDraw(const LeanDrawJob& job) {
     const auto& anchor = leanDraws.AnchorAt(job.anchor);
     DirectDraws::Add(Counter::Draws);
+    const bool rectCensus = job.shape->decode->state.rectList && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectRectLists);
     struct ResolvedStorage {};
     auto& resolved = HostThreadLocal<DirectStages, ResolvedStorage>();
     struct SampleStorage {};
@@ -3562,6 +3747,8 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
     std::uint64_t probe = 0;
     std::shared_ptr<const DirectClass> found;
     std::shared_ptr<DrawRecordHit> hit;
+    bool rectVerify = false;
+    bool addressedVerify = false;
     try {
         reason = resolveDirectStages(job, anchor, resolved, timer);
         for (std::uint32_t again = 0; again < 2u && reason == Counter::FallbackUnsettled && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectRetry); ++again) reason = resolveDirectStages(job, anchor, resolved, timer);
@@ -3582,6 +3769,15 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
         }
         if (!reason && found == nullptr) reason = Counter::FallbackClassNew;
         else if (!reason && (job.recordFlags & DrawRecordFlags::VerifyDue) != 0 && !trusted()) reason = Counter::FallbackVerify;
+        else if (!reason && resolved.rect != nullptr && rectVerifyDue()) {
+            reason = Counter::FallbackVerify;
+            rectVerify = true;
+        }
+        else if (!reason && resolved.addressed && addressedVerifyDue()) {
+            addressedVerify = true;
+            reason = Counter::FallbackVerify;
+        }
+        if (!reason && resolved.addressed) hit->contentKey = anchor.device->DrawContentKey(resolved.decode->state, hit->parameters, hit->stages);
     } catch (const std::exception&) {
         reason = Counter::FallbackWalk;
     }
@@ -3592,21 +3788,32 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
         hit->direct = true;
         if (hit->parameters.indirect) DirectDraws::Add(Counter::IndirectHits);
         auto* const splits = timer != nullptr && stepSplits() ? timer : nullptr;
-        if ((job.recordFlags & DrawRecordFlags::DirectBuffers) != 0) {
+        if (hit->addressed) {
+            DirectDraws::Add(Counter::AddressedServed);
+            DirectDraws::Add(Counter::AddressedSnapshotRegions, hit->snapshots.size());
+            std::uint64_t snapshotBytes = 0;
+            for (const auto& snapshot : hit->snapshots) snapshotBytes += snapshot.bytes.size();
+            DirectDraws::Add(Counter::AddressedSnapshotBytes, snapshotBytes);
+        }
+        if (!hit->addressed && (job.recordFlags & DrawRecordFlags::DirectBuffers) != 0) {
             prepareBuffers(job, anchor, resolved, *hit, splits);
             lap(Step::Buffers);
         }
-        if ((job.recordFlags & DrawRecordFlags::DirectInputs) != 0) {
+        if (!hit->addressed && (job.recordFlags & DrawRecordFlags::DirectInputs) != 0) {
             prepareInputs(job, anchor, resolved, *hit);
             lap(Step::Inputs);
         }
-        if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::CommitFragments)) recordFragment(job, anchor, *hit);
+        if (!hit->addressed && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::CommitFragments)) recordFragment(job, anchor, *hit);
         if (splits != nullptr) splits->Split(Step::Fragment);
         commitRecordDraw(job, anchor, std::move(hit));
         if (splits != nullptr) splits->Split(Step::Commit);
         lap(Step::HandOff);
         if (timer != nullptr) timer->Report();
         DirectDraws::Add(Counter::Direct);
+        if (rectCensus) {
+            DirectDraws::Add(Counter::RectListsSeen);
+            DirectDraws::Add(Counter::RectListsDirect);
+        }
         ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
         return;
     }
@@ -3615,12 +3822,19 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
         ~FallbackMark() { ThreadReport::MarkItem(ThreadReport::ItemMark::PlanFallback); }
     } fallbackMark;
     DirectDraws::Add(*reason);
+    if (rectCensus) {
+        DirectDraws::Add(Counter::RectListsSeen);
+        DirectDraws::Add(*reason == Counter::FallbackShape ? Counter::RectListsShape : *reason == Counter::FallbackClassNew ? Counter::RectListsClassNew : *reason == Counter::FallbackVerify ? Counter::RectListsVerify : Counter::RectListsOther);
+    }
+    if (resolved.addressed && *reason != Counter::FallbackAddressed && *reason != Counter::FallbackVerify) DirectDraws::Add(Counter::AddressedLater);
     if (*reason == Counter::FallbackClassNew) {
         buildDirectClass(job, anchor, key, probe, resolved, *hit);
         return;
     }
     if (*reason == Counter::FallbackVerify) {
-        verifyDirectHit(job, anchor, *found, resolved, *hit);
+        if (rectVerify) verifyDirectRectList(job, anchor, *found, resolved, *hit);
+        if (addressedVerify) verifyAddressedHit(job, anchor, *found, resolved, *hit);
+        else verifyDirectHit(job, anchor, *found, resolved, *hit);
         return;
     }
     finishLeanDraw(job, anchor);

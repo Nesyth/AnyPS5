@@ -109,6 +109,8 @@ struct DrawRecordStageView {
     std::vector<std::uint32_t> bindings;
     std::vector<std::uint32_t> vertexAttributes;
     std::vector<ShaderRecompiler::RegisteredImageView> views;
+    std::uint64_t moduleLow = 0;
+    std::uint64_t moduleHigh = 0;
 };
 
 struct DrawRecordView {
@@ -122,6 +124,7 @@ struct DrawRecordView {
     std::optional<std::uint32_t> fragmentOutputs;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> snapshotWords;
     std::vector<std::uint64_t> fetched;
+    bool addressed = false;
 
     void CaptureSnapshots(std::span<const Graphics::GuestMemorySnapshot> snapshots);
     void Capture(std::span<const Graphics::CompiledShader> shaders, const Pm4::DrawParameters& drawParameters);
@@ -211,6 +214,8 @@ struct DrawRecordHit {
     bool relocated = false;
     bool planned = false;
     bool direct = false;
+    bool addressed = false;
+    std::vector<std::uint32_t> contentKey;
     // A direct hit's class, which keeps the record and the stages' donors alive, and the captures
     // whose registered image views the hit's stages point into.
     std::shared_ptr<const void> owner;

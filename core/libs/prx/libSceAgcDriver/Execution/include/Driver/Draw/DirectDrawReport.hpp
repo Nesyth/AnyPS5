@@ -496,6 +496,32 @@ enum class Counter : std::uint16_t {
     InputsVerifyCapacityDiffering,
     MergedSettlesRechecked,
     MergedSettlesRecheckRefused,
+    ShapeRectIndirect,
+    ShapeRectPrograms,
+    ShapeRectUnprepared,
+    RectListsSeen,
+    RectListsDirect,
+    RectListsShape,
+    RectListsClassNew,
+    RectListsVerify,
+    RectListsOther,
+    RectListsVerifyChecked,
+    RectListsVerifyDiffering,
+    RectListsCommitFirst,
+    RectListsCommitRecipe,
+    RectListsFollowed,
+    AddressedServed,
+    AddressedCommits,
+    AddressedSnapshotRegions,
+    AddressedSnapshotBytes,
+    AddressedSwitchOff,
+    AddressedStores,
+    AddressedOverlap,
+    AddressedLater,
+    AddressedClassesBuilt,
+    AddressedClassesRefused,
+    AddressedVerifyChecked,
+    AddressedVerifyDiffering,
     Count,
 };
 
@@ -508,6 +534,8 @@ std::uint64_t VerifyEvery();
 std::uint64_t BufferVerifyEvery();
 std::uint64_t InputVerifyEvery();
 std::uint64_t RepeatVerifyEvery();
+std::uint64_t RectVerifyEvery();
+std::uint64_t AddressedVerifyEvery();
 void NoteRepeatDifference(std::string_view field, std::string_view detail);
 void NoteBindingsDifference(std::string_view field, std::string_view detail);
 
@@ -523,6 +551,8 @@ void NoteClasses(std::size_t known, std::size_t bytes);
 void NoteStages(std::size_t known);
 void NoteDifference(DrawRecords::Field field, std::string_view detail);
 void NoteBuildDifference(DrawRecords::Field field, std::string_view detail);
+void NoteRectDifference(DrawRecords::Field field, std::string_view detail);
+void NoteAddressedDifference(DrawRecords::Field field, std::string_view detail);
 // A prepared-buffers verify difference: one stderr line, at most 8 per 10 s report window.
 void NoteBufferDifference(std::string_view what, std::string_view detail);
 void NoteAllowed(DrawRecords::Allowed kind);

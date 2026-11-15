@@ -81,6 +81,7 @@ struct DirectClassKey {
     std::uint32_t count = 0;
     bool indexed = false;
     std::uint64_t indirect = 0;
+    const void* generated = nullptr;
 
     static DirectClassKey For(const LeanDrawJob& job, const DirectStages& resolved);
     std::uint64_t Probe() const;
@@ -93,6 +94,7 @@ struct DirectClass {
     DirectClassKey key;
     std::uint64_t probe = 0;
     std::array<std::shared_ptr<const DirectStage>, DirectClassKey::MaxStages> stages;
+    std::shared_ptr<const ShaderRecompiler::RectListShaders> generated;
     std::shared_ptr<const DrawRecord> record;
     DirectDraws::Counter refusal = DirectDraws::Counter::Count;
 
@@ -226,6 +228,9 @@ struct DirectStages {
     std::uint64_t beforeSerial = 0;
     bool serialed = false;
     bool viewing = false;
+    std::shared_ptr<const ShaderRecompiler::RectListShaders> rect;
+    const ShaderRecompiler::RecompileResult* rectControl = nullptr;
+    bool addressed = false;
 
     const std::vector<Graphics::DecodeRead>& DecodeReads(std::size_t index) const { return stages[index].decodeView != nullptr ? *stages[index].decodeView : decodeReads[index]; }
     const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& VertexInfo(std::size_t index) const { return stages[index].vertexView != nullptr ? *stages[index].vertexView : vertexInfos[index]; }

@@ -942,6 +942,14 @@ ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapsh
     throw std::runtime_error("AGC driver: prepared rectangle artifacts are missing");
 }
 
+std::shared_ptr<const ShaderRecompiler::RectListShaders> PreparedRectangleShaders(const ShaderSnapshot& snapshot, std::uint64_t vertexId, std::uint64_t fragmentId) {
+    std::lock_guard lock(snapshot.prepared->mutex);
+    for (const auto& entry : snapshot.prepared->rectangles) {
+        if (entry.vertexId == vertexId && entry.fragmentId == fragmentId) return entry.shaders;
+    }
+    return nullptr;
+}
+
 ShaderRecompiler::RectListShaders DrawRectangle(const ShaderSnapshot& front, const std::shared_ptr<const ShaderSnapshot>& fragment, std::uint64_t vertexId, std::uint64_t fragmentId, const ShaderRecompiler::SpirvTarget& target) {
     const auto prepared = [&] {
         std::lock_guard lock(front.prepared->mutex);

@@ -5340,7 +5340,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& inputs = prepared.inputs;
     const auto plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer, prepared.fragmentOutputs, prepared.contentKey);
     if (plan.nothing) return false;
-    if (plan.generatedKey) prepared.recipeOut = nullptr;
+    if (plan.generatedKey && !(prepared.recordRecipe && RuntimeSwitches::Set(RuntimeSwitch::DirectRectLists))) prepared.recipeOut = nullptr;
     inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing);
     if (inputs.nothing) {
         if (VerifyDrawPlan()) requireDrawPlanRepeats(context, state, draw, shaders, plan);
