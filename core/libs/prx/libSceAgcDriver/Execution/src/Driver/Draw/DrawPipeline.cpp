@@ -1642,7 +1642,10 @@ DrawFinisher::ExactFound DrawFinisher::exactPending(std::span<const Range> range
             break;
         }
         const auto& slot = leanSlot(unknown);
-        if (slot.resolved.load(std::memory_order_acquire) != 1) result.unresolved = std::max(result.unresolved, unknown);
+        if (slot.resolved.load(std::memory_order_acquire) != 1) {
+            if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpNoResolveWaits)) ++result.skipped;
+            else result.unresolved = std::max(result.unresolved, unknown);
+        }
         else if (rangesOverlap(slot.resolvedWrites, ranges)) result.blocker = std::max(result.blocker, unknown);
         else ++result.skipped;
         const auto before = slot.unknownBefore;

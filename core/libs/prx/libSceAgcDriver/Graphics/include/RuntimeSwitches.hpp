@@ -242,6 +242,7 @@ enum class RuntimeSwitch : std::size_t {
     TailsAhead,
     FixupsByTurn,
     FrameFlow,
+    XpNoResolveWaits,
     Count,
 };
 
