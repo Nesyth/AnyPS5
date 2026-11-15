@@ -240,6 +240,7 @@ enum class RuntimeSwitch : std::size_t {
     XpFlow,
     DeepFlow,
     TailsAhead,
+    FixupsByTurn,
     Count,
 };
 

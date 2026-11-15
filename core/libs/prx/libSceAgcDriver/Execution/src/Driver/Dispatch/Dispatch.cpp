@@ -709,6 +709,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread() && (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchBeside) || DrawFinisher::Flow() || DrawFinisher::Deep())) {
             const auto code = std::span(snapshot.code).subspan(codeOffset);
             const bool deep = DrawFinisher::Deep();
+            const bool fixupsByTurn = deep && DispatchMissItemsEnabled() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FixupsByTurn);
             const auto fills = [&] {
                 return (!partialLastGroup && matchesFillKernel(code, userData, compute))
                     || (!partialLastGroup && indirectArguments == 0 && (MatchDwordPatternFill(packet, code, userData, compute) || MatchConstantDwordFill(packet, code, userData, compute) || MatchClampedGlobalFill(packet, code, userData, compute) || MatchMemoryValueBufferFill(packet, code, userData, compute)));
@@ -719,7 +720,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     || (indirectArguments == 0 && (packet[4] & 0x20u) == 0 && Graphics::MatchMemoryValueFill(code, userData, compute.numThreads, {packet[1], packet[2], packet[3]}).has_value())
                     || Graphics::HtileDepthClearAddress(code, userData, compute.numThreads) != 0
                     || Graphics::MatchHtileBufferMaskClear(code, userData, compute, packet, indirectArguments).has_value()
-                    || Graphics::MatchHtileZmaskFixup(code, userData, compute, packet, indirectArguments).has_value();
+                    || (!fixupsByTurn && Graphics::MatchHtileZmaskFixup(code, userData, compute, packet, indirectArguments).has_value());
             };
             const auto noteKind = [&] {
                 if (!pipelineCandidate) return DeepKept::NoteNotCandidate;
