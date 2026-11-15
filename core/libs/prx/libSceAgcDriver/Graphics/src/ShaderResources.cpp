@@ -284,6 +284,59 @@ void noteReleased(const std::shared_ptr<Texture>& texture, std::uint64_t address
     GuestMemory::NoteTextureReleased(address);
 }
 
+void noteRefilled(std::uint64_t address) {
+    TextureReleaseSerial().fetch_add(1, std::memory_order_acq_rel);
+    GuestMemory::NoteTextureReleased(address);
+}
+
+enum class ReleaseCause : std::uint8_t { Other, UncachedView, Evicted, StaleView, Rewritten, KeysChanged, NowPending, Shape, NotAdmitted, Cleared, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(ReleaseCause::Count)> ReleaseCauseNames{"other", "view of an uncached image", "budget eviction", "stale view", "snapshot rewritten", "DCC keys changed", "now pending in a storage image", "surface size or refuted proof", "not admitted", "device cleared"};
+enum class ReleaseKind : std::uint8_t { Snapshot, Keyed, View, Copy, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(ReleaseKind::Count)> ReleaseKindNames{"snapshot", "keyed snapshot or clear", "view", "per-use copy"};
+constexpr std::size_t RefillRefusals = static_cast<std::size_t>(Texture::RefillRefusal::Count) + 2u;
+constexpr std::size_t RefillRefusedByView = static_cast<std::size_t>(Texture::RefillRefusal::Count);
+constexpr std::size_t RefillThrew = RefillRefusedByView + 1u;
+constexpr std::array<const char*, RefillRefusals> RefillRefusalNames{"none", "no origin", "descriptor or kind differs", "sparse", "no recorder", "replaced by a view", "refill threw"};
+
+struct TemplateKeepCensus {
+    using Counter = std::atomic<std::uint64_t>;
+    std::array<std::array<Counter, static_cast<std::size_t>(ReleaseKind::Count)>, static_cast<std::size_t>(ReleaseCause::Count)> released{};
+    std::array<Counter, static_cast<std::size_t>(ReleaseCause::Count)> refilled{};
+    std::array<Counter, RefillRefusals> refused{};
+    Counter refillsVerified{0};
+    Counter refillsDiffering{0};
+};
+
+TemplateKeepCensus& templateKeepCensus() {
+    static auto* census = new TemplateKeepCensus();
+    return *census;
+}
+
+ReleaseKind releaseKind(const CachedTexture& entry) {
+    if (entry.source != nullptr) return entry.texture != nullptr && entry.texture->CopyKind() != Texture::PerUseCopy::None ? ReleaseKind::Copy : ReleaseKind::View;
+    return entry.keys != DccKeys::Uncompressed ? ReleaseKind::Keyed : ReleaseKind::Snapshot;
+}
+
+void noteReleaseCause(ReleaseCause cause, ReleaseKind kind) {
+    if (!ResourceCache::FateCensus()) return;
+    templateKeepCensus().released[static_cast<std::size_t>(cause)][static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void noteRefill(ReleaseCause cause, std::size_t refusal) {
+    if (!ResourceCache::FateCensus()) return;
+    auto& census = templateKeepCensus();
+    if (refusal == static_cast<std::size_t>(Texture::RefillRefusal::None)) census.refilled[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
+    else census.refused[std::min(refusal, RefillRefusals - 1u)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t TemplateKeepsVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_TEMPLATE_KEEPS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
 bool SamplerCacheDisabled() {
     static const bool disabled = std::getenv("APS5_NO_SAMPLER_CACHE") != nullptr;
     return disabled;
@@ -305,7 +358,7 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
     return cache.entries.end();
 }
 
-void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
+void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it, ReleaseCause cause = ReleaseCause::Other, bool release = true) {
     cache.bytes -= it->accounted;
     if (it->source != nullptr) {
         for (auto [view, last] = cache.views.equal_range(it->source.get()); view != last; ++view) {
@@ -315,7 +368,10 @@ void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
             }
         }
     }
-    if (it->texture.use_count() > 1) noteReleased(it->texture, it->address);
+    if (release && it->texture.use_count() > 1) {
+        noteReleaseCause(cause, releaseKind(*it));
+        noteReleased(it->texture, it->address);
+    }
     cache.index.erase(it->key);
     cache.owners.erase(it->texture.get());
     cache.entries.erase(it);
@@ -334,7 +390,7 @@ void dropUncachedViews(TextureCache& cache) {
     for (const auto& weak : images) {
         const auto image = weak.lock();
         if (image == nullptr) continue;
-        for (auto view = cache.views.find(image.get()); view != cache.views.end(); view = cache.views.find(image.get())) eraseTexture(cache, view->second);
+        for (auto view = cache.views.find(image.get()); view != cache.views.end(); view = cache.views.find(image.get())) eraseTexture(cache, view->second, ReleaseCause::UncachedView);
     }
 }
 
@@ -407,7 +463,7 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
         } else if (keep && !over) {
             break;
         } else {
-            eraseTexture(cache, back);
+            eraseTexture(cache, back, ReleaseCause::Evicted);
             ++cache.counts.evicted;
         }
     }
@@ -1135,7 +1191,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const CacheHold held(sampledCacheHeld);
     dropUncachedViews(cache);
     std::vector<std::byte> recycled;
+    std::shared_ptr<Texture> refill;
+    auto refillCause = ReleaseCause::Other;
+    auto refillKind = ReleaseKind::Snapshot;
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
+        auto staleCause = ReleaseCause::StaleView;
         if (it->source != nullptr) {
             // The view follows the storage image, whatever the GPU wrote to it since; guest memory
             // written meanwhile is taken in by refreshing the image. A fast clear the image cannot
@@ -1151,6 +1211,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 return it->texture;
             }
         } else if (source == nullptr && it->surfaceBytes == guestBytes && it->keys == *keys && !it->refuted) {
+            staleCause = ReleaseCause::Rewritten;
             // Unwritten pages need no comparison; partially resident textures compare only committed
             // pages. The compare goes through the flush hook: it waits for recorded work over the
             // surface (counted, and named for the [hooksync] line).
@@ -1186,12 +1247,31 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
                 return it->texture;
             }
+        } else {
+            staleCause = source != nullptr ? ReleaseCause::NowPending : it->keys != *keys ? ReleaseCause::KeysChanged : ReleaseCause::Shape;
         }
         if (it->bytes.size() == bytes) recycled = std::move(it->bytes);
         else parkSnapshot(cache, it->bytes);
-        eraseTexture(cache, it);
+        const bool refillable = it->source == nullptr && it->texture.use_count() > 1 && RuntimeSwitches::Set(RuntimeSwitch::TemplateKeeps);
+        if (refillable) {
+            refill = it->texture;
+            refillCause = staleCause;
+            refillKind = releaseKind(*it);
+        }
+        eraseTexture(cache, it, staleCause, !refillable);
         ++cache.counts.stale;
     }
+    const auto releaseRefill = [&](std::size_t refusal) {
+        if (refill == nullptr) return;
+        noteRefill(refillCause, refusal);
+        noteReleaseCause(refillCause, refillKind);
+        noteReleased(refill, address);
+        refill.reset();
+    };
+    struct RefillUnwind {
+        const decltype(releaseRefill)& release;
+        ~RefillUnwind() { release(RefillThrew); }
+    } refillUnwind{releaseRefill};
     const auto clear = source == nullptr ? SampledClearColor(context, resource, *keys, depthCompare) : std::nullopt;
     const bool noSnapshot = source != nullptr || clear.has_value();
     if (noSnapshot) parkSnapshot(cache, recycled);
@@ -1203,7 +1283,45 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         const CacheHold reclaimable(sampledCacheReclaimable);
         return std::make_shared<Texture>(context, std::forward<decltype(args)>(args)...);
     };
+    const auto takeRefill = [&](std::span<const std::byte> snapshot, bool refillDepthCompare, const VkClearColorValue* refillClear) -> std::shared_ptr<Texture> {
+        if (refill == nullptr) return nullptr;
+        auto refusal = Texture::RefillRefusal::None;
+        try {
+            const CacheHold reclaimable(sampledCacheReclaimable);
+            refusal = refill->Refill(*context.detiler, resource, components, snapshot, refillDepthCompare, layerRows, refillClear);
+        } catch (...) {
+            releaseRefill(RefillThrew);
+            throw;
+        }
+        if (refusal != Texture::RefillRefusal::None) {
+            releaseRefill(static_cast<std::size_t>(refusal));
+            return nullptr;
+        }
+        noteRefill(refillCause, static_cast<std::size_t>(refusal));
+        noteRefilled(address);
+        auto kept = std::move(refill);
+        static std::atomic<std::uint64_t> refillOrdinal{0};
+        if (const auto every = TemplateKeepsVerifyEvery(); every != 0 && refillOrdinal.fetch_add(1, std::memory_order_relaxed) % every == 0) {
+            auto& census = templateKeepCensus();
+            const char* what = nullptr;
+            try {
+                const auto fresh = createTexture(*context.detiler, resource, components, snapshot, refillDepthCompare, layerRows, refillClear);
+                what = kept->RefillDifference(*fresh);
+            } catch (const std::exception&) {
+                what = "a fresh texture that threw";
+            }
+            static std::atomic<std::uint64_t> checks{0};
+            static std::atomic<std::uint64_t> differences{0};
+            census.refillsVerified.fetch_add(1, std::memory_order_relaxed);
+            if (what != nullptr) census.refillsDiffering.fetch_add(1, std::memory_order_relaxed);
+            const auto checked = checks.fetch_add(1, std::memory_order_relaxed) + 1u;
+            const auto differing = what != nullptr ? differences.fetch_add(1, std::memory_order_relaxed) + 1u : differences.load(std::memory_order_relaxed);
+            if (what != nullptr && (differing <= 16u || differing % 4096u == 0u)) std::fprintf(stderr, "[template-keeps-verify] a refilled texture 0x%llx (%ux%u format %u) differs from a fresh one in its %s; %llu refills checked, %llu differing\n", static_cast<unsigned long long>(address), resource.width, resource.height, resource.format, what, static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing));
+        }
+        return kept;
+    };
     if (source != nullptr) {
+        releaseRefill(RefillRefusedByView);
         entry.source = source;
         entry.sourceVersion = source->Version();
         if (depthCompare) {
@@ -1224,7 +1342,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         entry.accounted = source->Cached() ? 0u : heldBytes(*source);
         counters.fromStorage.fetch_add(1, std::memory_order_relaxed);
     } else if (clear) {
-        entry.texture = createTexture(*context.detiler, resource, components, std::span<const std::byte>{}, false, layerRows, &*clear);
+        entry.texture = takeRefill(std::span<const std::byte>{}, false, &*clear);
+        if (entry.texture == nullptr) entry.texture = createTexture(*context.detiler, resource, components, std::span<const std::byte>{}, false, layerRows, &*clear);
         entry.accounted = entry.texture->AllocationBytes();
         counters.cleared.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -1242,7 +1361,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             for (std::size_t i = 0; i < entry.bytes.size(); i += 64) nonzero += entry.bytes[i] != std::byte{0};
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, entry.bytes.size() / 64);
         }
-        entry.texture = createTexture(*context.detiler, resource, components, entry.bytes, depthCompare, layerRows);
+        entry.texture = takeRefill(entry.bytes, depthCompare, nullptr);
+        if (entry.texture == nullptr) entry.texture = createTexture(*context.detiler, resource, components, entry.bytes, depthCompare, layerRows);
         entry.accounted = entry.texture->AllocationBytes();
         constexpr std::size_t SnapshotCompareBytes = 256u << 10u;
         if (entry.bytes.size() > SnapshotCompareBytes && (entry.generation != 0 || entry.untracked[0] != 0)) parkSnapshot(cache, entry.bytes);
@@ -1251,6 +1371,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto budget = sampledBudget(context, cache);
     auto texture = entry.texture;
     if (!admitTexture(cache, key, entry.accounted, budget)) {
+        noteReleaseCause(ReleaseCause::NotAdmitted, releaseKind(entry));
         noteReleased(texture, resource.baseAddress);
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
         reportCacheCounts(cache, budget);
@@ -1665,7 +1786,7 @@ void ClearCachedTextures(VkDevice device) {
         std::lock_guard lock(sampled.mutex);
         const CacheHold held(sampledCacheHeld);
         for (auto it = sampled.entries.begin(); it != sampled.entries.end();) {
-            if (it->key.device == device) eraseTexture(sampled, it++);
+            if (it->key.device == device) eraseTexture(sampled, it++, ReleaseCause::Cleared);
             else ++it;
         }
         sampled.spare.clear();
@@ -3017,6 +3138,7 @@ void ShaderResources::buildComplete() {
         }
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
         noteReusable();
+        keptSeen.store(Texture::Refills(), std::memory_order_relaxed);
         completed = true;
         if (BuildProfiled()) {
             timing.completeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stageStart).count();
@@ -12800,6 +12922,119 @@ void ShaderResources::RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out
     }
 }
 
+namespace {
+
+std::pair<std::uint64_t, std::uint64_t> DescriptorRegion(std::uint64_t address, std::uint64_t bytes) {
+    const auto begin = address & ~std::uint64_t{3};
+    const auto end = begin == address ? address + bytes : (address + bytes + 3u) & ~std::uint64_t{3};
+    return {begin, end};
+}
+
+void CoverRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    std::erase_if(ranges, [](const std::pair<std::uint64_t, std::uint64_t>& range) { return range.second <= range.first; });
+    std::sort(ranges.begin(), ranges.end());
+    std::size_t kept = 0;
+    for (std::size_t index = 0; index < ranges.size(); ++index) {
+        if (kept != 0 && ranges[index].first <= ranges[kept - 1].second) ranges[kept - 1].second = std::max(ranges[kept - 1].second, ranges[index].second);
+        else ranges[kept++] = ranges[index];
+    }
+    ranges.resize(kept);
+}
+
+}
+
+bool ShaderResources::MovedRunAccesses(std::span<const MovedBuffer> moved, std::vector<std::array<std::uint64_t, 3>>& out) const {
+    RunAccesses(out);
+    if (moved.empty() || usesBda || guestMemory.HoldsLease()) return false;
+    const auto region = DescriptorRegion;
+    const auto cover = CoverRanges;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> held;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> own;
+    std::vector<std::array<std::uint64_t, 3>> live;
+    for (const auto& access : out) {
+        if ((access[2] & Recorder::RunAccessImage) != 0) live.push_back(access);
+        else if ((access[2] & Recorder::RunAccessWritten) == 0) held.emplace_back(access[0], access[1]);
+    }
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        if (!item.guest) continue;
+        own.push_back(region(item.address, item.size));
+        const auto entry = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& candidate) { return candidate.allocation == index; });
+        const auto range = entry != moved.end() ? region(entry->address, entry->size) : own.back();
+        live.push_back({range.first, range.second, 0});
+    }
+    cover(held);
+    cover(own);
+    if (held != own) {
+        for (const auto& entry : moved) {
+            const auto range = region(entry.address, entry.size);
+            out.push_back({range.first, range.second, 0});
+            if (entry.written) out.push_back({entry.address, entry.address + entry.size, Recorder::RunAccessWritten});
+        }
+        return false;
+    }
+    for (const auto& [begin, end] : MovedGpuWrites(moved)) live.push_back({begin, end, Recorder::RunAccessWritten});
+    out = std::move(live);
+    return true;
+}
+
+std::vector<std::string> ShaderResources::VerifyMovedRunAccesses(const CompiledShader& shader, std::span<const std::array<std::uint64_t, 3>> accesses) const {
+    std::vector<std::string> differences;
+    if (shader.program == nullptr) {
+        differences.emplace_back("no compiled shader");
+        return differences;
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> bound(allocations.size());
+    for (std::size_t index = 0; index < allocations.size(); ++index) bound[index] = {allocations[index].address, allocations[index].address + allocations[index].size};
+    for (const auto& binding : shader.program->bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) continue;
+        const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+        if (kept == bindings.end() || kept->allocations.size() != binding.count) {
+            char text[96];
+            std::snprintf(text, sizeof(text), "binding %u has another shape than the template's", binding.binding);
+            differences.emplace_back(text);
+            continue;
+        }
+        for (std::uint32_t element = 0; element < binding.count; ++element) {
+            const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
+            const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
+            const auto address = descriptor.Base48();
+            const auto size = guestBufferBytes(std::span<const std::uint32_t>(words, 4));
+            const auto index = kept->allocations[element];
+            if (index >= allocations.size() || !allocations[index].guest) continue;
+            bound[index] = size == 0 || address == 0 ? std::pair<std::uint64_t, std::uint64_t>{0, 0} : std::pair<std::uint64_t, std::uint64_t>{address, address + size};
+        }
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> expectedAll, expectedWrites, recordedAll, recordedWrites;
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        if (!allocations[index].guest || bound[index].second <= bound[index].first) continue;
+        expectedAll.push_back(DescriptorRegion(bound[index].first, bound[index].second - bound[index].first));
+        if (allocations[index].written) expectedWrites.push_back(bound[index]);
+    }
+    for (const auto& access : accesses) {
+        if ((access[2] & Recorder::RunAccessImage) != 0) continue;
+        recordedAll.emplace_back(access[0], access[1]);
+        if ((access[2] & Recorder::RunAccessWritten) != 0) recordedWrites.emplace_back(access[0], access[1]);
+    }
+    expectedAll.insert(expectedAll.end(), expectedWrites.begin(), expectedWrites.end());
+    CoverRanges(expectedAll);
+    CoverRanges(expectedWrites);
+    CoverRanges(recordedAll);
+    CoverRanges(recordedWrites);
+    const auto compare = [&](const char* what, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& recorded, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& expected) {
+        if (recorded == expected) return;
+        std::size_t at = 0;
+        while (at < recorded.size() && at < expected.size() && recorded[at] == expected[at]) ++at;
+        const auto one = [](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& list, std::size_t index) { return index < list.size() ? list[index] : std::pair<std::uint64_t, std::uint64_t>{0, 0}; };
+        char text[224];
+        std::snprintf(text, sizeof(text), "the %s differ (%zu ranges recorded, %zu expected), first at %zu: recorded 0x%llx-0x%llx, expected 0x%llx-0x%llx", what, recorded.size(), expected.size(), at, static_cast<unsigned long long>(one(recorded, at).first), static_cast<unsigned long long>(one(recorded, at).second), static_cast<unsigned long long>(one(expected, at).first), static_cast<unsigned long long>(one(expected, at).second));
+        differences.emplace_back(text);
+    };
+    compare("accessed ranges", recordedAll, expectedAll);
+    compare("written ranges", recordedWrites, expectedWrites);
+    return differences;
+}
+
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
     std::vector<std::pair<VkImage, bool>> images;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
@@ -12818,6 +13053,89 @@ bool ShaderResources::HasCachedStorageImages() const {
 
 bool ShaderResources::HoldsReleasedTexture() const {
     return std::any_of(textures.begin(), textures.end(), [](const auto& texture) { return texture != nullptr && texture->Released(); });
+}
+
+bool ShaderResources::KeptUse() const {
+    const auto refills = Texture::Refills();
+    if (refills == keptSeen.load(std::memory_order_relaxed)) return false;
+    const auto seen = keptSeen.exchange(refills, std::memory_order_relaxed);
+    if (seen >= refills) return false;
+    return std::any_of(textures.begin(), textures.end(), [&](const auto& texture) { return texture != nullptr && texture->RefillSerial() > seen; });
+}
+
+const char* ShaderResources::KeptDifference(const ShaderResources& fresh, std::span<const MovedBuffer> moved) const {
+    if (textures != fresh.textures) return "sampled textures";
+    if (StorageImages() != fresh.StorageImages()) return "storage images";
+    if (layoutKey != fresh.layoutKey || fragmentLayoutKey != fresh.fragmentLayoutKey) return "set layouts";
+    if (descriptorWrites.size() != fresh.descriptorWrites.size()) return "descriptor writes";
+    for (std::size_t index = 0; index < descriptorWrites.size(); ++index) {
+        const auto& mine = descriptorWrites[index];
+        const auto& other = fresh.descriptorWrites[index];
+        if (mine.dstBinding != other.dstBinding || mine.dstArrayElement != other.dstArrayElement || mine.descriptorCount != other.descriptorCount || mine.descriptorType != other.descriptorType || (mine.dstSet == _set) != (other.dstSet == fresh._set) || (mine.pImageInfo != nullptr) != (other.pImageInfo != nullptr) || (mine.pBufferInfo != nullptr) != (other.pBufferInfo != nullptr)) return "descriptor writes";
+    }
+    const bool sharedSamplers = context.samplerCache != nullptr && !SamplerCacheDisabled();
+    if (descriptorImages.size() != fresh.descriptorImages.size()) return "image descriptors";
+    for (std::size_t index = 0; index < descriptorImages.size(); ++index) {
+        const auto& mine = descriptorImages[index];
+        const auto& other = fresh.descriptorImages[index];
+        if (mine.imageView != other.imageView) return "image views";
+        if (mine.imageLayout != other.imageLayout) return "image layouts";
+        if (sharedSamplers && mine.sampler != other.sampler) return "samplers";
+    }
+    if (sharedSamplers) {
+        if (samplers.size() != fresh.samplers.size()) return "samplers";
+        for (std::size_t index = 0; index < samplers.size(); ++index) {
+            const auto& mine = samplers[index];
+            const auto& other = fresh.samplers[index];
+            if ((mine == nullptr) != (other == nullptr) || (mine != nullptr && mine->Handle() != other->Handle())) return "samplers";
+        }
+    }
+    if (allocations.size() != fresh.allocations.size()) return "bound ranges";
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& mine = allocations[index];
+        const auto& other = fresh.allocations[index];
+        if (mine.guest != other.guest) return "bound ranges";
+        if (!mine.guest) continue;
+        auto address = mine.address;
+        auto size = mine.size;
+        if (const auto entry = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& candidate) { return candidate.allocation == index; }); entry != moved.end()) {
+            address = entry->address;
+            size = entry->size;
+        }
+        if (address != other.address || size != other.size) return "bound ranges";
+    }
+    return nullptr;
+}
+
+std::string ShaderResources::TakeTemplateKeepText() {
+    auto& census = templateKeepCensus();
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+    const auto join = [](std::string& text, const std::string& item) {
+        if (!text.empty()) text += ", ";
+        text += item;
+    };
+    std::string released;
+    for (std::size_t cause = 0; cause < census.released.size(); ++cause) {
+        for (std::size_t kind = 0; kind < census.released[cause].size(); ++kind) {
+            const auto count = take(census.released[cause][kind]);
+            if (count != 0) join(released, std::string(ReleaseCauseNames[cause]) + " (" + ReleaseKindNames[kind] + ") " + std::to_string(count));
+        }
+    }
+    std::string refilled;
+    for (std::size_t cause = 0; cause < census.refilled.size(); ++cause) {
+        if (const auto count = take(census.refilled[cause]); count != 0) join(refilled, std::string(ReleaseCauseNames[cause]) + " " + std::to_string(count));
+    }
+    std::string refused;
+    for (std::size_t reason = 0; reason < census.refused.size(); ++reason) {
+        if (const auto count = take(census.refused[reason]); count != 0) join(refused, std::string(RefillRefusalNames[reason]) + " " + std::to_string(count));
+    }
+    const auto verified = take(census.refillsVerified);
+    const auto differing = take(census.refillsDiffering);
+    std::string text = "textures released while held: " + (released.empty() ? std::string("none") : released);
+    text += "; refilled in place: " + (refilled.empty() ? std::string("none") : refilled);
+    text += "; refills refused: " + (refused.empty() ? std::string("none") : refused);
+    if (verified != 0) text += "; refills verified " + std::to_string(verified) + ", differing " + std::to_string(differing);
+    return text;
 }
 
 bool ShaderResources::ReadsImage(const StorageTexture* image) const {

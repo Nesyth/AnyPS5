@@ -1413,6 +1413,53 @@ constexpr std::array<const char*, static_cast<std::size_t>(ContentKeyComponent::
 constexpr std::array<const char*, 4> RemovalAgeNames{"same present", "1 present back", "2-7 back", "8+ back"};
 constexpr std::size_t ProofRefusals = static_cast<std::size_t>(ShaderResources::ProofRefusal::Count);
 constexpr std::size_t FastFailSlots = static_cast<std::size_t>(ShaderResources::FastFail::Count) + 1u;
+enum class NotKeyedReason : std::uint8_t { NoRecorder, RecordingOff, DumpLimit, TargetNotResident, CachesOff, RectListStage, GeometryStage, OtherStage, AddressStores, NeverReusable, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(NotKeyedReason::Count)> NotKeyedNames{"no recorder", "draws not recorded", "target dump", "target not resident", "template caches off", "rect-list generated stage", "geometry stage without a variant", "other stage without a variant", "address-based stores", "never reusable: other"};
+
+struct TemplateKeepDrawCensus {
+    using Counter = std::atomic<std::uint64_t>;
+    std::array<Counter, static_cast<std::size_t>(NotKeyedReason::Count)> notKeyed{};
+    Counter generatedHits{0};
+    Counter generatedBuilt{0};
+    Counter keptHits{0};
+    Counter verified{0};
+    Counter differing{0};
+    Counter notRun{0};
+};
+
+TemplateKeepDrawCensus& templateKeepDrawCensus() {
+    static auto* census = new TemplateKeepDrawCensus();
+    return *census;
+}
+
+void noteNotKeyed(NotKeyedReason reason) {
+    templateKeepDrawCensus().notKeyed[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+NotKeyedReason notKeyedReason(const State& state, std::span<const CompiledShader> shaders) {
+    static const bool cachesOff = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    if (cachesOff) return NotKeyedReason::CachesOff;
+    using Stage = ShaderRecompiler::ShaderStage;
+    for (const auto& shader : shaders) {
+        if (shader.program != nullptr && shader.program->PipelineVariantId() != 0) continue;
+        if (state.rectList && (shader.stage == Stage::TessellationControl || shader.stage == Stage::TessellationEvaluation)) return NotKeyedReason::RectListStage;
+        return shader.stage == Stage::Geometry ? NotKeyedReason::GeometryStage : NotKeyedReason::OtherStage;
+    }
+    const bool stores = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->bdaStores && std::ranges::any_of(shader.program->bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; }); });
+    return stores ? NotKeyedReason::AddressStores : NotKeyedReason::NeverReusable;
+}
+
+std::uint64_t templateKeepsVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_TEMPLATE_KEEPS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+bool templateKeepsCensus() {
+    return ResourceCache::FateCensus() || templateKeepsVerifyEvery() != 0;
+}
 
 struct TemplateBuildCensus {
     using Counter = std::atomic<std::uint64_t>;
@@ -1663,6 +1710,34 @@ std::string TakeTemplateBuildText() {
     if (!removedSites.empty()) text += " (" + removedSites + ")";
     if (!removedText.empty()) text += ": " + removedText;
     if (!depth.empty()) text += "; multisample depth CheckCurrent: " + depth;
+    return text;
+}
+
+std::string TakeTemplateKeepText() {
+    auto& census = templateKeepDrawCensus();
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+    std::string notKeyed;
+    std::uint64_t notKeyedTotal = 0;
+    for (std::size_t reason = 0; reason < census.notKeyed.size(); ++reason) {
+        const auto count = take(census.notKeyed[reason]);
+        if (count == 0) continue;
+        notKeyedTotal += count;
+        if (!notKeyed.empty()) notKeyed += ", ";
+        notKeyed += std::string(NotKeyedNames[reason]) + " " + std::to_string(count);
+    }
+    const auto generatedHits = take(census.generatedHits);
+    const auto generatedBuilt = take(census.generatedBuilt);
+    const auto kept = take(census.keptHits);
+    const auto verified = take(census.verified);
+    const auto differing = take(census.differing);
+    const auto notRun = take(census.notRun);
+    const auto textures = ShaderResources::TakeTemplateKeepText();
+    const bool on = RuntimeSwitches::Set(RuntimeSwitch::TemplateKeeps);
+    std::string text = std::string("APS5_TEMPLATE_KEEPS ") + (on ? "set" : "unset") + "; template hits on a refilled texture " + std::to_string(kept);
+    if (verified != 0 || notRun != 0) text += " (verified " + std::to_string(verified) + ", differing " + std::to_string(differing) + ", not run " + std::to_string(notRun) + ")";
+    text += "; " + textures;
+    text += "; not keyed " + std::to_string(notKeyedTotal) + (notKeyed.empty() ? std::string() : " (" + notKeyed + ")");
+    text += "; keyed by the generated-stage rule: hits " + std::to_string(generatedHits) + ", built " + std::to_string(generatedBuilt);
     return text;
 }
 
@@ -2133,9 +2208,17 @@ struct DrawPlan {
     std::shared_ptr<const VertexInputLayout> retainedVertexInput;
     bool candidate = false;
     bool keyed = false;
+    bool generatedKey = false;
     ResourceCache::Key contentKey;
     const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
 };
+
+bool GeneratedRectStage(const CompiledShader& shader) {
+    using Stage = ShaderRecompiler::ShaderStage;
+    if (shader.program == nullptr || shader.heap != nullptr || shader.program->PipelineVariantId() != 0) return false;
+    if (shader.stage != Stage::TessellationControl && shader.stage != Stage::TessellationEvaluation) return false;
+    return std::ranges::all_of(shader.program->bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer; });
+}
 
 bool EarlyDrawKeys() {
     static const bool enabled = std::getenv("APS5_NO_EARLY_DRAW_KEY") == nullptr;
@@ -2234,7 +2317,9 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
     static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
-    plan.candidate = recipe == nullptr && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; });
+    const bool generatedRule = recipe == nullptr && state.rectList && RuntimeSwitches::Set(RuntimeSwitch::TemplateKeeps) && !BarycentricPatches(state, shaders);
+    plan.candidate = recipe == nullptr && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [&](const CompiledShader& shader) { return shader.program != nullptr && (shader.program->PipelineVariantId() != 0 || (generatedRule && GeneratedRectStage(shader))); });
+    plan.generatedKey = generatedRule && plan.candidate && std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program->PipelineVariantId() == 0; });
     plan.keyed = plan.candidate && !ShaderResources::NeverReusable(shaders);
     if (plan.keyed) {
         const auto keyStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -3246,6 +3331,33 @@ void verifyMovedInPlace(const Context& context, const State& state, const Pm4::D
     if (differs || checked % 4096u == 0u) std::fprintf(stderr, "[moved-in-place-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(different));
 }
 
+void noteKeptHit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, const ShaderResources& served, std::span<const ShaderResources::MovedBuffer> moved, bool refilled) {
+    auto& census = templateKeepDrawCensus();
+    if (refilled) census.keptHits.fetch_add(1, std::memory_order_relaxed);
+    const auto every = templateKeepsVerifyEvery();
+    static std::atomic<std::uint64_t> ordinal{0};
+    if (every == 0 || ordinal.fetch_add(1, std::memory_order_relaxed) % every != 0) return;
+    std::shared_ptr<ShaderResources> fresh;
+    try {
+        fresh = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->Keep(fresh);
+    } catch (const std::exception& error) {
+        census.notRun.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<std::uint64_t> notRun{0};
+        const auto skipped = notRun.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (skipped <= 16u || skipped % 4096u == 0u) std::fprintf(stderr, "[template-keeps-verify] %llu checks of kept templates not run: the fresh build threw: %s\n", static_cast<unsigned long long>(skipped), error.what());
+        return;
+    }
+    const char* what = served.KeptDifference(*fresh, moved);
+    static std::atomic<std::uint64_t> checks{0};
+    static std::atomic<std::uint64_t> differences{0};
+    census.verified.fetch_add(1, std::memory_order_relaxed);
+    if (what != nullptr) census.differing.fetch_add(1, std::memory_order_relaxed);
+    const auto checked = checks.fetch_add(1, std::memory_order_relaxed) + 1u;
+    const auto differing = what != nullptr ? differences.fetch_add(1, std::memory_order_relaxed) + 1u : differences.load(std::memory_order_relaxed);
+    if (what != nullptr && (differing <= 16u || differing % 4096u == 0u)) std::fprintf(stderr, "[template-keeps-verify] %s differs from a fresh build in its %s; %llu kept uses checked, %llu differing\n", refilled ? "a template kept over a refilled texture" : "a rect-list template keyed by the generated-stage rule", what, static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing));
+}
+
 void noteLeanCoverage(const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, const Recorder* recorder) {
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (!stats) return;
@@ -3363,6 +3475,9 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 noteLeanCoverage(*resolved.resources, resolved.moved, recorder);
+                const bool keptUse = templateKeepsCensus() && resolved.resources->KeptUse();
+                if (keptUse || (plan.generatedKey && templateKeepsVerifyEvery() != 0)) noteKeptHit(context, state, draw, shaders, snapshots, indexBytes, *resolved.resources, resolved.moved, keptUse);
+                if (plan.generatedKey && ResourceCache::FateCensus()) templateKeepDrawCensus().generatedHits.fetch_add(1, std::memory_order_relaxed);
                 if (resolved.resources->HeapStage()) {
                     const auto reason = replayDraw == ReplayReason::Eligible ? resolved.resources->HeapReplayRefusal(shaders) : replayDraw;
                     if (ReplayCensusEnabled() && replayDraw != ReplayReason::Count) {
@@ -3397,11 +3512,13 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     } else {
         if (view != nullptr) view->lookup = DrawCommitLookup::Uncacheable;
         countCache(&DrawProfile::uncacheable);
+        if (recordable && ResourceCache::FateCensus()) noteNotKeyed(notKeyedReason(state, shaders));
     }
     findCost.Stop();
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
         if (ResourceCache::FateCensus()) noteTemplateLookup(resolved.contentKey, buildCause, true);
+        if (plan.generatedKey && ResourceCache::FateCensus()) templateKeepDrawCensus().generatedBuilt.fetch_add(1, std::memory_order_relaxed);
         HeapCostScope buildCost(HeapCost::TemplateBuild);
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, recordable && drawStagingEnabled());
         buildCost.Stop();
@@ -5223,6 +5340,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& inputs = prepared.inputs;
     const auto plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer, prepared.fragmentOutputs, prepared.contentKey);
     if (plan.nothing) return false;
+    if (plan.generatedKey) prepared.recipeOut = nullptr;
     inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing);
     if (inputs.nothing) {
         if (VerifyDrawPlan()) requireDrawPlanRepeats(context, state, draw, shaders, plan);
@@ -5375,6 +5493,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     const bool recordDraws = RecordDraws();
     auto* recorder = prepared.recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
+    if (!recordable && ResourceCache::FateCensus()) noteNotKeyed(!recordDraws ? NotKeyedReason::RecordingOff : recorder == nullptr ? NotKeyedReason::NoRecorder : dumpLimit != 0 ? NotKeyedReason::DumpLimit : NotKeyedReason::TargetNotResident);
     auto& resolved = prepared.resolved;
     const bool replayOn = RuntimeSwitches::Set(RuntimeSwitch::ReplayHeapStage) || RuntimeSwitches::Set(RuntimeSwitch::XpReplay);
     const auto replayDraw = replayOn || ReplayCensusEnabled() ? heapReplayDrawReason(state, draw, shaders, inputs, targets, !stencilReferences.empty(), recordable) : ReplayReason::Count;

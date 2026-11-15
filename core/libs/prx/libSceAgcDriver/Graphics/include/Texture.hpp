@@ -156,8 +156,21 @@ public:
     bool Released() const { return released.load(std::memory_order_acquire); }
     void MarkReleased() { released.store(true, std::memory_order_release); }
     FastProofStamp& FastProof() const { return fastProof; }
+    enum class RefillRefusal : std::uint8_t { None, NoOrigin, Shape, Sparse, NoRecorder, Count };
+    RefillRefusal Refill(TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, bool layerRows, const VkClearColorValue* clear);
+    std::uint64_t RefillSerial() const { return refillSerial.load(std::memory_order_acquire); }
+    static std::uint64_t Refills();
+    const char* RefillDifference(const Texture& fresh) const;
 
 private:
+    struct SnapshotOrigin {
+        GuestTextureResource descriptor;
+        VkComponentMapping components;
+        bool depthCompare = false;
+        bool layerRows = false;
+    };
+    std::optional<SnapshotOrigin> origin;
+    std::atomic<std::uint64_t> refillSerial{0};
     mutable FastProofStamp fastProof;
     void release() noexcept;
     bool refreshBlockCopy();

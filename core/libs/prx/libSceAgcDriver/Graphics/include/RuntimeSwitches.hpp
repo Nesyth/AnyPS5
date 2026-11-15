@@ -222,6 +222,9 @@ enum class RuntimeSwitch : std::size_t {
     XpTrustFinisher,
     XpTrustCommitter,
     XpDispatchNoCommit,
+    TemplateKeeps,
+    DepthCheckLean,
+    DispatchRelocateTrials,
     Count,
 };
 

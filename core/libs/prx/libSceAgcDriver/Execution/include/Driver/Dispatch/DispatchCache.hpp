@@ -116,6 +116,7 @@ struct DispatchVariant {
     bool relocated = false;
     bool descriptorsPatched = false;
     bool writtenPatched = false;
+    std::atomic<std::uint64_t> relocationProbe{0};
 };
 
 struct DispatchRelocation {

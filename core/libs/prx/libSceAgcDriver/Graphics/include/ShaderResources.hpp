@@ -674,6 +674,8 @@ public:
     const void* MemoryOwner() const { return &guestMemory; }
     void CopyBacksAfterRun(std::shared_ptr<ShaderResources> self) { afterRunSelf = std::move(self); }
     void RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const;
+    bool MovedRunAccesses(std::span<const MovedBuffer> moved, std::vector<std::array<std::uint64_t, 3>>& out) const;
+    std::vector<std::string> VerifyMovedRunAccesses(const CompiledShader& shader, std::span<const std::array<std::uint64_t, 3>> accesses) const;
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool SpaceReuse() const { return spaceReuse; }
     static bool SpaceReuseDisabled();
@@ -704,6 +706,9 @@ public:
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;
     bool HoldsReleasedTexture() const;
+    bool KeptUse() const;
+    const char* KeptDifference(const ShaderResources& fresh, std::span<const MovedBuffer> moved) const;
+    static std::string TakeTemplateKeepText();
     std::uint32_t TableElements() const { return tableElements[0] + tableElements[1]; }
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
     const std::vector<std::uint32_t>& FragmentLayoutKey() const { return fragmentLayoutKey; }
@@ -1118,6 +1123,7 @@ private:
     };
     std::vector<ImagePosition> indexImagePositions;
     bool rebound = false;
+    mutable std::atomic<std::uint64_t> keptSeen{0};
     // T1 (design_cpu_final M3): brings the overlapping surfaces' own objects up to date exactly as
     // the full walk's lookups would, in the walk's binding order, without the lookups: a storage
     // image's Refresh (which stores the foreign images over its surface first), a view's source's

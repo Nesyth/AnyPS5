@@ -5718,6 +5718,7 @@ struct DispatchTemplateCensus {
     std::array<std::atomic<std::uint64_t>, MoveRefusals> refusedStageA{};
     std::array<std::atomic<std::uint64_t>, MoveRefusals> refusedRecord{};
     std::atomic<std::uint64_t> builtProof{0}, builtNotCacheable{0}, kept{0};
+    std::atomic<std::uint64_t> movedRuns{0}, movedRunsInPlace{0}, movedRunsKept{0}, movedRunsJoined{0};
     std::array<std::atomic<std::uint64_t>, NotReusableReasons> notKept{};
     std::atomic<std::int64_t> lastReport{0};
     AgcDriver::Mutex keysMutex;
@@ -5808,6 +5809,11 @@ void ReportTemplateCensus() {
     }
     const auto built = noTemplates + stageA + record + proof + notCacheable;
     std::fprintf(stderr, "[dispatch-templates] (10 s) %llu dispatch commits: %llu recipe hits (%llu with moves; rebuilt: proof %llu, move refused %llu, device %llu, other %llu, live key or buffer ranges differ from the recipe's %llu);%llu templates reused (exact %llu, read-only moves %llu, written moves %llu); %llu templates built (no template %llu: %s; move refused at stage A %llu (%s), at the record %llu (%s); proof failed %llu; not cacheable %llu); built templates kept %llu, not kept %llu: %s\n", commits, recipes, recipeMoves, rebuilds[0], rebuilds[1], rebuilds[2], rebuilds[3], rebuilds[4], reusedExact + reusedReadOnly + reusedWritten, reusedExact, reusedReadOnly, reusedWritten, built, noTemplates, noTemplate.c_str(), stageA, stageAText.c_str(), record, recordText.c_str(), proof, notCacheable, kept, notKeptTotal, notKept.c_str());
+    const auto movedRuns = take(census.movedRuns);
+    const auto movedRunsInPlace = take(census.movedRunsInPlace);
+    const auto movedRunsKept = take(census.movedRunsKept);
+    const auto movedRunsJoined = take(census.movedRunsJoined);
+    if (movedRuns != 0) std::fprintf(stderr, "[dispatch-moved-runs] (10 s) %llu dispatches recorded through moved buffers could run beside other unordered dispatches (%llu with in-place written buffers): %llu took the template's ranges with each moved buffer's old range replaced by its moved one, %llu kept the template's ranges and added the moved ones (the template's regions are not its buffers' ranges); %llu joined an open run\n", movedRuns, movedRunsInPlace, movedRuns - movedRunsKept, movedRunsKept, movedRunsJoined);
 }
 
 struct MovedWritesVerify {
@@ -5977,6 +5983,7 @@ struct RecordedDispatch {
     std::array<std::uint32_t, 3> threadLimit{};
     std::vector<Graphics::ShaderResources::MovedBuffer> moved{};
     const ResourceCache::Key* key = nullptr;
+    std::vector<Graphics::ShaderResources::MovedBuffer> readMoves{};
 };
 
 struct DispatchCompletion {
@@ -5997,6 +6004,7 @@ struct DispatchCompletion {
     char* groupsText;
     std::vector<Graphics::ShaderResources::MovedBuffer> moved{};
     bool movesRecipe = false;
+    std::vector<Graphics::ShaderResources::MovedBuffer> readMoves{};
 };
 
 namespace {
@@ -6044,6 +6052,25 @@ void verifyMovedWrites(const RecordedDispatch& record) {
         if (verify.printed.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[dispatch-moved-writes-verify] program 0x%llx: %s\n", static_cast<unsigned long long>(record.programAddress), difference.c_str());
     }
     if (checked % 4096 == 0) std::fprintf(stderr, "[dispatch-moved-writes-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(verify.differing.load(std::memory_order_relaxed)));
+}
+
+void verifyMovedRuns(const RecordedDispatch& record, std::span<const std::array<std::uint64_t, 3>> accesses) {
+    static const std::uint64_t every = VerifyEvery("APS5_VERIFY_DISPATCH_MOVED_RUNS");
+    if (every == 0 || record.resources == nullptr || record.shader == nullptr) return;
+    static std::atomic<std::uint64_t> seen{0}, checked{0}, differing{0}, printed{0};
+    if (seen.fetch_add(1, std::memory_order_relaxed) % every != 0) return;
+    std::vector<std::string> differences;
+    try {
+        differences = record.resources->VerifyMovedRunAccesses(*record.shader, accesses);
+    } catch (const std::exception& error) {
+        differences.emplace_back(std::string("the check could not be made: ") + error.what());
+    }
+    const auto count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!differences.empty()) differing.fetch_add(1, std::memory_order_relaxed);
+    for (const auto& difference : differences) {
+        if (printed.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[dispatch-moved-runs-verify] program 0x%llx: %s\n", static_cast<unsigned long long>(record.programAddress), difference.c_str());
+    }
+    if (count % 4096 == 0) std::fprintf(stderr, "[dispatch-moved-runs-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differing.load(std::memory_order_relaxed)));
 }
 
 void verifyMovedRecipe(const Recipe& recipe, const Graphics::CompiledShader& shader, std::uint64_t program) {
@@ -6585,15 +6612,30 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     bool unordered = false;
     const auto overlapQueue = Graphics::Recorder::TakeDispatchOrder(unordered);
     const auto* groupLimit = state->properties.limits.maxComputeWorkGroupCount;
-    const bool overlapCapable = overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && record.threadGroup == std::array<std::uint32_t, 3>{} && record.shader->program->workgroupMemoryDwords == 0 && state->checkpointMarker == nullptr && state->bufferMarker == nullptr && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && !resources.HasHostGpuCopies() && !movedInPlace;
+    const std::span<const Graphics::ShaderResources::MovedBuffer> runMoves = record.moved.empty() ? std::span<const Graphics::ShaderResources::MovedBuffer>(record.readMoves) : std::span<const Graphics::ShaderResources::MovedBuffer>(record.moved);
+    const bool movedRuns = !runMoves.empty() && record.bindings != nullptr && DispatchMovedWritesOn();
+    const bool overlapCapable = overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && record.threadGroup == std::array<std::uint32_t, 3>{} && record.shader->program->workgroupMemoryDwords == 0 && state->checkpointMarker == nullptr && state->bufferMarker == nullptr && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && !resources.HasHostGpuCopies() && (!movedInPlace || movedRuns);
     std::vector<Graphics::Recorder::RunAccess> runAccesses;
-    if (overlapCapable) resources.RunAccesses(runAccesses);
+    bool movedRanges = false;
+    if (overlapCapable && movedRuns) {
+        movedRanges = resources.MovedRunAccesses(runMoves, runAccesses);
+        if (movedRanges) verifyMovedRuns(record, runAccesses);
+    } else if (overlapCapable) {
+        resources.RunAccesses(runAccesses);
+    }
     VkAccessFlags covered = 0;
     bool overlapped = false;
     const std::array<const void*, 2> runOwners{record.resources.get(), resources.MemoryOwner()};
     const auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, runAccesses, &covered, overlapped) : recorder.Commands(&covered);
     constexpr VkAccessFlags runLeadingCovered = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     if (overlapCapable && !overlapped && (covered & runLeadingCovered) != runLeadingCovered) covered = 0;
+    if (overlapCapable && movedRuns && DispatchCensus()) {
+        auto& counts = TemplateCensus();
+        counts.movedRuns.fetch_add(1, std::memory_order_relaxed);
+        if (movedInPlace) counts.movedRunsInPlace.fetch_add(1, std::memory_order_relaxed);
+        if (!movedRanges) counts.movedRunsKept.fetch_add(1, std::memory_order_relaxed);
+        if (overlapped) counts.movedRunsJoined.fetch_add(1, std::memory_order_relaxed);
+    }
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     if (record.resources != nullptr) record.resources->KeepStorageImageBytes(recorder);
@@ -7078,6 +7120,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     auto recordRefusal = Graphics::ShaderResources::MoveRefusal::None;
     int reusedMoves = 0;
     std::vector<Graphics::ShaderResources::MovedBuffer> movedList;
+    std::vector<Graphics::ShaderResources::MovedBuffer> readMoveList;
     // The batches the pre-sync (PrepareDispatch) waited for are reaped first: their completions
     // (CPU write-backs) land before stage B or a cached object's Revalidate reads, and the flush
     // hook then finds nothing pending over their surfaces.
@@ -7205,6 +7248,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                         moves.bytes.fetch_add(proof.bytes, std::memory_order_relaxed);
                         noteDispatchMoveSize(proof.bytes);
                         if (proof.written != 0) movedList = std::move(*moved);
+                        else if (DispatchMovedWritesOn()) readMoveList = std::move(*moved);
                         reusedMoves = proof.written != 0 ? 2 : 1;
                     }
                 }
@@ -7213,6 +7257,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                     refusedMove = true;
                     reusedMoves = 0;
                     movedList.clear();
+                    readMoveList.clear();
                     buildWhy = BuildWhy::Record;
                     cached = state->resourceCache.Find(contentKey);
                     if (cached != nullptr && cached->Revalidate(shaders[0])) usable = true;
@@ -7307,6 +7352,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     DispatchCompletion completion{context, shaders, pushStages, pushBytes, objects, resources, contentKey, cacheable, fromCache, revalidateMs, overlay, lookupsBefore, timer, timing, groupsText};
     completion.moved = std::move(movedList);
+    completion.readMoves = std::move(readMoveList);
     completion.movesRecipe = overlay != nullptr && DispatchMovedRecipesOn();
     return recordCompletedDispatch(shader, x, y, z, arguments, programAddress, recipeOut, threadGroup, htileClear, completion);
 }
@@ -7338,6 +7384,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     record.threadGroup = threadGroup;
     record.key = &contentKey;
     record.moved = std::move(completion.moved);
+    record.readMoves = std::move(completion.readMoves);
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;

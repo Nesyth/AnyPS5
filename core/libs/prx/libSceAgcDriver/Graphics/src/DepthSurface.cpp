@@ -380,6 +380,7 @@ bool htileProvesClear(std::uint32_t word, bool depthOnly, float clearDepth) {
 }
 
 enum class DepthCheck : std::size_t { Calls, Worked, FillNotes, PublicationSync, PendingSync, PendingDepth, PendingHtile, PendingStencil, Alias, StencilClear, DepthClear, HtileStore, Count };
+enum class DepthScan : std::size_t { Stencil, StencilSkipped, Htile, HtileQueued, Count };
 enum class DepthWriter : std::size_t { Dispatch, HtileClear, Untagged, Other, Untold, Count };
 constexpr std::array<const char*, static_cast<std::size_t>(DepthWriter::Count)> DepthWriterNames{"dispatch", "HTILE clear", "untagged", "copy/fill/clear", "untold"};
 
@@ -390,6 +391,10 @@ struct DepthCheckCounts {
     std::atomic<std::uint64_t> nanoseconds{0};
     std::atomic<std::uint64_t> syncNanoseconds{0};
     std::atomic<std::uint64_t> collectNanoseconds{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DepthScan::Count)> scans{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DepthScan::Count)> scanned{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DepthScan::Count)> scanNanoseconds{};
+    std::atomic<std::uint64_t> leanScans{0};
 };
 
 DepthCheckCounts& depthCheckCounts() {
@@ -431,6 +436,13 @@ public:
         counts.collects.fetch_add(collects, std::memory_order_relaxed);
         counts.syncNanoseconds.fetch_add(syncNs, std::memory_order_relaxed);
         counts.collectNanoseconds.fetch_add(collectNs, std::memory_order_relaxed);
+        for (std::size_t index = 0; index < scans.size(); ++index) {
+            if (scans[index] == 0u) continue;
+            counts.scans[index].fetch_add(scans[index], std::memory_order_relaxed);
+            counts.scanned[index].fetch_add(scanned[index], std::memory_order_relaxed);
+            counts.scanNanoseconds[index].fetch_add(scanNs[index], std::memory_order_relaxed);
+        }
+        if (leanScans != 0u) counts.leanScans.fetch_add(leanScans, std::memory_order_relaxed);
         counts.nanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count()), std::memory_order_relaxed);
     }
     std::chrono::steady_clock::time_point Now() const { return on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; }
@@ -456,6 +468,14 @@ public:
         noted[static_cast<std::size_t>(DepthCheck::HtileStore)] = true;
         writers[1] = depthWriter(recorder, 0u, 0u, note);
     }
+    void Scanned(DepthScan scan, std::uint64_t elements, bool lean, std::chrono::steady_clock::time_point since) {
+        if (!on) return;
+        const auto index = static_cast<std::size_t>(scan);
+        ++scans[index];
+        scanned[index] += elements;
+        scanNs[index] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
+        if (lean) ++leanScans;
+    }
 
 private:
     bool on = depthCheckCensus();
@@ -465,6 +485,10 @@ private:
     std::uint64_t collects = 0;
     std::uint64_t syncNs = 0;
     std::uint64_t collectNs = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(DepthScan::Count)> scans{};
+    std::array<std::uint64_t, static_cast<std::size_t>(DepthScan::Count)> scanned{};
+    std::array<std::uint64_t, static_cast<std::size_t>(DepthScan::Count)> scanNs{};
+    std::uint64_t leanScans = 0;
 };
 
 std::uint64_t fillNoteAfter(const Recorder& recorder, const GuestMemory::UnchangedQuery& range, std::uint64_t floor, std::uint32_t word) {
@@ -475,6 +499,115 @@ std::uint64_t fillNoteAfter(const Recorder& recorder, const GuestMemory::Unchang
         found = write.note;
     }
     return found;
+}
+
+bool depthCheckLean() {
+    return RuntimeSwitches::Set(RuntimeSwitch::DepthCheckLean);
+}
+
+std::uint64_t depthCheckLeanVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_DEPTH_CHECK_LEAN");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+struct DepthCheckLeanVerify {
+    std::atomic<std::uint64_t> uses{0};
+    std::atomic<std::uint64_t> checked{0};
+    std::atomic<std::uint64_t> differing{0};
+};
+
+DepthCheckLeanVerify& depthCheckLeanVerify() {
+    static auto* verify = new DepthCheckLeanVerify();
+    return *verify;
+}
+
+bool depthCheckLeanVerifies() {
+    const auto every = depthCheckLeanVerifyEvery();
+    return every != 0u && depthCheckLeanVerify().uses.fetch_add(1, std::memory_order_relaxed) % every == 0u;
+}
+
+void noteDepthCheckLeanVerify(const char* plane, std::uint64_t address, std::size_t bytes, bool lean, bool full) {
+    auto& verify = depthCheckLeanVerify();
+    const auto checked = verify.checked.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (lean == full) return;
+    const auto differing = verify.differing.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (differing <= 16u) std::fprintf(stderr, "[depth-check-lean-verify] %s 0x%llx+0x%zx: lean scan %s, full scan %s (%llu checked, %llu differing)\n", plane, static_cast<unsigned long long>(address), bytes, lean ? "holds" : "fails", full ? "holds" : "fails", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing));
+}
+
+constexpr std::size_t LeanScanBlock = 64u;
+
+bool leanBytesHold(const std::uint8_t* bytes, std::size_t count, std::uint8_t value) {
+    const std::uint64_t pattern = 0x0101010101010101ull * value;
+    std::size_t offset = 0u;
+    for (; offset + LeanScanBlock <= count; offset += LeanScanBlock) {
+        std::array<std::uint64_t, LeanScanBlock / sizeof(std::uint64_t)> words;
+        std::memcpy(words.data(), bytes + offset, LeanScanBlock);
+        std::uint64_t differs = 0u;
+        for (const auto word : words) differs |= word ^ pattern;
+        if (differs != 0u) return false;
+    }
+    for (; offset < count; ++offset) {
+        if (bytes[offset] != value) return false;
+    }
+    return true;
+}
+
+bool leanStencilPlaneHolds(const std::uint8_t* bytes, std::size_t count, std::uint8_t value) {
+    if (!depthCheckLeanVerifies()) return leanBytesHold(bytes, count, value);
+    const std::vector<std::uint8_t> copy(bytes, bytes + count);
+    const bool full = std::all_of(copy.begin(), copy.end(), [&](std::uint8_t byte) { return byte == value; });
+    noteDepthCheckLeanVerify("stencil plane", reinterpret_cast<std::uintptr_t>(bytes), count, leanBytesHold(copy.data(), count, value), full);
+    return full;
+}
+
+struct HtileClearProof {
+    std::uint32_t mask;
+    std::uint32_t value;
+    std::uint32_t stencil;
+};
+
+HtileClearProof htileClearProof(bool depthOnly, float clearDepth, VkImageAspectFlags aspects) {
+    return {depthOnly ? 0xffffffffu : 0xfffff00fu, clearDepth == 0.0f ? 0u : depthOnly ? 0xfffffff0u : 0xfffc0000u, (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0u ? 0x300u : 0u};
+}
+
+bool leanHtileWordsProve(const std::uint8_t* bytes, std::size_t words, const HtileClearProof& proof) {
+    const auto widen = [](std::uint32_t word) { return static_cast<std::uint64_t>(word) * 0x0000000100000001ull; };
+    const auto mask = widen(proof.mask);
+    const auto value = widen(proof.value);
+    const auto stencil = widen(proof.stencil);
+    constexpr std::size_t BlockWords = LeanScanBlock / sizeof(std::uint32_t);
+    std::size_t index = 0u;
+    for (; index + BlockWords <= words; index += BlockWords) {
+        std::array<std::uint64_t, LeanScanBlock / sizeof(std::uint64_t)> pairs;
+        std::memcpy(pairs.data(), bytes + index * sizeof(std::uint32_t), LeanScanBlock);
+        std::uint64_t differs = 0u;
+        for (const auto pair : pairs) differs |= ((pair & mask) ^ value) | (pair & stencil);
+        if (differs != 0u) return false;
+    }
+    for (; index < words; ++index) {
+        std::uint32_t word;
+        std::memcpy(&word, bytes + index * sizeof(std::uint32_t), sizeof(word));
+        if ((word & proof.mask) != proof.value || (word & proof.stencil) != 0u) return false;
+    }
+    return true;
+}
+
+bool fullHtileWordsProve(std::span<const std::uint32_t> words, bool depthOnly, float clearDepth, VkImageAspectFlags aspects) {
+    return std::all_of(words.begin(), words.end(), [&](std::uint32_t word) { return htileProvesClear(word, depthOnly, clearDepth) && ((aspects & VK_IMAGE_ASPECT_STENCIL_BIT) == 0u || htileProvesStencilClear(word)); });
+}
+
+bool leanHtileProves(std::uint64_t address, std::size_t bytes, bool depthOnly, float clearDepth, VkImageAspectFlags aspects) {
+    const auto proof = htileClearProof(depthOnly, clearDepth, aspects);
+    const auto words = bytes / sizeof(std::uint32_t);
+    if (!depthCheckLeanVerifies()) return leanHtileWordsProve(reinterpret_cast<const std::uint8_t*>(address), words, proof);
+    std::vector<std::uint32_t> copy(words);
+    std::memcpy(copy.data(), reinterpret_cast<const void*>(address), words * sizeof(std::uint32_t));
+    const bool full = fullHtileWordsProve(copy, depthOnly, clearDepth, aspects);
+    noteDepthCheckLeanVerify("HTILE", address, bytes, leanHtileWordsProve(reinterpret_cast<const std::uint8_t*>(copy.data()), words, proof), full);
+    return full;
 }
 
 bool uniformPlaneTarget(const DepthTarget& target) {
@@ -931,7 +1064,13 @@ public:
             else Require(gpuFill || stencilStored || GuestMemory::StoredAllSince_nid_no_patch(plane.address, plane.bytes, stencilClearGeneration), "native multisample stencil plane fill has no complete tracked store");
             if (!queuedStencilFill && !stencilPlaneAliased) {
                 const auto* bytes = reinterpret_cast<const std::uint8_t*>(plane.address);
-                Require(std::all_of(bytes, bytes + plane.bytes, [&](std::uint8_t value) { return value == *stencilClearValue; }), "native multisample stencil plane does not hold its fill value");
+                const bool lean = depthCheckLean();
+                const auto scanStart = check.Now();
+                if (!lean) Require(std::all_of(bytes, bytes + plane.bytes, [&](std::uint8_t value) { return value == *stencilClearValue; }), "native multisample stencil plane does not hold its fill value");
+                else Require(leanStencilPlaneHolds(bytes, plane.bytes, *stencilClearValue), "native multisample stencil plane does not hold its fill value");
+                check.Scanned(DepthScan::Stencil, plane.bytes, lean, scanStart);
+            } else {
+                check.Scanned(DepthScan::StencilSkipped, 0u, false, check.Now());
             }
             const auto generation = GuestMemory::CollectWritesUncached(plane.address, plane.bytes);
             Require(GuestMemory::UnchangedSinceCollected(plane.address, plane.bytes, stencilClearGeneration), "CPU writes raced native multisample stencil plane fill");
@@ -955,12 +1094,17 @@ public:
             Require(clearDepth == 0.0f || clearDepth == 1.0f, "native multisample depth clear value is not implemented");
             auto current = sampling.initial;
             current[1].generation = GuestMemory::CollectWritesUncached(metadata.address, metadata.bytes);
-            std::vector<std::uint32_t> words(queuedFill ? 1u : metadata.bytes / sizeof(std::uint32_t), queuedFill ? *clearPattern : 0u);
-            if (!queuedFill) std::memcpy(words.data(), reinterpret_cast<const void*>(metadata.address), metadata.bytes);
-            for (const auto word : words) {
-                Require(htileProvesClear(word, target.htileDepthOnly, clearDepth), "native multisample depth completed HTILE does not prove its clear value");
-                Require((clearAspects & VK_IMAGE_ASPECT_STENCIL_BIT) == 0u || htileProvesStencilClear(word), "native multisample stencil completed HTILE does not prove its clear value");
+            const bool lean = !queuedFill && depthCheckLean();
+            const auto scanStart = check.Now();
+            if (!lean || !leanHtileProves(metadata.address, metadata.bytes, target.htileDepthOnly, clearDepth, clearAspects)) {
+                std::vector<std::uint32_t> words(queuedFill ? 1u : metadata.bytes / sizeof(std::uint32_t), queuedFill ? *clearPattern : 0u);
+                if (!queuedFill) std::memcpy(words.data(), reinterpret_cast<const void*>(metadata.address), metadata.bytes);
+                for (const auto word : words) {
+                    Require(htileProvesClear(word, target.htileDepthOnly, clearDepth), "native multisample depth completed HTILE does not prove its clear value");
+                    Require((clearAspects & VK_IMAGE_ASPECT_STENCIL_BIT) == 0u || htileProvesStencilClear(word), "native multisample stencil completed HTILE does not prove its clear value");
+                }
             }
+            check.Scanned(queuedFill ? DepthScan::HtileQueued : DepthScan::Htile, queuedFill ? 1u : metadata.bytes / sizeof(std::uint32_t), lean, scanStart);
             for (const auto& range : current) GuestMemory::CollectWritesUncached(range.address, range.bytes);
             Require(GuestMemory::UnchangedSinceAll(current), "guest writes raced native multisample depth clear");
             Require(GuestMemory::UnchangedSinceCollected(metadata.address, metadata.bytes, clearGeneration), "CPU writes raced native multisample depth clear");
@@ -3523,12 +3667,24 @@ std::string TakeDepthCheckText() {
     const auto nanoseconds = counts.nanoseconds.exchange(0, std::memory_order_relaxed);
     const auto syncNanoseconds = counts.syncNanoseconds.exchange(0, std::memory_order_relaxed);
     const auto collectNanoseconds = counts.collectNanoseconds.exchange(0, std::memory_order_relaxed);
+    std::array<unsigned long long, static_cast<std::size_t>(DepthScan::Count)> scans{};
+    std::array<unsigned long long, static_cast<std::size_t>(DepthScan::Count)> scanned{};
+    std::array<unsigned long long, static_cast<std::size_t>(DepthScan::Count)> scanNanoseconds{};
+    for (std::size_t index = 0; index < scans.size(); ++index) {
+        scans[index] = counts.scans[index].exchange(0, std::memory_order_relaxed);
+        scanned[index] = counts.scanned[index].exchange(0, std::memory_order_relaxed);
+        scanNanoseconds[index] = counts.scanNanoseconds[index].exchange(0, std::memory_order_relaxed);
+    }
+    const auto leanScans = counts.leanScans.exchange(0, std::memory_order_relaxed);
     const auto at = [&](DepthCheck event) { return events[static_cast<std::size_t>(event)]; };
     const auto calls = at(DepthCheck::Calls);
     if (calls == 0) return {};
     char text[1024];
     std::snprintf(text, sizeof(text), "%llu calls (%.1f us each), %llu with work: fill-note searches %llu, publication syncs %llu, pending-write syncs %llu (over depth %llu, HTILE %llu, stencil %llu; newest writer: %s), alias checks %llu, stencil clear completions %llu, depth clear completions %llu; HTILE store pending that is not the clear fill %llu (writer: %s); %llu range collects (%.1f us); syncs %.1f us", calls, static_cast<double>(nanoseconds) / 1e3 / static_cast<double>(calls), at(DepthCheck::Worked), at(DepthCheck::FillNotes), at(DepthCheck::PublicationSync), at(DepthCheck::PendingSync), at(DepthCheck::PendingDepth), at(DepthCheck::PendingHtile), at(DepthCheck::PendingStencil), pendingWriters.c_str(), at(DepthCheck::Alias), at(DepthCheck::StencilClear), at(DepthCheck::DepthClear), at(DepthCheck::HtileStore), htileWriters.c_str(), static_cast<unsigned long long>(collects), static_cast<double>(collectNanoseconds) / 1e3, static_cast<double>(syncNanoseconds) / 1e3);
-    return text;
+    const auto scan = [](DepthScan kind) { return static_cast<std::size_t>(kind); };
+    char scanText[512];
+    std::snprintf(scanText, sizeof(scanText), "; content scans: stencil plane %llu over %.1f KiB (%.1f us), not scanned %llu; HTILE %llu over %llu words (%.1f us), queued fill %llu; lean %llu; lean verify since start %llu checked, %llu differing", scans[scan(DepthScan::Stencil)], static_cast<double>(scanned[scan(DepthScan::Stencil)]) / 1024.0, static_cast<double>(scanNanoseconds[scan(DepthScan::Stencil)]) / 1e3, scans[scan(DepthScan::StencilSkipped)], scans[scan(DepthScan::Htile)], scanned[scan(DepthScan::Htile)], static_cast<double>(scanNanoseconds[scan(DepthScan::Htile)]) / 1e3, scans[scan(DepthScan::HtileQueued)], static_cast<unsigned long long>(leanScans), static_cast<unsigned long long>(depthCheckLeanVerify().checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(depthCheckLeanVerify().differing.load(std::memory_order_relaxed)));
+    return std::string(text) + scanText;
 }
 
 void NoteHtileWriter_nid_no_patch(const char* kind, std::uint64_t program, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes) {
