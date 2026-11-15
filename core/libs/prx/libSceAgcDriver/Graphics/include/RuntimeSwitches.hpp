@@ -217,6 +217,8 @@ enum class RuntimeSwitch : std::size_t {
     UnlockedStamps,
     WriteSnapshotFronts,
     PendingFronts,
+    InvocationSlotsWide,
+    XpSkipDispatches,
     Count,
 };
 

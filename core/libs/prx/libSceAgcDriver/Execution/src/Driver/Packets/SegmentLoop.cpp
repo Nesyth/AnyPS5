@@ -856,6 +856,11 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
             index = next;
             continue;
         }
+        if ((opcode == 0x15u || opcode == 0x16u) && !predicated && LeanFront::SwitchSet(frontLatch, RuntimeSwitch::XpSkipDispatches)) {
+            recent.Record(cursor);
+            index = next;
+            continue;
+        }
         const bool verifyPacket = LeanFront::Due(frontLatch, LeanFront::Item::Packet);
         if constexpr (!Timers) {
             if (plainRegisters && !verifyPacket && !profilePackets && entry.Has(LeanPacket::Plain) && entry.Has(LeanPacket::KeepsFinisher) && entry.pipeline == LeanPacket::Pipeline::Keeps && !entry.Has(LeanPacket::IndirectRegisters) && (opcode == 0x69 || opcode == 0x76 || opcode == 0x79) && !run.gate.everyPacket && deferredLabels().labels.empty()) {
