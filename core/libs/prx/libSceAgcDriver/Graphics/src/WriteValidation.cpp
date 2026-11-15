@@ -19,6 +19,11 @@
 
 namespace AgcDriver::Graphics::WriteValidation {
 
+bool FinisherSide() {
+    static const bool on = std::getenv("APS5_WRITE_VALIDATION_FINISHER") != nullptr;
+    return on;
+}
+
 namespace Detail {
 
 std::atomic<std::uint64_t> session{Unlatched};

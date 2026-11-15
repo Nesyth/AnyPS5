@@ -465,7 +465,7 @@ void noteDeepSiteWait(DeepSite site, bool job) {
 }
 
 void raiseQueued(Graphics::WriteValidation::Source source, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes) {
-    if (writes.empty() || Graphics::WriteValidation::Session() == 0) return;
+    if (writes.empty() || Graphics::WriteValidation::Session() == 0 || !Graphics::WriteValidation::FinisherSide()) return;
     for (const auto& [begin, end] : writes) Graphics::WriteValidation::Raise(Graphics::WriteValidation::Class::Q, source, begin, end);
 }
 
@@ -2091,7 +2091,7 @@ void DrawFinisher::FlushOpenRun() {
 }
 
 void DrawFinisher::HoldOpenRunWrite(const Range& range) {
-    const Graphics::WriteValidation::RaiseScope raised(Graphics::WriteValidation::Class::Q, Graphics::WriteValidation::Source::RunWrite, range.first, range.second);
+    const Graphics::WriteValidation::RaiseScope raised(Graphics::WriteValidation::Class::Q, Graphics::WriteValidation::Source::RunWrite, range.first, Graphics::WriteValidation::FinisherSide() ? range.second : range.first);
     if (deepRing.load(std::memory_order_relaxed)) {
         deepWrites->Insert({&range, 1}, nextSeq, frontSeq.load(std::memory_order_acquire));
         openRunWrites.push_back(range);

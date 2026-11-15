@@ -4086,7 +4086,7 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
     const bool snapshotTrusted = trusted();
     resolved.serialed = !snapshotTrusted && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SettleSerial);
     if (resolved.serialed) resolved.beforeSerial = Graphics::Recorder::PublishGeneration();
-    resolved.wvSession = Validation::Session();
+    resolved.wvSession = Validation::FinisherSide() ? Validation::Session() : 0;
     if (resolved.wvSession != 0) Validation::Note(Validation::Test::PendingSnapshot, Validation::Outcome::Kept);
     if (snapshotTrusted) resolved.before.reset();
     else resolved.before = Graphics::Recorder::PendingWriteSnapshot();

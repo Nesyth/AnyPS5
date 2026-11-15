@@ -78,6 +78,8 @@ void RaiseAll(Class kind, Source source);
 std::uint64_t Latch();
 void Relatch();
 
+bool FinisherSide();
+
 inline std::uint64_t Session() {
     const auto value = Detail::session.load(std::memory_order_seq_cst);
     return value != Unlatched ? value : Latch();
