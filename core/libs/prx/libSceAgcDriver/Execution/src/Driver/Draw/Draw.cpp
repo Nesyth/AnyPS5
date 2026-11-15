@@ -272,6 +272,31 @@ void noteHeld(HeldReason reason) {
     std::fprintf(stderr, "[finisher-held] held draws' writes:%s\n", text.c_str());
 }
 
+template <typename Program>
+void noteHeldProgram(const Program& program) {
+    static const bool profile = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!profile) return;
+    static std::mutex mutex;
+    static std::map<std::uint32_t, std::uint64_t> causes;
+    static std::uint64_t total = 0;
+    std::uint32_t cause = 0xfffffffdu;
+    if (program.snapshot != nullptr) {
+        cause = ProgramWriteCause(*program.snapshot, program.codeOffset);
+        if (cause == 0 && program.tailContinuation != nullptr) cause = 0x80000000u | ProgramWriteCause(*program.tailContinuation, 0);
+    }
+    std::lock_guard lock(mutex);
+    ++causes[cause];
+    if (++total % 4096u != 0) return;
+    std::string text;
+    for (const auto& [key, count] : causes) {
+        char item[48];
+        std::snprintf(item, sizeof(item), " 0x%08x x%llu", key, static_cast<unsigned long long>(count));
+        text += item;
+    }
+    std::fprintf(stderr, "[finisher-held] programs counted as writing memory, by the first such instruction (family << 16 | opcode; 0xffffffff decode failed, 0xfffffffe offset past the code, 0xfffffffd no snapshot, 0x8... found in the continuation):%s\n", text.c_str());
+    causes.clear();
+}
+
 std::optional<HeldReason> writesBeyondTargets(const ShaderRecompiler::RecompileResult& compiled) {
     using Role = ShaderRecompiler::DescriptorRole;
     for (const auto& binding : compiled.bindings) {
@@ -312,6 +337,7 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
             const auto& program = (*tail.programs)[i];
             if (!candidates && program.snapshot != nullptr && !ProgramWritesMemory(*program.snapshot, program.codeOffset) && (program.tailContinuation == nullptr || !ProgramWritesMemory(*program.tailContinuation, 0))) continue;
             if (!candidates) {
+                noteHeldProgram(program);
                 const auto stage = (*tail.programs)[i].binary.stage;
                 noteHeld(stage == ShaderRecompiler::ShaderStage::Fragment ? HeldReason::NullFragment : stage == ShaderRecompiler::ShaderStage::Vertex ? HeldReason::NullVertex : HeldReason::NullOther);
                 return held;

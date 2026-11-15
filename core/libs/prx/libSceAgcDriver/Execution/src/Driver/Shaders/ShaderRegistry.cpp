@@ -444,6 +444,36 @@ bool decodedWritesMemory(std::span<const std::uint32_t> code) {
 
 }
 
+std::uint32_t ProgramWriteCause(const ShaderSnapshot& snapshot, std::size_t codeOffset) {
+    using Family = ShaderRecompiler::RdnaInstructionFamily;
+    using Op = ShaderRecompiler::RdnaOpcode;
+    if (codeOffset > snapshot.code.size()) return 0xfffffffeu;
+    try {
+        const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(std::span(snapshot.code).subspan(codeOffset));
+        for (const auto& instruction : decoded.instructions) {
+            bool writes = false;
+            switch (instruction.family) {
+            case Family::MUBUF: case Family::MTBUF: case Family::FLAT: case Family::MIMG: case Family::SMEM:
+                writes = !readOnlyMemoryOp(instruction.op);
+                break;
+            case Family::DS:
+                writes = decodedWritesMemory(std::span(snapshot.code).subspan(codeOffset));
+                break;
+            case Family::Unknown:
+                writes = true;
+                break;
+            default:
+                writes = instruction.op == Op::SSetpcB64 || instruction.op == Op::SSwappcB64 || instruction.op == Op::SRfeB64;
+                break;
+            }
+            if (writes) return (static_cast<std::uint32_t>(instruction.family) << 16u) | (static_cast<std::uint32_t>(instruction.op) & 0xffffu);
+        }
+    } catch (const std::exception&) {
+        return 0xffffffffu;
+    }
+    return 0;
+}
+
 bool ProgramWritesMemory(const ShaderSnapshot& snapshot, std::size_t codeOffset) {
     constexpr std::uint8_t Unknown = 0, Reads = 1, Writes = 2;
     if (codeOffset == 0) {
