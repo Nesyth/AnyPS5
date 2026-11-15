@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -169,19 +170,24 @@ void Expect(const std::uint32_t* input, const std::uint32_t* output, std::uint32
 }
 
 struct Step {
-    std::uint64_t checked, exact, moved, refused, rebuilt, kept, served;
+    std::uint64_t checked, exact, moved, refused, rebuilt, kept, served, placed, unplaced;
 };
 
 Step Since(const AgcDriver::VulkanDevice::DispatchMoveCount& before) {
     const auto now = AgcDriver::VulkanDevice::DispatchMoveCounts();
-    return {now.checked - before.checked, now.exact - before.exact, now.moved - before.moved, now.refused - before.refused, now.rebuilt - before.rebuilt, now.kept - before.kept, now.served - before.served};
+    return {now.checked - before.checked, now.exact - before.exact, now.moved - before.moved, now.refused - before.refused, now.rebuilt - before.rebuilt, now.kept - before.kept, now.served - before.served, now.placed - before.placed, now.unplaced - before.unplaced};
 }
 
 void Print(const char* what, const Step& step) {
     std::printf("dispatch move: %s: checked %llu, exact %llu, moved %llu, refused %llu\n", what, static_cast<unsigned long long>(step.checked), static_cast<unsigned long long>(step.exact), static_cast<unsigned long long>(step.moved), static_cast<unsigned long long>(step.refused));
 }
 
+void PrintPlacements(const char* what, const Step& step) {
+    std::printf("dispatch move: %s: inputs behind a pending write bound in place %llu, refused in place %llu\n", what, static_cast<unsigned long long>(step.placed), static_cast<unsigned long long>(step.unplaced));
+}
+
 bool RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
+    const bool lean = AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::DispatchCommitLean);
     Fill(guest.InputA(), 0xa000u);
     Fill(guest.InputB(), 0xb000u);
     Fill(guest.InputC(), 0xc000u);
@@ -206,6 +212,7 @@ bool RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
     const bool templates = repeats.checked != 0;
     if (templates) {
         Require(repeats.exact == 1 && repeats.moved == 2 && repeats.refused == 0, "dispatch move: the repeats were not served as one exact hit and two moved ones");
+        Require(repeats.placed == 0 && repeats.unplaced == 0, "dispatch move: an input with no pending write over it was taken for one behind a pending write");
     } else {
         std::puts("dispatch move: the device kept no template (no host imports); the moved-buffer path is not exercised");
     }
@@ -236,9 +243,16 @@ bool RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
     Expect(guest.InputA(), guest.OutputO(), 2u * Constant, "an input moved onto a range a recorded dispatch still writes");
     const auto refused = Since(refusals);
     Print("two inputs moved onto written ranges", refused);
-    if (templates) {
+    if (lean) PrintPlacements("two inputs moved onto written ranges", refused);
+    if (!lean) Require(refused.placed == 0 && refused.unplaced == 0, "dispatch move: an input behind a pending write was bound or refused in place without APS5_DISPATCH_COMMIT_LEAN");
+    if (templates && !lean) {
         Require(refused.refused == 2, "dispatch move: the inputs moved onto written ranges were not both refused");
         Require(refused.rebuilt == 2 && refused.kept == 2 && refused.served == 0, "dispatch move: the two refusals were not two rebuilds inserted beside the template");
+    }
+    if (templates && lean) {
+        Require(refused.placed + refused.unplaced == 1, "dispatch move: the input moved onto a range a recorded dispatch still writes was neither bound in place nor refused in place");
+        Require(refused.refused == 1 + refused.unplaced && refused.moved == refused.placed, "dispatch move: the input moved into its own output's unwritten half was not refused, or the one behind a recorded write was not served as its placement says");
+        Require(refused.rebuilt == refused.refused && refused.kept == refused.refused && refused.served == 0, "dispatch move: the refusals were not rebuilds inserted beside the template");
     }
 
     const auto afterRefusals = AgcDriver::VulkanDevice::DispatchMoveCounts();
@@ -261,7 +275,9 @@ bool RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
         Expect(guest.InputA(), guest.OutputO(), Constant, "the input at A after the refused one");
         const auto step = Since(alternating);
         Print("A alternating with a refused input", step);
-        if (templates) Require(step.refused == 1 && step.served == 1 && step.rebuilt == 0 && step.exact == 2 && step.moved == 0, "dispatch move: a refused input rebuilt, or evicted the template of A, while A alternated with it");
+        if (lean) PrintPlacements("A alternating with a refused input", step);
+        if (templates && !lean) Require(step.refused == 1 && step.served == 1 && step.rebuilt == 0 && step.exact == 2 && step.moved == 0, "dispatch move: a refused input rebuilt, or evicted the template of A, while A alternated with it");
+        if (templates && lean) Require(step.placed + step.unplaced == 1 && step.refused == step.unplaced && step.served == step.unplaced && step.moved == step.placed && step.rebuilt == 0 && step.exact == 2, "dispatch move: an input behind a recorded write was neither bound in place nor served by its earlier rebuild, or evicted the template of A, while A alternated with it");
     }
     const auto total = AgcDriver::VulkanDevice::DispatchMoveCounts();
     std::printf("dispatch move: in total: checked %llu, exact %llu, moved %llu, refused %llu, dropped by stage A %llu\n", static_cast<unsigned long long>(total.checked), static_cast<unsigned long long>(total.exact), static_cast<unsigned long long>(total.moved), static_cast<unsigned long long>(total.refused), static_cast<unsigned long long>(total.filtered));

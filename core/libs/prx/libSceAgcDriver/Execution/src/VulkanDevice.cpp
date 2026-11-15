@@ -5657,6 +5657,7 @@ constexpr std::size_t MoveRefusals = static_cast<std::size_t>(Graphics::ShaderRe
 struct DispatchMoveCounters {
     std::atomic<std::uint64_t> checked{0}, exact{0}, moved{0}, buffers{0}, bytes{0};
     std::atomic<std::uint64_t> rebuilt{0}, kept{0}, served{0};
+    std::atomic<std::uint64_t> placed{0}, unplaced{0};
     std::array<std::atomic<std::uint64_t>, 5> sizes{};
     std::array<std::atomic<std::uint64_t>, MoveRefusals> refused{};
     std::array<std::atomic<std::uint64_t>, MoveRefusals> filtered{};
@@ -6027,6 +6028,14 @@ void NoteReadsInPlace(const Graphics::ShaderResources::MoveProof& proof, bool pl
     census.readsRefused[proof.guarded ? MovedCounts : static_cast<std::size_t>(proof.inPlace)].fetch_add(1, std::memory_order_relaxed);
 }
 
+void NoteDispatchPlacement(const Graphics::ShaderResources::MoveProof& proof, bool placed) {
+    if (placed) {
+        if (proof.readsInPlace != 0) DispatchMoves().placed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (proof.refusal == Graphics::ShaderResources::MoveRefusal::Overlap && proof.overlap == 2 && (proof.guarded || proof.inPlace != Graphics::ShaderResources::MovedCount::Count)) DispatchMoves().unplaced.fetch_add(1, std::memory_order_relaxed);
+}
+
 void ReportCommitCensus() {
     auto& census = CommitCounts();
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -6386,7 +6395,7 @@ void verifyMovedWrites(const RecordedDispatch& record) {
     if (checked % 4096 == 0) std::fprintf(stderr, "[dispatch-moved-writes-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(verify.differing.load(std::memory_order_relaxed)));
 }
 
-void verifyCommitLean(const RecordedDispatch& record) {
+void verifyCommitLean(const RecordedDispatch& record, const Graphics::Recorder& recorder) {
     static const std::uint64_t every = VerifyEvery("APS5_VERIFY_DISPATCH_COMMIT_LEAN");
     if (every == 0 || !record.lean || record.resources == nullptr || record.shader == nullptr) return;
     static std::atomic<std::uint64_t> seen{0}, checked{0}, differing{0}, printed{0};
@@ -6395,6 +6404,9 @@ void verifyCommitLean(const RecordedDispatch& record) {
     try {
         const auto& moves = record.moved.empty() ? record.readMoves : record.moved;
         if (record.bindings == nullptr || !moves.empty()) differences = record.resources->VerifyMovedWrites(*record.shader, moves);
+        if (std::ranges::any_of(record.moved, [](const Graphics::ShaderResources::MovedBuffer& entry) { return entry.inPlace != VK_NULL_HANDLE && !entry.written; })) {
+            for (auto& text : record.resources->VerifyInPlaceReads(record.moved, recorder)) differences.push_back(std::move(text));
+        }
         if (record.key != nullptr) {
             const bool writes = MovedWritesKey(*record.key);
             const bool beside = BesideKey(*record.key);
@@ -6469,7 +6481,7 @@ VkDevice VulkanDevice::Device() const {
 
 VulkanDevice::DispatchMoveCount VulkanDevice::DispatchMoveCounts() {
     auto& moves = DispatchMoves();
-    DispatchMoveCount count{moves.checked.load(), moves.exact.load(), moves.moved.load(), 0, 0, moves.rebuilt.load(), moves.kept.load(), moves.served.load()};
+    DispatchMoveCount count{moves.checked.load(), moves.exact.load(), moves.moved.load(), 0, 0, moves.rebuilt.load(), moves.kept.load(), moves.served.load(), moves.placed.load(), moves.unplaced.load()};
     for (std::size_t i = 1; i < MoveRefusals; ++i) {
         count.refused += moves.refused[i].load();
         count.filtered += moves.filtered[i].load();
@@ -7285,7 +7297,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         Graphics::NoteHtileWriter_nid_no_patch(record.htileClear.has_value() ? "recognised HTILE clear dispatch" : "dispatch", record.programAddress, resources.GpuWrites());
     }
     verifyMovedWrites(record);
-    verifyCommitLean(record);
+    verifyCommitLean(record, recorder);
     if (record.htileClear.has_value()) {
         Graphics::QueueHtileDepthClear(record.htileClear->first, record.htileClear->second);
         const Graphics::Recorder::WriterScope writerScope{Graphics::Recorder::WriterTag(8)};
@@ -7653,6 +7665,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                         recordRefusal = proof.refusal;
                         recordOverlap = proof.overlap;
                         NoteReadsInPlace(proof, false, false);
+                        NoteDispatchPlacement(proof, false);
                     } else if (moved->empty()) {
                         moves.exact.fetch_add(1, std::memory_order_relaxed);
                     } else {
@@ -7661,6 +7674,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                         moves.bytes.fetch_add(proof.bytes, std::memory_order_relaxed);
                         noteDispatchMoveSize(proof.bytes);
                         NoteReadsInPlace(proof, true, false);
+                        NoteDispatchPlacement(proof, true);
                         if (proof.readsInPlace != 0) leanRecord = true;
                         if (proof.written != 0 || proof.readsInPlace != 0) movedList = std::move(*moved);
                         else if (DispatchMovedWritesOn()) readMoveList = std::move(*moved);

@@ -9361,6 +9361,11 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedD
             proof.inPlace = why;
             return false;
         }
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> span{{{begin, begin + bytes}}};
+        if (StorageTexture::AnyPendingOverlaps(span)) {
+            proof.inPlace = MovedCount::InPlaceStorage;
+            return false;
+        }
         const auto* import = HostImportFor(context, begin, bytes);
         if (import == nullptr) {
             proof.inPlace = MovedCount::NoImport;
@@ -9613,6 +9618,60 @@ std::vector<std::string> ShaderResources::VerifyMovedWrites(const CompiledShader
         const auto& item = allocations[entry.allocation];
         const std::pair<std::uint64_t, std::uint64_t> old{item.address, item.address + item.size};
         if (std::find(expected.begin(), expected.end(), old) == expected.end() && std::find(writes.begin(), writes.end(), old) != writes.end()) note("old range still written", 0, static_cast<std::uint32_t>(entry.allocation), old.first, old.second, 0, 0);
+    }
+    return differences;
+}
+
+std::vector<std::string> ShaderResources::VerifyInPlaceReads(std::span<const MovedBuffer> moved, const Recorder& recorder) const {
+    std::vector<std::string> differences;
+    const auto note = [&](const char* what, const MovedBuffer& entry, std::uint64_t recorded, std::uint64_t fresh) {
+        char text[256];
+        std::snprintf(text, sizeof(text), "read-only buffer 0x%llx+0x%llx bound in place: %s, recorded 0x%llx, a fresh build 0x%llx", static_cast<unsigned long long>(entry.address), static_cast<unsigned long long>(entry.size), what, static_cast<unsigned long long>(recorded), static_cast<unsigned long long>(fresh));
+        differences.emplace_back(text);
+    };
+    const auto premise = [&](const char* what, const char* detail, const MovedBuffer& entry) {
+        char text[256];
+        std::snprintf(text, sizeof(text), "read-only buffer 0x%llx+0x%llx bound in place: %s%s", static_cast<unsigned long long>(entry.address), static_cast<unsigned long long>(entry.size), what, detail);
+        differences.emplace_back(text);
+    };
+    const auto writes = MovedGpuWrites(moved);
+    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
+    for (const auto& entry : moved) {
+        if (entry.inPlace == VK_NULL_HANDLE || entry.written) continue;
+        if (entry.allocation >= allocations.size() || !allocations[entry.allocation].guest || allocations[entry.allocation].written) {
+            premise("not a read-only guest buffer of the template", "", entry);
+            continue;
+        }
+        const auto& item = allocations[entry.allocation];
+        const auto first = entry.address & ~std::uint64_t{3};
+        const auto last = first == entry.address ? entry.address + entry.size : (entry.address + entry.size + 3) & ~std::uint64_t{3};
+        const auto* import = ExistingHostImportFor(context, first, static_cast<std::size_t>(last - first));
+        if (import == nullptr) {
+            premise("no import serves the range a fresh build binds", "", entry);
+        } else {
+            const auto offset = HostImportOffset(*import, entry.address);
+            const auto adjustment = static_cast<std::uint32_t>(offset % alignment);
+            auto range = GuestBufferMemory::ViewBytes(entry.size, adjustment);
+            if (entry.size <= context.limits.maxStorageBufferRange) range = std::min<std::uint64_t>(range, context.limits.maxStorageBufferRange & ~std::uint64_t{3});
+            if (import->buffer != entry.inPlace) note("bound to another buffer than the import's, offsets", entry, entry.importOffset, offset - adjustment);
+            if (entry.importOffset != offset - adjustment) note("descriptor offset", entry, entry.importOffset, offset - adjustment);
+            if (entry.bytes != range) note("descriptor range", entry, entry.bytes, range);
+            if (item.adjustment != adjustment) note("view adjustment", entry, item.adjustment, adjustment);
+            if (entry.begin != entry.address - adjustment) note("view begin", entry, entry.begin, entry.address - adjustment);
+            if (entry.address - adjustment + range > import->base + import->bytes) note("view end past the import's end", entry, entry.address - adjustment + range, import->base + import->bytes);
+        }
+        bool ownImage = false;
+        for (std::size_t index = 0; index < storageTextures.size() && !ownImage; ++index) {
+            const auto& texture = storageTextures[index];
+            if (texture == nullptr || index >= storageWritten.size() || !storageWritten[index]) continue;
+            const auto base = texture->Descriptor().baseAddress;
+            ownImage = entry.begin < base + texture->GuestBytes() && base < entry.begin + entry.bytes;
+        }
+        if (const auto why = InPlaceRefusal(recorder, entry.begin, entry.bytes); why != MovedCount::Count && !(ownImage && why == MovedCount::InPlaceStorage)) premise("a fresh build would sync, flush or copy first: ", MovedCountName(why), entry);
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> span{{{entry.begin, entry.begin + entry.bytes}}};
+        if (!ownImage && StorageTexture::AnyPendingOverlaps(span)) premise("a fresh build would flush first: storage image results pending or being written back over the range", "", entry);
+        if (MayOverlapDepthGuards_nid_no_patch(entry.begin, entry.bytes) || MayOverlapMultisampleGuards(entry.begin, entry.bytes)) premise("a depth or multisample guard covers the range", "", entry);
+        if (std::ranges::any_of(writes, [&](const std::pair<std::uint64_t, std::uint64_t>& written) { return written.first < entry.begin + entry.bytes && entry.begin < written.second; })) premise("the dispatch writes the range it reads in place", "", entry);
     }
     return differences;
 }

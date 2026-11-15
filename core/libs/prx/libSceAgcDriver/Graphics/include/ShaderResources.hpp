@@ -697,6 +697,7 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> MovedGpuWrites(std::span<const MovedBuffer> moved) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> MovedInPlaceReads(std::span<const MovedBuffer> moved) const;
     std::vector<std::string> VerifyMovedWrites(const CompiledShader& shader, std::span<const MovedBuffer> moved) const;
+    std::vector<std::string> VerifyInPlaceReads(std::span<const MovedBuffer> moved, const Recorder& recorder) const;
     enum class NotReusable : std::uint8_t { None, HtileClear, CopiedWrites, LeaseOrTable, MultisampleSources, PerUseTextures, DataBuffers, NoImportSerial, Count };
     NotReusable NotReusableReason() const { return notReusable; }
     static std::size_t MaxDrawSnapshotBytes();
