@@ -3,13 +3,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
-#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTickets.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/LeanDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
-#include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -366,23 +364,6 @@ std::shared_ptr<DrawRecordHit> pooledHit(std::uint64_t device) {
         return slot;
     }
     return std::make_shared<DrawRecordHit>();
-}
-
-struct DraftStorage {};
-
-void recycleDraft(DrawRecordHit& draft) {
-    auto reads = std::move(draft.reads);
-    reads.clear();
-    recycleHit(draft);
-    draft.reads = std::move(reads);
-}
-
-DrawRecordHit& ticketDraft(TicketArena& arena) {
-    auto& draft = HostThreadLocal<DrawRecordHit, DraftStorage>();
-    recycleDraft(draft);
-    draft.moveSides = true;
-    arena.RefillBlob(draft.spareBuffers.blob);
-    return draft;
 }
 
 const Graphics::Recorder::WriteRanges* pendingSince(const DirectStages& resolved, std::shared_ptr<const Graphics::Recorder::WriteRanges>& held) {
@@ -963,7 +944,7 @@ std::uint64_t DirectStores::Follow(std::uint64_t serial) {
     auto live = Graphics::RuntimeSwitches::Snapshot();
     // Switches that change only what the committer does with a hit, or only dispatch packets,
     // leave the stages and classes as they are, so an in-run A/B of one keeps the stores.
-    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic, Graphics::RuntimeSwitch::CommitFragments, Graphics::RuntimeSwitch::ExpressCommits, Graphics::RuntimeSwitch::XpStreamSegments, Graphics::RuntimeSwitch::XpNoEagerStore, Graphics::RuntimeSwitch::LabelOrderedStores, Graphics::RuntimeSwitch::DeeperRing, Graphics::RuntimeSwitch::BesideSampleDumps, Graphics::RuntimeSwitch::DispatchBeside, Graphics::RuntimeSwitch::FaultFragments, Graphics::RuntimeSwitch::StageMemo, Graphics::RuntimeSwitch::KeepFaultSlots, Graphics::RuntimeSwitch::SiblingFinishers, Graphics::RuntimeSwitch::FastSettle, Graphics::RuntimeSwitch::XpSlowFinisher, Graphics::RuntimeSwitch::XpSlowCommitter, Graphics::RuntimeSwitch::XpSlowWorker, Graphics::RuntimeSwitch::XpExpressFloor, Graphics::RuntimeSwitch::LeanExpress, Graphics::RuntimeSwitch::XpAppendCommits, Graphics::RuntimeSwitch::PreciseSettle, Graphics::RuntimeSwitch::AppendCommits, Graphics::RuntimeSwitch::StageMemoPatchVertex, Graphics::RuntimeSwitch::StageMemoPatchBuffers, Graphics::RuntimeSwitch::StageMemoPatchData, Graphics::RuntimeSwitch::RunFollow, Graphics::RuntimeSwitch::TurnWaitsByJob, Graphics::RuntimeSwitch::ExpressKeepState, Graphics::RuntimeSwitch::StageMemoFront, Graphics::RuntimeSwitch::StageMemoAdmitThird, Graphics::RuntimeSwitch::CommitStamps, Graphics::RuntimeSwitch::PassReadsOnce, Graphics::RuntimeSwitch::ReapThrottle, Graphics::RuntimeSwitch::OcclusionWindows, Graphics::RuntimeSwitch::ExpressPassStamps, Graphics::RuntimeSwitch::PassBarriersMerged, Graphics::RuntimeSwitch::LabelReadbackMemo, Graphics::RuntimeSwitch::ExpressTargetUploads, Graphics::RuntimeSwitch::DrawRuns, Graphics::RuntimeSwitch::LargeBatches, Graphics::RuntimeSwitch::ReplayStateDedupe, Graphics::RuntimeSwitch::RunFollowNoCarry, Graphics::RuntimeSwitch::RunFollowPlainLoop, Graphics::RuntimeSwitch::FinisherParkSlots, Graphics::RuntimeSwitch::ListHooksOnce, Graphics::RuntimeSwitch::DispatchEnvOnce, Graphics::RuntimeSwitch::PlainRegisterPackets, Graphics::RuntimeSwitch::UserWordBlocks, Graphics::RuntimeSwitch::XpDeviceUploads, Graphics::RuntimeSwitch::XpDepthLayouts, Graphics::RuntimeSwitch::XpTargetRestarts, Graphics::RuntimeSwitch::TargetRestarts, Graphics::RuntimeSwitch::MovedInPlace, Graphics::RuntimeSwitch::IndirectInPass, Graphics::RuntimeSwitch::FragmentOwnSets, Graphics::RuntimeSwitch::DirectBuffersInPlace, Graphics::RuntimeSwitch::DirectGpuIndirect, Graphics::RuntimeSwitch::ExpressGpuIndirect, Graphics::RuntimeSwitch::RegisterRuns, Graphics::RuntimeSwitch::ListRegisterPackets, Graphics::RuntimeSwitch::PacketClassTable, Graphics::RuntimeSwitch::RangeMemo, Graphics::RuntimeSwitch::PendingIndexKept, Graphics::RuntimeSwitch::FillImageIndex, Graphics::RuntimeSwitch::WatchedReaps, Graphics::RuntimeSwitch::DeferredBatchStamps, Graphics::RuntimeSwitch::StageViews, Graphics::RuntimeSwitch::StageMemoLeanStores, Graphics::RuntimeSwitch::SettleSerial, Graphics::RuntimeSwitch::FragmentPlans, Graphics::RuntimeSwitch::BufferBlobAppend, Graphics::RuntimeSwitch::ShapePrologue, Graphics::RuntimeSwitch::DirectHandoff, Graphics::RuntimeSwitch::InputsMemo, Graphics::RuntimeSwitch::WorkerHelps, Graphics::RuntimeSwitch::DispatchMovedWrites, Graphics::RuntimeSwitch::DispatchRelocate, Graphics::RuntimeSwitch::DispatchMovedRecipes, Graphics::RuntimeSwitch::StageMemoPatchMerged, Graphics::RuntimeSwitch::StageMemoChained, Graphics::RuntimeSwitch::StageMemoAdmitWays, Graphics::RuntimeSwitch::StageMemoInvocationWays, Graphics::RuntimeSwitch::ImportSnapshots, Graphics::RuntimeSwitch::FollowWindows, Graphics::RuntimeSwitch::KeepBindingsMoved, Graphics::RuntimeSwitch::FollowWider, Graphics::RuntimeSwitch::ExpressDepthIntent, Graphics::RuntimeSwitch::LazyInPlaceImports, Graphics::RuntimeSwitch::PreparedCapacity, Graphics::RuntimeSwitch::MergedSettle, Graphics::RuntimeSwitch::IdleHitRelease, Graphics::RuntimeSwitch::FragmentParkedSets, Graphics::RuntimeSwitch::UnlockedStamps, Graphics::RuntimeSwitch::WriteSnapshotFronts, Graphics::RuntimeSwitch::PendingFronts, Graphics::RuntimeSwitch::InvocationSlotsWide, Graphics::RuntimeSwitch::DrawTickets, Graphics::RuntimeSwitch::TicketPrefetch}) live.Assign(id, false);
+    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic, Graphics::RuntimeSwitch::CommitFragments, Graphics::RuntimeSwitch::ExpressCommits, Graphics::RuntimeSwitch::XpStreamSegments, Graphics::RuntimeSwitch::XpNoEagerStore, Graphics::RuntimeSwitch::LabelOrderedStores, Graphics::RuntimeSwitch::DeeperRing, Graphics::RuntimeSwitch::BesideSampleDumps, Graphics::RuntimeSwitch::DispatchBeside, Graphics::RuntimeSwitch::FaultFragments, Graphics::RuntimeSwitch::StageMemo, Graphics::RuntimeSwitch::KeepFaultSlots, Graphics::RuntimeSwitch::SiblingFinishers, Graphics::RuntimeSwitch::FastSettle, Graphics::RuntimeSwitch::XpSlowFinisher, Graphics::RuntimeSwitch::XpSlowCommitter, Graphics::RuntimeSwitch::XpSlowWorker, Graphics::RuntimeSwitch::XpExpressFloor, Graphics::RuntimeSwitch::LeanExpress, Graphics::RuntimeSwitch::XpAppendCommits, Graphics::RuntimeSwitch::PreciseSettle, Graphics::RuntimeSwitch::AppendCommits, Graphics::RuntimeSwitch::StageMemoPatchVertex, Graphics::RuntimeSwitch::StageMemoPatchBuffers, Graphics::RuntimeSwitch::StageMemoPatchData, Graphics::RuntimeSwitch::RunFollow, Graphics::RuntimeSwitch::TurnWaitsByJob, Graphics::RuntimeSwitch::ExpressKeepState, Graphics::RuntimeSwitch::StageMemoFront, Graphics::RuntimeSwitch::StageMemoAdmitThird, Graphics::RuntimeSwitch::CommitStamps, Graphics::RuntimeSwitch::PassReadsOnce, Graphics::RuntimeSwitch::ReapThrottle, Graphics::RuntimeSwitch::OcclusionWindows, Graphics::RuntimeSwitch::ExpressPassStamps, Graphics::RuntimeSwitch::PassBarriersMerged, Graphics::RuntimeSwitch::LabelReadbackMemo, Graphics::RuntimeSwitch::ExpressTargetUploads, Graphics::RuntimeSwitch::DrawRuns, Graphics::RuntimeSwitch::LargeBatches, Graphics::RuntimeSwitch::ReplayStateDedupe, Graphics::RuntimeSwitch::RunFollowNoCarry, Graphics::RuntimeSwitch::RunFollowPlainLoop, Graphics::RuntimeSwitch::FinisherParkSlots, Graphics::RuntimeSwitch::ListHooksOnce, Graphics::RuntimeSwitch::DispatchEnvOnce, Graphics::RuntimeSwitch::PlainRegisterPackets, Graphics::RuntimeSwitch::UserWordBlocks, Graphics::RuntimeSwitch::XpDeviceUploads, Graphics::RuntimeSwitch::XpDepthLayouts, Graphics::RuntimeSwitch::XpTargetRestarts, Graphics::RuntimeSwitch::TargetRestarts, Graphics::RuntimeSwitch::MovedInPlace, Graphics::RuntimeSwitch::IndirectInPass, Graphics::RuntimeSwitch::FragmentOwnSets, Graphics::RuntimeSwitch::DirectBuffersInPlace, Graphics::RuntimeSwitch::DirectGpuIndirect, Graphics::RuntimeSwitch::ExpressGpuIndirect, Graphics::RuntimeSwitch::RegisterRuns, Graphics::RuntimeSwitch::ListRegisterPackets, Graphics::RuntimeSwitch::PacketClassTable, Graphics::RuntimeSwitch::RangeMemo, Graphics::RuntimeSwitch::PendingIndexKept, Graphics::RuntimeSwitch::FillImageIndex, Graphics::RuntimeSwitch::WatchedReaps, Graphics::RuntimeSwitch::DeferredBatchStamps, Graphics::RuntimeSwitch::StageViews, Graphics::RuntimeSwitch::StageMemoLeanStores, Graphics::RuntimeSwitch::SettleSerial, Graphics::RuntimeSwitch::FragmentPlans, Graphics::RuntimeSwitch::BufferBlobAppend, Graphics::RuntimeSwitch::ShapePrologue, Graphics::RuntimeSwitch::DirectHandoff, Graphics::RuntimeSwitch::InputsMemo, Graphics::RuntimeSwitch::WorkerHelps, Graphics::RuntimeSwitch::DispatchMovedWrites, Graphics::RuntimeSwitch::DispatchRelocate, Graphics::RuntimeSwitch::DispatchMovedRecipes, Graphics::RuntimeSwitch::StageMemoPatchMerged, Graphics::RuntimeSwitch::StageMemoChained, Graphics::RuntimeSwitch::StageMemoAdmitWays, Graphics::RuntimeSwitch::StageMemoInvocationWays, Graphics::RuntimeSwitch::ImportSnapshots, Graphics::RuntimeSwitch::FollowWindows, Graphics::RuntimeSwitch::KeepBindingsMoved, Graphics::RuntimeSwitch::FollowWider, Graphics::RuntimeSwitch::ExpressDepthIntent, Graphics::RuntimeSwitch::LazyInPlaceImports, Graphics::RuntimeSwitch::PreparedCapacity, Graphics::RuntimeSwitch::MergedSettle, Graphics::RuntimeSwitch::IdleHitRelease, Graphics::RuntimeSwitch::FragmentParkedSets, Graphics::RuntimeSwitch::UnlockedStamps, Graphics::RuntimeSwitch::WriteSnapshotFronts, Graphics::RuntimeSwitch::PendingFronts, Graphics::RuntimeSwitch::InvocationSlotsWide}) live.Assign(id, false);
     if (!tagged || deviceSerial != serial || !(live == switches)) {
         tagged = true;
         deviceSerial = serial;
@@ -997,13 +978,6 @@ void DirectStepClock::Report() const {
     for (std::size_t index = 0; index < nanoseconds.size(); ++index) {
         if (reached[index]) DirectDraws::AddStep(static_cast<Step>(index), nanoseconds[index]);
     }
-    if (formatted && DirectDraws::FormatLaps()) DirectDraws::AddFormatDraw(format, nanoseconds.data(), reached.data(), allocations.data(), frees.data(), noted == 7u);
-}
-
-void DirectStepClock::NoteAllocations(std::size_t at) {
-    if (at >= allocations.size() || !DirectDraws::JobAllocations()) return;
-    AgcDriver::HostAllocationCounts(allocations[at], frees[at]);
-    noted = static_cast<std::uint8_t>(noted | (1u << at));
 }
 
 namespace {
@@ -3421,14 +3395,8 @@ std::optional<Counter> Driver::assembleDirectHit(const LeanDrawJob& job, DirectS
         auto& stage = resolved.stages[i];
         const auto* side = stage.sideView;
         if (side == nullptr) {
-            if (hit.moveSides) {
-                std::swap(hit.sides[i], stage.side);
-                RefillTicketSide(stage.side);
-            } else if (hit.pooled) {
-                hit.sides[i] = stage.side;
-            } else {
-                hit.sides[i] = std::move(stage.side);
-            }
+            if (hit.pooled) hit.sides[i] = stage.side;
+            else hit.sides[i] = std::move(stage.side);
             side = &hit.sides[i];
         }
         entryReads = entryReads && stage.sideView != nullptr && stage.memo != nullptr && static_cast<const StageMemoEntry*>(stage.memo)->viewable;
@@ -3458,8 +3426,7 @@ std::optional<Counter> Driver::assembleDirectHit(const LeanDrawJob& job, DirectS
         hit.parameters.firstInstance = offset;
     }
     if (entryReads) {
-        if (hit.moveSides) QueuedDrawReadRangesInto(hit.parameters, {}, hit.reads);
-        else hit.reads = QueuedDrawReadRanges(hit.parameters, {});
+        hit.reads = QueuedDrawReadRanges(hit.parameters, {});
         for (const auto& stage : resolved.stages) {
             const auto& held = static_cast<const StageMemoEntry*>(stage.memo)->bufferReads;
             hit.reads.insert(hit.reads.end(), held.begin(), held.end());
@@ -3467,8 +3434,6 @@ std::optional<Counter> Driver::assembleDirectHit(const LeanDrawJob& job, DirectS
         const auto& attributes = static_cast<const StageMemoEntry*>(resolved.stages.front().memo)->attributeReads;
         hit.reads.insert(hit.reads.end(), attributes.begin(), attributes.end());
         DirectDraws::Add(Counter::StageViewReads);
-    } else if (hit.moveSides) {
-        QueuedDrawReadRangesInto(hit.parameters, hit.stages, hit.reads);
     } else {
         hit.reads = QueuedDrawReadRanges(hit.parameters, hit.stages);
     }
@@ -3567,15 +3532,11 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
     const auto lap = [&](Step step) {
         if (timer != nullptr) timer->Lap(step);
     };
-    if (timer != nullptr) timer->NoteAllocations(0);
     std::optional<Counter> reason;
     DirectClassKey key;
     std::uint64_t probe = 0;
     std::shared_ptr<const DirectClass> found;
     std::shared_ptr<DrawRecordHit> hit;
-    DrawRecordHit* current = nullptr;
-    TicketArena* arena = nullptr;
-    bool ticketsOn = false;
     try {
         reason = resolveDirectStages(job, anchor, resolved, timer);
         for (std::uint32_t again = 0; again < 2u && reason == Counter::FallbackUnsettled && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectRetry); ++again) reason = resolveDirectStages(job, anchor, resolved, timer);
@@ -3589,17 +3550,9 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
             else if (found != nullptr && found->record->vertexLayout != resolved.vertexLayout) found = nullptr;
             lap(Step::Class);
         }
-        if (timer != nullptr) timer->NoteAllocations(1);
         if (!reason) {
-            ticketsOn = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DrawTickets);
-            if (ticketsOn && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PooledHits)) arena = TicketArena::ForThread();
-            if (arena != nullptr) {
-                current = &ticketDraft(*arena);
-            } else {
-                hit = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PooledHits) ? pooledHit(job.deviceSerial) : std::make_shared<DrawRecordHit>();
-                current = hit.get();
-            }
-            reason = assembleDirectHit(job, resolved, *current);
+            hit = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PooledHits) ? pooledHit(job.deviceSerial) : std::make_shared<DrawRecordHit>();
+            reason = assembleDirectHit(job, resolved, *hit);
             lap(Step::Checks);
         }
         if (!reason && found == nullptr) reason = Counter::FallbackClassNew;
@@ -3608,42 +3561,26 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
         reason = Counter::FallbackWalk;
     }
     if (!reason) {
-        if (arena != nullptr) {
-            current->record = std::shared_ptr<const DrawRecord>(std::shared_ptr<const DrawRecord>{}, found->record.get());
-            current->owner = std::move(found);
-        } else {
-            current->record = found->record;
-            if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectHandoff)) current->owner = std::move(found);
-            else current->owner = found;
-        }
-        current->direct = true;
-        if (current->parameters.indirect) DirectDraws::Add(Counter::IndirectHits);
+        hit->record = found->record;
+        if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DirectHandoff)) hit->owner = std::move(found);
+        else hit->owner = found;
+        hit->direct = true;
+        if (hit->parameters.indirect) DirectDraws::Add(Counter::IndirectHits);
         auto* const splits = timer != nullptr && stepSplits() ? timer : nullptr;
         if ((job.recordFlags & DrawRecordFlags::DirectBuffers) != 0) {
-            prepareBuffers(job, anchor, resolved, *current, splits);
+            prepareBuffers(job, anchor, resolved, *hit, splits);
             lap(Step::Buffers);
         }
         if ((job.recordFlags & DrawRecordFlags::DirectInputs) != 0) {
-            prepareInputs(job, anchor, resolved, *current);
+            prepareInputs(job, anchor, resolved, *hit);
             lap(Step::Inputs);
         }
-        if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::CommitFragments)) recordFragment(job, anchor, *current);
+        if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::CommitFragments)) recordFragment(job, anchor, *hit);
         if (splits != nullptr) splits->Split(Step::Fragment);
-        auto format = DirectDraws::StepFormat::Hit;
-        if (ticketsOn) DrawTickets::Add(DrawTickets::Counter::Eligible);
-        if (arena != nullptr) {
-            if (commitTicketDraw(job, anchor, *current, *arena)) format = DirectDraws::StepFormat::Ticket;
-        } else {
-            if (ticketsOn) DrawTickets::AddFallback(Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PooledHits) ? TicketFallback::Pooled : TicketFallback::NoArena);
-            commitRecordDraw(job, anchor, std::move(hit));
-        }
+        commitRecordDraw(job, anchor, std::move(hit));
         if (splits != nullptr) splits->Split(Step::Commit);
         lap(Step::HandOff);
-        if (timer != nullptr) {
-            timer->Format(format);
-            timer->NoteAllocations(2);
-            timer->Report();
-        }
+        if (timer != nullptr) timer->Report();
         DirectDraws::Add(Counter::Direct);
         ThreadReport::MarkItem(ThreadReport::ItemMark::Planned);
         return;
@@ -3652,19 +3589,13 @@ void Driver::finishDirectDraw(const LeanDrawJob& job) {
     struct FallbackMark {
         ~FallbackMark() { ThreadReport::MarkItem(ThreadReport::ItemMark::PlanFallback); }
     } fallbackMark;
-    struct DraftRelease {
-        DrawRecordHit* draft;
-        ~DraftRelease() {
-            if (draft != nullptr) recycleDraft(*draft);
-        }
-    } draftRelease{arena != nullptr ? current : nullptr};
     DirectDraws::Add(*reason);
     if (*reason == Counter::FallbackClassNew) {
-        buildDirectClass(job, anchor, key, probe, resolved, *current);
+        buildDirectClass(job, anchor, key, probe, resolved, *hit);
         return;
     }
     if (*reason == Counter::FallbackVerify) {
-        verifyDirectHit(job, anchor, *found, resolved, *current);
+        verifyDirectHit(job, anchor, *found, resolved, *hit);
         return;
     }
     finishLeanDraw(job, anchor);

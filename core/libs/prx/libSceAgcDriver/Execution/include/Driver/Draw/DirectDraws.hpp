@@ -238,22 +238,12 @@ public:
     void Lap(DirectDraws::Step step);
     void Split(DirectDraws::Step step);
     void Report() const;
-    void Format(DirectDraws::StepFormat value) {
-        format = value;
-        formatted = true;
-    }
-    void NoteAllocations(std::size_t at);
 
 private:
     std::chrono::steady_clock::time_point mark{};
     std::chrono::steady_clock::time_point splitMark{};
     std::array<std::uint64_t, static_cast<std::size_t>(DirectDraws::Step::Count)> nanoseconds{};
     std::array<bool, static_cast<std::size_t>(DirectDraws::Step::Count)> reached{};
-    DirectDraws::StepFormat format = DirectDraws::StepFormat::Hit;
-    bool formatted = false;
-    std::array<std::uint64_t, 3> allocations{};
-    std::array<std::uint64_t, 3> frees{};
-    std::uint8_t noted = 0;
 };
 
 }

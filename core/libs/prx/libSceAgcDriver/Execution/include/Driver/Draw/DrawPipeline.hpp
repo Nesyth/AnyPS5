@@ -62,22 +62,6 @@ private:
     std::array<std::atomic<std::uint64_t>, Capacity * 3> slots{};
 };
 
-class TicketHold {
-public:
-    TicketHold() = default;
-    explicit TicketHold(void* held) noexcept : ticket(held) {}
-    TicketHold(TicketHold&& other) noexcept : ticket(std::exchange(other.ticket, nullptr)) {}
-    TicketHold& operator=(TicketHold&& other) noexcept;
-    TicketHold(const TicketHold&) = delete;
-    TicketHold& operator=(const TicketHold&) = delete;
-    ~TicketHold();
-    void* Get() const noexcept { return ticket; }
-    void* Release() noexcept { return std::exchange(ticket, nullptr); }
-
-private:
-    void* ticket = nullptr;
-};
-
 class DrawPipeline {
 public:
     using Commit = std::function<void()>;
@@ -107,9 +91,6 @@ public:
     void EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes);
     void EnqueueQuiet(Commit commit);
     void EnqueueKept(Commit commit, std::vector<Range> writes, std::vector<Range> reads, std::shared_ptr<const void> keep);
-    void EnqueueTicket(Commit&& commit, std::vector<Range>&& writes, std::span<const Range> reads, void* ticket, std::uint32_t lines);
-    static bool TicketPrefetched();
-    static std::uint64_t TicketPrefetches();
     static void NoteDrawKey(std::uint64_t key, std::uint64_t shape);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
@@ -149,14 +130,6 @@ private:
         std::uint64_t order = 0;
         std::uint32_t parts = 1;
         std::shared_ptr<const void> keep;
-        TicketHold ticket;
-        std::uint32_t readOffset = 0;
-        std::uint16_t readViewCount = 0;
-        std::uint16_t ticketLines = 0;
-        std::span<const Range> Reads() const {
-            if (readViewCount == 0 || ticket.Get() == nullptr) return std::span<const Range>(reads);
-            return std::span<const Range>(reinterpret_cast<const Range*>(static_cast<const std::byte*>(ticket.Get()) + readOffset), readViewCount);
-        }
     };
     DrawPipeline() = default;
     void enqueue(Item item);
@@ -244,7 +217,7 @@ public:
     static DepositCounts Deposits();
     static bool Overlap();
     bool PendingOverlaps(std::uint64_t begin, std::uint64_t end);
-    std::uint64_t ParkReads(std::span<const Range> reads);
+    std::uint64_t ParkReads(const std::vector<Range>& reads);
     void UnparkReads(std::uint64_t id);
     bool ParkedReadsOverlap(std::uint64_t address, std::size_t bytes);
     LabelLookup PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value);
@@ -349,8 +322,6 @@ private:
     bool parkInSlot(unsigned index);
     bool releaseRetiredHits(bool stopForJobs);
     void releaseAllRetiredHits();
-    void reclaimTickets(bool stopForJobs);
-    static void reclaimAllTickets();
     void verifiedIdleWait(std::unique_lock<std::mutex>& lock, const std::function<bool()>& ready);
     bool aheadWait(std::span<const Range> ranges);
     inline static std::atomic<std::size_t> outstanding{0};

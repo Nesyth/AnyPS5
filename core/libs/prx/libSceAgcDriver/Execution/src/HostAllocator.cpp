@@ -29,8 +29,6 @@ struct Cache {
     void* heads[AllClasses];
     std::uint16_t counts[AllClasses];
     std::ptrdiff_t untilSample;
-    std::uint64_t allocations;
-    std::uint64_t frees;
 };
 
 constexpr std::uint16_t KeptLists = 8;
@@ -200,7 +198,6 @@ SRWLOCK censusReportLock = SRWLOCK_INIT;
 std::atomic<std::uint64_t> censusDropped{0};
 std::atomic<std::uint64_t> censusReportAt{0};
 const bool censusOn = std::getenv("APS5_HEAP_CENSUS") != nullptr;
-const bool jobCountsOn = std::getenv("APS5_JOB_ALLOCATIONS") != nullptr;
 
 std::size_t CensusBucket(const void* block) noexcept {
     return static_cast<std::size_t>(((reinterpret_cast<std::uintptr_t>(block) >> 4) * 0x9e3779b97f4a7c15ull) >> 48);
@@ -418,9 +415,6 @@ void* Allocate(std::size_t bytes, void* site) {
     for (;;) {
         if (void* block = TryAllocate(bytes)) {
             if (censusOn) CensusNote(block, bytes, site);
-            if (jobCountsOn) {
-                if (auto* cache = CurrentCache()) ++cache->allocations;
-            }
             return block;
         }
         const auto handler = std::get_new_handler();
@@ -433,7 +427,6 @@ void Release(void* block, std::size_t bytes = 0) noexcept {
     if (block == nullptr) return;
     if (censusOn) CensusRemove(block);
     if (auto* cache = CurrentCache()) {
-        if (jobCountsOn) ++cache->frees;
         const bool large = LargeCache();
         const auto usable = bytes != 0 && bytes % Granule == 0 && (bytes <= LargestCached || !large) ? bytes : _msize(block);
         const bool largeBlock = large && usable > LargestCached && usable <= LargestLarge && std::has_single_bit(usable);
@@ -466,19 +459,6 @@ void SetHostPrefetchQuery(bool (*query)()) noexcept {
     prefetchQuery.store(query, std::memory_order_release);
 }
 
-bool HostAllocationCountsOn() noexcept {
-    return jobCountsOn;
-}
-
-void HostAllocationCounts(std::uint64_t& allocations, std::uint64_t& frees) noexcept {
-    allocations = 0;
-    frees = 0;
-    if (auto* cache = CurrentCache()) {
-        allocations = cache->allocations;
-        frees = cache->frees;
-    }
-}
-
 }
 
 void* operator new(std::size_t bytes) { return Allocate(bytes, __builtin_return_address(0)); }
@@ -503,22 +483,5 @@ void operator delete(void* block, std::size_t bytes) noexcept { Release(block, b
 void operator delete[](void* block, std::size_t bytes) noexcept { Release(block, bytes); }
 void operator delete(void* block, const std::nothrow_t&) noexcept { Release(block); }
 void operator delete[](void* block, const std::nothrow_t&) noexcept { Release(block); }
-
-#else
-
-#include <cstdint>
-
-namespace AgcDriver {
-
-bool HostAllocationCountsOn() noexcept {
-    return false;
-}
-
-void HostAllocationCounts(std::uint64_t& allocations, std::uint64_t& frees) noexcept {
-    allocations = 0;
-    frees = 0;
-}
-
-}
 
 #endif

@@ -500,13 +500,8 @@ enum class Counter : std::uint16_t {
 };
 
 enum class Step : std::uint8_t { Request, Invocation, Walk, Key, Side, Class, Checks, Buffers, Inputs, HandOff, BuffersPrepare, BuffersSettle, BuffersPlace, Fragment, Commit, Count };
-enum class StepFormat : std::uint8_t { Hit, Ticket, Count };
 
 constexpr std::uint64_t StepSampleEvery = 64;
-
-bool FormatLaps();
-bool JobAllocations();
-void AddFormatDraw(StepFormat format, const std::uint64_t* nanoseconds, const bool* reached, const std::uint64_t* allocations, const std::uint64_t* frees, bool allocationsNoted);
 
 std::uint64_t VerifyEvery();
 // APS5_VERIFY_DIRECT_BUFFERS, read once.

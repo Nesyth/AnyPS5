@@ -5235,11 +5235,6 @@ bool VulkanDevice::ExpressFollow(const Graphics::State& graphics, const Pm4::Dra
     return Graphics::ExpressFollowCommit(state->context, graphics, draw, shaders, record, prepared, preparedInputs, fragment);
 }
 
-bool VulkanDevice::ExpressFollow(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, DrawRecordCommit& record, const Graphics::ShaderResources::PreparedBuffersView& prepared, const Graphics::PreparedInputsView& preparedInputs, DrawFragment& fragment, std::span<const Graphics::KeptOwner> owners, Graphics::FollowFormat format) {
-    if (!state->contextReady || record.recipe == nullptr || record.recipe->device != state->device) return false;
-    return Graphics::ExpressFollowCommit(state->context, graphics, draw, shaders, record, prepared, preparedInputs, fragment, owners, format);
-}
-
 bool VulkanDevice::RecordDrawFragment(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, const DrawFragmentBlock& block, const Graphics::ShaderResources::PreparedBuffers& prepared, const Graphics::PreparedInputs& inputs, DrawFragment& out, DrawFragmentRefusal& refusal) const {
     if (!state->contextReady) {
         refusal = DrawFragmentRefusal::Device;

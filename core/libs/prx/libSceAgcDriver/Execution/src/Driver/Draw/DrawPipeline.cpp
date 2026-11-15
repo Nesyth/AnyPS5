@@ -1,6 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDrawReport.hpp"
-#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTickets.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
@@ -77,12 +76,6 @@ struct FinisherRunLoopSlot {};
 struct FinisherRetiredSlot {};
 using FinisherRunLoop = HostThreadSlot<bool, FinisherRunLoopSlot>;
 using FinisherRetired = HostThreadSlot<bool, FinisherRetiredSlot>;
-struct TicketPrefetchedSlot {};
-using TicketPrefetchedNow = HostThreadSlot<bool, TicketPrefetchedSlot>;
-std::atomic<std::uint64_t> ticketPrefetches{0};
-constexpr std::size_t TicketBooks = 16;
-constexpr std::uint32_t TicketPublishEvery = 8;
-constexpr std::uint32_t TicketPrefetchLines = 256;
 
 struct RetiredHits {
     static constexpr std::size_t Cap = 256;
@@ -279,17 +272,6 @@ bool countRange(std::vector<std::pair<DrawPipeline::Range, std::uint32_t>>& coun
     counted.pop_back();
     return true;
 }
-}
-
-TicketHold& TicketHold::operator=(TicketHold&& other) noexcept {
-    if (this == &other) return *this;
-    if (ticket != nullptr) AbandonTicket(ticket);
-    ticket = std::exchange(other.ticket, nullptr);
-    return *this;
-}
-
-TicketHold::~TicketHold() {
-    if (ticket != nullptr) AbandonTicket(ticket);
 }
 
 void PublishedRanges::Publish(std::span<const std::pair<Range, std::uint32_t>> entries, std::uint32_t unknownHeld) {
@@ -811,22 +793,6 @@ void DrawFinisher::releaseAllRetiredHits() {
     if (released == 0) return;
     DirectDraws::Add(DirectDraws::Counter::HitsReleasedIdle, released);
     DirectDraws::Add(DirectDraws::Counter::HitsReleaseNanoseconds, elapsedNs(began));
-}
-
-void DrawFinisher::reclaimTickets(bool stopForJobs) {
-    auto* const arena = TicketArena::Current();
-    if (arena != nullptr) {
-        while (!leanReady() && (!stopForJobs || untakenJobs.load(std::memory_order_acquire) == 0) && arena->ReclaimOne()) {
-        }
-    }
-    if (TicketArena::OrphansWaiting() && !leanReady() && (!stopForJobs || untakenJobs.load(std::memory_order_acquire) == 0)) TicketArena::ReclaimOrphansAtIdle();
-}
-
-void DrawFinisher::reclaimAllTickets() {
-    auto* const arena = TicketArena::Current();
-    if (arena == nullptr) return;
-    while (arena->ReclaimOne()) {
-    }
 }
 
 DrawFinisher::Slot* DrawFinisher::untaken() {
@@ -1446,7 +1412,7 @@ void DrawFinisher::forwardMerged(std::vector<Deposit>& deposits, std::size_t& se
         auto& head = deposits[first];
         const auto joins = [&](const Deposit& held) {
             const auto& item = held.item;
-            return held.pipeline == head.pipeline && item.draw && !item.store && !item.quiet && item.labelAddress == 0 && item.labelBytes.empty() && item.order == 0 && item.kind == head.item.kind && item.ticket.Get() == nullptr;
+            return held.pipeline == head.pipeline && item.draw && !item.store && !item.quiet && item.labelAddress == 0 && item.labelBytes.empty() && item.order == 0 && item.kind == head.item.kind;
         };
         std::size_t last = first + 1;
         if (merging && joins(head)) {
@@ -1469,8 +1435,7 @@ void DrawFinisher::forwardMerged(std::vector<Deposit>& deposits, std::size_t& se
             for (const auto& range : item.writes) {
                 if (std::find(merged.writes.begin(), merged.writes.end(), range) == merged.writes.end()) merged.writes.push_back(range);
             }
-            const auto partReads = item.Reads();
-            merged.reads.insert(merged.reads.end(), partReads.begin(), partReads.end());
+            merged.reads.insert(merged.reads.end(), item.reads.begin(), item.reads.end());
             parts->push_back(std::move(item));
         }
         merged.commit = [parts] {
@@ -1560,10 +1525,10 @@ bool DrawFinisher::depositsWrite(std::span<const Range> ranges) {
     return false;
 }
 
-std::uint64_t DrawFinisher::ParkReads(std::span<const Range> reads) {
+std::uint64_t DrawFinisher::ParkReads(const std::vector<Range>& reads) {
     std::lock_guard lock(parkedReadsMutex);
     const auto id = nextParkedReads++;
-    parkedReads.emplace_back(id, std::vector<Range>(reads.begin(), reads.end()));
+    parkedReads.emplace_back(id, reads);
     parkedReadCount.fetch_add(1, std::memory_order_release);
     return id;
 }
@@ -1591,7 +1556,7 @@ bool DrawFinisher::ParkedReadsOverlap(std::uint64_t address, std::size_t bytes) 
 bool DrawFinisher::depositsRead(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
     for (const auto& held : ownDeposits()) {
-        for (const auto& [begin, limit] : held.item.Reads()) {
+        for (const auto& [begin, limit] : held.item.reads) {
             if (address < limit && begin < end) return true;
         }
     }
@@ -1617,7 +1582,6 @@ void DrawFinisher::run(unsigned index) {
     PerformanceTrace::BindThread(FinisherNames[index]);
     if (index == 0) StartFinisherSampler();
     FinisherRunLoop::Set(true);
-    TicketArena::BindThread(index);
     ThreadReport::Clock::time_point lastEnd{};
     bool woken = false;
     for (;;) {
@@ -1635,7 +1599,6 @@ void DrawFinisher::run(unsigned index) {
         const bool slots = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FinisherParkSlots) && ringMode.load(std::memory_order_acquire) && finisherTakes(index) && !closed.load(std::memory_order_acquire);
         if (slots) idleSpinners.fetch_add(1, std::memory_order_seq_cst);
         static_cast<void>(releaseRetiredHits(true));
-        reclaimTickets(true);
         if (finisherTakes(index) && spinHandoff()) SpinUntil(HandoffSpinWindow(), [&] { return untakenJobs.load(std::memory_order_acquire) != 0 || leanReady(); });
         else if (finisherTakes(index)) SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         if (slots) idleSpinners.fetch_sub(1, std::memory_order_seq_cst);
@@ -1645,7 +1608,6 @@ void DrawFinisher::run(unsigned index) {
             continue;
         }
         if (!releaseRetiredHits(true) && finisherTakes(index) && untakenJobs.load(std::memory_order_acquire) == 0) continue;
-        reclaimTickets(true);
         if (slots && finisherTakes(index)) {
             woken = parkInSlot(index);
             continue;
@@ -1659,8 +1621,6 @@ void DrawFinisher::run(unsigned index) {
             if (!finisherTakes(index) && !closing) {
                 lock.unlock();
                 releaseAllRetiredHits();
-                reclaimAllTickets();
-                TicketArena::Orphan();
                 ReleaseFinisherThread(FinisherNames[index]);
                 lock.lock();
                 dormant.fetch_or(1u << index, std::memory_order_seq_cst);
@@ -1738,8 +1698,6 @@ void DrawFinisher::run(unsigned index) {
         if (turnSleepers != 0) turnWake.notify_all();
     }
     releaseAllRetiredHits();
-    reclaimAllTickets();
-    TicketArena::Orphan();
     FinisherRunLoop::Set(false);
     runningFinishers.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -1890,33 +1848,6 @@ void DrawPipeline::EnqueueKept(Commit commit, std::vector<Range> writes, std::ve
     enqueue({std::move(commit), std::move(writes), 0, {}, std::move(reads), true, false, CommitKind::Other, false, 0, 1, std::move(keep)});
 }
 
-void DrawPipeline::EnqueueTicket(Commit&& commit, std::vector<Range>&& writes, std::span<const Range> reads, void* ticket, std::uint32_t lines) {
-    TicketHold hold{ticket};
-    Item item{std::move(commit), std::move(writes), 0, {}, {}, true};
-    if (!reads.empty()) {
-        const auto base = reinterpret_cast<std::uintptr_t>(ticket);
-        const auto at = reinterpret_cast<std::uintptr_t>(reads.data());
-        const bool inside = ticket != nullptr && at >= base && at - base <= std::numeric_limits<std::uint32_t>::max() && reads.size() <= std::numeric_limits<std::uint16_t>::max();
-        if (inside) {
-            item.readOffset = static_cast<std::uint32_t>(at - base);
-            item.readViewCount = static_cast<std::uint16_t>(reads.size());
-        } else {
-            item.reads.assign(reads.begin(), reads.end());
-        }
-    }
-    item.ticketLines = static_cast<std::uint16_t>(std::min<std::uint32_t>(lines, std::numeric_limits<std::uint16_t>::max()));
-    item.ticket = std::move(hold);
-    enqueue(std::move(item));
-}
-
-bool DrawPipeline::TicketPrefetched() {
-    return TicketPrefetchedNow::Get();
-}
-
-std::uint64_t DrawPipeline::TicketPrefetches() {
-    return ticketPrefetches.load(std::memory_order_relaxed);
-}
-
 void DrawPipeline::Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw) {
     enqueue({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, false, kind});
 }
@@ -1961,14 +1892,14 @@ void DrawPipeline::enqueue(Item item) {
     }
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) {
         const bool dispatchTurn = item.kind == CommitKind::Dispatch && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchBeside);
-        if ((item.Reads().empty() || dispatchTurn) && !ItemTurn::Get() && FinisherProducer::Get() && DrawFinisher::Overlap() && !GuestMemory::GpuMutex().HeldByThisThread() && (dispatchTurn || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ItemsByTurn))) {
+        if ((item.reads.empty() || dispatchTurn) && !ItemTurn::Get() && FinisherProducer::Get() && DrawFinisher::Overlap() && !GuestMemory::GpuMutex().HeldByThisThread() && (dispatchTurn || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ItemsByTurn))) {
             DrawFinisher::Pending held;
             held.unknown = false;
             held.writes = item.writes;
             held.labelAddress = item.labelAddress;
             held.labelBytes = item.labelBytes;
             itemsByTurn.fetch_add(1, std::memory_order_relaxed);
-            const auto parked = item.Reads().empty() ? std::uint64_t{0} : DrawFinisher::Get().ParkReads(item.Reads());
+            const auto parked = item.reads.empty() ? std::uint64_t{0} : DrawFinisher::Get().ParkReads(item.reads);
             auto shared = std::make_shared<Item>(std::move(item));
             DrawFinisher::Get().Enqueue([this, shared, parked] {
                 struct Scope {
@@ -2027,7 +1958,7 @@ void DrawPipeline::queueItem(Item item) {
     }
     depthSum += items.size();
     ++enqueued;
-    heldReadRanges.fetch_add(item.Reads().size(), std::memory_order_relaxed);
+    heldReadRanges.fetch_add(item.reads.size(), std::memory_order_relaxed);
     countWrites(item.writes, true);
     enqueuedItems.fetch_add(1, std::memory_order_release);
     items.push_back(std::move(item));
@@ -2133,55 +2064,6 @@ void DrawPipeline::run() {
     std::uint32_t itemParts = 1;
     std::vector<Range> itemRanges;
     bool taken = false;
-    struct TicketBook {
-        TicketArena* arena = nullptr;
-        std::uint64_t seq = 0;
-        std::uint32_t pending = 0;
-    };
-    std::array<TicketBook, TicketBooks> ticketBooks{};
-    bool ticketsPending = false;
-    const auto publishTickets = [&] {
-        if (!ticketsPending) return;
-        for (auto& book : ticketBooks) {
-            if (book.pending == 0) continue;
-            book.arena->PublishRetired(book.seq);
-            book.pending = 0;
-        }
-        ticketsPending = false;
-    };
-    const auto retireTicket = [&](void* ticket) {
-        const auto retire = RetireOf(ticket);
-        if (retire.arena == nullptr) return;
-        TicketBook* book = nullptr;
-        TicketBook* spare = nullptr;
-        for (auto& entry : ticketBooks) {
-            if (entry.arena == retire.arena) {
-                book = &entry;
-                break;
-            }
-            if (spare == nullptr && entry.pending == 0) spare = &entry;
-        }
-        if (book == nullptr) book = spare;
-        if (book == nullptr) {
-            retire.arena->PublishRetired(retire.seq);
-            return;
-        }
-        if (book->arena != retire.arena) {
-            book->arena = retire.arena;
-            book->pending = 0;
-        }
-        book->seq = retire.seq;
-        if (++book->pending < TicketPublishEvery) {
-            ticketsPending = true;
-            return;
-        }
-        book->arena->PublishRetired(book->seq);
-        book->pending = 0;
-    };
-    const void* prefetchTicket = nullptr;
-    std::uint32_t prefetchLines = 0;
-    const void* issuedTicket = nullptr;
-    bool frontPrefetched = false;
     const auto takeFront = [&] {
         if (depositVerifyEvery() != 0) verifyOrder(items.front().order);
         commit = stopped ? nullptr : &items.front().commit;
@@ -2194,22 +2076,9 @@ void DrawPipeline::run() {
             itemRanges = items.front().writes;
             if (items.front().labelAddress != 0 && !items.front().labelBytes.empty()) itemRanges.emplace_back(items.front().labelAddress, items.front().labelAddress + items.front().labelBytes.size());
         }
-        const void* const front = items.front().ticket.Get();
-        const bool prefetched = front != nullptr && front == issuedTicket;
-        if (prefetched != frontPrefetched) {
-            frontPrefetched = prefetched;
-            TicketPrefetchedNow::Set(prefetched);
-        }
-        prefetchTicket = nullptr;
-        prefetchLines = 0;
-        if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::TicketPrefetch) && items.size() > 1 && items[1].ticket.Get() != nullptr) {
-            prefetchTicket = items[1].ticket.Get();
-            prefetchLines = items[1].ticketLines;
-        }
     };
     for (;;) {
         if (!taken) {
-            if (ticketsPending && outstanding.load(std::memory_order_acquire) == 0) publishTickets();
             static const bool idleCensus = std::getenv("APS5_PIPELINE_STATS") != nullptr;
             const bool idleNow = idleCensus && outstanding.load(std::memory_order_acquire) == 0;
             const unsigned idleState = idleNow ? DrawFinisher::Get().IdleState() : 0;
@@ -2224,13 +2093,6 @@ void DrawPipeline::run() {
             takeFront();
         }
         taken = false;
-        issuedTicket = prefetchTicket;
-        if (prefetchTicket != nullptr) {
-            const auto* const bytes = static_cast<const char*>(prefetchTicket);
-            const auto lines = std::min(prefetchLines, TicketPrefetchLines);
-            for (std::uint32_t line = 0; line < lines; ++line) __builtin_prefetch(bytes + std::size_t{line} * 64u, 0, 3);
-            ticketPrefetches.store(ticketPrefetches.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-        }
         const auto start = std::chrono::steady_clock::now();
         const auto idleTo = ThreadReport::Enabled() && lastEnd != ThreadReport::Clock::time_point{} ? ThreadReport::SnapshotStates(start) : ThreadReport::StateTimes{};
         std::exception_ptr fatal;
@@ -2287,7 +2149,6 @@ void DrawPipeline::run() {
         bool keepRun = false;
         auto ended = Graphics::ExpressRunEnd::LockWaiter;
         const bool mergedTake = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow) && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollowPlainLoop);
-        void* retiredTicket = nullptr;
         {
             const auto lock = lockFor(mutex);
             retiredItems.fetch_add(1, std::memory_order_release);
@@ -2297,7 +2158,6 @@ void DrawPipeline::run() {
             kindNs[kindIndex].fetch_add(spent, std::memory_order_relaxed);
             retired.push_back(std::move(items.front()));
             items.pop_front();
-            retiredTicket = retired.back().ticket.Release();
             commits += itemParts;
             commitNs += spent;
             if (failed) ++commitErrors;
@@ -2311,10 +2171,8 @@ void DrawPipeline::run() {
                 taken = true;
             }
         }
-        if (retiredTicket != nullptr) retireTicket(retiredTicket);
         if (runHold && (!keepRun || GuestMemory::GpuMutex().HasWaiters())) dropHold(ended);
     }
-    publishTickets();
     dropHold(Graphics::ExpressRunEnd::Stop);
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -2343,12 +2201,9 @@ void DrawPipeline::Stop() {
 }
 
 void DrawPipeline::ReleaseRetired() {
-    {
-        std::vector<Item> done;
-        const auto lock = lockFor(mutex);
-        std::swap(done, retired);
-    }
-    TicketArena::ReclaimOrphans();
+    std::vector<Item> done;
+    const auto lock = lockFor(mutex);
+    std::swap(done, retired);
 }
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
@@ -2395,7 +2250,7 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     const auto lock = lockFor(pipeline.mutex);
     heldReadQueries.fetch_add(1, std::memory_order_relaxed);
     for (const auto& item : pipeline.items) {
-        for (const auto& [begin, limit] : item.Reads()) {
+        for (const auto& [begin, limit] : item.reads) {
             if (address >= limit || begin >= end) continue;
             heldReadHits.fetch_add(1, std::memory_order_relaxed);
             return true;
@@ -2410,9 +2265,7 @@ std::uint64_t DrawPipeline::HeldReadQueries() {
 
 void DrawPipeline::ReleaseRunningReads() {
     const auto lock = lockFor(mutex);
-    if (items.empty()) return;
-    items.front().reads.clear();
-    items.front().readViewCount = 0;
+    if (!items.empty()) items.front().reads.clear();
 }
 
 std::uint64_t DrawPipeline::DrainRequestsByReason(DrainReason reason) {

@@ -64,8 +64,6 @@ struct DirectStages;
 struct DirectClass;
 struct DirectClassKey;
 class DirectStepClock;
-class TicketArena;
-struct FollowParts;
 
 struct DrawStageContext {
     const QueueState& queue;
@@ -365,9 +363,6 @@ private:
     void commitRecordDraw(const LeanDrawJob& job, const LeanAnchor& anchor, std::shared_ptr<DrawRecordHit> hit);
     void commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, DrawRecordHit& hit, const VulkanDevice::DrawTraceContext& trace, std::uint64_t shape);
     bool followRecord(VulkanDevice& localDevice, std::uint32_t queue, const Graphics::State& graphics, DrawRecordHit& hit, const VulkanDevice::DrawTraceContext& trace);
-    bool followCore(VulkanDevice& localDevice, std::uint32_t queue, const Graphics::State& graphics, const FollowParts& parts);
-    bool commitTicketDraw(const LeanDrawJob& job, const LeanAnchor& anchor, DrawRecordHit& draft, TicketArena& arena);
-    void commitTicket(void* ticket);
     bool verifyRecordCommit(const DrawRecord& record, const DrawCommitView& answer, const DrawCommitView& today);
     void verifyRecordHit(const LeanDrawJob& job, const DrawRecord& record, const DrawRecordView& answer, const DrawRecordSink& sink);
     bool compareRecordAnswer(const LeanDrawJob& job, const DrawRecord& record, const DrawRecordView& answer, const DrawRecordSink& sink, void (*noteDifference)(DrawRecords::Field, std::string_view), void (*noteAllowed)(DrawRecords::Allowed));
