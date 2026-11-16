@@ -2117,6 +2117,7 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
     static_cast<void>(unwatchHooked);
     const MapImportGate::PublishHold publication(descriptor.baseAddress, DescribeSurface(descriptor).guestBytes);
     auto texture = std::shared_ptr<StorageTexture>(new StorageTexture(context, detiler, descriptor, mipLevel));
+    texture->usedPresent.store(Recorder::Presents(), std::memory_order_relaxed);
     uploadReason = "first";
     texture->upload();
     texture->defaultMip = mipLevel;
@@ -3322,6 +3323,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
         return true;
     }
+    restoreCopy(CopySite::Refresh);
     refreshProof = {};
     struct Exempt {
         const StorageTexture* previous;
@@ -3767,11 +3769,12 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 }
 
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers, bool keepWritten) {
+    std::vector<bool> selected(trackedLayers, true);
+    if (layers != nullptr) selected = *layers;
+    restoreCopy(CopySite::Capture, &selected);
     guestSnapshots.fetch_add(1, std::memory_order_relaxed);
     original.resize(static_cast<std::size_t>(guestBytes));
     comparedRanges = {};
-    std::vector<bool> selected(trackedLayers, true);
-    if (layers != nullptr) selected = *layers;
     const auto runs = unitRuns(selected);
     for (const auto& [begin, end] : runs) GuestMemory::FlushGpuWrites(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin));
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
@@ -3931,7 +3934,7 @@ bool StorageTexture::UntrackedUnchanged() const {
 }
 
 bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize) const {
-    if (!originalHolds(address, bytes)) return false;
+    if (releasedCopy.active || !originalHolds(address, bytes)) return false;
     struct Exempt {
         const StorageTexture* previous;
         ~Exempt() { Refreshing::Set(previous); }
@@ -4021,6 +4024,7 @@ std::vector<bool> StorageTexture::cpuUploadLayers(const std::vector<bool>& units
 }
 
 void StorageTexture::upload(const std::vector<bool>* layers) {
+    restoreCopy(CopySite::Upload);
     const GuestMemory::UnflushedReadScope unflushed(RuntimeSwitches::Set(RuntimeSwitch::XpUploadNoSync));
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -5336,6 +5340,8 @@ void StorageTexture::RememberPassNote(std::uint64_t recorder, std::uint64_t pass
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
+    restoreCopy(CopySite::Pending);
+    usedPresent.store(Recorder::Presents(), std::memory_order_relaxed);
     const bool newlyPending = count == 0 || first + count > trackedLayers || !layerPending.AllIn(first, count);
     const bool borrowedMarked = borrowedUnits.size() == trackedLayers && borrowedUnits.AnyIn(first, count);
     const bool handed = !handedOver.empty() || !handedUnits.empty();
@@ -6142,6 +6148,7 @@ void StorageTexture::forgetSavedOver(std::uint64_t address, std::size_t bytes) {
 }
 
 void StorageTexture::saveBeforeUnwatch() {
+    restoreCopy(CopySite::Unwatch);
     std::vector<bool> units(trackedLayers, false);
     for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) units[unit] = layerPending[unit] && !layerOriginal[unit];
     const auto runs = unitRuns(units);
@@ -6748,7 +6755,9 @@ std::uint64_t StorageTexture::PendingSerial() {
 }
 
 void StorageTexture::NoteProved() const {
-    provedPresent.store(Recorder::Presents(), std::memory_order_relaxed);
+    const auto present = Recorder::Presents();
+    provedPresent.store(present, std::memory_order_relaxed);
+    usedPresent.store(present, std::memory_order_relaxed);
 }
 
 namespace {
@@ -8092,6 +8101,7 @@ bool StorageTexture::cpuLeftUnchanged(std::uint32_t layer, std::uint64_t from, s
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    restoreCopy(CopySite::WriteBack);
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -8653,6 +8663,279 @@ void StorageTexture::release() noexcept {
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
     imageAllocation.Reset();
+}
+
+namespace {
+
+constexpr std::uint64_t CopyPrime1 = 0x9e3779b185ebca87ull;
+constexpr std::uint64_t CopyPrime2 = 0xc2b2ae3d27d4eb4full;
+constexpr std::uint64_t CopyPrime3 = 0x165667b19e3779f9ull;
+constexpr std::uint64_t CopyPrime4 = 0x85ebca77c2b2ae63ull;
+constexpr std::size_t CopyExaminedPerCall = 64;
+constexpr std::size_t CopyReleasesPerCall = 16;
+constexpr std::uint64_t CopyHashedPerCall = 16ull << 20u;
+
+std::uint64_t copyMix(std::uint64_t value) {
+    value ^= value >> 33u;
+    value *= 0xff51afd7ed558ccdull;
+    value ^= value >> 33u;
+    value *= 0xc4ceb9fe1a85ec53ull;
+    value ^= value >> 33u;
+    return value;
+}
+
+std::array<std::uint64_t, 2> copyHash(std::span<const std::byte> bytes) {
+    std::array<std::uint64_t, 4> first{CopyPrime1 + CopyPrime2, CopyPrime2, 0, std::uint64_t{0} - CopyPrime1};
+    std::array<std::uint64_t, 4> second{CopyPrime3, CopyPrime4 + CopyPrime3, CopyPrime1, std::uint64_t{0} - CopyPrime4};
+    std::array<std::uint64_t, 4> words{};
+    const auto mixWords = [&] {
+        for (std::size_t lane = 0; lane < words.size(); ++lane) {
+            first[lane] = std::rotl(first[lane] + words[lane] * CopyPrime2, 31) * CopyPrime1;
+            second[lane] = std::rotl(second[lane] ^ (words[lane] * CopyPrime4), 29) * CopyPrime3;
+        }
+    };
+    std::size_t at = 0;
+    for (; at + sizeof(words) <= bytes.size(); at += sizeof(words)) {
+        std::memcpy(words.data(), bytes.data() + at, sizeof(words));
+        mixWords();
+    }
+    if (at < bytes.size()) {
+        words = {};
+        std::memcpy(words.data(), bytes.data() + at, bytes.size() - at);
+        mixWords();
+    }
+    std::uint64_t low = static_cast<std::uint64_t>(bytes.size()) * CopyPrime1;
+    std::uint64_t high = static_cast<std::uint64_t>(bytes.size()) * CopyPrime3 + CopyPrime2;
+    for (std::size_t lane = 0; lane < words.size(); ++lane) {
+        low = copyMix(low ^ first[lane]) * CopyPrime4 + CopyPrime2;
+        high = copyMix(high ^ second[lane]) * CopyPrime2 + CopyPrime4;
+    }
+    return {copyMix(low), copyMix(high)};
+}
+
+struct CopyReleaseCensus {
+    std::atomic<std::uint64_t> released{0};
+    std::atomic<std::uint64_t> releasedBytes{0};
+    std::atomic<std::uint64_t> restored{0};
+    std::atomic<std::uint64_t> restoredBytes{0};
+    std::atomic<std::uint64_t> changedUnits{0};
+    std::atomic<std::uint64_t> changedElsewhere{0};
+    std::atomic<std::uint64_t> checked{0};
+    std::atomic<std::uint64_t> differing{0};
+    std::atomic<std::uint64_t> changedBeforeRefresh{0};
+    std::atomic<std::uint64_t> reportedElsewhere{0};
+    std::atomic<std::int64_t> window{-1};
+    std::atomic<std::int64_t> verifyWindow{-1};
+    StorageTexture::CopyReleaseTotals reported{};
+    std::size_t cursor = 0;
+};
+
+CopyReleaseCensus& copyCensus() {
+    static CopyReleaseCensus census;
+    return census;
+}
+
+bool copyVerifyOn() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_VERIFY_STORAGE_COPY_RELEASE");
+        return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
+    }();
+    return verify;
+}
+
+std::uint64_t copyIdlePresents() {
+    static const std::uint64_t presents = [] {
+        const char* text = std::getenv("APS5_STORAGE_COPY_IDLE_FRAMES");
+        return text != nullptr && *text != '\0' ? static_cast<std::uint64_t>(std::strtoull(text, nullptr, 10)) : std::uint64_t{120};
+    }();
+    return presents;
+}
+
+unsigned long long copyMiB(std::uint64_t bytes) {
+    return static_cast<unsigned long long>(bytes >> 20u);
+}
+
+}
+
+const char* StorageTexture::CopySiteName(CopySite site) {
+    switch (site) {
+    case CopySite::Refresh:
+        return "refresh";
+    case CopySite::Upload:
+        return "upload";
+    case CopySite::Capture:
+        return "guest byte capture";
+    case CopySite::Pending:
+        return "results marked pending";
+    case CopySite::Unwatch:
+        return "save before unwatch";
+    case CopySite::WriteBack:
+        return "write-back";
+    }
+    return "unnamed";
+}
+
+const char* StorageTexture::releaseCopy() {
+    if (releasedCopy.active) return "released already";
+    if (layerPending.Any() || Dirty()) return "results pending";
+    if (std::any_of(savedTicket.begin(), savedTicket.end(), [](std::uint64_t ticket) { return ticket != 0; })) return "saved bytes of a write-back in flight";
+    if (!keptAtUnwatch.empty()) return "blocks kept for the CPU";
+    if (borrowedUnits.Any() || !handedOver.empty() || !handedUnits.empty() || !adoptedSources.empty()) return "results of another image";
+    const bool holds = std::find(layerOriginal.begin(), layerOriginal.end(), true) != layerOriginal.end();
+    if (holds && original.size() != guestBytes) return "an incomplete copy";
+    if (holds && std::any_of(layerGeneration.begin(), layerGeneration.end(), [](std::uint64_t value) { return value != 0; }) && !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) return "memory that left the write watch under a generation";
+    const auto copyBytes = static_cast<std::uint64_t>(original.capacity());
+    const auto baselineBytes = generationBaseline.empty() ? static_cast<std::uint64_t>(generationBaseline.capacity()) : std::uint64_t{0};
+    if (copyBytes == 0 && baselineBytes == 0) return "no copy";
+    if (holds) {
+        releasedCopy.hashes.assign(trackedLayers, {});
+        for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+            if (!layerOriginal[unit]) continue;
+            releasedCopy.hashes[unit] = copyHash(std::span<const std::byte>(original).subspan(static_cast<std::size_t>(layerBegin(unit) - descriptor.baseAddress), static_cast<std::size_t>(layerBytes(unit))));
+        }
+        if (copyVerifyOn()) releasedCopy.kept.swap(original);
+        releasedCopy.active = true;
+    }
+    std::vector<std::byte>().swap(original);
+    if (baselineBytes != 0) std::vector<std::byte>().swap(generationBaseline);
+    auto& census = copyCensus();
+    census.released.fetch_add(1, std::memory_order_relaxed);
+    census.releasedBytes.fetch_add(copyBytes + baselineBytes, std::memory_order_relaxed);
+    return nullptr;
+}
+
+void StorageTexture::restoreCopy(CopySite site, const std::vector<bool>* overwritten) {
+    if (!releasedCopy.active) return;
+    std::vector<bool> held(trackedLayers, false);
+    releasedCopy.active = false;
+    usedPresent.store(Recorder::Presents(), std::memory_order_relaxed);
+    auto& census = copyCensus();
+    bool any = false;
+    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+        held[unit] = layerOriginal[unit] && (overwritten == nullptr || unit >= overwritten->size() || !(*overwritten)[unit]);
+        any = any || held[unit];
+    }
+    struct Unheld {
+        StorageTexture& texture;
+        bool done = false;
+        ~Unheld() {
+            if (!done) texture.layerOriginal.assign(texture.trackedLayers, false);
+        }
+    } unheld{*this};
+    if (any) {
+        original.resize(static_cast<std::size_t>(guestBytes));
+        for (const auto& [begin, end] : unitRuns(held)) GuestMemory::ReadCommittedUnguarded(descriptor.baseAddress + begin, std::span(original).subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)));
+    }
+    const bool verified = releasedCopy.kept.size() == guestBytes;
+    std::uint64_t restoredBytes = 0;
+    std::size_t changed = 0;
+    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+        if (!held[unit]) continue;
+        const auto offset = static_cast<std::size_t>(layerBegin(unit) - descriptor.baseAddress);
+        const auto bytes = static_cast<std::size_t>(layerBytes(unit));
+        const auto restored = std::span<std::byte>(original).subspan(offset, bytes);
+        const bool same = unit < releasedCopy.hashes.size() && copyHash(restored) == releasedCopy.hashes[unit];
+        restoredBytes += bytes;
+        if (verified) {
+            const auto* kept = releasedCopy.kept.data() + offset;
+            const bool equal = std::memcmp(restored.data(), kept, bytes) == 0;
+            census.checked.fetch_add(1, std::memory_order_relaxed);
+            if (!same && !equal && site == CopySite::Refresh) census.changedBeforeRefresh.fetch_add(1, std::memory_order_relaxed);
+            const char* difference = same != equal ? (same ? "the hash matched bytes that differ" : "the hash differs over equal bytes") : !same && site != CopySite::Refresh ? "the guest bytes changed since the release and were not read again by a refresh first" : nullptr;
+            if (difference != nullptr) {
+                if (census.differing.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[storage-copies-verify] difference at 0x%llx+0x%zx (unit %u of image 0x%llx+0x%llx), path %s: %s; the kept bytes stand\n", static_cast<unsigned long long>(layerBegin(unit)), bytes, unit, static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), CopySiteName(site), difference);
+                std::memcpy(restored.data(), kept, bytes);
+                continue;
+            }
+        }
+        if (same) continue;
+        ++changed;
+        layerOriginal[unit] = false;
+        cancelStoredSave(unit);
+    }
+    unheld.done = true;
+    std::vector<std::array<std::uint64_t, 2>>().swap(releasedCopy.hashes);
+    std::vector<std::byte>().swap(releasedCopy.kept);
+    if (!any) return;
+    census.restored.fetch_add(1, std::memory_order_relaxed);
+    census.restoredBytes.fetch_add(restoredBytes, std::memory_order_relaxed);
+    census.changedUnits.fetch_add(changed, std::memory_order_relaxed);
+    if (changed == 0 || site == CopySite::Refresh) return;
+    census.changedElsewhere.fetch_add(changed, std::memory_order_relaxed);
+    if (census.reportedElsewhere.fetch_add(1, std::memory_order_relaxed) < 4) std::fprintf(stderr, "[storage-copies] image 0x%llx+0x%llx: %zu units changed since their copy was released and were read again at %s, so they no longer hold their copy\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), changed, CopySiteName(site));
+}
+
+const char* StorageTexture::ReleaseCopyForTest() {
+    return releaseCopy();
+}
+
+StorageTexture::CopyReleaseTotals StorageTexture::CopyReleaseCounts() {
+    const auto& census = copyCensus();
+    return {census.released.load(std::memory_order_relaxed), census.releasedBytes.load(std::memory_order_relaxed), census.restored.load(std::memory_order_relaxed), census.restoredBytes.load(std::memory_order_relaxed), census.changedUnits.load(std::memory_order_relaxed), census.changedElsewhere.load(std::memory_order_relaxed)};
+}
+
+void StorageTexture::ReleaseIdleCopies() {
+    const bool on = RuntimeSwitches::Set(RuntimeSwitch::StorageCopyRelease);
+    const bool stats = PipelineStatsOn();
+    const bool verify = copyVerifyOn();
+    if ((!on && !stats && !verify) || !GuestMemory::GpuMutex().HeldByThisThread()) return;
+    auto& census = copyCensus();
+    const auto now = Recorder::Presents();
+    const auto idle = copyIdlePresents();
+    const auto idleNow = [&](const StorageTexture& texture) {
+        const auto used = texture.usedPresent.load(std::memory_order_relaxed);
+        return used <= now && now - used >= idle;
+    };
+    const bool report = stats && TenSecondsPassed(census.window);
+    const bool verifyReport = verify && TenSecondsPassed(census.verifyWindow);
+    std::size_t cached = 0;
+    std::size_t holding = 0;
+    std::size_t releasedNow = 0;
+    std::size_t idlePending = 0;
+    std::uint64_t holdingBytes = 0;
+    std::uint64_t keptBytes = 0;
+    std::vector<std::shared_ptr<StorageTexture>> candidates;
+    {
+        auto& live = Live();
+        std::lock_guard lock(live.mutex);
+        if (report) {
+            for (const auto* texture : live.textures) {
+                if (texture->released || !texture->Cached()) continue;
+                ++cached;
+                if (texture->original.capacity() != 0) {
+                    ++holding;
+                    holdingBytes += texture->original.capacity();
+                }
+                if (texture->releasedCopy.active) {
+                    ++releasedNow;
+                    keptBytes += texture->releasedCopy.kept.capacity();
+                }
+                if (idleNow(*texture) && texture->layerPending.Any()) ++idlePending;
+            }
+        }
+        const auto count = live.textures.size();
+        const auto examined = std::min(count, CopyExaminedPerCall);
+        for (std::size_t step = 0; on && step < examined && candidates.size() < CopyReleasesPerCall; ++step) {
+            auto* texture = live.textures[census.cursor++ % count];
+            if (texture->released || !texture->Cached() || texture->releasedCopy.active || !idleNow(*texture)) continue;
+            if (texture->original.capacity() == 0 && (!texture->generationBaseline.empty() || texture->generationBaseline.capacity() == 0)) continue;
+            if (auto alive = texture->weak_from_this().lock()) candidates.push_back(std::move(alive));
+        }
+    }
+    std::uint64_t hashed = 0;
+    for (const auto& texture : candidates) {
+        const bool holds = std::find(texture->layerOriginal.begin(), texture->layerOriginal.end(), true) != texture->layerOriginal.end();
+        if (holds && hashed >= CopyHashedPerCall) continue;
+        const auto bytes = holds ? static_cast<std::uint64_t>(texture->original.size()) : std::uint64_t{0};
+        if (texture->releaseCopy() == nullptr) hashed += bytes;
+    }
+    if (report) {
+        const auto totals = CopyReleaseCounts();
+        const auto& last = census.reported;
+        AgcDriver::ProfilePrint_nid_no_patch("[storage-copies] (10 s) %zu images cached, %zu holding a copy (%llu MiB), %zu with their copy released (%llu MiB kept aside to verify); released %llu copies (%llu MiB), read again %llu (%llu MiB; %llu units changed since their release, %llu of them read again outside a refresh); %zu idle images not released because results were pending; release %s, idle after %llu presents\n", cached, holding, copyMiB(holdingBytes), releasedNow, copyMiB(keptBytes), static_cast<unsigned long long>(totals.released - last.released), copyMiB(totals.releasedBytes - last.releasedBytes), static_cast<unsigned long long>(totals.restored - last.restored), copyMiB(totals.restoredBytes - last.restoredBytes), static_cast<unsigned long long>(totals.changedUnits - last.changedUnits), static_cast<unsigned long long>(totals.changedElsewhere - last.changedElsewhere), idlePending, on ? "on" : "off", static_cast<unsigned long long>(idle));
+        census.reported = totals;
+    }
+    if (verifyReport) AgcDriver::ProfilePrint_nid_no_patch("[storage-copies-verify] %llu checked, %llu differing; %llu units changed since their release before a refresh read them again\n", static_cast<unsigned long long>(census.checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(census.differing.load(std::memory_order_relaxed)), static_cast<unsigned long long>(census.changedBeforeRefresh.load(std::memory_order_relaxed)));
 }
 
 std::uint64_t StorageTexture::GuestBytes() const {

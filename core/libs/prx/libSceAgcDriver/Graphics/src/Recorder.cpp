@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionSnapshots.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
@@ -466,16 +467,30 @@ void ReleaseThreadMain() {
     for (;;) {
         while (queue.items.empty() && !queue.stop) {
             queue.waiting = true;
-            queue.wake.wait(lock);
+            if (SpreadDestruction::Pending()) queue.wake.wait_for(lock, SpreadDestruction::Gap());
+            else queue.wake.wait(lock);
             queue.waiting = false;
+            if (!queue.items.empty() || queue.stop || !SpreadDestruction::Pending()) continue;
+            lock.unlock();
+            SpreadDestruction::Step();
+            lock.lock();
         }
         if (queue.items.empty()) return;
         auto items = std::move(queue.items);
         queue.items.clear();
         lock.unlock();
         DestroyDeferred(std::move(items), true);
+        SpreadDestruction::Step();
         lock.lock();
     }
+}
+
+void WakeReleaseThreadForSpread() {
+    auto& queue = ReleaseThreadQueue();
+    {
+        std::lock_guard lock(queue.mutex);
+    }
+    queue.wake.notify_one();
 }
 
 // Stops the release thread once it emptied the queue and joins it (~Recorder, before its device
@@ -488,6 +503,7 @@ void JoinReleaseThread() {
     {
         std::lock_guard lock(queue.mutex);
         if (!queue.started) return;
+        SpreadDestruction::SetWake(nullptr);
         queue.stop = true;
         worker = std::move(queue.thread);
     }
@@ -524,6 +540,7 @@ void ReleaseDeferredKeeps() {
             if (!queue.started) {
                 queue.thread = std::thread(&ReleaseThreadMain);
                 queue.started = true;
+                SpreadDestruction::SetWake(&WakeReleaseThreadForSpread);
             }
             // The allocation before any move: a failure here leaves `releasing` intact for the
             // fallback below, and the moves cannot throw.

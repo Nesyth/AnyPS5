@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageMemory.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <cstdint>
@@ -38,6 +39,48 @@ struct SlabSlot {
     VkDeviceSize offset;
     void* mapping;
 };
+
+struct SpreadDestructionCounts {
+    std::uint64_t queued = 0;
+    std::uint64_t queuedBytes = 0;
+    std::uint64_t destroyed = 0;
+    std::uint64_t destroyedBytes = 0;
+    std::uint64_t portions = 0;
+    std::uint64_t overBound = 0;
+    std::uint64_t overBoundBytes = 0;
+    std::uint64_t drained = 0;
+    std::uint64_t drainedBytes = 0;
+    std::uint64_t pending = 0;
+    std::uint64_t pendingBytes = 0;
+    std::uint64_t longestPortionUs = 0;
+    std::uint64_t largestPending = 0;
+    std::uint64_t largestPendingBytes = 0;
+    std::uint64_t ownerBatches = 0;
+    std::uint64_t ownersQueued = 0;
+    std::uint64_t ownersReleased = 0;
+    std::uint64_t ownerPortions = 0;
+    std::uint64_t ownersOverBound = 0;
+    std::uint64_t ownersDrained = 0;
+    std::uint64_t ownersPending = 0;
+};
+
+namespace SpreadDestruction {
+
+bool Queueing();
+void SetWake(void (*wake)());
+bool Pending();
+std::chrono::milliseconds Gap();
+std::size_t PerStep();
+std::chrono::microseconds Budget();
+VkDeviceSize MaxBytes();
+std::size_t Step() noexcept;
+std::size_t Step(std::size_t count, std::chrono::microseconds budget) noexcept;
+void DrainAll() noexcept;
+bool Release(std::vector<std::shared_ptr<const void>>& owners, std::size_t bytes) noexcept;
+SpreadDestructionCounts Counts();
+SpreadDestructionCounts TakeWindow();
+
+}
 
 // Released buffer allocations kept for reuse, since creating, binding and mapping one costs tens of
 // microseconds and a build makes several. Small requests are served by size class (the next power of
@@ -86,6 +129,11 @@ public:
     SlabSlot TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable);
     VkDeviceSize PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noexcept;
     std::size_t SlabBlocks();
+    std::size_t DestroyPending(std::size_t count, std::chrono::steady_clock::time_point deadline) noexcept;
+    VkDeviceSize DrainPending() noexcept;
+    std::size_t PendingAllocations();
+    VkDeviceSize PendingBytes();
+    void SetPendingBound(VkDeviceSize bytes);
 
 private:
     friend class ImageAllocation;
@@ -164,6 +212,7 @@ private:
     static bool DeviceTiered(VkMemoryPropertyFlags properties);
     static std::size_t NextCapacity(std::size_t capacity);
     VkDeviceSize destroy(const BufferAllocation& allocation, bool retained = false) noexcept;
+    void retire(const BufferAllocation& allocation, bool retained) noexcept;
     VkDeviceSize trim();
     // Moves the tier's least recently used slot (the oldest front of its lists) to `evicted`; the
     // caller destroys those after releasing the mutex, so builds taking buffers on other threads
@@ -211,6 +260,10 @@ private:
     std::unordered_map<VkDeviceMemory, std::unique_ptr<ImageBlock>> imageBlocks;
     std::array<ImageBlock*, VK_MAX_MEMORY_TYPES> imageAvailable{};
     std::atomic<VkDeviceSize> retainedImageSlabBytes{0};
+    AgcDriver::Mutex pendingMutex;
+    std::deque<BufferAllocation> pending;
+    VkDeviceSize pendingBytes = 0;
+    VkDeviceSize pendingBound = 0;
     static constexpr VkDeviceSize budget = 512ull * 1024 * 1024;
     // The small tier's own budget (slots of at most half a MiB each): pinned host memory the large
     // tier's budget does not count.

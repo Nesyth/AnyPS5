@@ -407,6 +407,7 @@ void Driver::commitFlip(const FlipCommit& flip) {
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             const auto localDevice = device.Load();
             if (localDevice != nullptr) static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("flip"));
+            Graphics::StorageTexture::ReleaseIdleCopies();
             if (flip.label) {
                 const auto label = Pm4::DecodeLabelWrite(flip.words);
                 require(label.has_value(), "AGC driver: the label of an ordered flip decodes to no label write");
@@ -994,6 +995,7 @@ void Driver::execute(const Submission& submission) {
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());
                 const auto localDevice = device.Load();
                 if (localDevice != nullptr) static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("flip"));
+                Graphics::StorageTexture::ReleaseIdleCopies();
 
                 if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0, Graphics::Recorder::SubmitReason::Flip);
                 if (localDevice != nullptr) localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);

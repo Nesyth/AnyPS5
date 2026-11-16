@@ -4459,6 +4459,13 @@ void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destinati
     copyCommitted(address, destination);
 }
 
+void ReadCommittedUnguarded(std::uint64_t address, std::span<std::byte> destination) {
+    if (destination.empty()) return;
+    const TimedAccess timed(CounterRead, destination.size());
+    CountReadCaller(__builtin_return_address(0));
+    copyCommitted(address, destination);
+}
+
 void noteCompareKinds(std::uint64_t address, std::size_t bytes) {
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!stats) return;

@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -1563,6 +1564,28 @@ std::size_t DirectClass::Bytes() const {
     return sizeof(DirectClass) + (record != nullptr ? record->Bytes() : 0);
 }
 
+namespace {
+
+bool spreadClasses() {
+    return Graphics::SpreadDestruction::Queueing();
+}
+
+template<typename Map>
+void releaseClasses(Map& classes, std::size_t bytes) noexcept {
+    if (classes.empty()) return;
+    std::vector<std::shared_ptr<const void>> owners;
+    try {
+        owners.reserve(classes.size() + 1);
+        for (auto& entry : classes) owners.push_back(std::move(entry.second));
+        owners.push_back(std::make_shared<Map>(std::move(classes)));
+    } catch (...) {
+        return;
+    }
+    Graphics::SpreadDestruction::Release(owners, bytes);
+}
+
+}
+
 std::shared_ptr<const DirectClass> DirectClassStore::Find(const DirectClassKey& key, std::uint64_t probe) const {
     auto& slot = HostThreadLocal<ClassFront, ClassFrontStorage>().slots[static_cast<std::size_t>(probe % FrontSlots)];
     if (slot.entry != nullptr && slot.probe == probe && slot.clears == clears.load(std::memory_order_acquire) && slot.entry->key == key) return slot.entry;
@@ -1575,21 +1598,31 @@ std::shared_ptr<const DirectClass> DirectClassStore::Find(const DirectClassKey& 
 
 std::shared_ptr<const DirectClass> DirectClassStore::Install(std::shared_ptr<const DirectClass> entry, std::uint64_t tag, bool& installed) {
     installed = false;
-    std::lock_guard lock(mutex);
-    if (!DirectStores::Get().Current(tag)) return entry;
-    if (const auto found = classes.find(entry->key); found != classes.end()) return found->second;
-    if (classes.size() >= Bound) {
-        DirectDraws::Add(Counter::ClassesEvicted, kept);
-        classes.clear();
-        kept = 0;
-        bytes = 0;
-        clears.fetch_add(1, std::memory_order_release);
+    decltype(classes) evicted;
+    std::size_t evictedBytes = 0;
+    {
+        std::lock_guard lock(mutex);
+        if (!DirectStores::Get().Current(tag)) return entry;
+        if (const auto found = classes.find(entry->key); found != classes.end()) return found->second;
+        if (classes.size() >= Bound) {
+            DirectDraws::Add(Counter::ClassesEvicted, kept);
+            if (spreadClasses()) {
+                classes.swap(evicted);
+                evictedBytes = bytes;
+            } else {
+                classes.clear();
+            }
+            kept = 0;
+            bytes = 0;
+            clears.fetch_add(1, std::memory_order_release);
+        }
+        if (entry->record != nullptr) ++kept;
+        bytes += entry->Bytes();
+        classes.emplace(entry->key, entry);
+        installed = true;
+        note();
     }
-    if (entry->record != nullptr) ++kept;
-    bytes += entry->Bytes();
-    classes.emplace(entry->key, entry);
-    installed = true;
-    note();
+    releaseClasses(evicted, evictedBytes);
     return entry;
 }
 
@@ -1612,22 +1645,42 @@ bool DirectClassStore::Refuse(const DirectClass& found, Counter reason) {
 }
 
 void DirectClassStore::Evict() {
-    std::lock_guard lock(mutex);
-    DirectDraws::Add(Counter::ClassesEvicted, kept);
-    classes.clear();
-    kept = 0;
-    bytes = 0;
-    clears.fetch_add(1, std::memory_order_release);
-    note();
+    decltype(classes) evicted;
+    std::size_t evictedBytes = 0;
+    {
+        std::lock_guard lock(mutex);
+        DirectDraws::Add(Counter::ClassesEvicted, kept);
+        if (spreadClasses()) {
+            classes.swap(evicted);
+            evictedBytes = bytes;
+        } else {
+            classes.clear();
+        }
+        kept = 0;
+        bytes = 0;
+        clears.fetch_add(1, std::memory_order_release);
+        note();
+    }
+    releaseClasses(evicted, evictedBytes);
 }
 
 void DirectClassStore::Clear() {
-    std::lock_guard lock(mutex);
-    classes.clear();
-    kept = 0;
-    bytes = 0;
-    clears.fetch_add(1, std::memory_order_release);
-    note();
+    decltype(classes) evicted;
+    std::size_t evictedBytes = 0;
+    {
+        std::lock_guard lock(mutex);
+        if (spreadClasses()) {
+            classes.swap(evicted);
+            evictedBytes = bytes;
+        } else {
+            classes.clear();
+        }
+        kept = 0;
+        bytes = 0;
+        clears.fetch_add(1, std::memory_order_release);
+        note();
+    }
+    releaseClasses(evicted, evictedBytes);
 }
 
 std::size_t DirectClassStore::Size() const {
@@ -1666,7 +1719,7 @@ std::uint64_t DirectStores::Follow(std::uint64_t serial) {
     auto live = Graphics::RuntimeSwitches::Snapshot();
     // Switches that change only what the committer does with a hit, or only dispatch packets,
     // leave the stages and classes as they are, so an in-run A/B of one keeps the stores.
-    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic, Graphics::RuntimeSwitch::CommitFragments, Graphics::RuntimeSwitch::ExpressCommits, Graphics::RuntimeSwitch::XpStreamSegments, Graphics::RuntimeSwitch::XpNoEagerStore, Graphics::RuntimeSwitch::LabelOrderedStores, Graphics::RuntimeSwitch::DeeperRing, Graphics::RuntimeSwitch::BesideSampleDumps, Graphics::RuntimeSwitch::DispatchBeside, Graphics::RuntimeSwitch::FaultFragments, Graphics::RuntimeSwitch::StageMemo, Graphics::RuntimeSwitch::KeepFaultSlots, Graphics::RuntimeSwitch::SiblingFinishers, Graphics::RuntimeSwitch::FastSettle, Graphics::RuntimeSwitch::XpSlowFinisher, Graphics::RuntimeSwitch::XpSlowCommitter, Graphics::RuntimeSwitch::XpSlowWorker, Graphics::RuntimeSwitch::XpExpressFloor, Graphics::RuntimeSwitch::LeanExpress, Graphics::RuntimeSwitch::XpAppendCommits, Graphics::RuntimeSwitch::PreciseSettle, Graphics::RuntimeSwitch::AppendCommits, Graphics::RuntimeSwitch::StageMemoPatchVertex, Graphics::RuntimeSwitch::StageMemoPatchBuffers, Graphics::RuntimeSwitch::StageMemoPatchData, Graphics::RuntimeSwitch::RunFollow, Graphics::RuntimeSwitch::TurnWaitsByJob, Graphics::RuntimeSwitch::ExpressKeepState, Graphics::RuntimeSwitch::StageMemoFront, Graphics::RuntimeSwitch::StageMemoAdmitThird, Graphics::RuntimeSwitch::CommitStamps, Graphics::RuntimeSwitch::PassReadsOnce, Graphics::RuntimeSwitch::ReapThrottle, Graphics::RuntimeSwitch::OcclusionWindows, Graphics::RuntimeSwitch::ExpressPassStamps, Graphics::RuntimeSwitch::PassBarriersMerged, Graphics::RuntimeSwitch::LabelReadbackMemo, Graphics::RuntimeSwitch::ExpressTargetUploads, Graphics::RuntimeSwitch::DrawRuns, Graphics::RuntimeSwitch::LargeBatches, Graphics::RuntimeSwitch::ReplayStateDedupe, Graphics::RuntimeSwitch::ReplayStateAcrossBinds, Graphics::RuntimeSwitch::RunFollowNoCarry, Graphics::RuntimeSwitch::RunFollowPlainLoop, Graphics::RuntimeSwitch::FinisherParkSlots, Graphics::RuntimeSwitch::ListHooksOnce, Graphics::RuntimeSwitch::DispatchEnvOnce, Graphics::RuntimeSwitch::PlainRegisterPackets, Graphics::RuntimeSwitch::UserWordBlocks, Graphics::RuntimeSwitch::XpDeviceUploads, Graphics::RuntimeSwitch::XpDepthLayouts, Graphics::RuntimeSwitch::XpTargetRestarts, Graphics::RuntimeSwitch::TargetRestarts, Graphics::RuntimeSwitch::MovedInPlace, Graphics::RuntimeSwitch::IndirectInPass, Graphics::RuntimeSwitch::FragmentOwnSets, Graphics::RuntimeSwitch::DirectBuffersInPlace, Graphics::RuntimeSwitch::DirectGpuIndirect, Graphics::RuntimeSwitch::ExpressGpuIndirect, Graphics::RuntimeSwitch::RegisterRuns, Graphics::RuntimeSwitch::ListRegisterPackets, Graphics::RuntimeSwitch::PacketClassTable, Graphics::RuntimeSwitch::RangeMemo, Graphics::RuntimeSwitch::PendingIndexKept, Graphics::RuntimeSwitch::FillImageIndex, Graphics::RuntimeSwitch::WatchedReaps, Graphics::RuntimeSwitch::DeferredBatchStamps, Graphics::RuntimeSwitch::StageViews, Graphics::RuntimeSwitch::StageMemoLeanStores, Graphics::RuntimeSwitch::SettleSerial, Graphics::RuntimeSwitch::FragmentPlans, Graphics::RuntimeSwitch::BufferBlobAppend, Graphics::RuntimeSwitch::ShapePrologue, Graphics::RuntimeSwitch::DirectHandoff, Graphics::RuntimeSwitch::InputsMemo, Graphics::RuntimeSwitch::WorkerHelps, Graphics::RuntimeSwitch::DispatchMovedWrites, Graphics::RuntimeSwitch::DispatchRelocate, Graphics::RuntimeSwitch::DispatchMovedRecipes, Graphics::RuntimeSwitch::StageMemoPatchMerged, Graphics::RuntimeSwitch::StageMemoChained, Graphics::RuntimeSwitch::StageMemoAdmitWays, Graphics::RuntimeSwitch::StageMemoInvocationWays, Graphics::RuntimeSwitch::ImportSnapshots, Graphics::RuntimeSwitch::FollowWindows, Graphics::RuntimeSwitch::KeepBindingsMoved, Graphics::RuntimeSwitch::FollowWider, Graphics::RuntimeSwitch::ExpressDepthIntent, Graphics::RuntimeSwitch::LazyInPlaceImports, Graphics::RuntimeSwitch::PreparedCapacity, Graphics::RuntimeSwitch::MergedSettle, Graphics::RuntimeSwitch::IdleHitRelease, Graphics::RuntimeSwitch::FragmentParkedSets, Graphics::RuntimeSwitch::UnlockedStamps, Graphics::RuntimeSwitch::WriteSnapshotFronts, Graphics::RuntimeSwitch::PendingFronts, Graphics::RuntimeSwitch::InvocationSlotsWide, Graphics::RuntimeSwitch::XpTrustFinisher, Graphics::RuntimeSwitch::XpTrustCommitter, Graphics::RuntimeSwitch::TemplateKeeps, Graphics::RuntimeSwitch::DepthCheckLean, Graphics::RuntimeSwitch::DispatchRelocateTrials, Graphics::RuntimeSwitch::DirectRectLists, Graphics::RuntimeSwitch::DirectAddressed, Graphics::RuntimeSwitch::TrustAudit, Graphics::RuntimeSwitch::ProofKeeps, Graphics::RuntimeSwitch::ViewTemplateKeeps, Graphics::RuntimeSwitch::LeanFallbackDraws, Graphics::RuntimeSwitch::LabelRuns, Graphics::RuntimeSwitch::DispatchCommitLean, Graphics::RuntimeSwitch::RecordHeavyDraws, Graphics::RuntimeSwitch::InPlaceExact, Graphics::RuntimeSwitch::XpJobReplay, Graphics::RuntimeSwitch::XpFlow, Graphics::RuntimeSwitch::DeepFlow, Graphics::RuntimeSwitch::TailsAhead, Graphics::RuntimeSwitch::FixupsByTurn, Graphics::RuntimeSwitch::FrameFlow, Graphics::RuntimeSwitch::XpNoResolveWaits, Graphics::RuntimeSwitch::WriteValidation, Graphics::RuntimeSwitch::OrderedSyncs, Graphics::RuntimeSwitch::DeepShallow, Graphics::RuntimeSwitch::HtileCarryFills, Graphics::RuntimeSwitch::HostDeepCache, Graphics::RuntimeSwitch::CommitRing, Graphics::RuntimeSwitch::PublicationFromFills, Graphics::RuntimeSwitch::CommitFeed, Graphics::RuntimeSwitch::DeepRuns, Graphics::RuntimeSwitch::FollowAhead}) live.Assign(id, false);
+    for (const auto id : {Graphics::RuntimeSwitch::DirectDraws, Graphics::RuntimeSwitch::DirectCleanProofs, Graphics::RuntimeSwitch::DirectPassTargets, Graphics::RuntimeSwitch::CleanCollects, Graphics::RuntimeSwitch::DirectBuffers, Graphics::RuntimeSwitch::PipelineDispatch, Graphics::RuntimeSwitch::PipelineDispatchMisses, Graphics::RuntimeSwitch::XpCommitFloor, Graphics::RuntimeSwitch::MsaaRecords, Graphics::RuntimeSwitch::XpInputsAsIs, Graphics::RuntimeSwitch::XpStampsByEpoch, Graphics::RuntimeSwitch::MsaaRecordHold, Graphics::RuntimeSwitch::TemplateTouch, Graphics::RuntimeSwitch::DeferredEncode, Graphics::RuntimeSwitch::XpProofAsIs, Graphics::RuntimeSwitch::DirectInputs, Graphics::RuntimeSwitch::DirectRepeat, Graphics::RuntimeSwitch::CleanResidentViews, Graphics::RuntimeSwitch::CleanPendingRanges, Graphics::RuntimeSwitch::RefusedCollectMemo, Graphics::RuntimeSwitch::DirectRetry, Graphics::RuntimeSwitch::ItemsByTurn, Graphics::RuntimeSwitch::XpNoCommits, Graphics::RuntimeSwitch::FourthFinisher, Graphics::RuntimeSwitch::FifthFinisher, Graphics::RuntimeSwitch::DirectRepeatSets, Graphics::RuntimeSwitch::DirectRepeatStores, Graphics::RuntimeSwitch::DirectRepeatShared, Graphics::RuntimeSwitch::WorkerCore, Graphics::RuntimeSwitch::LeanListBatch, Graphics::RuntimeSwitch::LeanListDirect, Graphics::RuntimeSwitch::FinisherDeposit, Graphics::RuntimeSwitch::CommitBindings, Graphics::RuntimeSwitch::CommitBindingsStamps, Graphics::RuntimeSwitch::CommitBindingsSets, Graphics::RuntimeSwitch::CommitBindingsDynamic, Graphics::RuntimeSwitch::CommitFragments, Graphics::RuntimeSwitch::ExpressCommits, Graphics::RuntimeSwitch::XpStreamSegments, Graphics::RuntimeSwitch::XpNoEagerStore, Graphics::RuntimeSwitch::LabelOrderedStores, Graphics::RuntimeSwitch::DeeperRing, Graphics::RuntimeSwitch::BesideSampleDumps, Graphics::RuntimeSwitch::DispatchBeside, Graphics::RuntimeSwitch::FaultFragments, Graphics::RuntimeSwitch::StageMemo, Graphics::RuntimeSwitch::KeepFaultSlots, Graphics::RuntimeSwitch::SiblingFinishers, Graphics::RuntimeSwitch::FastSettle, Graphics::RuntimeSwitch::XpSlowFinisher, Graphics::RuntimeSwitch::XpSlowCommitter, Graphics::RuntimeSwitch::XpSlowWorker, Graphics::RuntimeSwitch::XpExpressFloor, Graphics::RuntimeSwitch::LeanExpress, Graphics::RuntimeSwitch::XpAppendCommits, Graphics::RuntimeSwitch::PreciseSettle, Graphics::RuntimeSwitch::AppendCommits, Graphics::RuntimeSwitch::StageMemoPatchVertex, Graphics::RuntimeSwitch::StageMemoPatchBuffers, Graphics::RuntimeSwitch::StageMemoPatchData, Graphics::RuntimeSwitch::RunFollow, Graphics::RuntimeSwitch::TurnWaitsByJob, Graphics::RuntimeSwitch::ExpressKeepState, Graphics::RuntimeSwitch::StageMemoFront, Graphics::RuntimeSwitch::StageMemoAdmitThird, Graphics::RuntimeSwitch::CommitStamps, Graphics::RuntimeSwitch::PassReadsOnce, Graphics::RuntimeSwitch::ReapThrottle, Graphics::RuntimeSwitch::OcclusionWindows, Graphics::RuntimeSwitch::ExpressPassStamps, Graphics::RuntimeSwitch::PassBarriersMerged, Graphics::RuntimeSwitch::LabelReadbackMemo, Graphics::RuntimeSwitch::ExpressTargetUploads, Graphics::RuntimeSwitch::DrawRuns, Graphics::RuntimeSwitch::LargeBatches, Graphics::RuntimeSwitch::ReplayStateDedupe, Graphics::RuntimeSwitch::ReplayStateAcrossBinds, Graphics::RuntimeSwitch::RunFollowNoCarry, Graphics::RuntimeSwitch::RunFollowPlainLoop, Graphics::RuntimeSwitch::FinisherParkSlots, Graphics::RuntimeSwitch::ListHooksOnce, Graphics::RuntimeSwitch::DispatchEnvOnce, Graphics::RuntimeSwitch::PlainRegisterPackets, Graphics::RuntimeSwitch::UserWordBlocks, Graphics::RuntimeSwitch::XpDeviceUploads, Graphics::RuntimeSwitch::XpDepthLayouts, Graphics::RuntimeSwitch::XpTargetRestarts, Graphics::RuntimeSwitch::TargetRestarts, Graphics::RuntimeSwitch::MovedInPlace, Graphics::RuntimeSwitch::IndirectInPass, Graphics::RuntimeSwitch::FragmentOwnSets, Graphics::RuntimeSwitch::DirectBuffersInPlace, Graphics::RuntimeSwitch::DirectGpuIndirect, Graphics::RuntimeSwitch::ExpressGpuIndirect, Graphics::RuntimeSwitch::RegisterRuns, Graphics::RuntimeSwitch::ListRegisterPackets, Graphics::RuntimeSwitch::PacketClassTable, Graphics::RuntimeSwitch::RangeMemo, Graphics::RuntimeSwitch::PendingIndexKept, Graphics::RuntimeSwitch::FillImageIndex, Graphics::RuntimeSwitch::WatchedReaps, Graphics::RuntimeSwitch::DeferredBatchStamps, Graphics::RuntimeSwitch::StageViews, Graphics::RuntimeSwitch::StageMemoLeanStores, Graphics::RuntimeSwitch::SettleSerial, Graphics::RuntimeSwitch::FragmentPlans, Graphics::RuntimeSwitch::BufferBlobAppend, Graphics::RuntimeSwitch::ShapePrologue, Graphics::RuntimeSwitch::DirectHandoff, Graphics::RuntimeSwitch::InputsMemo, Graphics::RuntimeSwitch::WorkerHelps, Graphics::RuntimeSwitch::DispatchMovedWrites, Graphics::RuntimeSwitch::DispatchRelocate, Graphics::RuntimeSwitch::DispatchMovedRecipes, Graphics::RuntimeSwitch::StageMemoPatchMerged, Graphics::RuntimeSwitch::StageMemoChained, Graphics::RuntimeSwitch::StageMemoAdmitWays, Graphics::RuntimeSwitch::StageMemoInvocationWays, Graphics::RuntimeSwitch::ImportSnapshots, Graphics::RuntimeSwitch::FollowWindows, Graphics::RuntimeSwitch::KeepBindingsMoved, Graphics::RuntimeSwitch::FollowWider, Graphics::RuntimeSwitch::ExpressDepthIntent, Graphics::RuntimeSwitch::LazyInPlaceImports, Graphics::RuntimeSwitch::PreparedCapacity, Graphics::RuntimeSwitch::MergedSettle, Graphics::RuntimeSwitch::IdleHitRelease, Graphics::RuntimeSwitch::FragmentParkedSets, Graphics::RuntimeSwitch::UnlockedStamps, Graphics::RuntimeSwitch::WriteSnapshotFronts, Graphics::RuntimeSwitch::PendingFronts, Graphics::RuntimeSwitch::InvocationSlotsWide, Graphics::RuntimeSwitch::XpTrustFinisher, Graphics::RuntimeSwitch::XpTrustCommitter, Graphics::RuntimeSwitch::TemplateKeeps, Graphics::RuntimeSwitch::DepthCheckLean, Graphics::RuntimeSwitch::DispatchRelocateTrials, Graphics::RuntimeSwitch::DirectRectLists, Graphics::RuntimeSwitch::DirectAddressed, Graphics::RuntimeSwitch::TrustAudit, Graphics::RuntimeSwitch::ProofKeeps, Graphics::RuntimeSwitch::ViewTemplateKeeps, Graphics::RuntimeSwitch::LeanFallbackDraws, Graphics::RuntimeSwitch::LabelRuns, Graphics::RuntimeSwitch::DispatchCommitLean, Graphics::RuntimeSwitch::RecordHeavyDraws, Graphics::RuntimeSwitch::InPlaceExact, Graphics::RuntimeSwitch::XpJobReplay, Graphics::RuntimeSwitch::XpFlow, Graphics::RuntimeSwitch::DeepFlow, Graphics::RuntimeSwitch::TailsAhead, Graphics::RuntimeSwitch::FixupsByTurn, Graphics::RuntimeSwitch::FrameFlow, Graphics::RuntimeSwitch::XpNoResolveWaits, Graphics::RuntimeSwitch::WriteValidation, Graphics::RuntimeSwitch::OrderedSyncs, Graphics::RuntimeSwitch::DeepShallow, Graphics::RuntimeSwitch::HtileCarryFills, Graphics::RuntimeSwitch::HostDeepCache, Graphics::RuntimeSwitch::CommitRing, Graphics::RuntimeSwitch::PublicationFromFills, Graphics::RuntimeSwitch::CommitFeed, Graphics::RuntimeSwitch::DeepRuns, Graphics::RuntimeSwitch::FollowAhead, Graphics::RuntimeSwitch::SpreadDestruction, Graphics::RuntimeSwitch::StorageCopyRelease}) live.Assign(id, false);
     if (!tagged || deviceSerial != serial || !(live == switches)) {
         tagged = true;
         deviceSerial = serial;

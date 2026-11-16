@@ -254,6 +254,8 @@ enum class RuntimeSwitch : std::size_t {
     DeepRuns,
     FollowAhead,
     ReplayStateAcrossBinds,
+    SpreadDestruction,
+    StorageCopyRelease,
     Count,
 };
 

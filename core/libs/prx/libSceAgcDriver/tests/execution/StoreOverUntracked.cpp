@@ -279,11 +279,13 @@ struct Case {
 
 enum class Outcome { Kept, Lost, Missed };
 
+enum class CopyRelease { None, CpuWrote, Unchanged };
+
 // The surface is outside the write watch from the start. Its first results are stored, which
 // leaves their bytes saved for the next store to compare with; the CPU writes another block, then
 // the next results land and are stored: the CPU's block was written after the first store, so it
 // keeps the CPU's bytes as the write watch would keep them.
-Outcome RunSecondStore(const char* name) {
+Outcome RunSecondStore(const char* name, CopyRelease release = CopyRelease::None) {
     Surface surface(true);
     struct WaitForWork {
         ~WaitForWork() { AgcDriverWaitIdle_nid_postfix(); }
@@ -326,8 +328,23 @@ Outcome RunSecondStore(const char* name) {
         std::fprintf(stderr, "[store over untracked] %s: the store left no saved guest bytes\n", name);
         return Outcome::Lost;
     }
+    const auto before = StorageTexture::CopyReleaseCounts();
+    if (release != CopyRelease::None) {
+        hold.lock();
+        const char* refusal = image->ReleaseCopyForTest();
+        const auto snapshotBytes = image->OriginalSnapshotBytes();
+        const bool claimed = image->GuestSnapshotValid() && image->CopyReleased();
+        hold.unlock();
+        if (refusal != nullptr) {
+            std::fprintf(stderr, "[store over untracked] %s: the saved guest bytes were not released: %s\n", name, refusal);
+            return Outcome::Lost;
+        }
+        Require(snapshotBytes == 0 && claimed, "store over untracked: the release kept the saved guest bytes or dropped the units' claim to them");
+    }
     auto* written = surface.Bytes() + 2 * Block;
-    for (std::size_t offset = 0; offset < Page; ++offset) static_cast<volatile std::uint8_t*>(written)[offset] = Pattern(offset);
+    if (release != CopyRelease::Unchanged) {
+        for (std::size_t offset = 0; offset < Page; ++offset) static_cast<volatile std::uint8_t*>(written)[offset] = Pattern(offset);
+    }
     Store(surface.Texels(), Side, StoreAgainCode);
     if (!heldLive(StoredAgain)) return Outcome::Missed;
     StorageTexture::FlushAllPending("store over untracked fixture");
@@ -335,6 +352,21 @@ Outcome RunSecondStore(const char* name) {
     std::vector<std::byte> whole(SurfaceBytes);
     AgcDriver::GuestMemory::Read(address, whole);
     Require(static_cast<const volatile std::uint32_t*>(surface.Texels())[0] == StoredAgain, "store over untracked: the second result did not reach a block the CPU left alone");
+    if (release != CopyRelease::None) {
+        const auto after = StorageTexture::CopyReleaseCounts();
+        hold.lock();
+        const bool stillReleased = image->CopyReleased();
+        hold.unlock();
+        Require(!stillReleased && after.restored == before.restored + 1, "store over untracked: the released copy was not read again exactly once");
+        Require(after.changedElsewhere == before.changedElsewhere, "store over untracked: the released copy was read again outside a refresh");
+        if (release == CopyRelease::CpuWrote) Require(after.changedUnits > before.changedUnits, "store over untracked: the unit the CPU wrote after the release read again as unchanged");
+        else Require(after.changedUnits == before.changedUnits, "store over untracked: a unit nobody wrote after the release read again as changed");
+    }
+    if (release == CopyRelease::Unchanged) {
+        if (reinterpret_cast<const volatile std::uint32_t*>(written)[0] == Untouched) return Outcome::Kept;
+        std::fprintf(stderr, "[store over untracked] %s: a block nobody wrote changed after the released copy was read again\n", name);
+        return Outcome::Lost;
+    }
     const auto lost = LostBytes(written);
     if (lost == 0) return Outcome::Kept;
     std::fprintf(stderr, "[store over untracked] %s: of 0x%zx bytes the CPU wrote between the two stores, %zu were lost\n", name, Page, lost);
@@ -511,13 +543,15 @@ int main(int argc, char** argv) {
             Require(outcome != Outcome::Missed, "store over untracked: the result was never held pending");
             kept = outcome == Outcome::Kept && kept;
         }
-        {
-            constexpr auto name = "a second store over a surface outside the write watch";
+        const auto secondStore = [&](const char* name, CopyRelease release) {
             auto outcome = Outcome::Missed;
-            for (std::uint32_t attempt = 0; attempt < 256u && outcome == Outcome::Missed; ++attempt) outcome = RunSecondStore(name);
+            for (std::uint32_t attempt = 0; attempt < 256u && outcome == Outcome::Missed; ++attempt) outcome = RunSecondStore(name, release);
             Require(outcome != Outcome::Missed, "store over untracked: the result was never held pending");
             kept = outcome == Outcome::Kept && kept;
-        }
+        };
+        secondStore("a second store over a surface outside the write watch", CopyRelease::None);
+        secondStore("a second store over a surface outside the write watch after its saved bytes were released and the CPU wrote a block", CopyRelease::CpuWrote);
+        secondStore("a second store over a surface outside the write watch after its saved bytes were released", CopyRelease::Unchanged);
         Require(kept, "a pending storage result was stored over bytes the CPU wrote to untracked memory");
         AgcDriverShutdown_nid_postfix();
         std::puts("store over untracked tests passed");

@@ -1272,7 +1272,9 @@ struct VulkanDevice::State {
                 }
             }
             Graphics::DestroyShadows(device);
+            Graphics::SpreadDestruction::DrainAll();
             recorder.reset();
+            Graphics::SpreadDestruction::DrainAll();
             // Cached graphics pipelines (with their framebuffers, modules, render passes and layouts)
             // belong to this device and must be destroyed while it lives.
             Graphics::ClearCachedPipelines(device);

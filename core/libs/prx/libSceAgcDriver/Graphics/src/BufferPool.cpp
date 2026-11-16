@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -8,9 +9,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <iterator>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <utility>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -47,6 +52,294 @@ bool systemMemoryHeap(const VkPhysicalDeviceMemoryProperties& memory, std::uint3
 
 constexpr VkBufferUsageFlags deviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
+std::uint64_t spreadValue(const char* name, std::uint64_t fallback, bool zeroAllowed) {
+    const char* text = std::getenv(name);
+    if (text == nullptr || text[0] == '\0') return fallback;
+    char* end = nullptr;
+    const auto value = std::strtoull(text, &end, 10);
+    if (end == text || *end != '\0' || (value == 0 && !zeroAllowed)) return fallback;
+    return value;
+}
+
+bool spreadStats() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return stats;
+}
+
+void noteHigh(std::atomic<std::uint64_t>& value, std::uint64_t seen) noexcept {
+    auto current = value.load(std::memory_order_relaxed);
+    while (seen > current && !value.compare_exchange_weak(current, seen, std::memory_order_relaxed)) {
+    }
+}
+
+struct OwnerBatch {
+    std::vector<std::shared_ptr<const void>> owners;
+    std::size_t next = 0;
+    std::size_t bytes = 0;
+};
+
+struct SpreadState {
+    std::atomic<void (*)()> wake{nullptr};
+    std::atomic<std::uint64_t> allocations{0};
+    std::atomic<std::uint64_t> allocationBytes{0};
+    std::atomic<std::uint64_t> owners{0};
+    std::mutex registryMutex;
+    std::vector<BufferPool*> pools;
+    std::size_t cursor = 0;
+    std::recursive_mutex stepMutex;
+    bool ownersTurn = false;
+    std::mutex ownerMutex;
+    std::deque<OwnerBatch> batches;
+    std::size_t ownerBytes = 0;
+    std::atomic<std::uint64_t> queued{0};
+    std::atomic<std::uint64_t> queuedBytes{0};
+    std::atomic<std::uint64_t> destroyed{0};
+    std::atomic<std::uint64_t> destroyedBytes{0};
+    std::atomic<std::uint64_t> portions{0};
+    std::atomic<std::uint64_t> overBound{0};
+    std::atomic<std::uint64_t> overBoundBytes{0};
+    std::atomic<std::uint64_t> drained{0};
+    std::atomic<std::uint64_t> drainedBytes{0};
+    std::atomic<std::uint64_t> longestPortionUs{0};
+    std::atomic<std::uint64_t> largestPending{0};
+    std::atomic<std::uint64_t> largestPendingBytes{0};
+    std::atomic<std::uint64_t> ownerBatches{0};
+    std::atomic<std::uint64_t> ownersQueued{0};
+    std::atomic<std::uint64_t> ownersReleased{0};
+    std::atomic<std::uint64_t> ownerPortions{0};
+    std::atomic<std::uint64_t> ownersOverBound{0};
+    std::atomic<std::uint64_t> ownersDrained{0};
+    std::mutex reportMutex;
+    std::chrono::steady_clock::time_point reported{};
+};
+
+SpreadState& spreadState() {
+    static auto& state = *new SpreadState();
+    return state;
+}
+
+void wakeDrain(SpreadState& state) noexcept {
+    if (const auto wake = state.wake.load(std::memory_order_acquire); wake != nullptr) wake();
+}
+
+std::size_t destroyAllocations(SpreadState& state, std::size_t count, std::chrono::steady_clock::time_point deadline) noexcept {
+    std::lock_guard registry(state.registryMutex);
+    const auto pools = state.pools.size();
+    std::size_t done = 0;
+    for (std::size_t visited = 0; visited < pools && done < count; ++visited) {
+        done += state.pools[(state.cursor + visited) % pools]->DestroyPending(count - done, deadline);
+        if (done != 0 && std::chrono::steady_clock::now() >= deadline) break;
+    }
+    if (pools != 0) state.cursor = (state.cursor + 1) % pools;
+    return done;
+}
+
+std::size_t releaseOwners(SpreadState& state, std::size_t count, std::chrono::steady_clock::time_point deadline) noexcept {
+    std::size_t done = 0;
+    while (done < count) {
+        std::shared_ptr<const void> owner;
+        std::vector<std::shared_ptr<const void>> spent;
+        {
+            std::lock_guard lock(state.ownerMutex);
+            if (state.batches.empty()) break;
+            auto& batch = state.batches.front();
+            owner = std::move(batch.owners[batch.next++]);
+            state.owners.fetch_sub(1);
+            if (batch.next == batch.owners.size()) {
+                state.ownerBytes -= batch.bytes;
+                spent = std::move(batch.owners);
+                state.batches.pop_front();
+            }
+        }
+        owner.reset();
+        ++done;
+        state.ownersReleased.fetch_add(1, std::memory_order_relaxed);
+        if (std::chrono::steady_clock::now() >= deadline) break;
+    }
+    return done;
+}
+
+void reportSpread(SpreadState& state) noexcept {
+    if (!spreadStats()) return;
+    try {
+        const auto now = std::chrono::steady_clock::now();
+        {
+            std::lock_guard lock(state.reportMutex);
+            if (state.reported == std::chrono::steady_clock::time_point{}) {
+                state.reported = now;
+                return;
+            }
+            if (now - state.reported < std::chrono::seconds(10)) return;
+            state.reported = now;
+        }
+        const bool on = RuntimeSwitches::Set(RuntimeSwitch::SpreadDestruction);
+        const auto counts = SpreadDestruction::TakeWindow();
+        if (!on && counts.queued == 0 && counts.ownersQueued == 0) return;
+        constexpr double MiBytes = 1048576.0;
+        std::fprintf(stderr, "[spread-destruction] switch %s, drain thread %s; allocations: %llu queued (%.1f MiB), %llu destroyed in %llu portions (%.1f MiB), %llu destroyed by the caller over the bound (%.1f MiB), %llu destroyed by drains (%.1f MiB), %llu pending (%.1f MiB); owners: %llu handed to the reaper in %llu batches, %llu released in %llu portions, %llu released by the caller over the bound, %llu released by drains, %llu pending; this window: longest portion %llu us, largest pending list %llu allocations (%.1f MiB); portion %zu objects or %lld us, bound %llu MiB\n",
+            on ? "on" : "off", state.wake.load(std::memory_order_acquire) != nullptr ? "on" : "off",
+            static_cast<unsigned long long>(counts.queued), counts.queuedBytes / MiBytes, static_cast<unsigned long long>(counts.destroyed), static_cast<unsigned long long>(counts.portions), counts.destroyedBytes / MiBytes,
+            static_cast<unsigned long long>(counts.overBound), counts.overBoundBytes / MiBytes, static_cast<unsigned long long>(counts.drained), counts.drainedBytes / MiBytes, static_cast<unsigned long long>(counts.pending), counts.pendingBytes / MiBytes,
+            static_cast<unsigned long long>(counts.ownersQueued), static_cast<unsigned long long>(counts.ownerBatches), static_cast<unsigned long long>(counts.ownersReleased), static_cast<unsigned long long>(counts.ownerPortions),
+            static_cast<unsigned long long>(counts.ownersOverBound), static_cast<unsigned long long>(counts.ownersDrained), static_cast<unsigned long long>(counts.ownersPending),
+            static_cast<unsigned long long>(counts.longestPortionUs), static_cast<unsigned long long>(counts.largestPending), counts.largestPendingBytes / MiBytes,
+            SpreadDestruction::PerStep(), static_cast<long long>(SpreadDestruction::Budget().count()), static_cast<unsigned long long>(SpreadDestruction::MaxBytes() >> 20u));
+    } catch (...) {
+    }
+}
+
+}
+
+namespace SpreadDestruction {
+
+bool Queueing() {
+    return RuntimeSwitches::Set(RuntimeSwitch::SpreadDestruction) && spreadState().wake.load(std::memory_order_acquire) != nullptr;
+}
+
+void SetWake(void (*wake)()) {
+    spreadState().wake.store(wake, std::memory_order_release);
+}
+
+bool Pending() {
+    auto& state = spreadState();
+    return state.allocations.load() != 0 || state.owners.load() != 0;
+}
+
+std::chrono::milliseconds Gap() {
+    return std::chrono::milliseconds(1);
+}
+
+std::size_t PerStep() {
+    static const auto count = static_cast<std::size_t>(spreadValue("APS5_SPREAD_DESTRUCTION_PER_STEP", 64, false));
+    return count;
+}
+
+std::chrono::microseconds Budget() {
+    static const auto budget = std::chrono::microseconds(static_cast<std::int64_t>(std::min<std::uint64_t>(spreadValue("APS5_SPREAD_DESTRUCTION_US", 300, true), 1000000)));
+    return budget;
+}
+
+VkDeviceSize MaxBytes() {
+    static const VkDeviceSize bytes = [] {
+        const auto mib = spreadValue("APS5_SPREAD_DESTRUCTION_MAX_MIB", 512, true);
+        return mib > (std::numeric_limits<VkDeviceSize>::max() >> 20u) ? std::numeric_limits<VkDeviceSize>::max() : static_cast<VkDeviceSize>(mib) << 20u;
+    }();
+    return bytes;
+}
+
+std::size_t Step() noexcept {
+    return Step(PerStep(), Budget());
+}
+
+std::size_t Step(std::size_t count, std::chrono::microseconds budget) noexcept {
+    auto& state = spreadState();
+    reportSpread(state);
+    if (count == 0 || !Pending()) return 0;
+    std::lock_guard step(state.stepMutex);
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + budget;
+    const bool ownersWaiting = state.owners.load() != 0;
+    const bool allocationsWaiting = state.allocations.load() != 0;
+    const bool owners = ownersWaiting && (!allocationsWaiting || state.ownersTurn);
+    state.ownersTurn = !owners;
+    const auto done = owners ? releaseOwners(state, count, deadline) : destroyAllocations(state, count, deadline);
+    if (done == 0) return 0;
+    (owners ? state.ownerPortions : state.portions).fetch_add(1, std::memory_order_relaxed);
+    noteHigh(state.longestPortionUs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()));
+    return done;
+}
+
+void DrainAll() noexcept {
+    auto& state = spreadState();
+    std::lock_guard step(state.stepMutex);
+    for (;;) {
+        std::vector<std::shared_ptr<const void>> owners;
+        std::size_t left = 0;
+        {
+            std::lock_guard lock(state.ownerMutex);
+            if (state.batches.empty()) break;
+            auto& batch = state.batches.front();
+            left = batch.owners.size() - batch.next;
+            owners = std::move(batch.owners);
+            state.ownerBytes -= batch.bytes;
+            state.owners.fetch_sub(left);
+            state.batches.pop_front();
+        }
+        state.ownersDrained.fetch_add(left, std::memory_order_relaxed);
+        owners.clear();
+    }
+    std::lock_guard registry(state.registryMutex);
+    for (auto* pool : state.pools) pool->DrainPending();
+}
+
+bool Release(std::vector<std::shared_ptr<const void>>& owners, std::size_t bytes) noexcept {
+    if (owners.empty()) return true;
+    if (!Queueing()) return false;
+    auto& state = spreadState();
+    const auto count = owners.size();
+    const auto bound = MaxBytes();
+    bool queued = false;
+    std::uint64_t before = 0;
+    try {
+        std::lock_guard lock(state.ownerMutex);
+        if (bytes <= bound && state.ownerBytes <= bound - bytes) {
+            state.batches.emplace_back();
+            auto& batch = state.batches.back();
+            batch.owners = std::move(owners);
+            batch.bytes = bytes;
+            state.ownerBytes += bytes;
+            before = state.owners.fetch_add(count);
+            queued = true;
+        }
+    } catch (...) {
+    }
+    if (!queued) {
+        state.ownersOverBound.fetch_add(count, std::memory_order_relaxed);
+        return false;
+    }
+    owners.clear();
+    state.ownerBatches.fetch_add(1, std::memory_order_relaxed);
+    state.ownersQueued.fetch_add(count, std::memory_order_relaxed);
+    if (before == 0) wakeDrain(state);
+    return true;
+}
+
+SpreadDestructionCounts Counts() {
+    auto& state = spreadState();
+    SpreadDestructionCounts counts;
+    counts.queued = state.queued.load(std::memory_order_relaxed);
+    counts.queuedBytes = state.queuedBytes.load(std::memory_order_relaxed);
+    counts.destroyed = state.destroyed.load(std::memory_order_relaxed);
+    counts.destroyedBytes = state.destroyedBytes.load(std::memory_order_relaxed);
+    counts.portions = state.portions.load(std::memory_order_relaxed);
+    counts.overBound = state.overBound.load(std::memory_order_relaxed);
+    counts.overBoundBytes = state.overBoundBytes.load(std::memory_order_relaxed);
+    counts.drained = state.drained.load(std::memory_order_relaxed);
+    counts.drainedBytes = state.drainedBytes.load(std::memory_order_relaxed);
+    counts.pending = state.allocations.load();
+    counts.pendingBytes = state.allocationBytes.load();
+    counts.longestPortionUs = state.longestPortionUs.load(std::memory_order_relaxed);
+    counts.largestPending = state.largestPending.load(std::memory_order_relaxed);
+    counts.largestPendingBytes = state.largestPendingBytes.load(std::memory_order_relaxed);
+    counts.ownerBatches = state.ownerBatches.load(std::memory_order_relaxed);
+    counts.ownersQueued = state.ownersQueued.load(std::memory_order_relaxed);
+    counts.ownersReleased = state.ownersReleased.load(std::memory_order_relaxed);
+    counts.ownerPortions = state.ownerPortions.load(std::memory_order_relaxed);
+    counts.ownersOverBound = state.ownersOverBound.load(std::memory_order_relaxed);
+    counts.ownersDrained = state.ownersDrained.load(std::memory_order_relaxed);
+    counts.ownersPending = state.owners.load();
+    return counts;
+}
+
+SpreadDestructionCounts TakeWindow() {
+    auto& state = spreadState();
+    auto counts = Counts();
+    counts.longestPortionUs = state.longestPortionUs.exchange(0, std::memory_order_relaxed);
+    counts.largestPending = state.largestPending.exchange(0, std::memory_order_relaxed);
+    counts.largestPendingBytes = state.largestPendingBytes.exchange(0, std::memory_order_relaxed);
+    return counts;
+}
+
 }
 
 BufferPool::BufferPool(const Context& context) : maxSlots(std::max<std::size_t>(1, std::min<std::size_t>(MaxSlots(), context.limits.maxMemoryAllocationCount / 6u))), cacheReclaim(context.cacheReclaim), device(context.device), unmap(context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")), destroyBuffer(context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")), freeMemory(context.Function<PFN_vkFreeMemory>("vkFreeMemory")), allocateMemory(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")), mapMemory(context.Function<PFN_vkMapMemory>("vkMapMemory")), physical(context.physical), memoryProperties(context.memory), memoryProperties2(context.memoryProperties2) {
@@ -57,9 +350,20 @@ BufferPool::BufferPool(const Context& context) : maxSlots(std::max<std::size_t>(
     physical = context.physical;
     memoryProperties2 = context.memoryProperties2;
     imageBudget = ImageBudget(deviceTier.budget);
+    pendingBound = SpreadDestruction::MaxBytes();
+    auto& state = spreadState();
+    std::lock_guard registry(state.registryMutex);
+    state.pools.push_back(this);
 }
 
 BufferPool::~BufferPool() {
+    {
+        auto& state = spreadState();
+        std::lock_guard registry(state.registryMutex);
+        std::erase(state.pools, this);
+        state.cursor = 0;
+    }
+    DrainPending();
     for (auto* tier : {&smallTier, &largeTier, &deviceTier}) {
         for (const auto& [key, slots] : tier->free) {
             for (const auto& slot : slots) destroy(slot.allocation, true);
@@ -204,9 +508,11 @@ void BufferPool::PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::
     BufferAllocation allocation{VK_NULL_HANDLE, memory, nullptr, 0, bytes, static_cast<std::size_t>(bytes), 0, memoryProperties.memoryTypes[memoryType].propertyFlags};
     allocation.memoryType = memoryType;
     std::vector<BufferAllocation> evicted;
+    bool urgent = false;
     try {
         std::lock_guard lock(mutex);
         if (heapOverBudget() || bytes > imageBudget - std::min(imageBudget, retainedImageSlabBytes.load(std::memory_order_relaxed))) {
+            urgent = true;
             while (imageSlots != 0 && evictOldestImage(evicted)) {
             }
             evicted.push_back(allocation);
@@ -233,7 +539,10 @@ void BufferPool::PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::
     } catch (...) {
         destroy(allocation);
     }
-    for (const auto& gone : evicted) destroy(gone, true);
+    for (const auto& gone : evicted) {
+        if (urgent) destroy(gone, true);
+        else retire(gone, true);
+    }
 }
 
 std::size_t BufferPool::RetainedImages() {
@@ -584,7 +893,7 @@ VkDeviceSize BufferPool::trim() {
         imageSlots = 0;
         imageOrder.clear();
     }
-    VkDeviceSize bytes = 0;
+    VkDeviceSize bytes = DrainPending();
     for (const auto* tier : {&retiredSmall, &retiredLarge, &retiredDevice}) {
         for (const auto& [key, slots] : tier->free) {
             for (const auto& slot : slots) bytes += destroy(slot.allocation, true);
@@ -613,6 +922,7 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
     // Evicted allocations are destroyed after the mutex is released (see evictOldest). The vector
     // may throw on growth; a Put that cannot retain simply destroys, as noexcept requires.
     std::vector<BufferAllocation> evicted;
+    bool urgent = false;
     try {
         std::lock_guard lock(mutex);
         auto& tier = tierFor(allocation.bytes, allocation.properties);
@@ -626,10 +936,111 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
             if (allocation.slab) MemoryAccounting::RetainPart(device, allocation.memory, allocation.allocationBytes, true);
             else MemoryAccounting::Retain(device, allocation.memory, allocation.allocationBytes);
         }
+        if (!evicted.empty() && SpreadDestruction::Queueing()) urgent = heapOverBudget();
     } catch (...) {
         destroy(allocation);
     }
-    for (const auto& gone : evicted) destroy(gone, true);
+    for (const auto& gone : evicted) {
+        if (urgent) destroy(gone, true);
+        else retire(gone, true);
+    }
+}
+
+void BufferPool::retire(const BufferAllocation& allocation, bool retained) noexcept {
+    if (!SpreadDestruction::Queueing()) {
+        destroy(allocation, retained);
+        return;
+    }
+    if (allocation.slab) {
+        if (retained) MemoryAccounting::RetainPart(device, allocation.memory, allocation.allocationBytes, false);
+    } else {
+        MemoryAccounting::Use(device, allocation.memory, "pending destruction");
+    }
+    auto& state = spreadState();
+    bool queued = false;
+    std::uint64_t before = 0;
+    std::uint64_t held = 0;
+    try {
+        std::lock_guard lock(pendingMutex);
+        if (pending.size() < maxSlots && allocation.allocationBytes <= pendingBound && pendingBytes <= pendingBound - allocation.allocationBytes) {
+            pending.push_back(allocation);
+            pendingBytes += allocation.allocationBytes;
+            before = state.allocations.fetch_add(1);
+            held = state.allocationBytes.fetch_add(allocation.allocationBytes) + allocation.allocationBytes;
+            queued = true;
+        }
+    } catch (...) {
+    }
+    if (!queued) {
+        state.overBound.fetch_add(1, std::memory_order_relaxed);
+        state.overBoundBytes.fetch_add(allocation.allocationBytes, std::memory_order_relaxed);
+        destroy(allocation);
+        return;
+    }
+    state.queued.fetch_add(1, std::memory_order_relaxed);
+    state.queuedBytes.fetch_add(allocation.allocationBytes, std::memory_order_relaxed);
+    noteHigh(state.largestPending, before + 1);
+    noteHigh(state.largestPendingBytes, held);
+    if (before == 0) wakeDrain(state);
+}
+
+std::size_t BufferPool::DestroyPending(std::size_t count, std::chrono::steady_clock::time_point deadline) noexcept {
+    auto& state = spreadState();
+    std::size_t done = 0;
+    while (done < count) {
+        BufferAllocation allocation{};
+        {
+            std::lock_guard lock(pendingMutex);
+            if (pending.empty()) break;
+            allocation = pending.front();
+            pending.pop_front();
+            pendingBytes -= allocation.allocationBytes;
+            state.allocations.fetch_sub(1);
+            state.allocationBytes.fetch_sub(allocation.allocationBytes);
+        }
+        destroy(allocation);
+        ++done;
+        state.destroyed.fetch_add(1, std::memory_order_relaxed);
+        state.destroyedBytes.fetch_add(allocation.allocationBytes, std::memory_order_relaxed);
+        if (std::chrono::steady_clock::now() >= deadline) break;
+    }
+    return done;
+}
+
+VkDeviceSize BufferPool::DrainPending() noexcept {
+    auto& state = spreadState();
+    VkDeviceSize released = 0;
+    for (;;) {
+        BufferAllocation allocation{};
+        {
+            std::lock_guard lock(pendingMutex);
+            if (pending.empty()) break;
+            allocation = pending.front();
+            pending.pop_front();
+            pendingBytes -= allocation.allocationBytes;
+            state.allocations.fetch_sub(1);
+            state.allocationBytes.fetch_sub(allocation.allocationBytes);
+        }
+        released += destroy(allocation);
+        state.drained.fetch_add(1, std::memory_order_relaxed);
+        state.drainedBytes.fetch_add(allocation.allocationBytes, std::memory_order_relaxed);
+    }
+    return released;
+}
+
+std::size_t BufferPool::PendingAllocations() {
+    std::lock_guard lock(pendingMutex);
+    return pending.size();
+}
+
+VkDeviceSize BufferPool::PendingBytes() {
+    std::lock_guard lock(pendingMutex);
+    return pendingBytes;
+}
+
+void BufferPool::SetPendingBound(VkDeviceSize bytes) {
+    std::lock_guard lock(pendingMutex);
+    pendingBound = bytes;
 }
 
 ImageAllocation::~ImageAllocation() {

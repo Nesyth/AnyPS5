@@ -622,8 +622,24 @@ public:
     std::uint64_t BudgetBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
+    static void ReleaseIdleCopies();
+    const char* ReleaseCopyForTest();
+    bool CopyReleased() const { return releasedCopy.active; }
+    struct CopyReleaseTotals {
+        std::uint64_t released = 0;
+        std::uint64_t releasedBytes = 0;
+        std::uint64_t restored = 0;
+        std::uint64_t restoredBytes = 0;
+        std::uint64_t changedUnits = 0;
+        std::uint64_t changedElsewhere = 0;
+    };
+    static CopyReleaseTotals CopyReleaseCounts();
 
 private:
+    enum class CopySite : std::uint8_t { Refresh, Upload, Capture, Pending, Unwatch, WriteBack };
+    static const char* CopySiteName(CopySite site);
+    const char* releaseCopy();
+    void restoreCopy(CopySite site, const std::vector<bool>* overwritten = nullptr);
     mutable FastProofStamp fastProof;
     std::atomic<std::uint64_t> provedEpoch{0};
     std::atomic<std::uint64_t> provedProof{0};
@@ -869,6 +885,12 @@ private:
     mutable std::array<ComparedRange, 4> comparedRanges{};
     mutable std::uint32_t nextComparedRange = 0;
     std::vector<std::byte> generationBaseline;
+    struct ReleasedCopy {
+        bool active = false;
+        std::vector<std::array<std::uint64_t, 2>> hashes;
+        std::vector<std::byte> kept;
+    };
+    ReleasedCopy releasedCopy;
     struct UnwatchHash {
         std::array<std::uint64_t, 2> hash{};
         std::uint64_t generation = 0;
@@ -986,6 +1008,7 @@ private:
     std::atomic<bool> cached{false};
     // The present a consumer last proved the image current at (NoteProved).
     mutable std::atomic<std::uint64_t> provedPresent{0};
+    mutable std::atomic<std::uint64_t> usedPresent{0};
     // Hook skips of this image since FlushPending last listed it (AccessKeptByCpu), the read site
     // of the last one (a GuestMemory::ReadSite), and the first pending layer under its access with
     // the version and layer generation seen: a listing counts a flush after a skip only while that

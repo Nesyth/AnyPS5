@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "AllocationFailure.hpp"
 #include "SlabReturn.hpp"
@@ -551,6 +552,107 @@ void Budget() {
     Expect(mock.frees != 0 && mock.liveBytes <= 512 * MiB, "the device tier retains " + std::to_string(mock.liveBytes / MiB) + " MiB after " + std::to_string(mock.frees) + " evictions, over its 512 MiB budget");
     DeviceBuffer probe(context, 48 * MiB, usage);
     Expect(MemoryOf(probe.Handle()) != first, "the least recently used device buffer survived the eviction");
+}
+
+void NoSpreadWake() {}
+
+struct SpreadScope {
+    SpreadScope() {
+        RuntimeSwitches::Assign(RuntimeSwitch::SpreadDestruction, true);
+        SpreadDestruction::SetWake(&NoSpreadWake);
+    }
+    ~SpreadScope() {
+        SpreadDestruction::DrainAll();
+        SpreadDestruction::SetWake(nullptr);
+        RuntimeSwitches::Assign(RuntimeSwitch::SpreadDestruction, false);
+    }
+    SpreadScope(const SpreadScope&) = delete;
+    SpreadScope& operator=(const SpreadScope&) = delete;
+};
+
+void ReleaseOverDeviceBudget(const Context& context, VkDeviceMemory* oldest = nullptr) {
+    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    std::vector<std::unique_ptr<DeviceBuffer>> live;
+    for (int i = 0; i < 12; ++i) live.push_back(std::make_unique<DeviceBuffer>(context, (48 + static_cast<std::size_t>(i) * 3) * MiB, usage));
+    if (oldest != nullptr) *oldest = MemoryOf(live.front()->Handle());
+    for (auto& buffer : live) buffer.reset();
+}
+
+void SpreadEvictionsQueue() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    const SpreadScope spread;
+    const auto before = SpreadDestruction::Counts();
+    ReleaseOverDeviceBudget(context);
+    auto& pool = *context.bufferPool;
+    const auto queued = pool.PendingAllocations();
+    Expect(queued >= 3 && mock.frees == 0, "evictions over the device tier budget were destroyed by the releasing thread instead of queued (" + std::to_string(mock.frees) + " frees, " + std::to_string(queued) + " queued)");
+    Expect(mock.liveBytes - pool.PendingBytes() <= 512 * MiB, "the device tier retains more than its budget beside the queued evictions");
+    Expect(SpreadDestruction::Counts().queued - before.queued == queued && SpreadDestruction::Counts().pending == queued, "the census did not count every queued eviction");
+    const auto buffers = mock.liveBuffers.size();
+    Expect(SpreadDestruction::Step(1, std::chrono::hours(1)) == 1 && mock.frees == 1 && pool.PendingAllocations() == queued - 1 && mock.liveBuffers.size() == buffers - 1, "a portion of one object did not destroy exactly one queued eviction with its buffer");
+    Expect(SpreadDestruction::Step(2, std::chrono::hours(1)) == 2 && mock.frees == 3 && pool.PendingAllocations() == queued - 3, "a portion did not respect its object count");
+    const auto left = pool.PendingAllocations();
+    if (left != 0) Expect(SpreadDestruction::Step(left + 8, std::chrono::microseconds(0)) == 1 && pool.PendingAllocations() == left - 1, "a portion with no time left did not stop after one object");
+    Expect(SpreadDestruction::Counts().destroyed - before.destroyed == queued - pool.PendingAllocations(), "the census did not count the objects destroyed in portions");
+    SpreadDestruction::DrainAll();
+    Expect(pool.PendingAllocations() == 0 && pool.PendingBytes() == 0 && mock.frees == queued && !SpreadDestruction::Pending(), "a drain left queued evictions or destroyed retained buffers");
+    context.bufferPool.reset();
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "pool destruction leaked a buffer after spread destruction");
+}
+
+void SpreadBound() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    const SpreadScope spread;
+    GetBufferPool(context)->SetPendingBound(60 * MiB);
+    const auto before = SpreadDestruction::Counts();
+    ReleaseOverDeviceBudget(context);
+    auto& pool = *context.bufferPool;
+    Expect(pool.PendingAllocations() == 1 && pool.PendingBytes() <= 60 * MiB, "the queued evictions exceed the pending bound");
+    Expect(mock.frees != 0 && SpreadDestruction::Counts().overBound - before.overBound == mock.frees, "an eviction over the pending bound was not destroyed by the caller");
+    Expect(mock.liveBytes - pool.PendingBytes() <= 512 * MiB, "the device tier retains more than its budget beside the bounded queue");
+    context.bufferPool.reset();
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty() && !SpreadDestruction::Pending(), "pool destruction did not drain its queued evictions");
+}
+
+void SpreadSwitchOff() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    RuntimeSwitches::Assign(RuntimeSwitch::SpreadDestruction, false);
+    SpreadDestruction::SetWake(&NoSpreadWake);
+    ReleaseOverDeviceBudget(context);
+    SpreadDestruction::SetWake(nullptr);
+    Expect(context.bufferPool->PendingAllocations() == 0 && mock.frees != 0, "evictions were queued with the switch off");
+    {
+        const SpreadScope spread;
+        SpreadDestruction::SetWake(nullptr);
+        ReleaseOverDeviceBudget(context);
+        Expect(context.bufferPool->PendingAllocations() == 0, "evictions were queued with no thread to destroy them");
+    }
+    context.bufferPool.reset();
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "the switch-off cleanup leaked a buffer");
+}
+
+void SpreadOwners() {
+    const SpreadScope spread;
+    int released = 0;
+    const auto make = [&released] { return std::shared_ptr<const void>(new int(0), [&released](const int* value) { ++released; delete value; }); };
+    std::vector<std::shared_ptr<const void>> owners;
+    for (int i = 0; i < 5; ++i) owners.push_back(make());
+    const auto before = SpreadDestruction::Counts();
+    Expect(SpreadDestruction::Release(owners, 1024) && owners.empty() && released == 0, "owners handed to the reaper were released by the caller");
+    Expect(SpreadDestruction::Counts().ownersPending == 5 && SpreadDestruction::Pending(), "the queued owners were not counted as pending");
+    Expect(SpreadDestruction::Step(2, std::chrono::hours(1)) == 2 && released == 2, "an owner portion did not respect its count");
+    Expect(SpreadDestruction::Step(8, std::chrono::microseconds(0)) == 1 && released == 3, "an owner portion with no time left did not stop after one owner");
+    std::vector<std::shared_ptr<const void>> large;
+    large.push_back(make());
+    Expect(!SpreadDestruction::Release(large, static_cast<std::size_t>(SpreadDestruction::MaxBytes())) && large.size() == 1 && released == 3, "owners over the bound were taken or released");
+    Expect(SpreadDestruction::Counts().ownersOverBound == before.ownersOverBound + 1, "owners over the bound were not counted");
+    large.clear();
+    SpreadDestruction::DrainAll();
+    Expect(released == 6 && SpreadDestruction::Counts().ownersPending == 0 && !SpreadDestruction::Pending(), "a drain left owners queued");
+    Expect(SpreadDestruction::Counts().ownersReleased - before.ownersReleased == 3 && SpreadDestruction::Counts().ownersDrained - before.ownersDrained == 2, "the census did not count released and drained owners");
 }
 
 void AddressAndHostClasses() {
@@ -1520,6 +1622,55 @@ void MemoryAccountingIdleReclaim() {
     if (failures == 0) std::puts("idle device reclaim allocation accounting passed");
 }
 
+void MemoryAccountingSpread() {
+    mock = MockDevice{};
+    auto context = budgetContext();
+    context.device = reinterpret_cast<VkDevice>(std::uintptr_t{107});
+    context.memoryProperties2 = nullptr;
+    const auto entryOf = [&](VkDeviceMemory memory) {
+        const auto snapshot = MemoryAccounting::Read(context.device);
+        Expect(snapshot.complete, "spread destruction made memory accounting incomplete");
+        const auto found = std::find_if(snapshot.allocations.begin(), snapshot.allocations.end(), [&](const auto& entry) { return entry.memory == memory; });
+        if (found == snapshot.allocations.end()) throw std::runtime_error("a queued allocation is missing from memory accounting");
+        return *found;
+    };
+    {
+        const SpreadScope spread;
+        VkDeviceMemory oldest = VK_NULL_HANDLE;
+        ReleaseOverDeviceBudget(context, &oldest);
+        auto& pool = *context.bufferPool;
+        Expect(pool.PendingAllocations() != 0 && mock.memoryBytes.contains(oldest), "the least recently used device buffer was not queued");
+        const auto queued = entryOf(oldest);
+        Expect(queued.retained == 0 && queued.category == "pending destruction", "a queued device allocation is counted as retained or under its former category");
+        SpreadDestruction::DrainAll();
+        const auto drained = MemoryAccounting::Read(context.device);
+        Expect(drained.complete && std::none_of(drained.allocations.begin(), drained.allocations.end(), [&](const auto& entry) { return entry.memory == oldest; }), "a destroyed queued allocation stayed in the ledger");
+        context.bufferPool.reset();
+        Expect(MemoryAccounting::Read(context.device).allocations.empty() && mock.liveBytes == 0, "spread destruction of device buffers left accounted memory");
+    }
+    {
+        const SpreadScope spread;
+        constexpr std::size_t Slots = 4096;
+        constexpr std::size_t Extra = 4;
+        std::vector<std::unique_ptr<Buffer>> live;
+        for (std::size_t i = 0; i < Slots + Extra; ++i) live.push_back(std::make_unique<Buffer>(context, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+        const auto snapshot = MemoryAccounting::Read(context.device);
+        Expect(snapshot.allocations.size() == 1, "the slab case does not fit one slab block");
+        const auto slab = snapshot.allocations.front().memory;
+        const auto bytes = BufferPool::SlabBlockBytes(256);
+        for (auto& buffer : live) buffer.reset();
+        auto& pool = *context.bufferPool;
+        Expect(pool.PendingAllocations() == Extra, "slab slots over the slot bound were not queued");
+        Expect(entryOf(slab).retained == bytes - Extra * 256, "a queued slab slot is counted as retained or a retained slot as active");
+        Expect(SpreadDestruction::Step(2, std::chrono::hours(1)) == 2 && entryOf(slab).retained == bytes - (Extra - 2) * 256, "a slab slot destroyed in a portion did not return to the block's retained bytes");
+        SpreadDestruction::DrainAll();
+        Expect(pool.PendingAllocations() == 0 && entryOf(slab).retained == bytes, "a drain left slab slots outside the block's retained bytes");
+        context.bufferPool.reset();
+        Expect(MemoryAccounting::Read(context.device).allocations.empty() && mock.liveBytes == 0 && mock.liveBuffers.empty(), "spread destruction of slab buffers left accounted memory");
+    }
+    if (failures == 0) std::puts("spread destruction allocation accounting passed");
+}
+
 void MemoryAccountingBudgetCap(bool floor = false) {
     Expect(MemoryAccounting::Enabled(), "memory accounting is not enabled");
     auto context = budgetContext();
@@ -1538,6 +1689,7 @@ int main(int argc, char** argv) {
             MemoryAccountingChecks();
             MemoryAccountingBufferReuse();
             MemoryAccountingIdleReclaim();
+            MemoryAccountingSpread();
             return failures == 0 ? 0 : 1;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--memory-accounting-budget-cap") {
@@ -1572,6 +1724,10 @@ int main(int argc, char** argv) {
         KeptUntilFence();
         SmallDeviceRetention();
         Budget();
+        SpreadEvictionsQueue();
+        SpreadBound();
+        SpreadSwitchOff();
+        SpreadOwners();
         AddressAndHostClasses();
         SmallDeviceClasses();
         SlabMetadataFailure();
