@@ -248,6 +248,7 @@ enum class RuntimeSwitch : std::size_t {
     DeepShallow,
     HtileCarryFills,
     HostDeepCache,
+    CommitRing,
     Count,
 };
 

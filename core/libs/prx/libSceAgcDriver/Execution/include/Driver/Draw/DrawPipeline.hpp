@@ -151,6 +151,10 @@ public:
     void AwaitWriters(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode, DeepSite site);
     bool AwaitExactWriters(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode, DeepSite site, FrameSite timed, FrameCheck check);
     bool DeepQueue() const { return deepQueue.load(std::memory_order_acquire); }
+    bool CommitRing() const { return commitRing.load(std::memory_order_acquire); }
+    enum class RingCount : std::uint32_t { FastPops, LockedPops, MutexPops, Enqueues, RoomWaits, RoomWaitNs, Contention, Sleeps, SleepNs, SlowScans, WaiterWakes, Latches, Unlatches, VerifyPops, VerifyScans, VerifyDiffering, Count };
+    static std::uint64_t RingTotal(RingCount count);
+    static constexpr std::size_t CommitRingSlots = 1024;
     void Stop();
     void ReleaseRetired();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
@@ -193,7 +197,25 @@ private:
         std::shared_ptr<const LabelRun> labelRun;
         bool counted = true;
         std::uint64_t parked = 0;
+        std::uint64_t ringOrdinal = 0;
     };
+    class QueuedView {
+    public:
+        explicit QueuedView(std::deque<Item>& queued) : listed(&queued) {}
+        QueuedView(Item* ringSlots, std::uint64_t first, std::uint64_t end) : slots(ringSlots), base(first), count(static_cast<std::size_t>(end - first)) {}
+        std::size_t size() const { return listed != nullptr ? listed->size() : count; }
+        bool empty() const { return size() == 0; }
+        Item& operator[](std::size_t index) const { return listed != nullptr ? (*listed)[index] : slots[static_cast<std::size_t>((base + index) & (CommitRingSlots - 1))]; }
+        Item& front() const { return (*this)[0]; }
+
+    private:
+        std::deque<Item>* listed = nullptr;
+        Item* slots = nullptr;
+        std::uint64_t base = 0;
+        std::size_t count = 0;
+    };
+    class QueueScan;
+    class RingLock;
     DrawPipeline() = default;
     void enqueue(Item item);
     void queueItem(Item item);
@@ -208,13 +230,28 @@ private:
     bool queuedOverlap(std::span<const Range> ranges);
     DeepFound deepQueued(std::span<const Range> ranges, std::uint64_t live) const;
     bool deepQueuedWithin(std::span<const Range> ranges, std::uint64_t from, std::uint64_t to) const;
-    DeepFound newestQueued(std::span<const Range> ranges) const;
+    DeepFound newestQueued(const QueuedView& queued, std::uint64_t retiredNow, std::span<const Range> ranges) const;
     DeepFound scanQueued(std::span<const Range> ranges);
     void verifyExactBytes(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode, FrameCheck check);
     void verifyQueued(std::uint32_t lookup, std::span<const Range> ranges);
     void noteDeepReads(const std::vector<Range>& reads, std::uint64_t stamp);
     bool readsMaybe(std::uint64_t address, std::size_t bytes) const;
     void verifyHeldReads(std::uint64_t address, std::size_t bytes);
+    bool queueLocked(Item& item);
+    bool ringEnqueue(Item& item);
+    void startCommitter();
+    void latchRing();
+    void unlatchRing();
+    void reclaimRing(std::uint64_t upTo, std::vector<Item>& out);
+    Item& ringSlot(std::uint64_t ordinal);
+    bool ringEmpty() const;
+    bool queueEmptyLocked();
+    void lowerRingWake(std::uint64_t target);
+    void awaitRingRoom(std::uint64_t resumeFill);
+    std::size_t roomLimitNow() const;
+    void raiseReadsLive(std::uint64_t live);
+    void ringReport();
+    std::string ringText();
 
     std::mutex mutex;
     std::condition_variable wake;
@@ -242,8 +279,26 @@ private:
     std::unique_ptr<std::array<std::atomic<std::uint64_t>, ReadRegionSlots>> readRegions;
     std::atomic<bool> deepIndexed{false};
     std::atomic<std::uint64_t> wideReads{0};
-    std::atomic<std::uint64_t> readsLive{1};
     std::atomic<std::uint64_t> deepEpoch{0};
+    alignas(64) std::atomic<std::uint64_t> readsLive{1};
+    alignas(64) std::atomic<bool> commitRing{false};
+    std::atomic<bool> ringClosing{false};
+    std::atomic<bool> failurePending{false};
+    std::atomic<bool> committerSleeping{false};
+    std::atomic<std::uint32_t> ringScans{0};
+    std::atomic<std::uint32_t> ringIdleWaiters{0};
+    std::atomic<std::uint64_t> ringWakeAt{~std::uint64_t{0}};
+    std::atomic<std::int64_t> ringReportAt{0};
+    std::unique_ptr<std::array<Item, CommitRingSlots>> ring;
+    alignas(64) std::atomic<bool> ringLocked{false};
+    std::uint64_t ringReclaimed = 0;
+    alignas(64) std::atomic<bool> committerRetiring{false};
+    std::atomic<std::uint64_t> ringCommits{0};
+    std::atomic<std::uint64_t> ringCommitNs{0};
+    std::atomic<std::uint64_t> ringCommitErrors{0};
+    std::uint64_t reportedRingCommits = 0;
+    std::uint64_t reportedRingCommitNs = 0;
+    std::uint64_t reportedRingCommitErrors = 0;
     std::size_t resumeAt = 0;
     bool committerWaiting = false;
     bool stopped = false;
@@ -263,7 +318,7 @@ private:
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrainReason::Count)> reasonRequests{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindCommits{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindNs{};
-    std::uint64_t depthSum = 0;
+    alignas(64) std::uint64_t depthSum = 0;
     std::size_t deepestItems = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };

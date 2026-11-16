@@ -1,15 +1,21 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DeepIndex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
+#include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <string>
 
 namespace AgcDriver::DriverDetail {
 
 namespace {
 
 constexpr std::uint64_t Golden = 0x9E3779B97F4A7C15ull;
+constexpr std::uint64_t NewestSlack = 64;
+constexpr std::uint64_t Unbounded = ~std::uint64_t{0};
+constexpr std::int64_t ReportNs = 10'000'000'000;
+constexpr std::uint64_t UnrecordedSamples = 8;
 
 std::size_t hashed(std::uint64_t value, unsigned bits) {
     return static_cast<std::size_t>((value * Golden) >> (64u - bits));
@@ -20,68 +26,151 @@ bool censusOn() {
     return on;
 }
 
-std::size_t sizeClass(std::uint64_t bytes) {
-    return bytes <= 8 ? 0 : bytes <= 64 ? 1 : bytes <= 4096 ? 2 : bytes <= 65536 ? 3 : 4;
-}
-
 unsigned long long wideCount(std::uint64_t value) {
     return static_cast<unsigned long long>(value);
 }
 
+std::int64_t steadyNs() {
+    return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
-void StampedRanges::reportCensus() const {
-    const auto at = [](const std::atomic<std::uint64_t>& value) { return wideCount(value.load(std::memory_order_relaxed)); };
-    const auto total = census.overflows.load(std::memory_order_relaxed);
-    const auto per = [&](const std::atomic<std::uint64_t>& value) { return total != 0 ? static_cast<double>(value.load(std::memory_order_relaxed)) / static_cast<double>(total) : 0.0; };
-    const auto unsure = census.unsure.load(std::memory_order_relaxed);
-    std::fprintf(stderr, "[deep-index] %s (cumulative): %llu inserts found no way (the new range: up to 8 bytes %llu, up to 64 %llu, up to 4 KiB %llu, up to 64 KiB %llu, larger %llu); live ways of those buckets on average %.1f, of the inserting region %.1f, on %.1f distinct 4 KiB pages; the live ways by size: up to 8 bytes %llu, up to 64 %llu, up to 4 KiB %llu, up to 64 KiB %llu, larger %llu; %llu lookups unsure (asked range over too many regions %llu, bucket overflow %llu, torn read %llu, wide bucket %llu); the asked range: up to 8 bytes %llu, up to 64 %llu, up to 4 KiB %llu, up to 64 KiB %llu, larger %llu; %.1f ranges per unsure lookup\n",
-        label, wideCount(total), at(census.placed[0]), at(census.placed[1]), at(census.placed[2]), at(census.placed[3]), at(census.placed[4]),
-        per(census.occupantsLive), per(census.occupantsInRegion), per(census.occupantPages),
-        at(census.occupants[0]), at(census.occupants[1]), at(census.occupants[2]), at(census.occupants[3]), at(census.occupants[4]),
-        wideCount(unsure), at(census.reasons[0]), at(census.reasons[1]), at(census.reasons[2]), at(census.reasons[3]),
-        at(census.asked[0]), at(census.asked[1]), at(census.asked[2]), at(census.asked[3]), at(census.asked[4]),
-        unsure != 0 ? static_cast<double>(census.askedRanges.load(std::memory_order_relaxed)) / static_cast<double>(unsure) : 0.0);
+struct MapLayout {
+    std::array<std::size_t, StampedRanges::Levels> own{};
+    std::array<std::size_t, StampedRanges::Levels> deep{};
+    std::size_t huge = 0;
+    std::size_t total = 0;
+};
+
+constexpr MapLayout makeLayout() {
+    MapLayout layout{};
+    std::size_t at = 0;
+    for (std::size_t level = 0; level < StampedRanges::Levels; ++level) {
+        layout.own[level] = at;
+        at += std::size_t{1} << StampedRanges::OwnBits[level];
+    }
+    for (std::size_t level = 0; level < StampedRanges::Levels; ++level) {
+        layout.deep[level] = at;
+        if (level != 0) at += std::size_t{1} << StampedRanges::DeepBits[level];
+    }
+    layout.huge = at;
+    layout.total = at + 1;
+    return layout;
 }
 
-void StampedRanges::noteOverflow(const Bucket& bucket, const Range& range, std::uint64_t region, std::uint64_t stamp, std::uint64_t live) {
-    if (!censusOn()) return;
-    const auto total = census.overflows.fetch_add(1, std::memory_order_relaxed) + 1;
-    census.placed[sizeClass(range.second - range.first)].fetch_add(1, std::memory_order_relaxed);
-    std::array<std::uint64_t, Ways> pages{};
-    std::size_t distinct = 0;
-    std::string dump;
-    for (const auto& way : bucket.ways) {
-        const auto begin = way.begin.load(std::memory_order_relaxed);
-        const auto end = way.end.load(std::memory_order_relaxed);
-        const auto first = way.first.load(std::memory_order_relaxed);
-        const auto last = way.last.load(std::memory_order_relaxed);
-        if (last < live) continue;
-        census.occupantsLive.fetch_add(1, std::memory_order_relaxed);
-        census.occupants[sizeClass(end - begin)].fetch_add(1, std::memory_order_relaxed);
-        if (region != ~std::uint64_t{0} && (begin >> RegionShift) <= region && region <= ((end > begin ? end - 1 : begin) >> RegionShift)) census.occupantsInRegion.fetch_add(1, std::memory_order_relaxed);
-        const auto page = begin >> 12u;
-        if (std::find(pages.begin(), pages.begin() + distinct, page) == pages.begin() + distinct) pages[distinct++] = page;
-        if (total <= 24) {
-            char item[112];
-            std::snprintf(item, sizeof(item), " [0x%llx +%llu, stamps %llu..%llu]", wideCount(begin), wideCount(end - begin), wideCount(first), wideCount(last));
-            dump += item;
+constexpr MapLayout Layout = makeLayout();
+
+std::size_t ownMap(std::size_t level, std::uint64_t block) {
+    return Layout.own[level] + hashed(block, StampedRanges::OwnBits[level]);
+}
+
+std::size_t deepMap(std::size_t level, std::uint64_t block) {
+    return level == 0 ? ownMap(0, block) : Layout.deep[level] + hashed(block, StampedRanges::DeepBits[level]);
+}
+
+std::uint64_t lastByte(const StampedRanges::Range& range) {
+    return range.second > range.first ? range.second - 1 : range.first;
+}
+
+std::size_t ownerLevel(const StampedRanges::Range& range) {
+    if (range.second < range.first) return StampedRanges::Levels;
+    const auto last = lastByte(range);
+    for (std::size_t level = 0; level < StampedRanges::Levels; ++level) {
+        const auto shift = StampedRanges::Shifts[level];
+        if ((last >> shift) - (range.first >> shift) < StampedRanges::WriteBlocks) return level;
+    }
+    return StampedRanges::Levels;
+}
+
+template<typename TVisit>
+void forEachPlacement(const StampedRanges::Range& range, TVisit&& visit) {
+    const auto level = ownerLevel(range);
+    if (level == StampedRanges::Levels) {
+        visit(Layout.huge);
+        return;
+    }
+    const auto last = lastByte(range);
+    const auto shift = StampedRanges::Shifts[level];
+    const auto ownFirst = range.first >> shift;
+    const auto ownLast = last >> shift;
+    visit(ownMap(level, ownFirst));
+    if (ownLast != ownFirst) visit(ownMap(level, ownLast));
+    for (std::size_t deep = std::max<std::size_t>(level, 1); deep < StampedRanges::Levels; ++deep) {
+        const auto deepShift = StampedRanges::Shifts[deep];
+        const auto deepFirst = range.first >> deepShift;
+        const auto deepLast = last >> deepShift;
+        visit(deepMap(deep, deepFirst));
+        if (deepLast != deepFirst) visit(deepMap(deep, deepLast));
+    }
+}
+
+bool overlapsAsked(const StampedRanges::Range& write, std::span<const StampedRanges::Range> asked) {
+    for (const auto& [begin, end] : asked) {
+        if (begin < write.second && write.first < end) return true;
+    }
+    return false;
+}
+
+void raiseNewest(std::atomic<std::uint64_t>& newest, std::uint64_t stamp) {
+    if (newest.load(std::memory_order_relaxed) >= stamp) return;
+    newest.store(stamp > Unbounded - NewestSlack ? Unbounded : stamp + NewestSlack, std::memory_order_relaxed);
+}
+
+std::uint64_t spanBits(std::uint64_t from, std::uint64_t to, std::uint64_t word) {
+    const auto base = word * 64;
+    const auto low = std::max(from, base);
+    const auto high = std::min(to, base + 64);
+    if (low >= high) return 0;
+    const auto width = high - low;
+    const auto ones = width >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << width) - 1;
+    return ones << (low - base);
+}
+
+std::uint32_t wordsBetween(std::uint64_t first, std::uint64_t last) {
+    return static_cast<std::uint32_t>(((std::uint64_t{2} << last) - 1) & ~((std::uint64_t{1} << first) - 1));
+}
+
+template<typename TCandidates, typename TTest>
+void walkNewestFirst(std::uint64_t hi, const TCandidates& candidates, TTest&& test, std::uint64_t& tested) {
+    constexpr std::size_t words = StampedRanges::Capacity / 64;
+    const auto top = static_cast<std::size_t>((hi - 1) & (StampedRanges::Capacity - 1));
+    const auto topWord = top >> 6;
+    const auto topBit = top & 63;
+    const auto below = topBit == 63 ? ~std::uint64_t{0} : (std::uint64_t{2} << topBit) - 1;
+    for (std::size_t step = 0; step <= words; ++step) {
+        const auto word = (topWord + words - step % words) % words;
+        if ((candidates.words & (std::uint32_t{1} << word)) == 0) continue;
+        auto bits = candidates.bits[word];
+        if (step == 0) bits &= below;
+        else if (step == words) bits &= ~below;
+        while (bits != 0) {
+            const auto bit = static_cast<std::size_t>(63 - std::countl_zero(bits));
+            bits &= ~(std::uint64_t{1} << bit);
+            ++tested;
+            if (test(word * 64 + bit)) return;
         }
     }
-    census.occupantPages.fetch_add(distinct, std::memory_order_relaxed);
-    if (total <= 24) std::fprintf(stderr, "[deep-index] %s sample: no way left for 0x%llx +%llu (stamp %llu, oldest live %llu) in the bucket of region 0x%llx; live ways:%s\n", label, wideCount(range.first), wideCount(range.second - range.first), wideCount(stamp), wideCount(live), wideCount(region), dump.c_str());
-    if (total % 4096u == 0) reportCensus();
 }
 
-void StampedRanges::noteUnsure(unsigned reason, const Bucket* bucket, const Range& range, std::size_t count, std::uint64_t live, std::uint64_t before) const {
-    if (!censusOn()) return;
-    census.reasons[reason].fetch_add(1, std::memory_order_relaxed);
-    census.asked[sizeClass(range.second - range.first)].fetch_add(1, std::memory_order_relaxed);
-    census.askedRanges.fetch_add(count, std::memory_order_relaxed);
-    const auto total = census.unsure.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (total <= 24) std::fprintf(stderr, "[deep-index] %s sample: lookup of 0x%llx +%llu (%zu ranges asked, oldest live %llu, before %llu) unsure, reason %u; the bucket overflowed over stamps %llu..%llu\n", label, wideCount(range.first), wideCount(range.second - range.first), count, wideCount(live), wideCount(before), reason,
-        bucket != nullptr ? wideCount(bucket->overflowFirst.load(std::memory_order_relaxed)) : 0ull, bucket != nullptr ? wideCount(bucket->overflowLast.load(std::memory_order_relaxed)) : 0ull);
-    if (total % 16384u == 0) reportCensus();
+struct CensusStripeTag {};
+std::atomic<std::uint32_t> nextCensusStripe{0};
+
+const char* const LostNames[] = {"beyond capacity", "out of order", "spill pool full"};
+
+}
+
+StampedRanges::StampedRanges()
+    : metas(std::make_unique<Meta[]>(Layout.total)),
+      maps(std::make_unique<Map[]>(Layout.total)),
+      slots(std::make_unique<Slot[]>(Capacity)),
+      blocks(std::make_unique<Block[]>(PoolBlocks)),
+      freeBlocks(std::make_unique<std::uint32_t[]>(PoolBlocks)),
+      marks(std::make_unique<std::uint64_t[]>(Layout.total)),
+      freeCount(PoolBlocks) {
+    for (std::size_t at = 0; at < PoolBlocks; ++at) freeBlocks[at] = static_cast<std::uint32_t>(PoolBlocks - 1 - at);
+}
+
+StampedRanges::~StampedRanges() {
+    if (censusOn() && written.inserts != 0) report();
 }
 
 bool StampedRanges::Regions(const Range& range, std::uint64_t limit, std::uint64_t& first, std::uint64_t& last) {
@@ -98,215 +187,534 @@ bool StampedRanges::CoarseRegions(const Range& range, std::uint64_t limit, std::
     return last - first < limit;
 }
 
-StampedRanges::Bucket& StampedRanges::bucketAt(std::uint64_t region) {
-    return buckets[hashed(region, BucketBits)];
+StampedRanges::Window StampedRanges::makeWindow(std::uint64_t lo, std::uint64_t hi) {
+    Window window;
+    window.lo = lo;
+    window.hi = hi;
+    window.first = lo & SlotMask;
+    window.length = std::min<std::uint64_t>(hi - lo, Capacity);
+    if (window.length >= Capacity) {
+        window.words = static_cast<std::uint32_t>((std::uint64_t{1} << Words) - 1);
+        return window;
+    }
+    const auto end = window.first + window.length;
+    const auto firstWord = window.first >> 6;
+    const auto lastWord = ((end - 1) & SlotMask) >> 6;
+    window.words = end <= Capacity ? wordsBetween(firstWord, lastWord) : wordsBetween(firstWord, Words - 1) | wordsBetween(0, lastWord);
+    return window;
 }
 
-const StampedRanges::Bucket& StampedRanges::bucketAt(std::uint64_t region) const {
-    return buckets[hashed(region, BucketBits)];
+std::uint64_t StampedRanges::windowBits(const Window& window, std::size_t word) {
+    if (window.length >= Capacity) return ~std::uint64_t{0};
+    const auto end = window.first + window.length;
+    if (end <= Capacity) return spanBits(window.first, end, word);
+    return spanBits(window.first, Capacity, word) | spanBits(0, end - Capacity, word);
 }
 
-void StampedRanges::bury(Bucket& bucket, const Entry& entry) {
-    auto& grave = bucket.graves[bucket.nextGrave];
-    bucket.nextGrave = (bucket.nextGrave + 1) % Graves;
-    const auto buried = grave.last.load(std::memory_order_relaxed);
-    if (buried > bucket.reclaimed.load(std::memory_order_relaxed)) bucket.reclaimed.store(buried, std::memory_order_release);
-    const auto version = grave.version.load(std::memory_order_relaxed);
-    grave.version.store(version + 1, std::memory_order_relaxed);
+std::size_t StampedRanges::blocksFor(std::size_t count) {
+    return count > Inline ? (count - Inline + BlockRanges - 1) / BlockRanges : 0;
+}
+
+bool StampedRanges::occupiedAt(std::size_t slot) const {
+    return ((occupied[slot >> 6] >> (slot & 63)) & 1u) != 0;
+}
+
+void StampedRanges::setOccupied(std::size_t slot, bool held) {
+    const auto bit = std::uint64_t{1} << (slot & 63);
+    if (held) occupied[slot >> 6] |= bit;
+    else occupied[slot >> 6] &= ~bit;
+}
+
+void StampedRanges::setBit(std::size_t map, std::size_t slot, std::uint64_t stamp) {
+    auto& meta = metas[map];
+    const auto word = slot >> 6;
+    const auto bit = std::uint64_t{1} << (slot & 63);
+    auto& held = maps[map].words[word];
+    const auto value = held.load(std::memory_order_relaxed);
+    if ((value & bit) == 0) {
+        held.store(value | bit, std::memory_order_relaxed);
+        if (value == 0) meta.summary.store(meta.summary.load(std::memory_order_relaxed) | (std::uint64_t{1} << word), std::memory_order_relaxed);
+        ++written.bitsSet;
+    }
+    raiseNewest(meta.newest, stamp);
+}
+
+void StampedRanges::clearBit(std::size_t map, std::size_t slot) {
+    const auto word = slot >> 6;
+    const auto bit = std::uint64_t{1} << (slot & 63);
+    auto& held = maps[map].words[word];
+    const auto value = held.load(std::memory_order_relaxed);
+    if ((value & bit) == 0) return;
+    const auto left = value & ~bit;
+    held.store(left, std::memory_order_relaxed);
+    if (left == 0) {
+        auto& meta = metas[map];
+        meta.summary.store(meta.summary.load(std::memory_order_relaxed) & ~(std::uint64_t{1} << word), std::memory_order_relaxed);
+    }
+    ++written.bitsCleared;
+}
+
+void StampedRanges::releaseSlot(std::size_t slot, bool keepMarked) {
+    const auto& held = slots[slot];
+    const auto count = static_cast<std::size_t>(held.count.load(std::memory_order_relaxed));
+    const auto clear = [&](std::size_t map) {
+        if (!keepMarked || marks[map] != markSerial) clearBit(map, slot);
+    };
+    const auto inlined = std::min(count, Inline);
+    for (std::size_t at = 0; at < inlined; ++at) {
+        const Range range{held.cells[at].begin.load(std::memory_order_relaxed), held.cells[at].end.load(std::memory_order_relaxed)};
+        forEachPlacement(range, clear);
+    }
+    auto block = held.head.load(std::memory_order_relaxed);
+    std::size_t left = count > Inline ? count - Inline : 0;
+    while (left != 0 && block != NoBlock) {
+        const auto& cells = blocks[block].cells;
+        const auto take = std::min(left, BlockRanges);
+        for (std::size_t at = 0; at < take; ++at) {
+            const Range range{cells[at].begin.load(std::memory_order_relaxed), cells[at].end.load(std::memory_order_relaxed)};
+            forEachPlacement(range, clear);
+        }
+        left -= take;
+        const auto next = blocks[block].next.load(std::memory_order_relaxed);
+        freeBlocks[freeCount++] = block;
+        block = next;
+    }
+    setOccupied(slot, false);
+}
+
+void StampedRanges::evictSlot(std::size_t slot) {
+    releaseSlot(slot, false);
+    auto& held = slots[slot];
+    const auto version = held.version.load(std::memory_order_relaxed);
+    held.version.store(version + 1, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
-    grave.begin.store(entry.begin.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    grave.end.store(entry.end.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    grave.first.store(entry.first.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    grave.last.store(entry.last.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    grave.version.store(version + 2, std::memory_order_release);
+    held.count.store(0, std::memory_order_relaxed);
+    held.head.store(NoBlock, std::memory_order_relaxed);
+    held.version.store(version + 2, std::memory_order_release);
+    ++written.evicted;
 }
 
-bool StampedRanges::place(Bucket& bucket, const Range& range, std::size_t index, std::uint64_t stamp, std::uint64_t live, Memo& memo, std::uint64_t region) {
-    Entry* free = nullptr;
-    std::uint64_t freeLast = 0;
-    for (auto& way : bucket.ways) {
-        const auto last = way.last.load(std::memory_order_relaxed);
-        if (last >= live) {
-            if (way.begin.load(std::memory_order_relaxed) != range.first || way.end.load(std::memory_order_relaxed) != range.second) continue;
-            way.last.store(stamp, std::memory_order_release);
-            bucket.newest.store(stamp, std::memory_order_release);
-            memo.entries.push_back({&way, &bucket, index});
-            return true;
-        }
-        if (free == nullptr || last < freeLast) {
-            free = &way;
-            freeLast = last;
+void StampedRanges::evictSkipped(std::uint64_t first, std::uint64_t length) {
+    if (length == 0) return;
+    const auto skipped = makeWindow(first, first + length);
+    auto words = skipped.words;
+    while (words != 0) {
+        const auto word = static_cast<std::size_t>(std::countr_zero(words));
+        words &= words - 1;
+        auto bits = occupied[word] & windowBits(skipped, word);
+        while (bits != 0) {
+            const auto bit = static_cast<std::size_t>(std::countr_zero(bits));
+            bits &= bits - 1;
+            evictSlot(word * 64 + bit);
         }
     }
-    if (free != nullptr) {
-        if (freeLast != 0) bury(bucket, *free);
-        const auto version = free->version.load(std::memory_order_relaxed);
-        free->version.store(version + 1, std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_release);
-        free->begin.store(range.first, std::memory_order_relaxed);
-        free->end.store(range.second, std::memory_order_relaxed);
-        free->first.store(stamp, std::memory_order_relaxed);
-        free->last.store(stamp, std::memory_order_relaxed);
-        free->version.store(version + 2, std::memory_order_release);
-        bucket.newest.store(stamp, std::memory_order_release);
-        memo.entries.push_back({free, &bucket, index});
-        return true;
+}
+
+std::size_t StampedRanges::heldSkipped(std::uint64_t first, std::uint64_t length) const {
+    if (length == 0) return 0;
+    const auto skipped = makeWindow(first, first + length);
+    auto words = skipped.words;
+    std::size_t held = 0;
+    while (words != 0) {
+        const auto word = static_cast<std::size_t>(std::countr_zero(words));
+        words &= words - 1;
+        auto bits = occupied[word] & windowBits(skipped, word);
+        while (bits != 0) {
+            const auto bit = static_cast<std::size_t>(std::countr_zero(bits));
+            bits &= bits - 1;
+            held += blocksFor(static_cast<std::size_t>(slots[word * 64 + bit].count.load(std::memory_order_relaxed)));
+        }
     }
-    const auto overflowLast = bucket.overflowLast.load(std::memory_order_relaxed);
-    if (overflowLast < live) {
-        if (overflowLast > bucket.reclaimed.load(std::memory_order_relaxed)) bucket.reclaimed.store(overflowLast, std::memory_order_release);
-        bucket.overflowFirst.store(stamp, std::memory_order_release);
+    return held;
+}
+
+void StampedRanges::writeCells(Slot& slot, std::size_t from, std::span<const Range> ranges) {
+    auto count = from;
+    for (const auto& range : ranges) {
+        if (count < Inline) {
+            slot.cells[count].begin.store(range.first, std::memory_order_relaxed);
+            slot.cells[count].end.store(range.second, std::memory_order_relaxed);
+        } else {
+            const auto spill = count - Inline;
+            if (spill % BlockRanges == 0) {
+                const auto block = freeBlocks[--freeCount];
+                blocks[block].next.store(NoBlock, std::memory_order_relaxed);
+                if (spill == 0) slot.head.store(block, std::memory_order_relaxed);
+                else blocks[currentTail].next.store(block, std::memory_order_relaxed);
+                currentTail = block;
+            }
+            auto& cell = blocks[currentTail].cells[spill % BlockRanges];
+            cell.begin.store(range.first, std::memory_order_relaxed);
+            cell.end.store(range.second, std::memory_order_relaxed);
+        }
+        ++count;
     }
-    bucket.overflowLast.store(stamp, std::memory_order_release);
-    bucket.newest.store(stamp, std::memory_order_release);
+    slot.count.store(static_cast<std::uint32_t>(count), std::memory_order_relaxed);
+    written.spillHighest = std::max<std::uint64_t>(written.spillHighest, PoolBlocks - freeCount);
+}
+
+void StampedRanges::placeRanges(std::span<const Range> ranges, std::size_t slot, std::uint64_t stamp) {
+    for (const auto& range : ranges) {
+        const auto level = ownerLevel(range);
+        raiseNewest(classes.newest[level], stamp);
+        ++written.ranges[level];
+        forEachPlacement(range, [&](std::size_t map) { setBit(map, slot, stamp); });
+    }
+}
+
+void StampedRanges::unrecord(std::uint64_t stamp, std::uint64_t live, std::size_t count, Lost reason) {
+    const auto lost = stamp == Unbounded ? Unbounded : stamp + 1;
+    if (front.lost.load(std::memory_order_relaxed) < lost) front.lost.store(lost, std::memory_order_release);
+    if (stamp == current) currentRecorded = false;
     overflows.store(overflows.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-    noteOverflow(bucket, range, region, stamp, live);
-    return false;
+    const auto total = ++written.unrecorded[static_cast<std::size_t>(reason)];
+    if (!censusOn() || total > UnrecordedSamples) return;
+    std::fprintf(stderr, "[deep-index] %s sample: stamp %llu not recorded (%s): oldest live %llu, newest recorded %llu, %llu ranges, %llu spill blocks free\n", label, wideCount(stamp), LostNames[static_cast<std::size_t>(reason)], wideCount(live), wideCount(front.newest.load(std::memory_order_relaxed)), wideCount(count), wideCount(freeCount));
+}
+
+void StampedRanges::append(std::span<const Range> ranges, std::uint64_t stamp, std::uint64_t live) {
+    const auto index = static_cast<std::size_t>(stamp & SlotMask);
+    auto& slot = slots[index];
+    const auto count = static_cast<std::size_t>(slot.count.load(std::memory_order_relaxed));
+    if (ranges.size() > MaxRanges - count || blocksFor(count + ranges.size()) - blocksFor(count) > freeCount) {
+        unrecord(stamp, live, count + ranges.size(), Lost::Pool);
+        return;
+    }
+    const auto version = slot.version.load(std::memory_order_relaxed);
+    slot.version.store(version + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    writeCells(slot, count, ranges);
+    slot.version.store(version + 2, std::memory_order_release);
+    placeRanges(ranges, index, stamp);
+    ++written.appends;
+}
+
+void StampedRanges::noteInsert() {
+    ++written.inserts;
+    if (!censusOn() || (written.inserts & 1023u) != 0) return;
+    const auto now = steadyNs();
+    if (written.reportedAt == 0) {
+        written.reportedAt = now;
+        return;
+    }
+    if (now - written.reportedAt < ReportNs) return;
+    written.reportedAt = now;
+    report();
 }
 
 void StampedRanges::Insert(std::span<const Range> ranges, std::uint64_t stamp, std::uint64_t live) {
     if (ranges.empty()) return;
-    for (auto& memo : memos) {
-        if (!memo.valid || memo.ranges.size() != ranges.size() || !std::equal(ranges.begin(), ranges.end(), memo.ranges.begin())) continue;
-        const bool fresh = std::all_of(memo.entries.begin(), memo.entries.end(), [&](const MemoEntry& held) {
-            const auto& range = memo.ranges[held.range];
-            return held.entry->last.load(std::memory_order_relaxed) >= live && held.entry->begin.load(std::memory_order_relaxed) == range.first && held.entry->end.load(std::memory_order_relaxed) == range.second;
-        });
-        if (!fresh) {
-            memo.valid = false;
-            break;
-        }
-        for (const auto& held : memo.entries) {
-            held.entry->last.store(stamp, std::memory_order_release);
-            held.bucket->newest.store(stamp, std::memory_order_release);
-        }
+    noteInsert();
+    if (started && stamp < current) {
+        unrecord(stamp, live, ranges.size(), Lost::Disorder);
         return;
     }
-    auto& memo = memos[nextMemo];
-    nextMemo = (nextMemo + 1) % memos.size();
-    memo.valid = false;
-    memo.ranges.assign(ranges.begin(), ranges.end());
-    memo.entries.clear();
-    bool placed = true;
-    for (std::size_t index = 0; index < ranges.size(); ++index) {
-        const auto& range = ranges[index];
-        std::uint64_t first = 0;
-        std::uint64_t last = 0;
-        if (!Regions(range, WideRegions, first, last)) {
-            placed = place(wide, range, index, stamp, live, memo, ~std::uint64_t{0}) && placed;
-            continue;
-        }
-        for (auto region = first; region <= last; ++region) placed = place(bucketAt(region), range, index, stamp, live, memo, region) && placed;
+    if (started && stamp == current) {
+        if (currentRecorded) append(ranges, stamp, live);
+        return;
     }
-    memo.valid = placed;
+    started = true;
+    current = stamp;
+    currentRecorded = false;
+    currentTail = NoBlock;
+    if (stamp >= live && stamp - live >= Capacity) {
+        unrecord(stamp, live, ranges.size(), Lost::Capacity);
+        return;
+    }
+    const auto index = static_cast<std::size_t>(stamp & SlotMask);
+    const auto previous = front.newest.load(std::memory_order_relaxed);
+    std::uint64_t skippedFirst = previous + 1;
+    std::uint64_t skipped = stamp > previous ? stamp - previous - 1 : 0;
+    if (skipped > Capacity - 1) {
+        skipped = Capacity - 1;
+        skippedFirst = stamp - skipped;
+    }
+    const auto needed = blocksFor(ranges.size());
+    auto available = freeCount;
+    if (occupiedAt(index)) available += blocksFor(static_cast<std::size_t>(slots[index].count.load(std::memory_order_relaxed)));
+    if (needed > available) available += heldSkipped(skippedFirst, skipped);
+    if (ranges.size() > MaxRanges || needed > available) {
+        unrecord(stamp, live, ranges.size(), Lost::Pool);
+        return;
+    }
+    front.newest.store(stamp, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_release);
+    evictSkipped(skippedFirst, skipped);
+    if (occupiedAt(index)) {
+        ++markSerial;
+        for (const auto& range : ranges) forEachPlacement(range, [&](std::size_t map) { marks[map] = markSerial; });
+        releaseSlot(index, true);
+    }
+    auto& slot = slots[index];
+    const auto version = slot.version.load(std::memory_order_relaxed);
+    slot.version.store(version + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    slot.stamp.store(stamp, std::memory_order_relaxed);
+    slot.head.store(NoBlock, std::memory_order_relaxed);
+    writeCells(slot, 0, ranges);
+    slot.version.store(version + 2, std::memory_order_release);
+    setOccupied(index, true);
+    placeRanges(ranges, index, stamp);
+    currentRecorded = true;
+    ++written.stamps;
 }
 
-bool StampedRanges::read(const Entry& entry, View& view) {
-    for (unsigned attempt = 0; attempt < ReadAttempts; ++attempt) {
-        const auto version = entry.version.load(std::memory_order_acquire);
-        if ((version & 1u) != 0) {
-            SpinPause();
-            continue;
-        }
-        view.begin = entry.begin.load(std::memory_order_relaxed);
-        view.end = entry.end.load(std::memory_order_relaxed);
-        view.first = entry.first.load(std::memory_order_relaxed);
-        view.last = entry.last.load(std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (entry.version.load(std::memory_order_relaxed) == version) return true;
+StampedRanges::ReadCensus* StampedRanges::readCensus() const {
+    if (!censusOn()) return nullptr;
+    auto stripe = HostThreadSlot<std::uint32_t, CensusStripeTag>::Get();
+    if (stripe == 0) {
+        stripe = static_cast<std::uint32_t>(nextCensusStripe.fetch_add(1, std::memory_order_relaxed) % CensusStripes + 1);
+        HostThreadSlot<std::uint32_t, CensusStripeTag>::Set(stripe);
     }
-    return false;
+    return &reads[stripe - 1];
 }
 
-bool StampedRanges::scanBefore(const Bucket& bucket, const Range& range, std::uint64_t live, std::uint64_t before, DeepFound& found) {
-    if (bucket.newest.load(std::memory_order_acquire) < live) return true;
-    const auto overflowLast = bucket.overflowLast.load(std::memory_order_acquire);
-    if (overflowLast >= live) {
-        const auto overflowFirst = bucket.overflowFirst.load(std::memory_order_acquire);
-        if (overflowFirst > overflowLast || overflowFirst < before) return false;
+void StampedRanges::noteTested(ReadCensus* census, std::uint64_t tested) {
+    if (census == nullptr) return;
+    const std::size_t bucket = tested == 0 ? 0 : tested == 1 ? 1 : tested < 4 ? 2 : tested < 8 ? 3 : tested < 16 ? 4 : tested < 64 ? 5 : 6;
+    census->tested[bucket].fetch_add(1, std::memory_order_relaxed);
+    census->testedTotal.fetch_add(tested, std::memory_order_relaxed);
+}
+
+void StampedRanges::gather(std::size_t map, const Window& window, Candidates& candidates) const {
+    const auto& meta = metas[map];
+    if (meta.newest.load(std::memory_order_relaxed) < window.lo) return;
+    auto words = static_cast<std::uint32_t>(meta.summary.load(std::memory_order_relaxed)) & window.words;
+    const auto& held = maps[map];
+    while (words != 0) {
+        const auto word = static_cast<std::size_t>(std::countr_zero(words));
+        words &= words - 1;
+        const auto bits = held.words[word].load(std::memory_order_relaxed) & windowBits(window, word);
+        if (bits == 0) continue;
+        candidates.bits[word] |= bits;
+        candidates.words |= std::uint32_t{1} << word;
     }
-    for (const auto& way : bucket.ways) {
-        if (way.last.load(std::memory_order_acquire) < live) continue;
-        View view;
-        if (!read(way, view)) return false;
-        if (view.last < live || range.first >= view.end || view.begin >= range.second) continue;
-        std::uint64_t candidate = view.last;
-        bool conservative = false;
-        if (view.last >= before) {
-            if (view.first >= before) continue;
-            candidate = before - 1;
-            conservative = true;
+}
+
+bool StampedRanges::collect(std::span<const Range> ranges, const Window& window, Candidates& candidates) const {
+    std::array<std::uint64_t, Classes> newest{};
+    for (std::size_t at = 0; at < Classes; ++at) newest[at] = classes.newest[at].load(std::memory_order_relaxed);
+    std::array<std::uint64_t, Levels> deepNewest{};
+    for (std::size_t at = 0; at < Levels; ++at) deepNewest[at] = at == 0 ? newest[0] : std::max(deepNewest[at - 1], newest[at]);
+    for (const auto& range : ranges) {
+        if (range.second < range.first) return false;
+        const auto last = lastByte(range);
+        std::size_t level = Levels;
+        for (std::size_t at = 0; at < Levels; ++at) {
+            if ((last >> Shifts[at]) - (range.first >> Shifts[at]) < QueryBlocks) {
+                level = at;
+                break;
+            }
         }
-        if (candidate < live) continue;
-        if (found.answer != DeepAnswer::Hit || candidate > found.stamp || (candidate == found.stamp && found.conservative && !conservative)) found = {DeepAnswer::Hit, candidate, conservative, {view.begin, view.end}};
+        if (level == Levels) {
+            candidates.every = true;
+            continue;
+        }
+        if (deepNewest[level] >= window.lo) {
+            for (auto block = range.first >> Shifts[level]; block <= (last >> Shifts[level]); ++block) gather(deepMap(level, block), window, candidates);
+        }
+        for (auto at = level + 1; at < Levels; ++at) {
+            if (newest[at] < window.lo) continue;
+            for (auto block = range.first >> Shifts[at]; block <= (last >> Shifts[at]); ++block) gather(ownMap(at, block), window, candidates);
+        }
+    }
+    if (newest[HugeLevel] >= window.lo) gather(Layout.huge, window, candidates);
+    if (candidates.every) {
+        for (std::size_t word = 0; word < Words; ++word) {
+            const auto bits = windowBits(window, word);
+            if (bits == 0) continue;
+            candidates.bits[word] = bits;
+            candidates.words |= std::uint32_t{1} << word;
+        }
     }
     return true;
 }
 
-DeepFound StampedRanges::Before(std::span<const Range> ranges, std::uint64_t live, std::uint64_t before) const {
-    DeepFound found;
-    const bool wideLive = wide.newest.load(std::memory_order_acquire) >= live;
-    for (const auto& range : ranges) {
-        std::uint64_t first = 0;
-        std::uint64_t last = 0;
-        if (!Regions(range, QueryRegions, first, last)) {
-            noteUnsure(0, nullptr, range, ranges.size(), live, before);
-            return {DeepAnswer::Unsure};
+StampedRanges::Seen StampedRanges::probe(std::size_t index, std::span<const Range> asked, const Window& window, std::uint64_t& stamp, Range& range) const {
+    const auto& slot = slots[index];
+    for (unsigned attempt = 0; attempt < ReadAttempts; ++attempt) {
+        const auto version = slot.version.load(std::memory_order_acquire);
+        if ((version & 1u) != 0) {
+            SpinPause();
+            continue;
         }
-        for (auto region = first; region <= last; ++region) {
-            const auto& bucket = bucketAt(region);
-            if (!scanBefore(bucket, range, live, before, found)) {
-                noteUnsure(bucket.overflowLast.load(std::memory_order_relaxed) >= live ? 1 : 2, &bucket, range, ranges.size(), live, before);
-                return {DeepAnswer::Unsure};
+        const auto held = slot.stamp.load(std::memory_order_relaxed);
+        const auto count = std::min<std::size_t>(slot.count.load(std::memory_order_relaxed), MaxRanges);
+        const bool inside = held >= window.lo && held < window.hi;
+        bool found = false;
+        bool broken = false;
+        Range seen{};
+        if (inside) {
+            const auto inlined = std::min(count, Inline);
+            for (std::size_t at = 0; at < inlined && !found; ++at) {
+                const Range cell{slot.cells[at].begin.load(std::memory_order_relaxed), slot.cells[at].end.load(std::memory_order_relaxed)};
+                if (!overlapsAsked(cell, asked)) continue;
+                found = true;
+                seen = cell;
+            }
+            auto block = slot.head.load(std::memory_order_relaxed);
+            std::size_t left = count > Inline ? count - Inline : 0;
+            while (left != 0 && !found) {
+                if (block >= PoolBlocks) {
+                    broken = true;
+                    break;
+                }
+                const auto& cells = blocks[block].cells;
+                const auto take = std::min(left, BlockRanges);
+                for (std::size_t at = 0; at < take && !found; ++at) {
+                    const Range cell{cells[at].begin.load(std::memory_order_relaxed), cells[at].end.load(std::memory_order_relaxed)};
+                    if (!overlapsAsked(cell, asked)) continue;
+                    found = true;
+                    seen = cell;
+                }
+                left -= take;
+                block = blocks[block].next.load(std::memory_order_relaxed);
             }
         }
-        if (wideLive && !scanBefore(wide, range, live, before, found)) {
-            noteUnsure(3, &wide, range, ranges.size(), live, before);
-            return {DeepAnswer::Unsure};
-        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (slot.version.load(std::memory_order_relaxed) != version || broken) continue;
+        if (!inside || !found) return Seen::Miss;
+        stamp = held;
+        range = seen;
+        return Seen::Hit;
     }
+    return Seen::Torn;
+}
+
+DeepFound StampedRanges::Before(std::span<const Range> ranges, std::uint64_t live, std::uint64_t before) const {
+    auto* const census = readCensus();
+    const std::size_t kind = before == Unbounded ? 1u : 0u;
+    if (census != nullptr) census->lookups[kind].fetch_add(1, std::memory_order_relaxed);
+    const auto unsure = [census](Doubt doubt) {
+        if (census != nullptr) census->unsure[static_cast<std::size_t>(doubt)].fetch_add(1, std::memory_order_relaxed);
+        return DeepFound{DeepAnswer::Unsure};
+    };
+    if (ranges.empty() || live >= before) {
+        noteTested(census, 0);
+        return {};
+    }
+    const auto newest = front.newest.load(std::memory_order_acquire);
+    const auto lost = front.lost.load(std::memory_order_acquire);
+    std::uint64_t oldest = 0;
+    if (newest + 1 >= Capacity) oldest = newest + 1 - Capacity;
+    const auto lo = std::max(live, oldest);
+    if (lo >= before) {
+        noteTested(census, 0);
+        return {};
+    }
+    if (lost > lo) return unsure(Doubt::Unrecorded);
+    const auto hi = std::min(before, newest + 1);
+    if (lo >= hi) {
+        noteTested(census, 0);
+        return {};
+    }
+    const auto window = makeWindow(lo, hi);
+    Candidates candidates;
+    if (!collect(ranges, window, candidates)) return unsure(Doubt::Inverted);
+    if (census != nullptr && candidates.every) census->everySlot.fetch_add(1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    DeepFound found;
+    bool torn = false;
+    std::uint64_t tested = 0;
+    walkNewestFirst(window.hi, candidates, [&](std::size_t slot) {
+        std::uint64_t stamp = 0;
+        Range range{};
+        const auto seen = probe(slot, ranges, window, stamp, range);
+        if (seen == Seen::Torn) {
+            torn = true;
+            return true;
+        }
+        if (seen != Seen::Hit) return false;
+        found = DeepFound{DeepAnswer::Hit, stamp, false, range};
+        return true;
+    }, tested);
+    noteTested(census, tested);
+    if (torn) return unsure(Doubt::Torn);
     return found;
 }
 
 DeepFound StampedRanges::Newest(std::span<const Range> ranges, std::uint64_t live) const {
-    return Before(ranges, live, ~std::uint64_t{0});
-}
-
-bool StampedRanges::scanWithin(const Bucket& bucket, const Range& range, std::uint64_t from, std::uint64_t to) {
-    if (bucket.newest.load(std::memory_order_acquire) < from) return false;
-    for (const auto& way : bucket.ways) {
-        if (way.last.load(std::memory_order_acquire) < from) continue;
-        View view;
-        if (!read(way, view)) return true;
-        if (view.last >= from && view.first < to && view.begin < range.second && range.first < view.end) return true;
-    }
-    for (const auto& grave : bucket.graves) {
-        if (grave.last.load(std::memory_order_acquire) < from) continue;
-        View view;
-        if (!read(grave, view)) return true;
-        if (view.last >= from && view.first < to && view.begin < range.second && range.first < view.end) return true;
-    }
-    const auto overflowLast = bucket.overflowLast.load(std::memory_order_acquire);
-    if (overflowLast >= from) {
-        const auto overflowFirst = bucket.overflowFirst.load(std::memory_order_acquire);
-        if (overflowFirst < to || overflowFirst > overflowLast) return true;
-    }
-    return bucket.reclaimed.load(std::memory_order_acquire) >= from;
+    return Before(ranges, live, Unbounded);
 }
 
 bool StampedRanges::Within(std::span<const Range> ranges, std::uint64_t from, std::uint64_t to) const {
-    if (from >= to) return false;
-    const bool wideSeen = wide.newest.load(std::memory_order_acquire) >= from;
-    for (const auto& range : ranges) {
-        std::uint64_t first = 0;
-        std::uint64_t last = 0;
-        if (!Regions(range, QueryRegions, first, last)) return true;
-        for (auto region = first; region <= last; ++region) {
-            if (scanWithin(bucketAt(region), range, from, to)) return true;
-        }
-        if (wideSeen && scanWithin(wide, range, from, to)) return true;
+    auto* const census = readCensus();
+    if (census != nullptr) census->lookups[2].fetch_add(1, std::memory_order_relaxed);
+    const auto kept = [census](Kept reason) {
+        if (census != nullptr) census->kept[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+        return true;
+    };
+    if (from >= to || ranges.empty()) {
+        noteTested(census, 0);
+        return false;
     }
+    const auto newest = front.newest.load(std::memory_order_acquire);
+    const auto lost = front.lost.load(std::memory_order_acquire);
+    if (lost > from) return kept(Kept::Unrecorded);
+    if (newest >= from && newest - from >= Capacity) return kept(Kept::Recycled);
+    const auto hi = std::min(to, newest + 1);
+    if (from >= hi) {
+        noteTested(census, 0);
+        return false;
+    }
+    const auto window = makeWindow(from, hi);
+    Candidates candidates;
+    if (!collect(ranges, window, candidates)) return kept(Kept::Inverted);
+    if (census != nullptr && candidates.every) census->everySlot.fetch_add(1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    bool hit = false;
+    bool torn = false;
+    std::uint64_t tested = 0;
+    walkNewestFirst(window.hi, candidates, [&](std::size_t slot) {
+        std::uint64_t stamp = 0;
+        Range range{};
+        const auto seen = probe(slot, ranges, window, stamp, range);
+        if (seen == Seen::Miss) return false;
+        hit = seen == Seen::Hit;
+        torn = seen == Seen::Torn;
+        return true;
+    }, tested);
+    noteTested(census, tested);
+    if (hit) return true;
+    if (torn) return kept(Kept::Torn);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const auto after = front.newest.load(std::memory_order_relaxed);
+    if (after >= from && after - from >= Capacity) return kept(Kept::Recycled);
+    if (front.lost.load(std::memory_order_relaxed) > from) return kept(Kept::Unrecorded);
     return false;
+}
+
+void StampedRanges::report() const {
+    std::array<std::uint64_t, 3> lookups{};
+    std::array<std::uint64_t, TestedBuckets> tested{};
+    std::array<std::uint64_t, static_cast<std::size_t>(Doubt::Count)> unsure{};
+    std::array<std::uint64_t, static_cast<std::size_t>(Kept::Count)> kept{};
+    std::uint64_t testedTotal = 0;
+    std::uint64_t everySlot = 0;
+    for (const auto& stripe : reads) {
+        for (std::size_t at = 0; at < lookups.size(); ++at) lookups[at] += stripe.lookups[at].load(std::memory_order_relaxed);
+        for (std::size_t at = 0; at < tested.size(); ++at) tested[at] += stripe.tested[at].load(std::memory_order_relaxed);
+        for (std::size_t at = 0; at < unsure.size(); ++at) unsure[at] += stripe.unsure[at].load(std::memory_order_relaxed);
+        for (std::size_t at = 0; at < kept.size(); ++at) kept[at] += stripe.kept[at].load(std::memory_order_relaxed);
+        testedTotal += stripe.testedTotal.load(std::memory_order_relaxed);
+        everySlot += stripe.everySlot.load(std::memory_order_relaxed);
+    }
+    std::uint64_t answered = 0;
+    for (const auto count : tested) answered += count;
+    const auto mean = answered != 0 ? static_cast<double>(testedTotal) / static_cast<double>(answered) : 0.0;
+    const auto& ranges = written.ranges;
+    const auto& lost = written.unrecorded;
+    std::fprintf(stderr, "[deep-index] %s (cumulative): %llu stamps recorded from %llu inserts, %llu appends; ranges by grain: 64 B %llu, 1 KiB %llu, 16 KiB %llu, 256 KiB %llu, 4 MiB %llu, 64 MiB %llu, wider %llu; not recorded: beyond capacity %llu, out of order %llu, spill pool full %llu; slots of skipped stamps evicted %llu; spill blocks in use %llu, highest %llu of %llu; bits set %llu, cleared %llu; lookups: before %llu, newest %llu, within %llu; slots tested per lookup: none %llu, 1 %llu, 2-3 %llu, 4-7 %llu, 8-15 %llu, 16-63 %llu, 64 or more %llu, mean %.2f; lookups over every slot %llu; unsure: unrecorded stamp %llu, torn read %llu, inverted range %llu; within true untested: recycled window %llu, unrecorded stamp %llu, torn read %llu, inverted range %llu\n",
+        label, wideCount(written.stamps), wideCount(written.inserts), wideCount(written.appends),
+        wideCount(ranges[0]), wideCount(ranges[1]), wideCount(ranges[2]), wideCount(ranges[3]), wideCount(ranges[4]), wideCount(ranges[5]), wideCount(ranges[6]),
+        wideCount(lost[0]), wideCount(lost[1]), wideCount(lost[2]),
+        wideCount(written.evicted), wideCount(PoolBlocks - freeCount), wideCount(written.spillHighest), wideCount(PoolBlocks),
+        wideCount(written.bitsSet), wideCount(written.bitsCleared),
+        wideCount(lookups[0]), wideCount(lookups[1]), wideCount(lookups[2]),
+        wideCount(tested[0]), wideCount(tested[1]), wideCount(tested[2]), wideCount(tested[3]), wideCount(tested[4]), wideCount(tested[5]), wideCount(tested[6]), mean,
+        wideCount(everySlot),
+        wideCount(unsure[0]), wideCount(unsure[1]), wideCount(unsure[2]),
+        wideCount(kept[0]), wideCount(kept[1]), wideCount(kept[2]), wideCount(kept[3]));
 }
 
 StampedKeys::Bucket& StampedKeys::bucketOf(std::uint64_t key) {

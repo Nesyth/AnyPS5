@@ -5,9 +5,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <utility>
-#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -25,15 +25,25 @@ public:
     using Range = std::pair<std::uint64_t, std::uint64_t>;
     static constexpr unsigned RegionShift = 12;
     static constexpr unsigned CoarseShift = 21;
-    static constexpr std::size_t Buckets = 8192;
-    static constexpr unsigned BucketBits = 13;
-    static constexpr std::size_t Ways = 64;
-    static constexpr std::size_t Graves = 4;
-    static constexpr std::uint64_t WideRegions = 64;
     static constexpr std::uint64_t QueryRegions = 1024;
     static constexpr std::uint64_t CoarseQueryRegions = 64;
+    static constexpr std::size_t Capacity = 1024;
+    static constexpr std::size_t Inline = 2;
+    static constexpr std::size_t BlockRanges = 7;
+    static constexpr std::size_t PoolBlocks = 4096;
+    static constexpr std::size_t MaxRanges = Inline + PoolBlocks * BlockRanges;
+    static constexpr std::size_t Levels = 6;
+    static constexpr std::array<unsigned, Levels> Shifts{6, 10, 14, 18, 22, 26};
+    static constexpr std::array<unsigned, Levels> OwnBits{13, 12, 11, 10, 9, 9};
+    static constexpr std::array<unsigned, Levels> DeepBits{0, 12, 11, 10, 9, 9};
+    static constexpr std::uint64_t WriteBlocks = 2;
+    static constexpr std::uint64_t QueryBlocks = 8;
     static constexpr unsigned ReadAttempts = 8;
-    static constexpr std::size_t Memos = 4;
+
+    StampedRanges();
+    ~StampedRanges();
+    StampedRanges(const StampedRanges&) = delete;
+    StampedRanges& operator=(const StampedRanges&) = delete;
 
     static bool Regions(const Range& range, std::uint64_t limit, std::uint64_t& first, std::uint64_t& last);
     static bool CoarseRegions(const Range& range, std::uint64_t limit, std::uint64_t& first, std::uint64_t& last);
@@ -45,68 +55,122 @@ public:
     void Name(const char* name) { label = name; }
 
 private:
-    struct Entry {
-        std::atomic<std::uint32_t> version{0};
+    static constexpr std::size_t Words = Capacity / 64;
+    static constexpr std::uint64_t SlotMask = Capacity - 1;
+    static constexpr std::uint32_t NoBlock = 0xffffffffu;
+    static constexpr std::size_t HugeLevel = Levels;
+    static constexpr std::size_t Classes = Levels + 1;
+    static constexpr std::size_t CensusStripes = 8;
+    static constexpr std::size_t TestedBuckets = 7;
+
+    struct Cell {
         std::atomic<std::uint64_t> begin{0};
         std::atomic<std::uint64_t> end{0};
-        std::atomic<std::uint64_t> first{0};
-        std::atomic<std::uint64_t> last{0};
     };
-    struct Census {
-        std::atomic<std::uint64_t> overflows{0};
-        std::array<std::atomic<std::uint64_t>, 5> placed{};
-        std::array<std::atomic<std::uint64_t>, 5> occupants{};
-        std::atomic<std::uint64_t> occupantsLive{0};
-        std::atomic<std::uint64_t> occupantsInRegion{0};
-        std::atomic<std::uint64_t> occupantPages{0};
-        std::atomic<std::uint64_t> unsure{0};
-        std::array<std::atomic<std::uint64_t>, 4> reasons{};
-        std::array<std::atomic<std::uint64_t>, 5> asked{};
-        std::atomic<std::uint64_t> askedRanges{0};
+    struct alignas(64) Slot {
+        std::atomic<std::uint32_t> version{0};
+        std::atomic<std::uint32_t> count{0};
+        std::atomic<std::uint64_t> stamp{0};
+        std::atomic<std::uint32_t> head{NoBlock};
+        std::array<Cell, Inline> cells{};
     };
-    struct Bucket {
+    struct alignas(64) Block {
+        std::atomic<std::uint32_t> next{NoBlock};
+        std::array<Cell, BlockRanges> cells{};
+    };
+    struct Meta {
         std::atomic<std::uint64_t> newest{0};
-        std::atomic<std::uint64_t> overflowFirst{0};
-        std::atomic<std::uint64_t> overflowLast{0};
-        std::atomic<std::uint64_t> reclaimed{0};
-        std::array<Entry, Ways> ways{};
-        std::array<Entry, Graves> graves{};
-        std::size_t nextGrave = 0;
+        std::atomic<std::uint64_t> summary{0};
     };
-    struct View {
-        std::uint64_t begin = 0;
-        std::uint64_t end = 0;
+    struct alignas(64) Map {
+        std::array<std::atomic<std::uint64_t>, Words> words{};
+    };
+    struct alignas(64) Front {
+        std::atomic<std::uint64_t> newest{0};
+        std::atomic<std::uint64_t> lost{0};
+    };
+    struct alignas(64) ClassStamps {
+        std::array<std::atomic<std::uint64_t>, Classes> newest{};
+    };
+    enum class Lost : std::uint8_t { Capacity, Disorder, Pool, Count };
+    enum class Doubt : std::uint8_t { Unrecorded, Torn, Inverted, Count };
+    enum class Kept : std::uint8_t { Recycled, Unrecorded, Torn, Inverted, Count };
+    struct alignas(64) ReadCensus {
+        std::array<std::atomic<std::uint64_t>, 3> lookups{};
+        std::array<std::atomic<std::uint64_t>, TestedBuckets> tested{};
+        std::atomic<std::uint64_t> testedTotal{0};
+        std::atomic<std::uint64_t> everySlot{0};
+        std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Doubt::Count)> unsure{};
+        std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Kept::Count)> kept{};
+    };
+    struct WriteCensus {
+        std::uint64_t inserts = 0;
+        std::uint64_t stamps = 0;
+        std::uint64_t appends = 0;
+        std::array<std::uint64_t, Classes> ranges{};
+        std::array<std::uint64_t, static_cast<std::size_t>(Lost::Count)> unrecorded{};
+        std::uint64_t evicted = 0;
+        std::uint64_t bitsSet = 0;
+        std::uint64_t bitsCleared = 0;
+        std::uint64_t spillHighest = 0;
+        std::int64_t reportedAt = 0;
+    };
+    struct Window {
+        std::uint64_t lo = 0;
+        std::uint64_t hi = 0;
         std::uint64_t first = 0;
-        std::uint64_t last = 0;
+        std::uint64_t length = 0;
+        std::uint32_t words = 0;
     };
-    struct MemoEntry {
-        Entry* entry = nullptr;
-        Bucket* bucket = nullptr;
-        std::size_t range = 0;
+    struct Candidates {
+        std::array<std::uint64_t, Words> bits{};
+        std::uint32_t words = 0;
+        bool every = false;
     };
-    struct Memo {
-        std::vector<Range> ranges;
-        std::vector<MemoEntry> entries;
-        bool valid = false;
-    };
-    Bucket& bucketAt(std::uint64_t region);
-    const Bucket& bucketAt(std::uint64_t region) const;
-    bool place(Bucket& bucket, const Range& range, std::size_t index, std::uint64_t stamp, std::uint64_t live, Memo& memo, std::uint64_t region);
-    void noteOverflow(const Bucket& bucket, const Range& range, std::uint64_t region, std::uint64_t stamp, std::uint64_t live);
-    void noteUnsure(unsigned reason, const Bucket* bucket, const Range& range, std::size_t count, std::uint64_t live, std::uint64_t before) const;
-    void reportCensus() const;
-    static void bury(Bucket& bucket, const Entry& entry);
-    static bool read(const Entry& entry, View& view);
-    static bool scanBefore(const Bucket& bucket, const Range& range, std::uint64_t live, std::uint64_t before, DeepFound& found);
-    static bool scanWithin(const Bucket& bucket, const Range& range, std::uint64_t from, std::uint64_t to);
+    enum class Seen : std::uint8_t { Miss, Hit, Torn };
 
-    std::array<Bucket, Buckets> buckets{};
-    Bucket wide{};
-    std::array<Memo, Memos> memos{};
-    std::size_t nextMemo = 0;
+    static Window makeWindow(std::uint64_t lo, std::uint64_t hi);
+    static std::uint64_t windowBits(const Window& window, std::size_t word);
+    static std::size_t blocksFor(std::size_t count);
+    bool occupiedAt(std::size_t slot) const;
+    void setOccupied(std::size_t slot, bool held);
+    void setBit(std::size_t map, std::size_t slot, std::uint64_t stamp);
+    void clearBit(std::size_t map, std::size_t slot);
+    void releaseSlot(std::size_t slot, bool keepMarked);
+    void evictSlot(std::size_t slot);
+    void evictSkipped(std::uint64_t first, std::uint64_t length);
+    std::size_t heldSkipped(std::uint64_t first, std::uint64_t length) const;
+    void writeCells(Slot& slot, std::size_t from, std::span<const Range> ranges);
+    void placeRanges(std::span<const Range> ranges, std::size_t slot, std::uint64_t stamp);
+    void append(std::span<const Range> ranges, std::uint64_t stamp, std::uint64_t live);
+    void unrecord(std::uint64_t stamp, std::uint64_t live, std::size_t count, Lost reason);
+    void noteInsert();
+    void report() const;
+    void gather(std::size_t map, const Window& window, Candidates& candidates) const;
+    bool collect(std::span<const Range> ranges, const Window& window, Candidates& candidates) const;
+    Seen probe(std::size_t slot, std::span<const Range> asked, const Window& window, std::uint64_t& stamp, Range& range) const;
+    ReadCensus* readCensus() const;
+    static void noteTested(ReadCensus* census, std::uint64_t tested);
+
+    std::unique_ptr<Meta[]> metas;
+    std::unique_ptr<Map[]> maps;
+    std::unique_ptr<Slot[]> slots;
+    std::unique_ptr<Block[]> blocks;
+    std::unique_ptr<std::uint32_t[]> freeBlocks;
+    std::unique_ptr<std::uint64_t[]> marks;
+    alignas(64) std::size_t freeCount = 0;
+    std::uint64_t markSerial = 0;
+    std::array<std::uint64_t, Words> occupied{};
+    std::uint64_t current = 0;
+    std::uint32_t currentTail = NoBlock;
+    bool started = false;
+    bool currentRecorded = false;
+    Front front;
+    ClassStamps classes;
     std::atomic<std::uint64_t> overflows{0};
     const char* label = "unnamed";
-    mutable Census census;
+    WriteCensus written;
+    mutable std::array<ReadCensus, CensusStripes> reads{};
 };
 
 class StampedKeys {

@@ -23,7 +23,6 @@ using AgcDriver::DriverDetail::DeepSite;
 using AgcDriver::DriverDetail::DrawFinisher;
 using AgcDriver::DriverDetail::DrawPipeline;
 using AgcDriver::DriverDetail::PublishedKeys;
-using AgcDriver::DriverDetail::StampedRanges;
 using AgcDriver::Graphics::RuntimeSwitch;
 namespace LeanFront = AgcDriver::DriverDetail::LeanFront;
 namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
@@ -363,41 +362,56 @@ void OneRangeManyWriters() {
     finisher.Drain();
 }
 
-void BucketOverflow() {
+void DenseWritesStayExact() {
     SetThreads(4);
     auto& finisher = DrawFinisher::Get();
     finisher.Drain();
     constexpr std::uint64_t Region = 0x350000000;
+    constexpr std::uint64_t Writes = 600;
+    constexpr std::uint64_t Step = 0x20;
     std::atomic<bool> open{false};
-    std::atomic<bool> readerDone{false};
     BlockFront(open);
     const auto overflowsBefore = DrawFinisher::DeepTotal(DeepCount::WriteOverflows);
     const auto scansBefore = DrawFinisher::DeepTotal(DeepCount::WorkerFallbacks);
-    constexpr std::uint64_t Writes = StampedRanges::Ways + 4;
-    constexpr std::uint64_t Step = 0x20;
-    static_assert(Writes * Step + 0x100 <= (std::uint64_t{1} << StampedRanges::RegionShift), "the writes of the overflow test must share one bucket");
-    for (std::uint64_t index = 0; index < Writes; ++index) PublishWrite({Region + index * Step, Region + index * Step + 0x10});
-    Require(DrawFinisher::DeepTotal(DeepCount::WriteOverflows) >= overflowsBefore + 4, "more writes than ways in one region did not overflow its bucket");
+    const auto fullBefore = DrawFinisher::DeepTotal(DeepCount::IndexFull);
+    for (std::uint64_t index = 0; index < Writes; ++index) PublishWrite({Region + index * Step, Region + index * Step + 4});
+    Require(DrawFinisher::DeepTotal(DeepCount::WriteOverflows) == overflowsBefore, "a write among 600 dense writes was not recorded in the index");
     for (std::uint64_t index = 0; index < Writes; ++index) {
         const auto at = Region + index * Step;
-        Require(finisher.PendingOverlaps(at + 8, at + 9), "a write in an overflowing bucket was missed");
-        Require(!finisher.PendingOverlaps(at + 0x10, at + 0x20), "a gap in an overflowing bucket overlapped");
+        Require(finisher.PendingOverlaps(at + 2, at + 3), "a dense write was missed");
+        Require(finisher.PendingOverlaps(at + 3, at + 0x10), "a read over the end of a dense write was missed");
+        Require(!finisher.PendingOverlaps(at + 4, at + Step), "a gap between dense writes overlapped");
+        Require(!finisher.PendingOverlaps(at + 4, at + 4), "an empty read at the end of a dense write overlapped");
     }
-    Require(DrawFinisher::DeepTotal(DeepCount::WorkerFallbacks) > scansBefore, "the worker answered from an overflowing bucket without its scan");
-    const auto fullBefore = DrawFinisher::DeepTotal(DeepCount::IndexFull);
+    const std::array<Range, 2> gaps{{{Region + 8, Region + Step}, {Region + 300 * Step + 4, Region + 301 * Step}}};
+    Require(!finisher.PendingOverlapsAny(gaps), "a list of gaps between dense writes overlapped");
+    Require(finisher.PendingOverlaps(Region, Region + Writes * Step), "a read over all dense writes was missed");
+    Require(DrawFinisher::DeepTotal(DeepCount::WorkerFallbacks) == scansBefore, "the worker fell back to its scan among dense writes");
     const auto waitsBefore = LeanFront::Total(LeanFront::Counter::AheadWaits);
+    std::atomic<bool> gapDone{false};
+    finisher.Enqueue([&gapDone] {
+        const DrawFinisher::AheadScope ahead;
+        static_cast<void>(DrawFinisher::Get().PendingOverlaps(Region + 5 * Step + 8, Region + 5 * Step + 0x18));
+        gapDone.store(true);
+    }, Held({}));
+    Require(WaitFor([&] { return gapDone.load(); }), "a job ahead of its turn waited to read a gap among dense earlier writes");
+    Require(LeanFront::Total(LeanFront::Counter::AheadWaits) == waitsBefore, "a job ahead of its turn that reads a gap among dense writes counted a wait");
+    Require(DrawFinisher::DeepTotal(DeepCount::IndexFull) == fullBefore, "a job ahead of its turn found the index full among dense writes");
+    std::atomic<bool> readerDone{false};
+    finisher.Enqueue([] {});
     finisher.Enqueue([&readerDone] {
         const DrawFinisher::AheadScope ahead;
-        static_cast<void>(DrawFinisher::Get().PendingOverlaps(Region + 0xf00, Region + 0xf10));
+        static_cast<void>(DrawFinisher::Get().PendingOverlaps(Region + 7 * Step + 8, Region + 7 * Step + 0x18));
         readerDone.store(true);
     }, Held({}));
     Pause();
-    Require(!readerDone.load(), "a job ahead of its turn went on past an overflowing bucket before its turn");
+    Require(!readerDone.load(), "a job ahead of its turn went on past an earlier job with unknown writes");
     open.store(true);
-    Require(WaitFor([&] { return readerDone.load(); }), "a job ahead of its turn never got its turn");
+    Require(WaitFor([&] { return readerDone.load(); }), "a job ahead of its turn never got past the earlier job with unknown writes");
     finisher.Drain();
-    Require(DrawFinisher::DeepTotal(DeepCount::IndexFull) == fullBefore + 1, "a turn wait for an overflowing bucket was not counted");
-    Require(LeanFront::Total(LeanFront::Counter::AheadWaits) == waitsBefore + 1, "a job ahead of its turn did not count one wait");
+    Require(LeanFront::Total(LeanFront::Counter::AheadWaits) == waitsBefore + 1, "a job ahead of an earlier job with unknown writes did not count one wait");
+    Require(DrawFinisher::DeepTotal(DeepCount::IndexFull) == fullBefore, "a wait for an earlier job with unknown writes was counted as a full index");
+    Require(DrawFinisher::DeepTotal(DeepCount::WorkerFallbacks) == scansBefore, "the worker fell back to its scan among dense writes");
 }
 
 void CommitterIndexes() {
@@ -543,7 +557,7 @@ int main() {
         UnknownJobs();
         KeysWithManyOutstanding();
         OneRangeManyWriters();
-        BucketOverflow();
+        DenseWritesStayExact();
         CommitterIndexes();
         TargetedCommitterWait();
         SwitchOffMidFlight();

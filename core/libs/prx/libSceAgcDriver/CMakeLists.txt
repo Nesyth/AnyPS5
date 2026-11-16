@@ -838,6 +838,8 @@ set(agcDeepFlowDifference "\\[deep-flow-verify\\] [-a-z ]+ differs:")
 set(agcFrameFlowEnvironment APS5_FRAME_FLOW=1 APS5_VERIFY_FRAME_FLOW=1)
 set(agcFrameFlowDifference "\\[frame-flow-verify\\] [-a-z ]+ differs:")
 set(agcOrderedSyncsEnvironment APS5_ORDERED_SYNCS=1 APS5_FIXUPS_BY_TURN=1)
+set(agcCommitRingEnvironment APS5_COMMIT_RING=1 APS5_VERIFY_COMMIT_RING=1)
+set(agcCommitRingDifference "\\[commit-ring-verify\\] [-a-z ]+ differs:")
 
 function(agc_add_draw_pipeline_test agcTestName)
     set(agcPipelineEnvironment ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1)
@@ -872,6 +874,9 @@ function(agc_add_deep_flow_test agcTestName)
     agc_add_env_test(${agcTestName}_ordered_syncs ${agcTestName}_tests
             ENV ${agcPipelineEnvironment} ${agcLateStackEnvironment} ${agcLeanFrontEnvironment} ${agcDeepFlowEnvironment} ${agcFrameFlowEnvironment} ${agcOrderedSyncsEnvironment})
     set_tests_properties(${agcTestName}_ordered_syncs PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDeepFlowDifference};${agcFrameFlowDifference}")
+    agc_add_env_test(${agcTestName}_commit_ring ${agcTestName}_tests
+            ENV ${agcPipelineEnvironment} ${agcLateStackEnvironment} ${agcLeanFrontEnvironment} ${agcDeepFlowEnvironment} ${agcFrameFlowEnvironment} ${agcOrderedSyncsEnvironment} ${agcCommitRingEnvironment})
+    set_tests_properties(${agcTestName}_commit_ring PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};${agcDeepFlowDifference};${agcFrameFlowDifference};${agcCommitRingDifference}")
 endfunction()
 
 set(agcWriteValidationDifference "\\[write-validation-verify\\] [-a-z ]+ differs:")

@@ -510,6 +510,158 @@ std::size_t readRegionSlot(std::uint64_t region) {
 }
 }
 
+namespace {
+enum class RingScan : std::uint32_t { QueuedItems, QueuedWriter, QueuedScan, DeepVerify, HeldReadsVerify, HeldReads, RunningReads, QueuedLabel, StoredBytes, Watch, WrittenSince, QueuedWrites, ValidationClear, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(RingScan::Count)> RingScanNames{"queued items", "queued writer", "queued scan", "deep verify", "held reads verify", "held reads", "running reads", "queued label", "stored bytes", "watch", "written since", "queued writes", "validation clear"};
+static_assert(RingScanNames.back() != nullptr, "every committer ring scan needs a name");
+constexpr std::uint64_t NoRingWake = ~std::uint64_t{0};
+constexpr std::uint32_t RingLockSpins = 4096;
+static_assert(DrawPipeline::CommitRingSlots >= DrawFinisher::LeanSlots && (DrawPipeline::CommitRingSlots & (DrawPipeline::CommitRingSlots - 1)) == 0, "the committer ring must hold the deepest committer queue, in a power-of-two number of slots");
+struct alignas(64) RingTotalLine {
+    std::atomic<std::uint64_t> value{0};
+};
+std::array<RingTotalLine, static_cast<std::size_t>(DrawPipeline::RingCount::Count)> ringTotals{};
+std::array<std::uint64_t, static_cast<std::size_t>(DrawPipeline::RingCount::Count)> ringReported{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RingScan::Count)> ringScanTotals{};
+std::array<std::uint64_t, static_cast<std::size_t>(RingScan::Count)> ringScanReported{};
+std::atomic<std::uint64_t> ringHighest{0};
+std::atomic<std::uint64_t> ringScanOrdinal{0};
+std::atomic<std::uint64_t> ringVerifyPrinted{0};
+std::atomic<std::int64_t> ringVerifyWindow{0};
+
+std::uint32_t ringScanId(RingScan scan) {
+    return static_cast<std::uint32_t>(scan);
+}
+
+void bumpRing(DrawPipeline::RingCount count, std::uint64_t by = 1) {
+    ringTotals[static_cast<std::size_t>(count)].value.fetch_add(by, std::memory_order_relaxed);
+}
+
+void bumpOwnedRing(DrawPipeline::RingCount count, std::uint64_t by = 1) {
+    auto& total = ringTotals[static_cast<std::size_t>(count)].value;
+    total.store(total.load(std::memory_order_relaxed) + by, std::memory_order_relaxed);
+}
+
+std::uint64_t ringVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_COMMIT_RING");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+bool ringWanted() {
+    return DrawFinisher::Deep() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::CommitRing);
+}
+
+void noteRingVerify(const char* check, bool differs, const char* detail) {
+    if (!differs) return;
+    bumpRing(DrawPipeline::RingCount::VerifyDiffering);
+    const auto window = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (ringVerifyWindow.exchange(window, std::memory_order_relaxed) != window) ringVerifyPrinted.store(0, std::memory_order_relaxed);
+    if (ringVerifyPrinted.fetch_add(1, std::memory_order_relaxed) >= 8) return;
+    std::fprintf(stderr, "[commit-ring-verify] %s differs: %s\n", check, detail);
+}
+}
+
+class DrawPipeline::RingLock {
+public:
+    explicit RingLock(DrawPipeline& pipeline) : owner(pipeline) { Lock(); }
+    ~RingLock() {
+        if (held) Unlock();
+    }
+    RingLock(const RingLock&) = delete;
+    RingLock& operator=(const RingLock&) = delete;
+
+    void Lock() {
+        if (owner.ringLocked.exchange(true, std::memory_order_acquire)) {
+            bumpRing(RingCount::Contention);
+            std::uint32_t spins = 0;
+            for (;;) {
+                while (owner.ringLocked.load(std::memory_order_relaxed)) {
+                    if (spins < RingLockSpins) {
+                        ++spins;
+                        SpinPause();
+                    } else {
+                        std::this_thread::yield();
+                    }
+                }
+                if (!owner.ringLocked.exchange(true, std::memory_order_acquire)) break;
+            }
+        }
+        held = true;
+    }
+
+    void Unlock() {
+        held = false;
+        owner.ringLocked.store(false, std::memory_order_release);
+    }
+
+private:
+    DrawPipeline& owner;
+    bool held = false;
+};
+
+class DrawPipeline::QueueScan {
+public:
+    QueueScan(DrawPipeline& pipeline, std::uint32_t caller) : owner(pipeline), lock(lockFor(pipeline.mutex)), view(pipeline.items) {
+        if (!owner.commitRing.load(std::memory_order_relaxed)) {
+            retired = owner.retiredItems.load(std::memory_order_relaxed);
+            return;
+        }
+        owner.ringScans.fetch_add(1, std::memory_order_seq_cst);
+        frozen = true;
+        for (std::uint32_t spins = 0; owner.committerRetiring.load(std::memory_order_seq_cst); ++spins) {
+            if (spins < RingLockSpins) SpinPause();
+            else std::this_thread::yield();
+        }
+        retired = owner.retiredItems.load(std::memory_order_seq_cst);
+        end = owner.enqueuedItems.load(std::memory_order_seq_cst);
+        view = QueuedView(owner.ring->data(), retired, end);
+        bumpRing(RingCount::SlowScans);
+        ringScanTotals[std::min<std::size_t>(caller, ringScanTotals.size() - 1)].fetch_add(1, std::memory_order_relaxed);
+        const auto every = ringVerifyEvery();
+        verifying = every != 0 && ringScanOrdinal.fetch_add(1, std::memory_order_relaxed) % every == 0;
+    }
+    ~QueueScan() {
+        if (frozen) owner.ringScans.fetch_sub(1, std::memory_order_seq_cst);
+    }
+    QueueScan(const QueueScan&) = delete;
+    QueueScan& operator=(const QueueScan&) = delete;
+
+    const QueuedView& Items() const { return view; }
+    std::uint64_t Retired() const { return retired; }
+    std::uint64_t Enqueued() const { return frozen ? end : owner.enqueuedItems.load(std::memory_order_relaxed); }
+    bool Frozen() const { return frozen; }
+
+    template<typename TScan>
+    void Check(const char* check, TScan&& scan) const {
+        if (!verifying) return;
+        const auto first = scan(view);
+        const RingLock stop(owner);
+        bumpRing(RingCount::VerifyScans);
+        const auto retiredNow = owner.retiredItems.load(std::memory_order_seq_cst);
+        std::uint64_t moved = 0;
+        for (auto ordinal = retired; ordinal < end; ++ordinal) {
+            if (owner.ringSlot(ordinal).ringOrdinal != ordinal + 1) ++moved;
+        }
+        const auto again = scan(view);
+        const bool same = first == again;
+        char text[320];
+        std::snprintf(text, sizeof(text), "items %llu to %llu scanned with the committer held; under the full stop %llu retired, %llu of the scanned slots no longer hold their item, the repeated scan %s", static_cast<unsigned long long>(retired), static_cast<unsigned long long>(end), static_cast<unsigned long long>(retiredNow), static_cast<unsigned long long>(moved), same ? "agrees" : "answers otherwise");
+        noteRingVerify(check, retiredNow != retired || moved != 0 || !same, text);
+    }
+
+private:
+    DrawPipeline& owner;
+    std::unique_lock<std::mutex> lock;
+    bool frozen = false;
+    bool verifying = false;
+    std::uint64_t retired = 0;
+    std::uint64_t end = 0;
+    QueuedView view;
+};
+
 void PublishedRanges::Publish(std::span<const std::pair<Range, std::uint32_t>> entries, std::uint32_t unknownHeld) {
     const auto before = seq.load(std::memory_order_relaxed);
     seq.store(before + 1, std::memory_order_relaxed);
@@ -1834,11 +1986,17 @@ void DrawFinisher::NoteNamingBlocker(std::uint64_t begin, std::uint64_t end) {
 }
 
 std::uint32_t DrawPipeline::DescribeQueuedWriter(std::uint64_t begin, std::uint64_t end) {
-    const auto lock = lockFor(mutex);
-    for (auto item = items.rbegin(); item != items.rend(); ++item) {
-        if (std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& write) { return begin < write.second && write.first < end; })) return 4000u + static_cast<std::uint32_t>(item->kind);
-    }
-    return 6000u;
+    const QueueScan scan(*this, ringScanId(RingScan::QueuedWriter));
+    const auto describe = [&](const QueuedView& queued) {
+        for (std::size_t index = queued.size(); index-- > 0;) {
+            const auto& item = queued[index];
+            if (std::any_of(item.writes.begin(), item.writes.end(), [&](const Range& write) { return begin < write.second && write.first < end; })) return 4000u + static_cast<std::uint32_t>(item.kind);
+        }
+        return 6000u;
+    };
+    const auto code = describe(scan.Items());
+    scan.Check("queued writer scan", describe);
+    return code;
 }
 
 DrawFinisher::ExactFound DrawFinisher::exactPending(std::span<const Range> ranges) {
@@ -3313,8 +3471,11 @@ std::size_t DrawPipeline::Depth() {
 
 std::size_t DrawPipeline::QueuedItems() {
     auto& pipeline = Queue0();
-    const auto lock = lockFor(pipeline.mutex);
-    return pipeline.items.size();
+    const QueueScan scan(pipeline, ringScanId(RingScan::QueuedItems));
+    const auto count = [](const QueuedView& queued) { return queued.size(); };
+    const auto size = count(scan.Items());
+    scan.Check("queued items scan", count);
+    return size;
 }
 
 bool& DrawPipeline::Active() {
@@ -3342,6 +3503,7 @@ unsigned DrawPipeline::Committers() {
 void DrawPipeline::rethrowFailure() {
     if (failure == nullptr) return;
     auto error = std::exchange(failure, nullptr);
+    failurePending.store(false, std::memory_order_release);
     std::rethrow_exception(error);
 }
 
@@ -3539,22 +3701,30 @@ void DrawPipeline::queueItem(Item item) {
             if (id != 0) DrawFinisher::Get().UnparkReads(id);
         }
     } unpark{std::exchange(item.parked, 0)};
+    for (;;) {
+        if (commitRing.load(std::memory_order_acquire) && ringEnqueue(item)) return;
+        if (queueLocked(item)) return;
+    }
+}
+
+bool DrawPipeline::queueLocked(Item& item) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
     const ClearOnExit<Item> clearReclaim{reclaim};
+    std::vector<Item> stranded;
     const auto lockStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto lock = lockFor(mutex);
+    if (commitRing.load(std::memory_order_relaxed)) return false;
     if (!retired.empty()) std::swap(retired, reclaim);
     if (profile) lockWaitNs += elapsedNs(lockStart);
     rethrowFailure();
     if (closing) {
         lock.unlock();
         item.commit();
-        return;
+        return true;
     }
-    const std::size_t deepLimit = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DeepShallow) && !DrawFinisher::Flow() ? static_cast<std::size_t>(shallowItems()) : DrawFinisher::LeanSlots;
-    const auto roomLimit = DrawFinisher::Flow() || (DrawFinisher::Deep() && deepQueue.load(std::memory_order_relaxed)) ? deepLimit : deepQueues() ? std::max<std::size_t>(Depth(), 32) : Depth();
+    const auto roomLimit = roomLimitNow();
     if (items.size() >= roomLimit) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const TailWatch watch(true, TailExtra::QueueRoom);
@@ -3575,10 +3745,16 @@ void DrawPipeline::queueItem(Item item) {
             ThreadReport::Add(forwarding ? ThreadReport::Count::FinisherForwardRoomNs : finisher ? ThreadReport::Count::FinisherRoomNs : worker ? ThreadReport::Count::WorkerCommitterRoomNs : ThreadReport::Count::OtherRoomNs, waited);
         }
         rethrowFailure();
+        if (commitRing.load(std::memory_order_relaxed)) return false;
     }
     if (items.empty()) {
         const bool deep = DrawFinisher::Deep();
         if (deepQueue.load(std::memory_order_relaxed) != deep) latchDeepQueue(deep);
+        if (deep && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::CommitRing)) {
+            std::swap(stranded, retired);
+            latchRing();
+            return false;
+        }
     }
     depthSum += items.size();
     ++enqueued;
@@ -3598,27 +3774,263 @@ void DrawPipeline::queueItem(Item item) {
     items.push_back(std::move(item));
     if (pipelineStats()) deepestItems = std::max(deepestItems, items.size());
     outstanding.fetch_add(1, std::memory_order_release);
-    if (!thread.joinable()) {
-        thread = std::thread([this] {
-            GuestMemory::MarkProofThread();
-            RaiseWorkerThreadPriority("draw committer");
-            PlaceReservedThread("draw committer");
-            run();
-        });
-        runningCommitters.fetch_add(1, std::memory_order_acq_rel);
-    }
+    startCommitter();
     if (committerWaiting) {
         ++wakes;
         wake.notify_one();
     }
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
-    if (!profile && !stats) return;
+    if (!profile && !stats) return true;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport >= std::chrono::seconds(10)) report(now);
+    return true;
+}
+
+void DrawPipeline::startCommitter() {
+    if (thread.joinable()) return;
+    thread = std::thread([this] {
+        GuestMemory::MarkProofThread();
+        RaiseWorkerThreadPriority("draw committer");
+        PlaceReservedThread("draw committer");
+        run();
+    });
+    runningCommitters.fetch_add(1, std::memory_order_acq_rel);
+}
+
+std::size_t DrawPipeline::roomLimitNow() const {
+    const std::size_t deepLimit = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DeepShallow) && !DrawFinisher::Flow() ? static_cast<std::size_t>(shallowItems()) : DrawFinisher::LeanSlots;
+    return DrawFinisher::Flow() || (DrawFinisher::Deep() && deepQueue.load(std::memory_order_relaxed)) ? deepLimit : deepQueues() ? std::max<std::size_t>(Depth(), 32) : Depth();
+}
+
+DrawPipeline::Item& DrawPipeline::ringSlot(std::uint64_t ordinal) {
+    return (*ring)[static_cast<std::size_t>(ordinal & (CommitRingSlots - 1))];
+}
+
+void DrawPipeline::latchRing() {
+    if (commitRing.load(std::memory_order_relaxed)) return;
+    if (ring == nullptr) ring = std::make_unique<std::array<Item, CommitRingSlots>>();
+    startCommitter();
+    const RingLock ringLock(*this);
+    ringReclaimed = enqueuedItems.load(std::memory_order_relaxed);
+    commitRing.store(true, std::memory_order_seq_cst);
+    bumpRing(RingCount::Latches);
+    if (committerWaiting) {
+        ++wakes;
+        wake.notify_one();
+    }
+}
+
+void DrawPipeline::unlatchRing() {
+    std::vector<Item> released;
+    const auto lock = lockFor(mutex);
+    const RingLock ringLock(*this);
+    if (!commitRing.load(std::memory_order_relaxed) || ringWanted()) return;
+    const auto retiredNow = retiredItems.load(std::memory_order_seq_cst);
+    if (retiredNow != enqueuedItems.load(std::memory_order_relaxed)) return;
+    reclaimRing(retiredNow, released);
+    commitRing.store(false, std::memory_order_seq_cst);
+    bumpRing(RingCount::Unlatches);
+    if (committerWaiting) {
+        ++wakes;
+        wake.notify_one();
+    }
+}
+
+void DrawPipeline::reclaimRing(std::uint64_t upTo, std::vector<Item>& out) {
+    for (; ringReclaimed < upTo; ++ringReclaimed) {
+        auto& slot = ringSlot(ringReclaimed);
+        out.push_back(std::move(slot));
+        slot.commit = nullptr;
+    }
+}
+
+bool DrawPipeline::ringEmpty() const {
+    const auto retiredNow = retiredItems.load(std::memory_order_seq_cst);
+    return retiredNow == enqueuedItems.load(std::memory_order_seq_cst);
+}
+
+void DrawPipeline::lowerRingWake(std::uint64_t target) {
+    if (target < ringWakeAt.load(std::memory_order_relaxed)) ringWakeAt.store(target, std::memory_order_seq_cst);
+}
+
+bool DrawPipeline::queueEmptyLocked() {
+    if (!commitRing.load(std::memory_order_relaxed)) return items.empty();
+    const auto drained = [&] { return ringEmpty() && outstanding.load(std::memory_order_seq_cst) == 0; };
+    if (drained()) return true;
+    lowerRingWake(enqueuedItems.load(std::memory_order_seq_cst));
+    return drained();
+}
+
+void DrawPipeline::raiseReadsLive(std::uint64_t live) {
+    auto current = readsLive.load(std::memory_order_relaxed);
+    while (current < live && !readsLive.compare_exchange_weak(current, live, std::memory_order_release, std::memory_order_relaxed)) {
+    }
+}
+
+void DrawPipeline::awaitRingRoom(std::uint64_t resumeFill) {
+    const auto room = [&] {
+        const auto retiredNow = retiredItems.load(std::memory_order_seq_cst);
+        return enqueuedItems.load(std::memory_order_seq_cst) - retiredNow <= resumeFill || !commitRing.load(std::memory_order_seq_cst);
+    };
+    ringIdleWaiters.fetch_add(1, std::memory_order_seq_cst);
+    if (!SpinUntil(HandoffSpinWindow(), room)) {
+        auto lock = lockFor(mutex);
+        for (;;) {
+            if (commitRing.load(std::memory_order_relaxed)) {
+                const auto end = enqueuedItems.load(std::memory_order_seq_cst);
+                lowerRingWake(end > resumeFill ? end - resumeFill : 0);
+            }
+            if (room()) break;
+            idle.wait(lock);
+        }
+    }
+    ringIdleWaiters.fetch_sub(1, std::memory_order_seq_cst);
+}
+
+bool DrawPipeline::ringEnqueue(Item& item) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    struct RingReclaimStorage {};
+    auto& reclaim = HostThreadLocal<std::vector<Item>, RingReclaimStorage>();
+    const ClearOnExit<Item> clearReclaim{reclaim};
+    std::optional<TailWatch> watch;
+    std::optional<ThreadReport::WorkerStateScope> room;
+    auto roomStart = std::chrono::steady_clock::time_point{};
+    bool waited = false;
+    for (;;) {
+        const auto lockStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        RingLock lock(*this);
+        if (!commitRing.load(std::memory_order_relaxed)) return false;
+        if (profile) lockWaitNs += elapsedNs(lockStart);
+        if (failurePending.load(std::memory_order_acquire)) {
+            lock.Unlock();
+            {
+                const auto held = lockFor(mutex);
+                rethrowFailure();
+            }
+            continue;
+        }
+        if (!waited && ringClosing.load(std::memory_order_acquire)) {
+            lock.Unlock();
+            item.commit();
+            return true;
+        }
+        const auto end = enqueuedItems.load(std::memory_order_relaxed);
+        const auto retiredNow = retiredItems.load(std::memory_order_seq_cst);
+        if (retiredNow == end && !ringWanted()) {
+            lock.Unlock();
+            unlatchRing();
+            return false;
+        }
+        const auto roomLimit = roomLimitNow();
+        if (end - retiredNow >= roomLimit) {
+            if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
+            if (!waited) {
+                waited = true;
+                watch.emplace(true, TailExtra::QueueRoom);
+                roomStart = std::chrono::steady_clock::now();
+                room.emplace(ThreadReport::WorkerState::RoomCommitter, ThreadReport::OnQueue0Worker());
+            }
+            lock.Unlock();
+            awaitRingRoom(static_cast<std::uint64_t>(roomLimit - 1));
+            continue;
+        }
+        if (waited) {
+            room.reset();
+            watch.reset();
+            const auto waitedNs = elapsedNs(roomStart);
+            fullWaitNs += waitedNs;
+            bumpRing(RingCount::RoomWaits);
+            bumpRing(RingCount::RoomWaitNs, waitedNs);
+            if (ThreadReport::Enabled()) {
+                const bool finisher = DrawFinisher::OnFinisherThread();
+                const bool forwarding = finisher && FinisherSeq::Get() == 0;
+                const bool worker = !finisher && ThreadReport::OnQueue0Worker();
+                ThreadReport::Add(forwarding ? ThreadReport::Count::FinisherForwardRoomWaits : finisher ? ThreadReport::Count::FinisherRoomWaits : worker ? ThreadReport::Count::WorkerCommitterRoomWaits : ThreadReport::Count::OtherRoomWaits, 1);
+                ThreadReport::Add(forwarding ? ThreadReport::Count::FinisherForwardRoomNs : finisher ? ThreadReport::Count::FinisherRoomNs : worker ? ThreadReport::Count::WorkerCommitterRoomNs : ThreadReport::Count::OtherRoomNs, waitedNs);
+            }
+        } else {
+            bumpRing(RingCount::Enqueues);
+        }
+        reclaimRing(retiredNow, reclaim);
+        const auto queued = static_cast<std::size_t>(end - retiredNow);
+        depthSum += queued;
+        ++enqueued;
+        heldReadRanges.fetch_add(item.reads.size(), std::memory_order_relaxed);
+        raiseQueued(Graphics::WriteValidation::Source::QueueItem, item.writes);
+        item.counted = false;
+        const auto stamp = end + 1;
+        (item.store ? *deepStores : *deepOthers).Insert(item.writes, stamp, retiredNow + 1);
+        if (!item.reads.empty()) noteDeepReads(item.reads, stamp);
+        item.ringOrdinal = stamp;
+        auto& slot = ringSlot(end);
+        slot = std::move(item);
+        if (pipelineStats()) {
+            deepestItems = std::max(deepestItems, queued + 1);
+            if (ringHighest.load(std::memory_order_relaxed) < queued + 1) ringHighest.store(queued + 1, std::memory_order_relaxed);
+        }
+        outstanding.fetch_add(1, std::memory_order_seq_cst);
+        enqueuedItems.store(stamp, std::memory_order_seq_cst);
+        raiseQueued(Graphics::WriteValidation::Source::QueueItem, slot.writes);
+        lock.Unlock();
+        if (committerSleeping.load(std::memory_order_seq_cst) && committerSleeping.exchange(false, std::memory_order_seq_cst)) {
+            const auto held = lockFor(mutex);
+            ++wakes;
+            wake.notify_one();
+        }
+        if (profile || stats) ringReport();
+        return true;
+    }
+}
+
+void DrawPipeline::ringReport() {
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count() < ringReportAt.load(std::memory_order_relaxed)) return;
+    const auto lock = lockFor(mutex);
+    const RingLock ringLock(*this);
+    if (now - lastReport >= std::chrono::seconds(10)) report(now);
+    ringReportAt.store(std::chrono::duration_cast<std::chrono::nanoseconds>((lastReport + std::chrono::seconds(10)).time_since_epoch()).count(), std::memory_order_relaxed);
+}
+
+std::uint64_t DrawPipeline::RingTotal(RingCount count) {
+    return ringTotals[static_cast<std::size_t>(count)].value.load(std::memory_order_relaxed);
+}
+
+std::string DrawPipeline::ringText() {
+    std::array<std::uint64_t, static_cast<std::size_t>(RingCount::Count)> window{};
+    for (std::size_t index = 0; index < window.size(); ++index) {
+        const auto total = ringTotals[index].value.load(std::memory_order_relaxed);
+        window[index] = total - ringReported[index];
+        ringReported[index] = total;
+    }
+    const auto at = [&](RingCount count) { return static_cast<unsigned long long>(window[static_cast<std::size_t>(count)]); };
+    std::string scans;
+    for (std::size_t index = 0; index < ringScanTotals.size(); ++index) {
+        const auto total = ringScanTotals[index].load(std::memory_order_relaxed);
+        const auto count = total - ringScanReported[index];
+        ringScanReported[index] = total;
+        if (count == 0) continue;
+        char item[64];
+        std::snprintf(item, sizeof(item), " %s %llu", RingScanNames[index], static_cast<unsigned long long>(count));
+        scans += item;
+    }
+    char text[2048];
+    std::snprintf(text, sizeof(text), "switch %s, latch %s, ring of %zu slots; pops without the lock %llu, with the lock while a scan ran %llu, on the locked queue %llu; ring enqueues without a room wait %llu, after one %llu (%.1f ms); enqueuer contention %llu; committer sleeps %llu (%.1f ms asleep); waiter wakes %llu; latched %llu, released %llu; scans on the slow path %llu by caller:%s; highest fill %llu; verify: pops checked %llu, scans checked %llu, differing %llu",
+        Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::CommitRing) ? "set" : "unset", commitRing.load(std::memory_order_relaxed) ? "on" : "off", CommitRingSlots, at(RingCount::FastPops), at(RingCount::LockedPops), at(RingCount::MutexPops), at(RingCount::Enqueues), at(RingCount::RoomWaits), static_cast<double>(window[static_cast<std::size_t>(RingCount::RoomWaitNs)]) / 1e6, at(RingCount::Contention), at(RingCount::Sleeps), static_cast<double>(window[static_cast<std::size_t>(RingCount::SleepNs)]) / 1e6, at(RingCount::WaiterWakes), at(RingCount::Latches), at(RingCount::Unlatches), at(RingCount::SlowScans), scans.empty() ? " none" : scans.c_str(), static_cast<unsigned long long>(ringHighest.exchange(0, std::memory_order_relaxed)), at(RingCount::VerifyPops), at(RingCount::VerifyScans), at(RingCount::VerifyDiffering));
+    return text;
 }
 
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     lastReport = now;
+    const auto ringCommitted = ringCommits.load(std::memory_order_relaxed);
+    const auto ringSpent = ringCommitNs.load(std::memory_order_relaxed);
+    const auto ringFailed = ringCommitErrors.load(std::memory_order_relaxed);
+    commits += ringCommitted - reportedRingCommits;
+    commitNs += ringSpent - reportedRingCommitNs;
+    commitErrors += ringFailed - reportedRingCommitErrors;
+    reportedRingCommits = ringCommitted;
+    reportedRingCommitNs = ringSpent;
+    reportedRingCommitErrors = ringFailed;
     std::string drainText;
     for (std::size_t i = 0; i < drains.size(); ++i) {
         char item[64];
@@ -3651,6 +4063,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     if (pipelineStats()) AgcDriver::ProfilePrint_nid_no_patch("[xp-flow] 10 s, %s; committer queue: highest %zu items, mean %.2f items ahead of an enqueued one\n", DrawFinisher::FlowText().c_str(), deepestItems, queued);
     if (pipelineStats()) AgcDriver::ProfilePrint_nid_no_patch("[deep-flow] 10 s, %s; committer queue: latch %s, highest %zu items\n", DrawFinisher::DeepText().c_str(), deepQueue.load(std::memory_order_relaxed) ? "on" : "off", deepestItems);
     if (pipelineStats()) AgcDriver::ProfilePrint_nid_no_patch("[frame-flow] 10 s, %s\n", DrawFinisher::FrameText().c_str());
+    if (pipelineStats()) AgcDriver::ProfilePrint_nid_no_patch("[commit-ring] 10 s: %s\n", ringText().c_str());
     deepestItems = 0;
     if (const auto encoded = Graphics::CommandEncoders::TotalsText(); !encoded.empty()) AgcDriver::ProfilePrint_nid_no_patch("[encode] (cumulative): %s\n", encoded.c_str());
     AgcDriver::ProfilePrint_nid_no_patch("[indirect-draws] (cumulative): %s\n", Graphics::IndirectDrawTotalsText().c_str());
@@ -3712,33 +4125,78 @@ void DrawPipeline::run() {
     std::vector<Range> itemRanges;
     bool taken = false;
     auto previousKind = CommitKind::Count;
-    const auto takeFront = [&] {
-        if (depositVerifyEvery() != 0 || (DrawFinisher::FrameVerifyEvery() != 0 && DrawFinisher::FrameFlow())) verifyOrder(items.front().order);
-        commit = stopped ? nullptr : &items.front().commit;
-        isDraw = items.front().draw;
-        quietItem = items.front().quiet;
-        itemParts = items.front().parts;
+    bool ringTurn = false;
+    std::uint64_t head = 0;
+    std::uint64_t lastPopped = 0;
+    std::uint64_t ringPops = 0;
+    const auto takeItem = [&](Item& item) {
+        if (depositVerifyEvery() != 0 || (DrawFinisher::FrameVerifyEvery() != 0 && DrawFinisher::FrameFlow())) verifyOrder(item.order);
+        commit = stopped ? nullptr : &item.commit;
+        isDraw = item.draw;
+        quietItem = item.quiet;
+        itemParts = item.parts;
         rangedItem = !isDraw && GuestMemory::RangeProofs();
         itemRanges.clear();
         if (rangedItem) {
-            itemRanges = items.front().writes;
-            if (items.front().labelAddress != 0 && !items.front().labelBytes.empty()) itemRanges.emplace_back(items.front().labelAddress, items.front().labelAddress + items.front().labelBytes.size());
+            itemRanges = item.writes;
+            if (item.labelAddress != 0 && !item.labelBytes.empty()) itemRanges.emplace_back(item.labelAddress, item.labelAddress + item.labelBytes.size());
         }
     };
+    const auto takeFront = [&] { takeItem(items.front()); };
     for (;;) {
         if (!taken) {
             static const bool idleCensus = std::getenv("APS5_PIPELINE_STATS") != nullptr;
             const bool idleNow = idleCensus && outstanding.load(std::memory_order_acquire) == 0;
             const unsigned idleState = idleNow ? DrawFinisher::Get().IdleState() : 0;
             const auto idleStart = idleNow ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
-            auto lock = lockFor(mutex);
-            committerWaiting = true;
-            wake.wait(lock, [&] { return !items.empty() || closing; });
-            committerWaiting = false;
-            if (idleNow) noteCommitterIdle(idleState, elapsedNs(idleStart));
-            if (items.empty()) break;
-            takeFront();
+            if (ringTurn) {
+                const auto ready = [&] { return enqueuedItems.load(std::memory_order_seq_cst) != head || !commitRing.load(std::memory_order_seq_cst) || ringClosing.load(std::memory_order_seq_cst); };
+                if (!ready()) SpinUntil(HandoffSpinWindow(), ready);
+                if (!ready()) {
+                    const auto asleep = std::chrono::steady_clock::now();
+                    auto lock = lockFor(mutex);
+                    committerWaiting = true;
+                    bool slept = false;
+                    for (;;) {
+                        committerSleeping.store(true, std::memory_order_seq_cst);
+                        if (closing || enqueuedItems.load(std::memory_order_seq_cst) != head || !commitRing.load(std::memory_order_relaxed)) break;
+                        slept = true;
+                        wake.wait(lock);
+                    }
+                    committerSleeping.store(false, std::memory_order_seq_cst);
+                    committerWaiting = false;
+                    if (slept) {
+                        bumpOwnedRing(RingCount::Sleeps);
+                        bumpOwnedRing(RingCount::SleepNs, elapsedNs(asleep));
+                    }
+                }
+                if (idleNow) noteCommitterIdle(idleState, elapsedNs(idleStart));
+                const bool arrived = enqueuedItems.load(std::memory_order_seq_cst) != head;
+                if (!commitRing.load(std::memory_order_seq_cst)) {
+                    ringTurn = false;
+                    continue;
+                }
+                if (!arrived) {
+                    if (ringClosing.load(std::memory_order_seq_cst) && enqueuedItems.load(std::memory_order_seq_cst) == head) break;
+                    continue;
+                }
+                takeItem(ringSlot(head));
+            } else {
+                SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
+                auto lock = lockFor(mutex);
+                committerWaiting = true;
+                wake.wait(lock, [&] { return !items.empty() || closing || commitRing.load(std::memory_order_relaxed); });
+                committerWaiting = false;
+                if (idleNow) noteCommitterIdle(idleState, elapsedNs(idleStart));
+                if (items.empty()) {
+                    if (!commitRing.load(std::memory_order_relaxed)) break;
+                    ringTurn = true;
+                    head = retiredItems.load(std::memory_order_relaxed);
+                    lastPopped = head;
+                    continue;
+                }
+                takeFront();
+            }
         }
         taken = false;
         const auto start = std::chrono::steady_clock::now();
@@ -3797,7 +4255,65 @@ void DrawPipeline::run() {
         bool keepRun = false;
         auto ended = Graphics::ExpressRunEnd::LockWaiter;
         const bool mergedTake = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow) && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollowPlainLoop);
-        {
+        if (ringTurn) {
+            auto& slot = ringSlot(head);
+            const auto kind = slot.kind;
+            const auto kindIndex = static_cast<std::size_t>(kind);
+            const bool counted = slot.counted;
+            const auto previousPop = std::exchange(lastPopped, slot.ringOrdinal);
+            if (const auto every = ringVerifyEvery(); every != 0 && ++ringPops % every == 0) {
+                bumpOwnedRing(RingCount::VerifyPops);
+                const auto retiredBefore = retiredItems.load(std::memory_order_seq_cst);
+                const auto enqueuedNow = enqueuedItems.load(std::memory_order_seq_cst);
+                char text[256];
+                std::snprintf(text, sizeof(text), "the committer took the slot of item %llu holding item %llu after item %llu, with %llu items retired and %llu enqueued", static_cast<unsigned long long>(head + 1), static_cast<unsigned long long>(slot.ringOrdinal), static_cast<unsigned long long>(previousPop), static_cast<unsigned long long>(retiredBefore), static_cast<unsigned long long>(enqueuedNow));
+                noteRingVerify("pop order", slot.ringOrdinal != head + 1 || slot.ringOrdinal != previousPop + 1 || retiredBefore != head || enqueuedNow <= head, text);
+            }
+            kindCommits[kindIndex].fetch_add(itemParts, std::memory_order_relaxed);
+            kindNs[kindIndex].fetch_add(spent, std::memory_order_relaxed);
+            if (LabelRunCensus::Enabled()) {
+                if (kind == CommitKind::EndOfPipe) LabelRunCensus::NoteCommitted(previousKind, previousKind == CommitKind::Count, itemParts);
+                previousKind = kind;
+            }
+            ringCommits.store(ringCommits.load(std::memory_order_relaxed) + itemParts, std::memory_order_relaxed);
+            ringCommitNs.store(ringCommitNs.load(std::memory_order_relaxed) + spent, std::memory_order_relaxed);
+            if (failed) ringCommitErrors.store(ringCommitErrors.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+            if (fatal != nullptr) {
+                const auto lock = lockFor(mutex);
+                if (failure == nullptr) failure = fatal;
+                failurePending.store(true, std::memory_order_seq_cst);
+            }
+            committerRetiring.store(true, std::memory_order_seq_cst);
+            const bool locked = counted || ringScans.load(std::memory_order_seq_cst) != 0;
+            std::unique_lock<std::mutex> held;
+            if (locked) {
+                committerRetiring.store(false, std::memory_order_seq_cst);
+                held = lockFor(mutex);
+                if (counted) countWrites(slot.writes, false);
+            }
+            const auto retiredNow = head + 1;
+            retiredItems.store(retiredNow, std::memory_order_seq_cst);
+            raiseReadsLive(retiredNow + 1);
+            outstanding.fetch_sub(1, std::memory_order_seq_cst);
+            if (locked) held.unlock();
+            else committerRetiring.store(false, std::memory_order_seq_cst);
+            bumpOwnedRing(locked ? RingCount::LockedPops : RingCount::FastPops);
+            head = retiredNow;
+            if (ringWakeAt.load(std::memory_order_seq_cst) <= retiredNow) {
+                const auto lock = lockFor(mutex);
+                ringWakeAt.store(NoRingWake, std::memory_order_seq_cst);
+                idle.notify_all();
+                bumpOwnedRing(RingCount::WaiterWakes);
+            }
+            const bool queued = enqueuedItems.load(std::memory_order_acquire) != head && commitRing.load(std::memory_order_acquire);
+            const bool closingNow = ringClosing.load(std::memory_order_acquire);
+            keepRun = runHold.has_value() && !stopped && !closingNow && queued && ringSlot(head).draw && ++runLength < LeanRunCap && ringIdleWaiters.load(std::memory_order_relaxed) == 0;
+            if (!keepRun) ended = stopped || closingNow ? Graphics::ExpressRunEnd::Stop : !queued ? Graphics::ExpressRunEnd::NotQueued : !ringSlot(head).draw ? Graphics::ExpressRunEnd::NotDraw : runLength >= LeanRunCap ? Graphics::ExpressRunEnd::Cap : Graphics::ExpressRunEnd::IdleWaiter;
+            if (mergedTake && queued) {
+                takeItem(ringSlot(head));
+                taken = true;
+            }
+        } else {
             const auto lock = lockFor(mutex);
             const auto retiredNow = retiredItems.fetch_add(1, std::memory_order_release) + 1;
             if (readsLive.load(std::memory_order_relaxed) < retiredNow + 1) readsLive.store(retiredNow + 1, std::memory_order_release);
@@ -3815,6 +4331,8 @@ void DrawPipeline::run() {
             commitNs += spent;
             if (failed) ++commitErrors;
             if (fatal != nullptr && failure == nullptr) failure = fatal;
+            if (fatal != nullptr) failurePending.store(true, std::memory_order_release);
+            bumpOwnedRing(RingCount::MutexPops);
             outstanding.fetch_sub(1, std::memory_order_release);
             if ((idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) || retireWaiters != 0) idle.notify_all();
             keepRun = runHold.has_value() && !stopped && !closing && !items.empty() && items.front().draw && ++runLength < LeanRunCap && idleWaiters == 0;
@@ -3849,6 +4367,9 @@ void DrawPipeline::Stop() {
         const auto lock = lockFor(mutex);
         closing = true;
         committer = std::move(thread);
+        std::optional<RingLock> ringLock;
+        if (commitRing.load(std::memory_order_relaxed)) ringLock.emplace(*this);
+        ringClosing.store(true, std::memory_order_seq_cst);
     }
     wake.notify_all();
     if (!committer.joinable()) return;
@@ -3858,8 +4379,12 @@ void DrawPipeline::Stop() {
 
 void DrawPipeline::ReleaseRetired() {
     std::vector<Item> done;
+    std::vector<Item> slots;
     const auto lock = lockFor(mutex);
     std::swap(done, retired);
+    if (!commitRing.load(std::memory_order_relaxed)) return;
+    const RingLock ringLock(*this);
+    reclaimRing(retiredItems.load(std::memory_order_seq_cst), slots);
 }
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
@@ -3881,7 +4406,9 @@ void DrawPipeline::drainAll(DrainReason reason, std::uint32_t opcode) {
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     auto lock = lockFor(mutex);
     ++idleWaiters;
-    idle.wait(lock, [&] { return items.empty(); });
+    ringIdleWaiters.fetch_add(1, std::memory_order_seq_cst);
+    while (!queueEmptyLocked()) idle.wait(lock);
+    ringIdleWaiters.fetch_sub(1, std::memory_order_seq_cst);
     --idleWaiters;
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];
@@ -3986,8 +4513,13 @@ DeepFound DrawPipeline::scanQueued(std::span<const Range> ranges) {
     const auto start = DrawFinisher::FrameCensus() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     DeepFound found;
     {
-        const auto lock = lockFor(mutex);
-        found = newestQueued(ranges);
+        const QueueScan scan(*this, ringScanId(RingScan::QueuedScan));
+        const auto newest = [&](const QueuedView& queued) {
+            const auto answer = newestQueued(queued, scan.Retired(), ranges);
+            return std::pair<int, std::uint64_t>(static_cast<int>(answer.answer), answer.stamp);
+        };
+        found = newestQueued(scan.Items(), scan.Retired(), ranges);
+        scan.Check("queued scan", newest);
     }
     DrawFinisher::NoteFrameSite(FrameSite::QueuedScan, start == std::chrono::steady_clock::time_point{} ? 0 : elapsedNs(start));
     return found;
@@ -4091,7 +4623,14 @@ bool DrawPipeline::awaitRetired(std::uint64_t item) {
     const ThreadReport::WorkerStateScope waiting(ThreadReport::WorkerState::DrainCommitter, ThreadReport::OnQueue0Worker());
     auto lock = lockFor(mutex);
     ++retireWaiters;
-    idle.wait(lock, [&] { return closing || passed(); });
+    for (;;) {
+        if (commitRing.load(std::memory_order_relaxed)) {
+            lowerRingWake(item + 1);
+            if (retiredItems.load(std::memory_order_seq_cst) > item) break;
+        }
+        if (closing || passed()) break;
+        idle.wait(lock);
+    }
     --retireWaiters;
     rethrowFailure();
     return passed();
@@ -4118,21 +4657,20 @@ bool DrawPipeline::deepQueuedWithin(std::span<const Range> ranges, std::uint64_t
     return deepStores->Within(ranges, from, to) || deepOthers->Within(ranges, from, to);
 }
 
-DeepFound DrawPipeline::newestQueued(std::span<const Range> ranges) const {
-    const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
-    for (std::size_t index = items.size(); index-- > 0;) {
-        if (rangesOverlap(items[index].writes, ranges)) return {DeepAnswer::Hit, retiredNow + index + 1};
+DeepFound DrawPipeline::newestQueued(const QueuedView& queued, std::uint64_t retiredNow, std::span<const Range> ranges) const {
+    for (std::size_t index = queued.size(); index-- > 0;) {
+        if (rangesOverlap(queued[index].writes, ranges)) return {DeepAnswer::Hit, retiredNow + index + 1};
     }
     return {};
 }
 
 void DrawPipeline::verifyQueued(std::uint32_t lookup, std::span<const Range> ranges) {
-    const auto lock = lockFor(mutex);
+    const QueueScan scan(*this, ringScanId(RingScan::DeepVerify));
     if (!deepQueue.load(std::memory_order_relaxed)) return;
-    const auto live = retiredItems.load(std::memory_order_relaxed) + 1;
+    const auto live = scan.Retired() + 1;
     const auto found = deepQueued(ranges, live);
     if (found.answer == DeepAnswer::Unsure) return;
-    noteDeepVerify(static_cast<DeepLookup>(lookup), found, newestQueued(ranges), true, live, 0, ranges);
+    noteDeepVerify(static_cast<DeepLookup>(lookup), found, newestQueued(scan.Items(), scan.Retired(), ranges), true, live, 0, ranges);
 }
 
 void DrawPipeline::noteDeepReads(const std::vector<Range>& reads, std::uint64_t stamp) {
@@ -4160,20 +4698,21 @@ bool DrawPipeline::readsMaybe(std::uint64_t address, std::size_t bytes) const {
 }
 
 void DrawPipeline::verifyHeldReads(std::uint64_t address, std::size_t bytes) {
-    const auto lock = lockFor(mutex);
+    const QueueScan scan(*this, ringScanId(RingScan::HeldReadsVerify));
     if (!deepQueue.load(std::memory_order_relaxed)) return;
     const auto end = address + bytes;
-    const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
-    DeepFound scan;
-    for (std::size_t index = items.size(); index-- > 0 && scan.answer != DeepAnswer::Hit;) {
-        for (const auto& [begin, limit] : items[index].reads) {
+    const auto retiredNow = scan.Retired();
+    const auto& queued = scan.Items();
+    DeepFound found;
+    for (std::size_t index = queued.size(); index-- > 0 && found.answer != DeepAnswer::Hit;) {
+        for (const auto& [begin, limit] : queued[index].reads) {
             if (address >= limit || begin >= end) continue;
-            scan = {DeepAnswer::Hit, retiredNow + index + 1};
+            found = {DeepAnswer::Hit, retiredNow + index + 1};
             break;
         }
     }
     const Range range{address, end};
-    noteDeepVerify(DeepLookup::HeldReads, readsMaybe(address, bytes) ? DeepFound{DeepAnswer::Hit} : DeepFound{}, scan, false, readsLive.load(std::memory_order_relaxed), 0, {&range, 1});
+    noteDeepVerify(DeepLookup::HeldReads, readsMaybe(address, bytes) ? DeepFound{DeepAnswer::Hit} : DeepFound{}, found, false, readsLive.load(std::memory_order_relaxed), 0, {&range, 1});
 }
 
 std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
@@ -4197,16 +4736,21 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
         return false;
     }
     const auto end = address + bytes;
-    const auto lock = lockFor(pipeline.mutex);
+    const QueueScan scan(pipeline, ringScanId(RingScan::HeldReads));
     heldReadQueries.fetch_add(1, std::memory_order_relaxed);
-    for (const auto& item : pipeline.items) {
-        for (const auto& [begin, limit] : item.reads) {
-            if (address >= limit || begin >= end) continue;
-            heldReadHits.fetch_add(1, std::memory_order_relaxed);
-            return true;
+    const auto held = [&](const QueuedView& queued) {
+        for (std::size_t index = 0; index < queued.size(); ++index) {
+            for (const auto& [begin, limit] : queued[index].reads) {
+                if (address >= limit || begin >= end) continue;
+                return true;
+            }
         }
-    }
-    return false;
+        return false;
+    };
+    const bool found = held(scan.Items());
+    scan.Check("held reads scan", held);
+    if (found) heldReadHits.fetch_add(1, std::memory_order_relaxed);
+    return found;
 }
 
 std::uint64_t DrawPipeline::HeldReadQueries() {
@@ -4214,11 +4758,13 @@ std::uint64_t DrawPipeline::HeldReadQueries() {
 }
 
 void DrawPipeline::ReleaseRunningReads() {
-    const auto lock = lockFor(mutex);
-    if (items.empty()) return;
-    items.front().reads.clear();
-    const auto live = retiredItems.load(std::memory_order_relaxed) + 2;
-    if (readsLive.load(std::memory_order_relaxed) < live) readsLive.store(live, std::memory_order_release);
+    const QueueScan scan(*this, ringScanId(RingScan::RunningReads));
+    const auto& queued = scan.Items();
+    if (queued.empty()) return;
+    queued.front().reads.clear();
+    const auto live = scan.Retired() + 2;
+    if (scan.Frozen()) raiseReadsLive(live);
+    else if (readsLive.load(std::memory_order_relaxed) < live) readsLive.store(live, std::memory_order_release);
 }
 
 std::uint64_t DrawPipeline::DrainRequestsByReason(DrainReason reason) {
@@ -4251,9 +4797,9 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
         std::memcpy(&value, item.labelBytes.data() + (address - item.labelAddress), bytes);
         return value;
     };
-    const auto newestValue = [&]() -> std::optional<std::uint64_t> {
-        for (auto item = items.rbegin(); item != items.rend(); ++item) {
-            if (writesOver(*item)) return valueOf(*item);
+    const auto newestValue = [&](const QueuedView& queued) -> std::optional<std::uint64_t> {
+        for (std::size_t index = queued.size(); index-- > 0;) {
+            if (writesOver(queued[index])) return valueOf(queued[index]);
         }
         return std::nullopt;
     };
@@ -4263,21 +4809,24 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
         const auto queued = deepQueued(asked, retiredItems.load(std::memory_order_acquire) + 1);
         noteDeepLookup(DeepLookup::QueuedLabel, queued.answer == DeepAnswer::Unsure);
         if (queued.answer == DeepAnswer::Clear) return std::nullopt;
-        const auto lock = lockFor(mutex);
-        const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
+        const QueueScan scan(*this, ringScanId(RingScan::QueuedLabel));
+        scan.Check("queued label scan", newestValue);
+        const auto& listed = scan.Items();
+        const auto retiredNow = scan.Retired();
         const auto held = deepQueued(asked, retiredNow + 1);
         if (held.answer == DeepAnswer::Clear) return std::nullopt;
         if (held.answer == DeepAnswer::Hit && held.stamp > retiredNow) {
             const auto at = static_cast<std::size_t>(held.stamp - 1 - retiredNow);
-            if (at < items.size() && writesOver(items[at])) return valueOf(items[at]);
+            if (at < listed.size() && writesOver(listed[at])) return valueOf(listed[at]);
         }
-        return newestValue();
+        return newestValue(listed);
     }
     if (lockless() || DrawFinisher::Flow()) {
         if (published.Overlaps({&range, 1}) == PublishedRanges::Answer::Clear) return std::nullopt;
     }
-    const auto lock = lockFor(mutex);
-    return newestValue();
+    const QueueScan scan(*this, ringScanId(RingScan::QueuedLabel));
+    scan.Check("queued label scan", newestValue);
+    return newestValue(scan.Items());
 }
 
 DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out) {
@@ -4289,23 +4838,29 @@ DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) return QueuedWrite::Unknown;
     const Range range{address, end};
     const auto writesOver = [&](const Item& item) { return std::any_of(item.writes.begin(), item.writes.end(), [&](const Range& write) { return address < write.second && write.first < end; }); };
-    const auto storedFrom = [&](const Item& item) {
-        if (out.size() != bytes || address < item.labelAddress || end > item.labelAddress + item.labelBytes.size()) return QueuedWrite::Unknown;
-        std::memcpy(out.data(), item.labelBytes.data() + (address - item.labelAddress), bytes);
+    const auto storedFrom = [&](const Item& item, std::span<std::byte> into) {
+        if (into.size() != bytes || address < item.labelAddress || end > item.labelAddress + item.labelBytes.size()) return QueuedWrite::Unknown;
+        std::memcpy(into.data(), item.labelBytes.data() + (address - item.labelAddress), bytes);
         return QueuedWrite::Stored;
     };
-    const auto newestStored = [&] {
+    const auto newestStored = [&](const QueuedView& queued, std::span<std::byte> into) {
         auto answer = QueuedWrite::None;
-        for (auto item = items.rbegin(); item != items.rend(); ++item) {
-            if (!writesOver(*item)) continue;
-            if (!item->store) return QueuedWrite::Unknown;
-            if (out.empty()) {
+        for (std::size_t index = queued.size(); index-- > 0;) {
+            const auto& item = queued[index];
+            if (!writesOver(item)) continue;
+            if (!item.store) return QueuedWrite::Unknown;
+            if (into.empty()) {
                 answer = QueuedWrite::Stored;
                 continue;
             }
-            return storedFrom(*item);
+            return storedFrom(item, into);
         }
         return answer;
+    };
+    const auto storedScan = [&](const QueuedView& queued) {
+        std::vector<std::byte> copy(out.size());
+        const auto answer = newestStored(queued, copy);
+        return std::pair<QueuedWrite, std::vector<std::byte>>(answer, std::move(copy));
     };
     if (deepQueue.load(std::memory_order_acquire)) {
         const std::span<const Range> asked(&range, 1);
@@ -4322,8 +4877,10 @@ DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::
             if (out.empty()) return other ? QueuedWrite::Unknown : QueuedWrite::Stored;
             if (other && (!store || others.stamp > stores.stamp)) return QueuedWrite::Unknown;
         }
-        const auto lock = lockFor(mutex);
-        const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
+        const QueueScan scan(*this, ringScanId(RingScan::StoredBytes));
+        scan.Check("stored bytes scan", storedScan);
+        const auto& listed = scan.Items();
+        const auto retiredNow = scan.Retired();
         const auto heldOthers = deepOthers->Newest(asked, retiredNow + 1);
         const auto heldStores = deepStores->Newest(asked, retiredNow + 1);
         if (heldOthers.answer != DeepAnswer::Unsure && heldStores.answer != DeepAnswer::Unsure) {
@@ -4333,9 +4890,9 @@ DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::
             if (out.empty()) return other ? QueuedWrite::Unknown : QueuedWrite::Stored;
             if (other && (!store || heldOthers.stamp > heldStores.stamp)) return QueuedWrite::Unknown;
             const auto at = static_cast<std::size_t>(heldStores.stamp - 1 - retiredNow);
-            if (heldStores.stamp > retiredNow && at < items.size() && items[at].store && writesOver(items[at])) return storedFrom(items[at]);
+            if (heldStores.stamp > retiredNow && at < listed.size() && listed[at].store && writesOver(listed[at])) return storedFrom(listed[at], out);
         }
-        return newestStored();
+        return newestStored(listed, out);
     }
     if (lockless() || DrawFinisher::Flow()) {
         const auto queued = published.Overlaps({&range, 1});
@@ -4345,8 +4902,9 @@ DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::
             return QueuedWrite::None;
         }
     }
-    const auto lock = lockFor(mutex);
-    return newestStored();
+    const QueueScan scan(*this, ringScanId(RingScan::StoredBytes));
+    scan.Check("stored bytes scan", storedScan);
+    return newestStored(scan.Items(), out);
 }
 
 void DrawPipeline::countWrites(const std::vector<Range>& writes, bool added) {
@@ -4370,12 +4928,13 @@ DrawPipeline::Watch DrawPipeline::WatchWrites() {
             watch.enqueued = enqueuedBefore;
             watch.deep = true;
             if (deepVerifyDue(DeepLookup::Watch)) {
-                const auto lock = lockFor(mutex);
+                const QueueScan scan(*this, ringScanId(RingScan::Watch));
                 if (deepQueue.load(std::memory_order_relaxed) && deepEpoch.load(std::memory_order_relaxed) == epoch) {
-                    watch.retired = retiredItems.load(std::memory_order_relaxed);
-                    watch.enqueued = enqueuedItems.load(std::memory_order_relaxed);
-                    watch.items = items.size();
-                    for (const auto& item : items) watch.verifyWrites.insert(watch.verifyWrites.end(), item.writes.begin(), item.writes.end());
+                    const auto& listed = scan.Items();
+                    watch.retired = scan.Retired();
+                    watch.enqueued = scan.Enqueued();
+                    watch.items = listed.size();
+                    for (std::size_t index = 0; index < listed.size(); ++index) watch.verifyWrites.insert(watch.verifyWrites.end(), listed[index].writes.begin(), listed[index].writes.end());
                     watch.verified = true;
                 }
             }
@@ -4406,13 +4965,19 @@ DrawPipeline::Watch DrawPipeline::WatchWrites() {
             return watch;
         }
     }
-    const auto lock = lockFor(mutex);
-    Watch watch{retiredItems.load(std::memory_order_relaxed), items.size(), {}};
+    const QueueScan scan(*this, ringScanId(RingScan::Watch));
+    const auto& listed = scan.Items();
+    Watch watch{scan.Retired(), listed.size(), {}};
     if (!flow) {
-        for (const auto& item : items) watch.writes.insert(watch.writes.end(), item.writes.begin(), item.writes.end());
+        for (std::size_t index = 0; index < listed.size(); ++index) watch.writes.insert(watch.writes.end(), listed[index].writes.begin(), listed[index].writes.end());
     } else {
         DrawFinisher::NoteFlowLookup(DrawFinisher::FlowLookup::Watch);
     }
+    scan.Check("watch scan", [](const QueuedView& queued) {
+        std::vector<Range> writes;
+        for (std::size_t index = 0; index < queued.size(); ++index) writes.insert(writes.end(), queued[index].writes.begin(), queued[index].writes.end());
+        return writes;
+    });
     if (own) {
         for (const auto& held : DrawFinisher::Get().ownDeposits()) {
             ++watch.items;
@@ -4451,9 +5016,17 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
             return since(retiredItems.load(std::memory_order_acquire));
         }
     }
-    const auto lock = lockFor(mutex);
-    if (std::any_of(items.begin(), items.end(), [&](const Item& item) { return overlaps(item.writes); })) return true;
-    return since(retiredItems.load(std::memory_order_relaxed));
+    const QueueScan scan(*this, ringScanId(RingScan::WrittenSince));
+    const auto written = [&](const QueuedView& queued) {
+        for (std::size_t index = 0; index < queued.size(); ++index) {
+            if (overlaps(queued[index].writes)) return true;
+        }
+        return false;
+    };
+    const bool found = written(scan.Items());
+    scan.Check("written since scan", written);
+    if (found) return true;
+    return since(scan.Retired());
 }
 
 bool DrawPipeline::Busy() const {
@@ -4466,8 +5039,11 @@ bool DrawPipeline::queuedOverlap(std::span<const Range> ranges) {
         const auto found = deepQueued(ranges, retiredItems.load(std::memory_order_acquire) + 1);
         noteDeepLookup(DeepLookup::QueuedWrites, found.answer == DeepAnswer::Unsure);
         if (found.answer != DeepAnswer::Unsure) return found.answer == DeepAnswer::Hit;
-        const auto lock = lockFor(mutex);
-        return newestQueued(ranges).answer == DeepAnswer::Hit;
+        const QueueScan scan(*this, ringScanId(RingScan::QueuedWrites));
+        const auto newest = [&](const QueuedView& queued) { return newestQueued(queued, scan.Retired(), ranges).answer == DeepAnswer::Hit; };
+        const bool hit = newest(scan.Items());
+        scan.Check("queued writes scan", newest);
+        return hit;
     }
     if (lockless() || DrawFinisher::Flow()) {
         const auto answer = published.Overlaps(ranges);
@@ -4494,8 +5070,16 @@ bool DrawPipeline::QueuedClearForValidation(std::span<const Range> ranges) {
         const auto answer = published.Overlaps(ranges);
         if (answer != PublishedRanges::Answer::Unsure) return answer == PublishedRanges::Answer::Clear;
     }
-    const auto lock = lockFor(mutex);
-    return std::none_of(items.begin(), items.end(), [&](const Item& item) { return rangesOverlap(item.writes, ranges); });
+    const QueueScan scan(*this, ringScanId(RingScan::ValidationClear));
+    const auto clear = [&](const QueuedView& queued) {
+        for (std::size_t index = 0; index < queued.size(); ++index) {
+            if (rangesOverlap(queued[index].writes, ranges)) return false;
+        }
+        return true;
+    };
+    const bool answer = clear(scan.Items());
+    scan.Check("validation clear scan", clear);
+    return answer;
 }
 
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
