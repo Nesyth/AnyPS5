@@ -251,7 +251,14 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
 
 ShaderMemory::PendingWrite Driver::queryNamingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     static const bool readThrough = std::getenv("APS5_NAMING_NO_LABEL_BYTES") == nullptr;
-    if (readThrough && bytes != 0 && known.size() == bytes && DrawPipeline::Active() && DrawFinisher::Get().PendingLabelBytes(address, known)) return ShaderMemory::PendingWrite::KnownValue;
+    if (readThrough && bytes != 0 && DrawPipeline::Active()) {
+        if (known.size() == bytes) {
+            if (DrawFinisher::Get().PendingLabelBytes(address, known)) return ShaderMemory::PendingWrite::KnownValue;
+        } else if (known.empty() && bytes <= 64) {
+            std::array<std::byte, 64> scratch{};
+            if (DrawFinisher::Get().PendingLabelBytes(address, std::span(scratch).first(bytes))) return ShaderMemory::PendingWrite::KnownValue;
+        }
+    }
     return queryPendingWrite(address, bytes, known);
 }
 
