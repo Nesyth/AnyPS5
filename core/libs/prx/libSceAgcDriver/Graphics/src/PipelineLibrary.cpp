@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommandStream.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -311,7 +312,8 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         const auto cache = context.pipelineCache;
         const auto cacheSynchronization = context.pipelineCacheSynchronization;
         const auto libraryLayout = descriptorHeap ? VkPipelineLayout{VK_NULL_HANDLE} : fullLayout;
-        std::function<void()> relink = [slot, createPipelines, cache, cacheSynchronization, libraryLayout, libraries, sampleCounts, attachmentSamples, &store, devicePointer = &device, descriptorHeap] {
+        const std::vector<VkDynamicState> linkedStates(info.pDynamicState->pDynamicStates, info.pDynamicState->pDynamicStates + info.pDynamicState->dynamicStateCount);
+        std::function<void()> relink = [slot, createPipelines, cache, cacheSynchronization, libraryLayout, libraries, sampleCounts, attachmentSamples, &store, devicePointer = &device, descriptorHeap, linkedStates] {
             if (slot->released.load()) return;
             auto linkedSamples = sampleCounts ? attachmentSamples(*sampleCounts) : VkAttachmentSampleCountInfoNV{};
             VkPipelineLibraryCreateInfoKHR linked{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
@@ -338,9 +340,13 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
                 Recorder::CountGpuSide(Recorder::GpuSide::RelinksFailed);
                 return;
             }
+            NotePipelineDynamicStates(result, linkedStates);
             slot->handle.store(result);
             if (slot->released.load()) {
-                if (const auto handle = slot->handle.exchange(VK_NULL_HANDLE)) slot->destroy(slot->device, handle, nullptr);
+                if (const auto handle = slot->handle.exchange(VK_NULL_HANDLE)) {
+                    ForgetPipelineDynamicStates(handle);
+                    slot->destroy(slot->device, handle, nullptr);
+                }
             }
             std::lock_guard lock(store.mutex);
             ++devicePointer->counters.optimized;
@@ -357,7 +363,10 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
 
 void OptimizedPipeline::Release() noexcept {
     released.store(true);
-    if (const auto pipeline = handle.exchange(VK_NULL_HANDLE)) destroy(device, pipeline, nullptr);
+    if (const auto pipeline = handle.exchange(VK_NULL_HANDLE)) {
+        ForgetPipelineDynamicStates(pipeline);
+        destroy(device, pipeline, nullptr);
+    }
 }
 
 void OptimizedPipeline::Schedule() {

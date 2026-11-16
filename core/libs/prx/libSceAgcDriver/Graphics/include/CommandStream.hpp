@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -145,6 +146,9 @@ private:
     std::vector<std::shared_ptr<Slab>> touched;
     std::vector<std::shared_ptr<Slab>> spliced;
 };
+
+void NotePipelineDynamicStates(VkPipeline pipeline, std::span<const VkDynamicState> states);
+void ForgetPipelineDynamicStates(VkPipeline pipeline) noexcept;
 
 }
 

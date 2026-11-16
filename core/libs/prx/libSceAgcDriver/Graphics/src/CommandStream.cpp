@@ -8,12 +8,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <new>
+#include <shared_mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #ifdef _WIN32
 #include <windows.h>
@@ -564,12 +568,75 @@ namespace {
 
 std::atomic<std::uint64_t> replayedRecords{0};
 std::atomic<std::uint64_t> droppedRecords{0};
+std::atomic<std::uint64_t> replayedBinds{0};
+std::atomic<std::uint64_t> keptBinds{0};
 
-void noteReplay(std::uint64_t replayed, std::uint64_t dropped) {
+void noteReplay(std::uint64_t replayed, std::uint64_t dropped, std::uint64_t binds, std::uint64_t kept) {
     const auto before = replayedRecords.fetch_add(replayed, std::memory_order_relaxed);
     const auto droppedNow = droppedRecords.fetch_add(dropped, std::memory_order_relaxed) + dropped;
+    const auto bindsNow = replayedBinds.fetch_add(binds, std::memory_order_relaxed) + binds;
+    const auto keptNow = keptBinds.fetch_add(kept, std::memory_order_relaxed) + kept;
     if (((before + replayed) >> 22u) == (before >> 22u)) return;
-    std::fprintf(stderr, "[replay-state] %llu records replayed, %llu dropped as unchanged state\n", static_cast<unsigned long long>(before + replayed), static_cast<unsigned long long>(droppedNow));
+    std::fprintf(stderr, "[replay-state] %llu records replayed, %llu dropped as unchanged state; %llu binds of another graphics pipeline, %llu of them kept dynamic state\n", static_cast<unsigned long long>(before + replayed), static_cast<unsigned long long>(droppedNow), static_cast<unsigned long long>(bindsNow), static_cast<unsigned long long>(keptNow));
+}
+
+constexpr std::uint32_t dynamicStateBit(VkDynamicState state) {
+    switch (state) {
+    case VK_DYNAMIC_STATE_VIEWPORT: return 1u << 0u;
+    case VK_DYNAMIC_STATE_SCISSOR: return 1u << 1u;
+    case VK_DYNAMIC_STATE_DEPTH_BIAS: return 1u << 2u;
+    case VK_DYNAMIC_STATE_DEPTH_BOUNDS: return 1u << 3u;
+    case VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK: return 1u << 4u;
+    case VK_DYNAMIC_STATE_STENCIL_WRITE_MASK: return 1u << 5u;
+    case VK_DYNAMIC_STATE_STENCIL_REFERENCE: return 1u << 6u;
+    case VK_DYNAMIC_STATE_CULL_MODE_EXT: return 1u << 7u;
+    case VK_DYNAMIC_STATE_FRONT_FACE_EXT: return 1u << 8u;
+    case VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE_EXT: return 1u << 9u;
+    case VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE_EXT: return 1u << 10u;
+    case VK_DYNAMIC_STATE_DEPTH_COMPARE_OP_EXT: return 1u << 11u;
+    case VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE_EXT: return 1u << 12u;
+    case VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE_EXT: return 1u << 13u;
+    case VK_DYNAMIC_STATE_STENCIL_OP_EXT: return 1u << 14u;
+    default: return 0u;
+    }
+}
+
+constexpr std::uint32_t dynamicStateBitOf(CommandOp op) {
+    switch (op) {
+    case CommandOp::SetViewport: return dynamicStateBit(VK_DYNAMIC_STATE_VIEWPORT);
+    case CommandOp::SetScissor: return dynamicStateBit(VK_DYNAMIC_STATE_SCISSOR);
+    case CommandOp::SetDepthBias: return dynamicStateBit(VK_DYNAMIC_STATE_DEPTH_BIAS);
+    case CommandOp::SetDepthBounds: return dynamicStateBit(VK_DYNAMIC_STATE_DEPTH_BOUNDS);
+    case CommandOp::SetStencilCompareMask: return dynamicStateBit(VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK);
+    case CommandOp::SetStencilWriteMask: return dynamicStateBit(VK_DYNAMIC_STATE_STENCIL_WRITE_MASK);
+    case CommandOp::SetStencilReference: return dynamicStateBit(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
+    case CommandOp::SetCullModeEXT: return dynamicStateBit(VK_DYNAMIC_STATE_CULL_MODE_EXT);
+    case CommandOp::SetFrontFaceEXT: return dynamicStateBit(VK_DYNAMIC_STATE_FRONT_FACE_EXT);
+    case CommandOp::SetDepthTestEnableEXT: return dynamicStateBit(VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE_EXT);
+    case CommandOp::SetDepthWriteEnableEXT: return dynamicStateBit(VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE_EXT);
+    case CommandOp::SetDepthCompareOpEXT: return dynamicStateBit(VK_DYNAMIC_STATE_DEPTH_COMPARE_OP_EXT);
+    case CommandOp::SetDepthBoundsTestEnableEXT: return dynamicStateBit(VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE_EXT);
+    case CommandOp::SetStencilTestEnableEXT: return dynamicStateBit(VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE_EXT);
+    case CommandOp::SetStencilOpEXT: return dynamicStateBit(VK_DYNAMIC_STATE_STENCIL_OP_EXT);
+    default: return 0u;
+    }
+}
+
+struct DynamicStateRegistry {
+    std::shared_mutex mutex;
+    std::unordered_map<VkPipeline, std::uint32_t> masks;
+};
+
+DynamicStateRegistry& dynamicStateRegistry() {
+    static auto* const registry = new DynamicStateRegistry;
+    return *registry;
+}
+
+std::uint32_t dynamicStatesOf(VkPipeline pipeline) {
+    auto& registry = dynamicStateRegistry();
+    std::shared_lock lock(registry.mutex);
+    const auto found = registry.masks.find(pipeline);
+    return found == registry.masks.end() ? 0u : found->second;
 }
 
 struct ReplayState {
@@ -577,10 +644,21 @@ struct ReplayState {
     std::array<std::array<const Record*, 2>, OpCount> faces{};
     VkPipeline graphicsPipeline = VK_NULL_HANDLE;
     bool bound = false;
+    bool acrossBinds = false;
+    std::uint64_t binds = 0;
+    std::uint64_t kept = 0;
 
     void Forget() {
         last.fill(nullptr);
         for (auto& pair : faces) pair = {nullptr, nullptr};
+    }
+
+    void Keep(std::uint32_t dynamic) {
+        for (std::size_t op = 0; op < OpCount; ++op) {
+            if ((dynamic & dynamicStateBitOf(static_cast<CommandOp>(op))) != 0u) continue;
+            last[op] = nullptr;
+            faces[op] = {nullptr, nullptr};
+        }
     }
 
     bool Plain(const Record& record) {
@@ -612,7 +690,14 @@ struct ReplayState {
             if (bound && pipeline == graphicsPipeline) return true;
             graphicsPipeline = pipeline;
             bound = true;
-            Forget();
+            ++binds;
+            const auto dynamic = acrossBinds ? dynamicStatesOf(pipeline) : 0u;
+            if (dynamic == 0u) {
+                Forget();
+                return false;
+            }
+            ++kept;
+            Keep(dynamic);
             return false;
         }
         case CommandOp::SetCullModeEXT:
@@ -650,6 +735,7 @@ void CommandStream::Replay(VkCommandBuffer commands) const {
         return;
     }
     ReplayState state;
+    state.acrossBinds = RuntimeSwitches::Set(RuntimeSwitch::ReplayStateAcrossBinds);
     std::uint64_t replayed = 0;
     std::uint64_t dropped = 0;
     for (const auto* record = first; record != nullptr; record = record->next) {
@@ -660,7 +746,23 @@ void CommandStream::Replay(VkCommandBuffer commands) const {
         replayRecord(commands, *record);
         ++replayed;
     }
-    noteReplay(replayed, dropped);
+    noteReplay(replayed, dropped, state.binds, state.kept);
+}
+
+void NotePipelineDynamicStates(VkPipeline pipeline, std::span<const VkDynamicState> states) {
+    if (pipeline == VK_NULL_HANDLE) return;
+    std::uint32_t mask = 0;
+    for (const auto state : states) mask |= dynamicStateBit(state);
+    auto& registry = dynamicStateRegistry();
+    std::unique_lock lock(registry.mutex);
+    registry.masks[pipeline] = mask;
+}
+
+void ForgetPipelineDynamicStates(VkPipeline pipeline) noexcept {
+    if (pipeline == VK_NULL_HANDLE) return;
+    auto& registry = dynamicStateRegistry();
+    std::unique_lock lock(registry.mutex);
+    registry.masks.erase(pipeline);
 }
 
 void CommandStream::Reset() {

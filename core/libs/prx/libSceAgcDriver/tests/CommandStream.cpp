@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommandStream.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -1033,6 +1034,99 @@ void FragmentsCompareRecordByRecord() {
 
 }
 
+void DynamicStateStaysAcrossBindsThatKeepItDynamic() {
+    const auto functions = resolve(stubContext());
+    const auto count = [](const char* name) {
+        const auto prefix = std::string(name) + '@';
+        return std::count_if(calls.begin(), calls.end(), [&](const std::string& line) { return line.rfind(prefix, 0) == 0; });
+    };
+    const auto first = fake<VkPipeline>(0x7101);
+    const auto second = fake<VkPipeline>(0x7102);
+    const auto fixed = fake<VkPipeline>(0x7103);
+    const auto unknown = fake<VkPipeline>(0x7104);
+    const VkViewport viewport{0.0f, 0.0f, 64.0f, 32.0f, 0.0f, 1.0f};
+    const VkViewport other{0.0f, 0.0f, 32.0f, 32.0f, 0.0f, 1.0f};
+    const VkRect2D scissor{{0, 0}, {64, 32}};
+    const auto whole = [&](VkCommandBuffer commands, VkPipeline pipeline, const VkViewport& area) {
+        functions.cmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        functions.cmdSetViewport(commands, 0, 1, &area);
+        functions.cmdSetScissor(commands, 0, 1, &scissor);
+        functions.cmdSetStencilReference(commands, VK_STENCIL_FACE_FRONT_AND_BACK, 7);
+        functions.cmdSetDepthBounds(commands, 0.25f, 0.75f);
+        functions.cmdDraw(commands, 3, 1, 0, 0);
+    };
+    const auto partial = [&](VkCommandBuffer commands, VkPipeline pipeline) {
+        functions.cmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        functions.cmdSetViewport(commands, 0, 1, &viewport);
+        functions.cmdSetScissor(commands, 0, 1, &scissor);
+        functions.cmdDraw(commands, 3, 1, 0, 0);
+    };
+    const std::array<VkDynamicState, 4> every{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BOUNDS};
+    const std::array<VkDynamicState, 2> area{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    NotePipelineDynamicStates(first, every);
+    NotePipelineDynamicStates(second, every);
+    NotePipelineDynamicStates(fixed, area);
+    const bool dedupe = RuntimeSwitches::Set(RuntimeSwitch::ReplayStateDedupe);
+    const bool across = RuntimeSwitches::Set(RuntimeSwitch::ReplayStateAcrossBinds);
+    RuntimeSwitches::Assign(RuntimeSwitch::ReplayStateDedupe, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::ReplayStateAcrossBinds, false);
+    {
+        CommandStream stream;
+        for (const auto pipeline : {first, second, first}) whole(stream.Handle(), pipeline, viewport);
+        calls.clear();
+        stream.Replay(Real);
+        Expect(count(BindPipelineName) == 3 && count(DrawName) == 3 && count(SetViewportName) == 3 && count(SetScissorName) == 3 && count(SetStencilReferenceName) == 3 && count(SetDepthBoundsName) == 3, "without the switch a bind of another pipeline does not send every dynamic state again");
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::ReplayStateAcrossBinds, true);
+    {
+        CommandStream stream;
+        for (const auto pipeline : {first, second, first}) whole(stream.Handle(), pipeline, viewport);
+        calls.clear();
+        stream.Replay(Real);
+        Expect(count(BindPipelineName) == 3 && count(DrawName) == 3 && count(SetViewportName) == 1 && count(SetScissorName) == 1 && count(SetStencilReferenceName) == 1 && count(SetDepthBoundsName) == 1, "binds of pipelines that keep a state dynamic sent " + std::to_string(count(SetViewportName)) + " viewports, " + std::to_string(count(SetScissorName)) + " scissors, " + std::to_string(count(SetStencilReferenceName)) + " stencil references and " + std::to_string(count(SetDepthBoundsName)) + " depth bounds, not one of each");
+    }
+    {
+        CommandStream stream;
+        whole(stream.Handle(), first, viewport);
+        whole(stream.Handle(), second, other);
+        whole(stream.Handle(), first, other);
+        calls.clear();
+        stream.Replay(Real);
+        Expect(count(SetViewportName) == 2 && count(SetScissorName) == 1, "a changed viewport under another pipeline was sent " + std::to_string(count(SetViewportName)) + " times, not twice");
+    }
+    {
+        CommandStream stream;
+        whole(stream.Handle(), first, viewport);
+        partial(stream.Handle(), fixed);
+        whole(stream.Handle(), second, viewport);
+        calls.clear();
+        stream.Replay(Real);
+        Expect(count(SetViewportName) == 1 && count(SetScissorName) == 1 && count(SetStencilReferenceName) == 2 && count(SetDepthBoundsName) == 2, "a pipeline with a static stencil reference and static depth bounds between two that keep them dynamic left " + std::to_string(count(SetStencilReferenceName)) + " stencil references and " + std::to_string(count(SetDepthBoundsName)) + " depth bounds, not two of each");
+    }
+    {
+        CommandStream stream;
+        whole(stream.Handle(), first, viewport);
+        whole(stream.Handle(), unknown, viewport);
+        whole(stream.Handle(), second, viewport);
+        calls.clear();
+        stream.Replay(Real);
+        Expect(count(SetViewportName) == 2 && count(SetScissorName) == 2 && count(SetStencilReferenceName) == 2 && count(SetDepthBoundsName) == 2, "a pipeline whose dynamic states were never noted kept state: " + std::to_string(count(SetViewportName)) + " viewports, not two");
+    }
+    ForgetPipelineDynamicStates(second);
+    {
+        CommandStream stream;
+        whole(stream.Handle(), first, viewport);
+        whole(stream.Handle(), second, viewport);
+        calls.clear();
+        stream.Replay(Real);
+        Expect(count(SetViewportName) == 2 && count(SetDepthBoundsName) == 2, "a pipeline whose note was dropped kept state");
+    }
+    ForgetPipelineDynamicStates(first);
+    ForgetPipelineDynamicStates(fixed);
+    RuntimeSwitches::Assign(RuntimeSwitch::ReplayStateDedupe, dedupe);
+    RuntimeSwitches::Assign(RuntimeSwitch::ReplayStateAcrossBinds, across);
+}
+
 int main() {
     try {
         EveryOpReplaysItsDeepCopies();
@@ -1045,6 +1139,7 @@ int main() {
         FragmentsSpliceInOrder();
         FragmentsSpanSlabsAndLargeRecords();
         FragmentsCompareRecordByRecord();
+        DynamicStateStaysAcrossBindsThatKeepItDynamic();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;
