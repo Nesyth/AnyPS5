@@ -58,6 +58,14 @@ struct Cache {
     std::ptrdiff_t untilSample;
     std::uint32_t paths[Paths];
     std::uint32_t pathEvents;
+    struct Site {
+        void* site;
+        std::uint32_t count;
+        std::uint32_t kib;
+    };
+    Site sites[256];
+    std::uint32_t siteEvents;
+    std::uint32_t siteBytes;
 };
 
 const bool pathsOn = std::getenv("APS5_PIPELINE_STATS") != nullptr;
@@ -487,9 +495,99 @@ void* TryAllocate(std::size_t bytes) noexcept {
     return std::malloc(bytes);
 }
 
+constexpr std::size_t SharedSites = std::size_t{1} << 13;
+
+struct SharedSite {
+    void* site;
+    std::uint64_t count;
+    std::uint64_t kib;
+};
+
+SharedSite sharedSites[SharedSites];
+SRWLOCK sharedSitesLock = SRWLOCK_INIT;
+std::uint64_t sharedSitesReportAt = 0;
+const bool sitesOn = std::getenv("APS5_HEAP_SITES") != nullptr;
+
+void ReportSites() noexcept {
+    const std::uint64_t now = GetTickCount64();
+    if (sharedSitesReportAt == 0) {
+        sharedSitesReportAt = now + 10000;
+        return;
+    }
+    if (now < sharedSitesReportAt) return;
+    sharedSitesReportAt = now + 10000;
+    std::uint64_t total = 0;
+    for (const auto& entry : sharedSites) total += entry.count;
+    char text[512];
+    std::snprintf(text, sizeof(text), "[heap-sites] 10 s: %llu allocations of the AGC driver's operator new; the largest sites:\n", static_cast<unsigned long long>(total));
+    std::fputs(text, stderr);
+    for (int rank = 0; rank < 40; ++rank) {
+        std::size_t best = SharedSites;
+        for (std::size_t at = 0; at < SharedSites; ++at) {
+            if (sharedSites[at].count != 0 && (best == SharedSites || sharedSites[at].count > sharedSites[best].count)) best = at;
+        }
+        if (best == SharedSites) break;
+        HMODULE module = nullptr;
+        char path[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(sharedSites[best].site), &module) && module != nullptr) GetModuleFileNameA(module, path, sizeof(path));
+        const char* name = path;
+        for (const char* at = path; *at != 0; ++at) {
+            if (*at == '\\' || *at == '/') name = at + 1;
+        }
+        std::snprintf(text, sizeof(text), "[heap-sites] %2d. %llu allocations, %llu KiB: %s+0x%llx\n", rank + 1, static_cast<unsigned long long>(sharedSites[best].count), static_cast<unsigned long long>(sharedSites[best].kib),
+            name, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(sharedSites[best].site) - reinterpret_cast<std::uintptr_t>(module)));
+        std::fputs(text, stderr);
+        sharedSites[best].count = 0;
+    }
+    for (auto& entry : sharedSites) entry = {};
+}
+
+void MergeSites(Cache* cache) noexcept {
+    AcquireSRWLockExclusive(&sharedSitesLock);
+    for (auto& mine : cache->sites) {
+        if (mine.site == nullptr) continue;
+        auto at = static_cast<std::size_t>((reinterpret_cast<std::uintptr_t>(mine.site) * 0x9e3779b97f4a7c15ull) >> 51);
+        for (std::size_t probes = 0; probes < SharedSites; ++probes) {
+            auto& entry = sharedSites[at];
+            if (entry.site == nullptr || entry.site == mine.site) {
+                entry.site = mine.site;
+                entry.count += mine.count;
+                entry.kib += mine.kib;
+                break;
+            }
+            at = (at + 1) & (SharedSites - 1);
+        }
+        mine = {};
+    }
+    ReportSites();
+    ReleaseSRWLockExclusive(&sharedSitesLock);
+}
+
+void NoteSite(std::size_t bytes, void* site) noexcept {
+    auto* cache = CurrentCache();
+    if (cache == nullptr) return;
+    auto at = static_cast<std::size_t>((reinterpret_cast<std::uintptr_t>(site) * 0x9e3779b97f4a7c15ull) >> 56);
+    for (std::size_t probes = 0; probes < 256; ++probes) {
+        auto& entry = cache->sites[at];
+        if (entry.site == nullptr || entry.site == site) {
+            entry.site = site;
+            ++entry.count;
+            cache->siteBytes += static_cast<std::uint32_t>(bytes);
+            entry.kib += cache->siteBytes >> 10;
+            cache->siteBytes &= 1023u;
+            break;
+        }
+        at = (at + 1) & 255u;
+    }
+    if (++cache->siteEvents < 65536) return;
+    cache->siteEvents = 0;
+    MergeSites(cache);
+}
+
 void* Allocate(std::size_t bytes, void* site) {
     for (;;) {
         if (void* block = TryAllocate(bytes)) {
+            if (sitesOn) NoteSite(bytes, site);
             if (censusOn) CensusNote(block, bytes, site);
             return block;
         }
