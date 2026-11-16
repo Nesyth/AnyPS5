@@ -39,6 +39,7 @@ public:
     DeepFound Newest(std::span<const Range> ranges, std::uint64_t live) const;
     bool Within(std::span<const Range> ranges, std::uint64_t from, std::uint64_t to) const;
     std::uint64_t Overflows() const { return overflows.load(std::memory_order_relaxed); }
+    void Name(const char* name) { label = name; }
 
 private:
     struct Entry {
@@ -47,6 +48,18 @@ private:
         std::atomic<std::uint64_t> end{0};
         std::atomic<std::uint64_t> first{0};
         std::atomic<std::uint64_t> last{0};
+    };
+    struct Census {
+        std::atomic<std::uint64_t> overflows{0};
+        std::array<std::atomic<std::uint64_t>, 5> placed{};
+        std::array<std::atomic<std::uint64_t>, 5> occupants{};
+        std::atomic<std::uint64_t> occupantsLive{0};
+        std::atomic<std::uint64_t> occupantsInRegion{0};
+        std::atomic<std::uint64_t> occupantPages{0};
+        std::atomic<std::uint64_t> unsure{0};
+        std::array<std::atomic<std::uint64_t>, 4> reasons{};
+        std::array<std::atomic<std::uint64_t>, 5> asked{};
+        std::atomic<std::uint64_t> askedRanges{0};
     };
     struct Bucket {
         std::atomic<std::uint64_t> newest{0};
@@ -75,7 +88,10 @@ private:
     };
     Bucket& bucketAt(std::uint64_t region);
     const Bucket& bucketAt(std::uint64_t region) const;
-    bool place(Bucket& bucket, const Range& range, std::size_t index, std::uint64_t stamp, std::uint64_t live, Memo& memo);
+    bool place(Bucket& bucket, const Range& range, std::size_t index, std::uint64_t stamp, std::uint64_t live, Memo& memo, std::uint64_t region);
+    void noteOverflow(const Bucket& bucket, const Range& range, std::uint64_t region, std::uint64_t stamp, std::uint64_t live);
+    void noteUnsure(unsigned reason, const Bucket* bucket, const Range& range, std::size_t count, std::uint64_t live, std::uint64_t before) const;
+    void reportCensus() const;
     static void bury(Bucket& bucket, const Entry& entry);
     static bool read(const Entry& entry, View& view);
     static bool scanBefore(const Bucket& bucket, const Range& range, std::uint64_t live, std::uint64_t before, DeepFound& found);
@@ -86,6 +102,8 @@ private:
     std::array<Memo, Memos> memos{};
     std::size_t nextMemo = 0;
     std::atomic<std::uint64_t> overflows{0};
+    const char* label = "unnamed";
+    mutable Census census;
 };
 
 class StampedKeys {

@@ -2494,6 +2494,7 @@ void DrawFinisher::fitLeanSpan() {
 void DrawFinisher::latchDeepRing(bool deep) {
     if (deep && deepWrites == nullptr) {
         deepWrites = std::make_unique<StampedRanges>();
+        deepWrites->Name("finisher writes");
         deepKeys = std::make_unique<StampedKeys>();
         deepShapes = std::make_unique<StampedKeys>();
         deepIndexed.store(true, std::memory_order_release);
@@ -4099,6 +4100,8 @@ void DrawPipeline::latchDeepQueue(bool deep) {
     if (deep && deepStores == nullptr) {
         deepStores = std::make_unique<StampedRanges>();
         deepOthers = std::make_unique<StampedRanges>();
+        deepStores->Name("queued stores");
+        deepOthers->Name("queued others");
         readRegions = std::make_unique<std::array<std::atomic<std::uint64_t>, ReadRegionSlots>>();
         deepIndexed.store(true, std::memory_order_release);
     }
