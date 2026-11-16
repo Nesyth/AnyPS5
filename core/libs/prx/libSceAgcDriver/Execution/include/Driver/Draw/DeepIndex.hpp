@@ -23,17 +23,20 @@ struct DeepFound {
 class StampedRanges {
 public:
     using Range = std::pair<std::uint64_t, std::uint64_t>;
-    static constexpr unsigned RegionShift = 21;
-    static constexpr std::size_t Buckets = 1024;
-    static constexpr unsigned BucketBits = 10;
-    static constexpr std::size_t Ways = 16;
+    static constexpr unsigned RegionShift = 12;
+    static constexpr unsigned CoarseShift = 21;
+    static constexpr std::size_t Buckets = 8192;
+    static constexpr unsigned BucketBits = 13;
+    static constexpr std::size_t Ways = 64;
     static constexpr std::size_t Graves = 4;
-    static constexpr std::uint64_t WideRegions = 16;
-    static constexpr std::uint64_t QueryRegions = 64;
+    static constexpr std::uint64_t WideRegions = 64;
+    static constexpr std::uint64_t QueryRegions = 1024;
+    static constexpr std::uint64_t CoarseQueryRegions = 64;
     static constexpr unsigned ReadAttempts = 8;
     static constexpr std::size_t Memos = 4;
 
     static bool Regions(const Range& range, std::uint64_t limit, std::uint64_t& first, std::uint64_t& last);
+    static bool CoarseRegions(const Range& range, std::uint64_t limit, std::uint64_t& first, std::uint64_t& last);
     void Insert(std::span<const Range> ranges, std::uint64_t stamp, std::uint64_t live);
     DeepFound Before(std::span<const Range> ranges, std::uint64_t live, std::uint64_t before) const;
     DeepFound Newest(std::span<const Range> ranges, std::uint64_t live) const;

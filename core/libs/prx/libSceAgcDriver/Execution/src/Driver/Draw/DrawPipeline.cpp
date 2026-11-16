@@ -4138,7 +4138,7 @@ void DrawPipeline::noteDeepReads(const std::vector<Range>& reads, std::uint64_t 
     for (const auto& read : reads) {
         std::uint64_t first = 0;
         std::uint64_t last = 0;
-        if (!StampedRanges::Regions(read, StampedRanges::QueryRegions, first, last)) {
+        if (!StampedRanges::CoarseRegions(read, StampedRanges::CoarseQueryRegions, first, last)) {
             wideReads.store(stamp, std::memory_order_release);
             continue;
         }
@@ -4151,7 +4151,7 @@ bool DrawPipeline::readsMaybe(std::uint64_t address, std::size_t bytes) const {
     if (wideReads.load(std::memory_order_acquire) >= live) return true;
     std::uint64_t first = 0;
     std::uint64_t last = 0;
-    if (!StampedRanges::Regions({address, address + bytes}, StampedRanges::QueryRegions, first, last)) return true;
+    if (!StampedRanges::CoarseRegions({address, address + bytes}, StampedRanges::CoarseQueryRegions, first, last)) return true;
     for (auto region = first; region <= last; ++region) {
         if ((*readRegions)[readRegionSlot(region)].load(std::memory_order_acquire) >= live) return true;
     }

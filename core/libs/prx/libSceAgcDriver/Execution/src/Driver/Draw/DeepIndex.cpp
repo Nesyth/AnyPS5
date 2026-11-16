@@ -91,6 +91,13 @@ bool StampedRanges::Regions(const Range& range, std::uint64_t limit, std::uint64
     return last - first < limit;
 }
 
+bool StampedRanges::CoarseRegions(const Range& range, std::uint64_t limit, std::uint64_t& first, std::uint64_t& last) {
+    if (range.second < range.first) return false;
+    first = range.first >> CoarseShift;
+    last = (range.second > range.first ? range.second - 1 : range.first) >> CoarseShift;
+    return last - first < limit;
+}
+
 StampedRanges::Bucket& StampedRanges::bucketAt(std::uint64_t region) {
     return buckets[hashed(region, BucketBits)];
 }

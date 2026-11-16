@@ -23,6 +23,7 @@ using AgcDriver::DriverDetail::DeepSite;
 using AgcDriver::DriverDetail::DrawFinisher;
 using AgcDriver::DriverDetail::DrawPipeline;
 using AgcDriver::DriverDetail::PublishedKeys;
+using AgcDriver::DriverDetail::StampedRanges;
 using AgcDriver::Graphics::RuntimeSwitch;
 namespace LeanFront = AgcDriver::DriverDetail::LeanFront;
 namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
@@ -372,10 +373,13 @@ void BucketOverflow() {
     BlockFront(open);
     const auto overflowsBefore = DrawFinisher::DeepTotal(DeepCount::WriteOverflows);
     const auto scansBefore = DrawFinisher::DeepTotal(DeepCount::WorkerFallbacks);
-    for (std::uint64_t index = 0; index < 20; ++index) PublishWrite({Region + index * 0x1000, Region + index * 0x1000 + 0x10});
-    Require(DrawFinisher::DeepTotal(DeepCount::WriteOverflows) >= overflowsBefore + 4, "20 writes in one region did not overflow its bucket");
-    for (std::uint64_t index = 0; index < 20; ++index) {
-        const auto at = Region + index * 0x1000;
+    constexpr std::uint64_t Writes = StampedRanges::Ways + 4;
+    constexpr std::uint64_t Step = 0x20;
+    static_assert(Writes * Step + 0x100 <= (std::uint64_t{1} << StampedRanges::RegionShift), "the writes of the overflow test must share one bucket");
+    for (std::uint64_t index = 0; index < Writes; ++index) PublishWrite({Region + index * Step, Region + index * Step + 0x10});
+    Require(DrawFinisher::DeepTotal(DeepCount::WriteOverflows) >= overflowsBefore + 4, "more writes than ways in one region did not overflow its bucket");
+    for (std::uint64_t index = 0; index < Writes; ++index) {
+        const auto at = Region + index * Step;
         Require(finisher.PendingOverlaps(at + 8, at + 9), "a write in an overflowing bucket was missed");
         Require(!finisher.PendingOverlaps(at + 0x10, at + 0x20), "a gap in an overflowing bucket overlapped");
     }
@@ -384,7 +388,7 @@ void BucketOverflow() {
     const auto waitsBefore = LeanFront::Total(LeanFront::Counter::AheadWaits);
     finisher.Enqueue([&readerDone] {
         const DrawFinisher::AheadScope ahead;
-        static_cast<void>(DrawFinisher::Get().PendingOverlaps(Region + 0x800, Region + 0x810));
+        static_cast<void>(DrawFinisher::Get().PendingOverlaps(Region + 0xf00, Region + 0xf10));
         readerDone.store(true);
     }, Held({}));
     Pause();
