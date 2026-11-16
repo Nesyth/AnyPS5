@@ -38,6 +38,9 @@ public:
     static constexpr std::array<unsigned, Levels> DeepBits{0, 12, 11, 10, 9, 9};
     static constexpr std::uint64_t WriteBlocks = 2;
     static constexpr std::uint64_t QueryBlocks = 8;
+    static constexpr unsigned NearShift = 22;
+    static constexpr unsigned NearBits = 12;
+    static constexpr std::uint64_t NearRegions = 16;
     static constexpr unsigned ReadAttempts = 8;
 
     StampedRanges();
@@ -158,6 +161,7 @@ private:
     std::unique_ptr<Block[]> blocks;
     std::unique_ptr<std::uint32_t[]> freeBlocks;
     std::unique_ptr<std::uint64_t[]> marks;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> nears;
     alignas(64) std::size_t freeCount = 0;
     std::uint64_t markSerial = 0;
     std::array<std::uint64_t, Words> occupied{};

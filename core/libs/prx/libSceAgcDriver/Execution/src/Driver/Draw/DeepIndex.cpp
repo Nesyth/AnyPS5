@@ -165,6 +165,7 @@ StampedRanges::StampedRanges()
       blocks(std::make_unique<Block[]>(PoolBlocks)),
       freeBlocks(std::make_unique<std::uint32_t[]>(PoolBlocks)),
       marks(std::make_unique<std::uint64_t[]>(Layout.total)),
+      nears(std::make_unique<std::atomic<std::uint64_t>[]>(std::size_t{1} << NearBits)),
       freeCount(PoolBlocks) {
     for (std::size_t at = 0; at < PoolBlocks; ++at) freeBlocks[at] = static_cast<std::uint32_t>(PoolBlocks - 1 - at);
 }
@@ -358,6 +359,10 @@ void StampedRanges::placeRanges(std::span<const Range> ranges, std::size_t slot,
         const auto level = ownerLevel(range);
         raiseNewest(classes.newest[level], stamp);
         ++written.ranges[level];
+        if (level != Levels) {
+            const auto nearLast = lastByte(range) >> NearShift;
+            for (auto region = range.first >> NearShift; region <= nearLast; ++region) raiseNewest(nears[hashed(region, NearBits)], stamp);
+        }
         forEachPlacement(range, [&](std::size_t map) { setBit(map, slot, stamp); });
     }
 }
@@ -509,6 +514,13 @@ bool StampedRanges::collect(std::span<const Range> ranges, const Window& window,
         if (level == Levels) {
             candidates.every = true;
             continue;
+        }
+        const auto nearFirst = range.first >> NearShift;
+        const auto nearLast = last >> NearShift;
+        if (nearLast - nearFirst < NearRegions) {
+            bool touched = false;
+            for (auto region = nearFirst; region <= nearLast && !touched; ++region) touched = nears[hashed(region, NearBits)].load(std::memory_order_relaxed) >= window.lo;
+            if (!touched) continue;
         }
         if (deepNewest[level] >= window.lo) {
             for (auto block = range.first >> Shifts[level]; block <= (last >> Shifts[level]); ++block) gather(deepMap(level, block), window, candidates);
