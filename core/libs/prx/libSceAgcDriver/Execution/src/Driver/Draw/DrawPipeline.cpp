@@ -1736,6 +1736,14 @@ std::uint32_t DrawFinisher::describePendingWriter(std::uint64_t begin, std::uint
         if (found.answer == DeepAnswer::Unsure) return 5000u;
         if (found.answer == DeepAnswer::Hit) {
             const auto& slot = leanSlot(found.stamp);
+            static std::atomic<std::uint32_t> samples{0};
+            if (samples.fetch_add(1, std::memory_order_relaxed) < 40u) {
+                const auto& held = slot.pending;
+                AgcDriver::ProfilePrint_nid_no_patch("[held-naming] sample: asked 0x%llx +%llu; writer seq %llu (front %llu, next %llu) origin %u kind %u, label 0x%llx +%zu bytes, label run %d, %zu write ranges, first [0x%llx, 0x%llx)\n",
+                    static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<unsigned long long>(found.stamp), static_cast<unsigned long long>(front), static_cast<unsigned long long>(nextSeq),
+                    static_cast<unsigned>(held.origin), static_cast<unsigned>(held.originKind), static_cast<unsigned long long>(held.labelAddress), held.labelBytes.size(), held.labelRun != nullptr ? 1 : 0, held.writes.size(),
+                    static_cast<unsigned long long>(held.writes.empty() ? 0 : held.writes.front().first), static_cast<unsigned long long>(held.writes.empty() ? 0 : held.writes.front().second));
+            }
             return 1000u + static_cast<std::uint32_t>(slot.pending.origin) * 100u + slot.pending.originKind;
         }
         if (lastUnknown.load(std::memory_order_relaxed) >= front) return 2000u;
