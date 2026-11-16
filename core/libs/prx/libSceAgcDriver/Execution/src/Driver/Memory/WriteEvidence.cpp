@@ -255,7 +255,11 @@ ShaderMemory::PendingWrite Driver::queryNamingWrite(std::uint64_t address, std::
         if (known.size() == bytes) {
             if (DrawFinisher::Get().PendingLabelBytes(address, known)) return ShaderMemory::PendingWrite::KnownValue;
         } else if (known.empty()) {
-            if (DrawFinisher::Get().PendingLabelSpan(address, bytes)) return ShaderMemory::PendingWrite::KnownValue;
+            if (bytes > 64) {
+                if (DrawFinisher::Busy() && DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, address + bytes)) return ShaderMemory::PendingWrite::Sync;
+            } else if (DrawFinisher::Get().PendingLabelSpan(address, bytes)) {
+                return ShaderMemory::PendingWrite::KnownValue;
+            }
         }
     }
     return queryPendingWrite(address, bytes, known);
