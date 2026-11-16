@@ -97,6 +97,7 @@ public:
     [[nodiscard]] std::uint32_t ForcedSyncs() const { return forcedSyncs; }
     [[nodiscard]] std::uint32_t SyncedReads() const { return syncedReads; }
     void DisableStamps() { stamps = false; }
+    static bool InPageQuery();
 
 private:
     std::vector<std::uint32_t>* readNodes = nullptr;

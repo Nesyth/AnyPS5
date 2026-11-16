@@ -227,6 +227,14 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
         auto& pipeline = DrawPipeline::Queue0();
         if (pipeline.Busy()) queued = pipeline.StoredBytes(address, bytes, known.size() == bytes ? known : std::span<std::byte>{});
         if (queued == DrawPipeline::QueuedWrite::Unknown && DrawFinisher::Deep()) {
+            static const bool pageWaits = std::getenv("APS5_PAGE_QUERY_WAITS") != nullptr;
+            if (!pageWaits && known.empty() && ShaderMemory::InPageQuery() && DrawFinisher::OrderedSyncs()) {
+                static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+                static std::atomic<std::uint64_t> answered{0};
+                const auto count = answered.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (stats && count % 4096u == 0) std::fprintf(stderr, "[write-evidence] page queries answered pending without a wait: %llu\n", static_cast<unsigned long long>(count));
+                return Policy::Sync;
+            }
             DrawFinisher::NoteNamingBlocker(address, address + bytes);
             DrawFinisher::NoteEvidenceWait(address, address + bytes, !known.empty());
             const DrawPipeline::Range range{address, address + bytes};

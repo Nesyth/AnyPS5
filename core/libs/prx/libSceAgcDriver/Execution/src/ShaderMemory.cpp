@@ -342,11 +342,24 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
     return page;
 }
 
+struct PageQueryStorage {};
+
+bool ShaderMemory::InPageQuery() {
+    return HostThreadLocal<bool, PageQueryStorage>();
+}
+
 void ShaderMemory::preparePage(Page& page, std::uint64_t base) {
     // A page is either mapped whole or read word by word where the guest mapped less than a page,
     // or where recorded GPU work writes into it (a whole-page read would wait for that work).
     if (GuestMemory::Accessible(reinterpret_cast<const void*>(base), PageBytes)) {
-        if (WordwisePages() && pendingWrite != nullptr && pendingWrite(base, PageBytes, {}) != PendingWrite::None) {
+        const auto pageQuery = [&] {
+            struct Scope {
+                Scope() { HostThreadLocal<bool, PageQueryStorage>() = true; }
+                ~Scope() { HostThreadLocal<bool, PageQueryStorage>() = false; }
+            } scope;
+            return pendingWrite(base, PageBytes, {});
+        };
+        if (WordwisePages() && pendingWrite != nullptr && pageQuery() != PendingWrite::None) {
             page.wordwise = true;
             ++CaptureTotals().pagesWordwise;
             return;
