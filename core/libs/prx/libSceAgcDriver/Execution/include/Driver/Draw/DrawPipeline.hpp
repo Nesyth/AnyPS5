@@ -376,6 +376,7 @@ public:
     static bool FrameFlow();
     static bool OrderedSyncsWanted();
     static bool& NamingWalk();
+    static std::string& NamingTrace();
     static void NoteNamingBlocker(std::uint64_t begin, std::uint64_t end);
     std::uint32_t describePendingWriter(std::uint64_t begin, std::uint64_t end);
     static bool OrderedSyncs();

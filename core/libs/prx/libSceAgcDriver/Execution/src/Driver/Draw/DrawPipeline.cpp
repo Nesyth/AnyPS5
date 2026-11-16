@@ -1723,6 +1723,11 @@ void DrawFinisher::AwaitPending(std::span<const Range> ranges, DeepSite site) {
     }
 }
 
+std::string& DrawFinisher::NamingTrace() {
+    struct NamingTraceStorage {};
+    return HostThreadLocal<std::string, NamingTraceStorage>();
+}
+
 bool& DrawFinisher::NamingWalk() {
     struct NamingWalkStorage {};
     return HostThreadLocal<bool, NamingWalkStorage>();

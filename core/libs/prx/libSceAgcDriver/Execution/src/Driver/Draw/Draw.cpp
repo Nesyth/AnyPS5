@@ -472,11 +472,33 @@ bool Driver::nameHeldWrites(const DrawTail& tail, std::vector<std::pair<std::uin
                 const auto request = drawStageRequest(program, tail.decode->state, tail.pixel, vertexInfo, tail.memory, tail.linked, *tail.localDevice, pushOffset, tail.drawParameters, std::nullopt);
                 ShaderMemory side(tail.memory, &queryNamingWrite, nullptr, nullptr, &QueryPendingSpan);
                 struct NamingScope {
-                    NamingScope() { DrawFinisher::NamingWalk() = true; }
+                    NamingScope() {
+                        DrawFinisher::NamingWalk() = true;
+                        DrawFinisher::NamingTrace().clear();
+                    }
                     ~NamingScope() { DrawFinisher::NamingWalk() = false; }
                 } naming;
                 capture = CapturePreparedResources(side, *program.snapshot, program.codeOffset, request);
                 if (capture != nullptr) complete = CapturedWriteRanges(capture->plan.get(), capture->snapshot, named);
+                static std::atomic<std::uint32_t> traces{0};
+                if (capture != nullptr && !complete && std::getenv("APS5_PIPELINE_STATS") != nullptr && traces.fetch_add(1, std::memory_order_relaxed) < 12u) {
+                    std::string missing;
+                    for (std::size_t resource = 0; resource < capture->snapshot.buffers.size(); ++resource) {
+                        const auto& buffer = capture->snapshot.buffers[resource];
+                        if (buffer.dwordCount == 0 || (buffer.dwordCount == 4 && (buffer.availableDwordMask & 0xfu) == 0xfu)) continue;
+                        char item[64];
+                        std::snprintf(item, sizeof(item), " buffer %zu count %u mask 0x%x", resource, static_cast<unsigned>(buffer.dwordCount), static_cast<unsigned>(buffer.availableDwordMask));
+                        missing += item;
+                    }
+                    for (std::size_t resource = 0; resource < capture->snapshot.images.size(); ++resource) {
+                        const auto& image = capture->snapshot.images[resource];
+                        if (image.dwordCount == 0 || (image.dwordCount == 8 && image.availableDwordMask == 0xffu)) continue;
+                        char item[64];
+                        std::snprintf(item, sizeof(item), " image %zu count %u mask 0x%x", resource, static_cast<unsigned>(image.dwordCount), static_cast<unsigned>(image.availableDwordMask));
+                        missing += item;
+                    }
+                    std::fprintf(stderr, "[held-naming] incomplete walk: stage %zu, %zu buffers, %zu images; not fully available:%s; queries:%s\n", static_cast<std::size_t>(i), capture->snapshot.buffers.size(), capture->snapshot.images.size(), missing.c_str(), DrawFinisher::NamingTrace().c_str());
+                }
             } catch (const std::exception&) {
                 return kept(FrameKept::HeldWalkFailed);
             }

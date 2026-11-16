@@ -250,6 +250,21 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
 }
 
 ShaderMemory::PendingWrite Driver::queryNamingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
+    static const bool traced = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (traced && DrawFinisher::NamingWalk()) {
+        const auto answer = queryNamingWriteUntraced(address, bytes, known);
+        auto& trace = DrawFinisher::NamingTrace();
+        if (trace.size() < 3000) {
+            char item[96];
+            std::snprintf(item, sizeof(item), " [0x%llx +%zu %s -> %u]", static_cast<unsigned long long>(address), bytes, known.empty() ? "span" : "word", static_cast<unsigned>(answer));
+            trace += item;
+        }
+        return answer;
+    }
+    return queryNamingWriteUntraced(address, bytes, known);
+}
+
+ShaderMemory::PendingWrite Driver::queryNamingWriteUntraced(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     static const bool readThrough = std::getenv("APS5_NAMING_NO_LABEL_BYTES") == nullptr;
     if (readThrough && bytes != 0 && DrawPipeline::Active()) {
         if (known.size() == bytes) {
