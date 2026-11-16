@@ -246,6 +246,7 @@ enum class RuntimeSwitch : std::size_t {
     WriteValidation,
     OrderedSyncs,
     DeepShallow,
+    HtileCarryFills,
     Count,
 };
 

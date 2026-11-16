@@ -25,11 +25,66 @@ constexpr std::uint16_t Depth(std::size_t sizeClass) {
     return sizeClass >= Classes ? 4 : sizeClass < 256 / Granule ? 64 : 16;
 }
 
+enum Path : std::size_t {
+    CacheSmall,
+    CacheLarge,
+    DepotSmall,
+    DepotLarge,
+    HeapSmall,
+    HeapLargeFirst,
+    HeapBeyond = HeapLargeFirst + LargeClasses,
+    FreeCacheSmall,
+    FreeCacheLarge,
+    FreeKeptList,
+    FreeHeapSmall,
+    FreeHeapLargeFirst,
+    FreeHeapUncached = FreeHeapLargeFirst + LargeClasses,
+    Paths,
+};
+
 struct Cache {
     void* heads[AllClasses];
     std::uint16_t counts[AllClasses];
     std::ptrdiff_t untilSample;
+    std::uint32_t paths[Paths];
+    std::uint32_t pathEvents;
 };
+
+const bool pathsOn = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+std::atomic<std::uint64_t> pathTotals[Paths];
+std::atomic<std::uint64_t> pathReportAt{0};
+
+void ReportPaths() noexcept {
+    const std::uint64_t now = GetTickCount64();
+    auto due = pathReportAt.load(std::memory_order_relaxed);
+    if (due == 0) {
+        pathReportAt.compare_exchange_strong(due, now + 10000, std::memory_order_relaxed);
+        return;
+    }
+    if (now < due || !pathReportAt.compare_exchange_strong(due, now + 10000, std::memory_order_relaxed)) return;
+    unsigned long long taken[Paths];
+    for (std::size_t path = 0; path < Paths; ++path) taken[path] = pathTotals[path].exchange(0, std::memory_order_relaxed);
+    char text[1024];
+    int at = std::snprintf(text, sizeof(text), "[heap-paths] 10 s: allocations from the thread cache: small %llu, large %llu; after a depot take: small %llu, large %llu; by malloc for a cached class: small %llu, large by class from 2 KiB", taken[CacheSmall], taken[CacheLarge], taken[DepotSmall], taken[DepotLarge], taken[HeapSmall]);
+    for (std::size_t index = 0; index < LargeClasses && at > 0 && static_cast<std::size_t>(at) < sizeof(text); ++index) at += std::snprintf(text + at, sizeof(text) - static_cast<std::size_t>(at), " %llu", taken[HeapLargeFirst + index]);
+    if (at > 0 && static_cast<std::size_t>(at) < sizeof(text)) at += std::snprintf(text + at, sizeof(text) - static_cast<std::size_t>(at), "; by malloc above 64 KiB or uncached %llu; frees into the thread cache: small %llu, large %llu; lists kept by the depot %llu; frees to the heap: small %llu, large by class", taken[HeapBeyond], taken[FreeCacheSmall], taken[FreeCacheLarge], taken[FreeKeptList], taken[FreeHeapSmall]);
+    for (std::size_t index = 0; index < LargeClasses && at > 0 && static_cast<std::size_t>(at) < sizeof(text); ++index) at += std::snprintf(text + at, sizeof(text) - static_cast<std::size_t>(at), " %llu", taken[FreeHeapLargeFirst + index]);
+    if (at > 0 && static_cast<std::size_t>(at) < sizeof(text)) std::snprintf(text + at, sizeof(text) - static_cast<std::size_t>(at), ", uncached %llu\n", taken[FreeHeapUncached]);
+    std::fputs(text, stderr);
+}
+
+void NotePath(Cache* cache, std::size_t path) noexcept {
+    if (!pathsOn || cache == nullptr) return;
+    ++cache->paths[path];
+    if (++cache->pathEvents < 4096) return;
+    cache->pathEvents = 0;
+    for (std::size_t index = 0; index < Paths; ++index) {
+        if (cache->paths[index] == 0) continue;
+        pathTotals[index].fetch_add(cache->paths[index], std::memory_order_relaxed);
+        cache->paths[index] = 0;
+    }
+    ReportPaths();
+}
 
 constexpr std::uint16_t KeptLists = 8;
 constexpr std::uint16_t KeptLargeLists = 2;
@@ -392,10 +447,12 @@ void* TryAllocate(std::size_t bytes) noexcept {
         const auto sizeClass = large ? LargeClassOf(bytes) : (bytes - 1) / Granule;
         const auto blockBytes = large ? std::size_t{2048} << (sizeClass - Classes) : (sizeClass + 1) * Granule;
         if (auto* cache = CurrentCache()) {
+            bool taken = false;
             if (cache->heads[sizeClass] == nullptr) {
                 if (void* list = TakeList(sizeClass)) {
                     cache->heads[sizeClass] = list;
                     cache->counts[sizeClass] = Depth(sizeClass);
+                    taken = true;
                 }
             }
             if (void* block = cache->heads[sizeClass]) {
@@ -403,11 +460,14 @@ void* TryAllocate(std::size_t bytes) noexcept {
                 cache->heads[sizeClass] = next;
                 --cache->counts[sizeClass];
                 if (next != nullptr && PrefetchNext()) PrefetchForWrite(next);
+                NotePath(cache, taken ? (large ? DepotLarge : DepotSmall) : (large ? CacheLarge : CacheSmall));
                 return block;
             }
+            NotePath(cache, large ? HeapLargeFirst + (sizeClass - Classes) : HeapSmall);
         }
         return std::malloc(blockBytes);
     }
+    if (pathsOn) NotePath(CurrentCache(), HeapBeyond);
     return std::malloc(bytes);
 }
 
@@ -435,13 +495,18 @@ void Release(void* block, std::size_t bytes = 0) noexcept {
             if (cache->counts[sizeClass] == Depth(sizeClass) && KeepList(sizeClass, cache->heads[sizeClass])) {
                 cache->heads[sizeClass] = nullptr;
                 cache->counts[sizeClass] = 0;
+                NotePath(cache, FreeKeptList);
             }
             if (cache->counts[sizeClass] < Depth(sizeClass)) {
                 *static_cast<void**>(block) = cache->heads[sizeClass];
                 cache->heads[sizeClass] = block;
                 ++cache->counts[sizeClass];
+                NotePath(cache, largeBlock ? FreeCacheLarge : FreeCacheSmall);
                 return;
             }
+            NotePath(cache, largeBlock ? FreeHeapLargeFirst + (sizeClass - Classes) : FreeHeapSmall);
+        } else {
+            NotePath(cache, FreeHeapUncached);
         }
     }
     std::free(block);

@@ -3078,9 +3078,7 @@ bool RoutesToNativeDepthOwner(const DepthTarget& target) {
     return std::ranges::any_of(depthGuards(), [&](const auto& range) { return range.active->load(std::memory_order_acquire) && target.htileAddress < range.address + range.bytes && range.address < target.htileAddress + bytes; });
 }
 
-std::optional<std::uint32_t> htileAfterPendingFills(const Recorder& recorder, std::uint64_t address, std::size_t bytes) {
-    auto writes = recorder.PendingWritesOver(address, bytes);
-    std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
+std::optional<std::uint32_t> htileAfterFills(std::span<const Recorder::PendingWrite> writes, std::uint64_t address, std::size_t bytes) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{address, address + bytes}};
     std::optional<std::uint32_t> landed;
     for (const auto& write : writes) {
@@ -3110,6 +3108,17 @@ std::optional<std::uint32_t> htileAfterPendingFills(const Recorder& recorder, st
         }
     }
     return landed;
+}
+
+std::vector<Recorder::PendingWrite> pendingNewestFirst(const Recorder& recorder, std::uint64_t address, std::size_t bytes) {
+    auto writes = recorder.PendingWritesOver(address, bytes);
+    std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
+    return writes;
+}
+
+std::optional<std::uint32_t> htileAfterPendingFills(const Recorder& recorder, std::uint64_t address, std::size_t bytes) {
+    const auto writes = pendingNewestFirst(recorder, address, bytes);
+    return htileAfterFills(writes, address, bytes);
 }
 
 struct HtileMaskWrite {
@@ -3186,11 +3195,31 @@ bool carriedFixupNote(std::uint64_t recorderId, std::uint64_t note) {
     return std::ranges::any_of(htileFixups(), [&](const HtileFixupWrite& write) { return write.carried && write.recorderId == recorderId && write.note == note; });
 }
 
+std::atomic<std::uint64_t> htileCarriesOverFills{0};
+
+bool fillsUnderCarriedFixups(const Recorder& recorder, std::uint64_t address, std::size_t bytes, bool fixupNeeded) {
+    if (!RuntimeSwitches::Set(RuntimeSwitch::HtileCarryFills)) return false;
+    const auto writes = pendingNewestFirst(recorder, address, bytes);
+    std::size_t fixups = 0;
+    {
+        std::lock_guard masks(htileMasksMutex());
+        while (fixups < writes.size() && carriedFixupNote(recorder.Id(), writes[fixups].note)) ++fixups;
+    }
+    if (fixups == writes.size() || (fixupNeeded && fixups == 0)) return false;
+    const auto landed = htileAfterFills(std::span<const Recorder::PendingWrite>(writes).subspan(fixups), address, bytes);
+    return landed.has_value() && HtileFillClears(*landed, false) == 0;
+}
+
 bool carriedOverPending(const Recorder& recorder, std::uint64_t address, std::size_t bytes) {
     const auto writes = recorder.PendingWritesOver(address, bytes);
     if (writes.empty()) return false;
-    std::lock_guard masks(htileMasksMutex());
-    return std::ranges::all_of(writes, [&](const Recorder::PendingWrite& write) { return carriedFixupNote(recorder.Id(), write.note); });
+    {
+        std::lock_guard masks(htileMasksMutex());
+        if (std::ranges::all_of(writes, [&](const Recorder::PendingWrite& write) { return carriedFixupNote(recorder.Id(), write.note); })) return true;
+    }
+    if (!fillsUnderCarriedFixups(recorder, address, bytes, true)) return false;
+    htileCarriesOverFills.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 enum class HtileReadEvent : std::size_t { Unchanged, Stamp, Fills, Mask, Read, ReadPending, Carried, CarryVerified, CarryMismatch, Count };
@@ -3205,7 +3234,7 @@ void noteHtileRead(HtileReadEvent event) {
     if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
     std::array<unsigned long long, static_cast<std::size_t>(HtileReadEvent::Count)> taken{};
     for (std::size_t index = 0; index < taken.size(); ++index) taken[index] = counts[index].exchange(0, std::memory_order_relaxed);
-    AgcDriver::ProfilePrint_nid_no_patch("[htile-reads] 10 s: %llu unchanged, %llu untracked stamp kept, %llu pending fills resolved, %llu mask clears resolved, %llu kept across ZMASK fixups (verify %llu, %llu differed); %llu read, %llu read over pending GPU writes\n", taken[0], taken[1], taken[2], taken[3], taken[6], taken[7], taken[8], taken[4], taken[5]);
+    AgcDriver::ProfilePrint_nid_no_patch("[htile-reads] 10 s: %llu unchanged, %llu untracked stamp kept, %llu pending fills resolved, %llu mask clears resolved, %llu kept across ZMASK fixups (verify %llu, %llu differed; of them over pending fills %llu); %llu read, %llu read over pending GPU writes\n", taken[0], taken[1], taken[2], taken[3], taken[6], taken[7], taken[8], static_cast<unsigned long long>(htileCarriesOverFills.exchange(0, std::memory_order_relaxed)), taken[4], taken[5]);
 }
 
 void describeHtileRead(const Recorder* recorder, const DepthTarget& target, std::size_t bytes, std::uint64_t collected) {
@@ -4288,8 +4317,12 @@ bool HtileClearStateCurrent(const Context& context, const HtileZmaskFixup& fixup
     }
     const auto writes = recorder->PendingWritesOver(fixup.address, fixup.bytes);
     if (!writes.empty()) {
-        std::lock_guard masks(htileMasksMutex());
-        if (!std::ranges::all_of(writes, [&](const Recorder::PendingWrite& write) { return carriedFixupNote(recorder->Id(), write.note); })) return false;
+        bool fixupsOnly = false;
+        {
+            std::lock_guard masks(htileMasksMutex());
+            fixupsOnly = std::ranges::all_of(writes, [&](const Recorder::PendingWrite& write) { return carriedFixupNote(recorder->Id(), write.note); });
+        }
+        if (!fixupsOnly && !fillsUnderCarriedFixups(*recorder, fixup.address, fixup.bytes, false)) return false;
     }
     std::lock_guard lock(htileReadsMutex());
     const auto found = htileReads().find(fixup.address);
