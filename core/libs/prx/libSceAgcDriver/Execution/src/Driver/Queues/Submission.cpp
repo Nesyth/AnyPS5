@@ -789,6 +789,7 @@ void Driver::SuspendPoint() {
     Submission boundary{};
     boundary.serial = accepted + 1;
     boundary.suspend = true;
+    boundary.suspendAfter = eventSerial.load(std::memory_order_acquire);
     static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (trace) std::fprintf(stderr, "[gpu] %.1f accepted serial=%llu suspend point\n", TraceMs(), static_cast<unsigned long long>(boundary.serial));
 

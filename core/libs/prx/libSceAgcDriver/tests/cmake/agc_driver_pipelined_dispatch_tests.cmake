@@ -6,3 +6,7 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
+
+if(BUILD_TESTING)
+    agc_add_deep_flow_test(agc_driver_pipelined_dispatch)
+endif()

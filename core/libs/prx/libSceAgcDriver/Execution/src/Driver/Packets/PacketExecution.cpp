@@ -440,6 +440,82 @@ void Driver::commitFlip(const FlipCommit& flip) {
     }
 }
 
+bool Driver::suspendOrdered() {
+    if (!DrawFinisher::OrderedSyncsWanted()) return false;
+    static const bool suspendDrain = std::getenv("APS5_SUSPEND_DRAIN") != nullptr;
+    static const bool orderedCompletion = std::getenv("APS5_PIPELINE_DRAIN_SUBMISSIONS") == nullptr && std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
+    const auto kept = [](FrameKept reason) {
+        DrawFinisher::NoteFrameKept(reason);
+        return false;
+    };
+    if (APS5_ENABLE_TIMING_LOG) return kept(FrameKept::SuspendTimingLog);
+    if (suspendDrain) return kept(FrameKept::SuspendDrainEnv);
+    if (!deferredLabels().labels.empty()) return kept(FrameKept::SuspendDeferredLabels);
+    if (!orderedCompletion) return kept(FrameKept::SuspendUnordered);
+    if (!DrawFinisher::OrderedSyncs()) DrawFinisher::Get().LatchFrameFlow();
+    if (!DrawFinisher::OrderedSyncs()) return kept(FrameKept::SuspendNotLatched);
+    return true;
+}
+
+void Driver::queueOrderedSuspend(const Submission& submission) {
+    const auto start = DrawFinisher::FrameCensus() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    ++suspendPoints;
+    {
+        std::optional<DrawPipeline::OrderProbe> probe;
+        if (DrawFinisher::FrameVerifyDue(FrameCheck::SuspendOrder)) probe.emplace(FrameCheck::SuspendOrder);
+        DrawPipeline::Queue0().EnqueueSuspend([this, serial = submission.serial, after = submission.suspendAfter] { commitSuspend(serial, after); });
+    }
+    completionDeferred() = true;
+    resetGraphics = true;
+    DrawFinisher::NoteFrameSite(FrameSite::SuspendOrdered, start == std::chrono::steady_clock::time_point{} ? 0 : static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+}
+
+void Driver::commitSuspend(std::uint64_t serial, std::uint64_t after) {
+    struct Complete {
+        Driver& driver;
+        std::uint64_t serial;
+        ~Complete() {
+            bool notify = true;
+            {
+                std::lock_guard lock(driver.mutex);
+                driver.markCompleted(serial);
+                notify = driver.idleWaiters != 0 || driver.orderHolders.load(std::memory_order_acquire) != 0 || completionsPending();
+            }
+            if (notify) driver.changed.notify_all();
+        }
+    } complete{*this, serial};
+    verifySuspendCommit(serial, after);
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto& costs = submissionCosts(0);
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    if (!Graphics::Recorder::PendingLabelSince().has_value() && Graphics::Recorder::RecordedWorkSinceSubmit() == 0) {
+        ++costs.suspendsSkipped;
+        return;
+    }
+    if (!GuestMemory::RangeProofs()) GuestMemory::BreakProofs(GuestMemory::ProofBreak::GpuLock);
+    if (const auto localDevice = device.Load()) localDevice->SubmitRecorded(true, Graphics::Recorder::SubmitReason::Suspend);
+    ++costs.suspends;
+    if (profile) costs.suspendNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+void Driver::verifySuspendCommit(std::uint64_t serial, std::uint64_t after) {
+    if (!DrawFinisher::FrameVerifyDue(FrameCheck::SuspendCompletion)) return;
+    std::size_t open = 0;
+    std::uint64_t first = 0;
+    {
+        std::lock_guard lock(mutex);
+        for (const auto received : queue0Uncommitted) {
+            if (received > after) continue;
+            if (open++ == 0) first = received;
+        }
+    }
+    char text[256];
+    std::snprintf(text, sizeof(text), "the ordered suspend point of serial %llu committed with %zu queue-0 submissions received up to event %llu not yet completed, the first received at event %llu", static_cast<unsigned long long>(serial), open, static_cast<unsigned long long>(after), static_cast<unsigned long long>(first));
+    DrawFinisher::NoteFrameCheck(FrameCheck::SuspendCompletion, open != 0, text);
+}
+
 std::optional<std::uint32_t> Driver::releaseInterrupt(std::span<const std::uint32_t> packet, std::uint32_t opcode, bool carriesFlip) {
     if (opcode != 0x49 || carriesFlip || packet.size() < 3) return std::nullopt;
     const auto interruptSelect = (packet[2] >> 24u) & 7u;
@@ -571,6 +647,10 @@ void Driver::execute(const Submission& submission) {
     const auto switchSet = [&](Graphics::RuntimeSwitch id) { return front == FrontMode::Lean ? LeanFront::SwitchSet(frontLatch, id) : Graphics::RuntimeSwitches::Set(id); };
     static const bool orderedWaits = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
     DrawPipeline::Active() = pipelined;
+    if (pipelined && submission.suspend && suspendOrdered()) {
+        queueOrderedSuspend(submission);
+        return;
+    }
     if (pipelined && DrawFinisher::FrameFlowWanted() && DrawFinisher::Busy()) {
         DrawFinisher::NoteFrameKept(FrameKept::FrontChange);
         DrawFinisher::Get().Drain();
@@ -694,6 +774,8 @@ void Driver::execute(const Submission& submission) {
         bool dmaBeside = false;
         DrawPipeline::Range argumentRange{};
         const bool argumentWait = pipelined && opcode == 0x16 && argumentWaitWanted(packet, queue, predicated, argumentRange);
+        DrawPipeline::Range indirectRange{};
+        const bool indirectQueued = pipelined && opcode == 0x16 && !argumentWait && orderedIndirectWanted(packet, queue, predicated, indirectRange);
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
             const bool queuesLabel = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && labelPacketQueues(packet, opcode);
             const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);
@@ -711,6 +793,7 @@ void Driver::execute(const Submission& submission) {
                 DrawFinisher::Get().AwaitExactPending({&argumentRange, 1}, DeepSite::IndirectArguments, FrameSite::ArgumentWait);
                 beside = true;
             }
+            if (!beside && indirectQueued) beside = true;
             if (!beside && !ordered && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::PacketFinisher)) {
                 if (opcode == 0x16 && DrawFinisher::FrameFlow()) DrawFinisher::NoteFrameKept(FrameKept::IndirectGpu);
                 noteKept();
@@ -746,8 +829,8 @@ void Driver::execute(const Submission& submission) {
                 }
             }
         }
-        if (pipelined && (opcode == 0x50 || (opcode == 0x46 && Pm4::SampleDump(packet))) && DrawFinisher::Get().FlipsQueued() != DrawFinisher::Get().FlipsCommitted() && DrawPipeline::Queue0().Busy()) {
-            DrawFinisher::NoteFrameKept(FrameKept::WorkerBehindFlip);
+        if (pipelined && (opcode == 0x50 || (opcode == 0x46 && Pm4::SampleDump(packet))) && (DrawFinisher::Get().FlipsQueued() != DrawFinisher::Get().FlipsCommitted() || DrawFinisher::Get().IndirectsInFlight()) && DrawPipeline::Queue0().Busy()) {
+            DrawFinisher::NoteFrameKept(DrawFinisher::Get().FlipsQueued() != DrawFinisher::Get().FlipsCommitted() ? FrameKept::WorkerBehindFlip : FrameKept::WorkerBehindIndirect);
             noteKept();
             DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         }
@@ -774,7 +857,7 @@ void Driver::execute(const Submission& submission) {
             }
         }
         timing.Mark("pipeline_prepare");
-        if (pipelined && !ordered && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode) && !(DrawFinisher::Deep() && asksVerdict() && awaitVerdictWriters(packet, header, opcode)) && !(argumentWait && DrawPipeline::Queue0().AwaitExactWriters({&argumentRange, 1}, DrawPipeline::DrainReason::Indirect, 0x16, DeepSite::IndirectArguments, FrameSite::ArgumentWait, FrameCheck::DispatchArguments))) {
+        if (pipelined && !ordered && !indirectQueued && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode) && !(DrawFinisher::Deep() && asksVerdict() && awaitVerdictWriters(packet, header, opcode)) && !(argumentWait && DrawPipeline::Queue0().AwaitExactWriters({&argumentRange, 1}, DrawPipeline::DrainReason::Indirect, 0x16, DeepSite::IndirectArguments, FrameSite::ArgumentWait, FrameCheck::DispatchArguments))) {
             const bool ordersFrame = header == FlipPacketHeader || header == RenderingWaitPacketHeader || submission.flips.contains(cursor) || opcode == 0x3c || opcode == 0x93 || opcode == 0x49 || opcode == 0x37;
             if (ordersFrame || !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::PacketCommitter)) {
                 if (opcode == 0x16 && !argumentWait && DrawFinisher::FrameFlow()) DrawFinisher::NoteFrameKept(FrameKept::IndirectGpu);
@@ -959,7 +1042,7 @@ void Driver::execute(const Submission& submission) {
             } clearOrder{ringOverlap};
             if (ringOverlap) ringOrder.afterDispatch = true;
             if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
-            else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission, indirectQueued); });
             Pm4::NoteDispatchRegisters(packet, queue);
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(opcode == 0x16);

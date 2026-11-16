@@ -1020,6 +1020,8 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
         bool dmaBeside = false;
         DrawPipeline::Range argumentRange{};
         const bool argumentWait = opcode == 0x16 && argumentWaitWanted(packet, queue, predicated, argumentRange);
+        DrawPipeline::Range indirectRange{};
+        const bool indirectQueued = opcode == 0x16 && !argumentWait && orderedIndirectWanted(packet, queue, predicated, indirectRange);
         if (DrawFinisher::Busy() && !entry.Has(LeanPacket::KeepsFinisher)) {
             const bool queuesLabel = !predicated && !entry.Has(LeanPacket::FlipHeader) && !entry.Has(LeanPacket::RenderingWait) && !flip && (opcode == 0x49 || opcode == 0x37) && labelPacketQueues(packet, opcode);
             const bool heldLabelWait = !predicated && orderedWaits() && entry.Has(LeanPacket::Wait) && !entry.Has(LeanPacket::RenderingWait) && PacketRules::waitTakesPendingLabel(packet);
@@ -1045,6 +1047,7 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                     DrawFinisher::Get().AwaitExactPending({&argumentRange, 1}, DeepSite::IndirectArguments, FrameSite::ArgumentWait);
                     keeps = true;
                 }
+                if (!keeps && indirectQueued) keeps = true;
             }
             const bool beside = DrawFinisher::Overlap() && (opcode != 0x15 || dispatchBeside) && (queuesLabel || heldLabelWait || queuesSampleDump || dmaBeside || keeps);
             if (!beside && !ordered && !LeanFront::SwitchSet(frontLatch, RuntimeSwitch::XpNoPacketDrains) && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::PacketFinisher)) {
@@ -1183,8 +1186,8 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                 DrawFinisher::Get().Drain(true);
             }
         }
-        if ((opcode == 0x50 || (opcode == 0x46 && Pm4::SampleDump(packet))) && DrawFinisher::Get().FlipsQueued() != DrawFinisher::Get().FlipsCommitted() && DrawPipeline::Queue0().Busy()) {
-            DrawFinisher::NoteFrameKept(FrameKept::WorkerBehindFlip);
+        if ((opcode == 0x50 || (opcode == 0x46 && Pm4::SampleDump(packet))) && (DrawFinisher::Get().FlipsQueued() != DrawFinisher::Get().FlipsCommitted() || DrawFinisher::Get().IndirectsInFlight()) && DrawPipeline::Queue0().Busy()) {
+            DrawFinisher::NoteFrameKept(DrawFinisher::Get().FlipsQueued() != DrawFinisher::Get().FlipsCommitted() ? FrameKept::WorkerBehindFlip : FrameKept::WorkerBehindIndirect);
             noteKept();
             DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         }
@@ -1227,9 +1230,10 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
             }
             if (!keeps && DrawFinisher::Deep() && asksVerdict()) keeps = PacketRules::awaitVerdictWriters(packet, header, opcode);
             if (!keeps && argumentWait) keeps = DrawPipeline::Queue0().AwaitExactWriters({&argumentRange, 1}, DrawPipeline::DrainReason::Indirect, 0x16, DeepSite::IndirectArguments, FrameSite::ArgumentWait, FrameCheck::DispatchArguments);
+            if (!keeps && indirectQueued) keeps = true;
             const bool ordersFrame = entry.Has(LeanPacket::FlipHeader) || entry.Has(LeanPacket::RenderingWait) || flip || entry.Has(LeanPacket::Wait) || opcode == 0x49 || opcode == 0x37;
             if (!keeps && !ordered && (ordersFrame || !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::PacketCommitter))) {
-                if (opcode == 0x16 && !argumentWait && DrawFinisher::FrameFlow()) DrawFinisher::NoteFrameKept(FrameKept::IndirectGpu);
+                if (opcode == 0x16 && !argumentWait && !indirectQueued && DrawFinisher::FrameFlow()) DrawFinisher::NoteFrameKept(FrameKept::IndirectGpu);
                 noteKept();
                 DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, entry.Has(LeanPacket::FlipHeader) ? 0xffu : opcode);
             }
@@ -1433,7 +1437,7 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                 }
             }
             if (opcode == 0x15) timedWork(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
-            else timedWork(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            else timedWork(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission, indirectQueued); });
             Pm4::NoteDispatchRegisters(packet, queue);
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(opcode == 0x16);

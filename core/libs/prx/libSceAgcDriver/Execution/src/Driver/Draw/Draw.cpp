@@ -376,6 +376,128 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
     return held;
 }
 
+bool stagesStoreThroughBda(const ShaderRecompiler::RecompileResult& compiled) {
+    return compiled.bdaStores && std::any_of(compiled.bindings.begin(), compiled.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
+}
+
+constexpr std::uint32_t HeldWalksPerPresent = 64;
+
+}
+
+bool Driver::nameHeldWrites(const DrawTail& tail, std::vector<std::pair<std::uint64_t, std::uint64_t>>& named) {
+    using Role = ShaderRecompiler::ProgramRole;
+    const auto start = std::chrono::steady_clock::now();
+    const auto spent = [&] { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()); };
+    const auto kept = [&](FrameKept reason) {
+        named.clear();
+        DrawFinisher::NoteFrameKept(reason);
+        DrawFinisher::NoteHeldNaming(false, 0, spent());
+        return false;
+    };
+    if (tail.decode == nullptr) return kept(FrameKept::HeldNoDecode);
+    if (tail.programs == nullptr || tail.matched.size() != tail.programs->size()) return kept(FrameKept::HeldSize);
+    if (Graphics::DescriptorHeapEnabled() || HeapFragmentsEnabled()) return kept(FrameKept::HeldHeap);
+    const auto& programs = *tail.programs;
+    const auto& roles = tail.decode->roles;
+    std::vector<std::size_t> walked;
+    for (std::size_t i = 0; i < programs.size(); ++i) {
+        if (i < roles.size() && roles[i] == Role::GeometryBack) continue;
+        const auto& program = programs[i];
+        const auto& variant = tail.matched[i];
+        if (variant != nullptr && variant->compiled != nullptr) {
+            const auto own = writesBeyondTargets(*variant->compiled);
+            const bool stageData = i < tail.stageData.size() && tail.stageData[i].compiled != nullptr;
+            const auto data = stageData ? writesBeyondTargets(*tail.stageData[i].compiled) : std::nullopt;
+            if (own == HeldReason::Bda || data == HeldReason::Bda || stagesStoreThroughBda(*variant->compiled) || (stageData && stagesStoreThroughBda(*tail.stageData[i].compiled))) return kept(FrameKept::HeldBda);
+            if (own.has_value() || data.has_value()) walked.push_back(i);
+            continue;
+        }
+        std::optional<FrameKept> refused;
+        const auto byForms = [&] {
+            if (program.snapshot == nullptr) {
+                refused = FrameKept::HeldUnbounded;
+                return;
+            }
+            const auto forms = ProgramWriteForms(*program.snapshot, program.codeOffset, program.tailContinuation.get());
+            if ((forms & ProgramWriteUnbounded) != 0) refused = FrameKept::HeldUnbounded;
+            else if ((forms & ProgramWriteScratch) != 0) refused = FrameKept::HeldScratch;
+            else if ((forms & ProgramWriteDescriptors) != 0) walked.push_back(i);
+        };
+        const bool candidates = !tail.drawHit && i < tail.dataCandidates.size() && !tail.dataCandidates[i].empty();
+        if (candidates) {
+            bool beyond = false;
+            bool unsure = false;
+            for (const auto& [candidate, regions] : tail.dataCandidates[i]) {
+                if (candidate == nullptr || candidate->compiled == nullptr) {
+                    unsure = true;
+                    continue;
+                }
+                const auto reason = writesBeyondTargets(*candidate->compiled);
+                if (reason == HeldReason::Bda || stagesStoreThroughBda(*candidate->compiled)) return kept(FrameKept::HeldBda);
+                if (reason.has_value()) beyond = true;
+            }
+            if (unsure) byForms();
+            if (refused.has_value()) return kept(*refused);
+            if (beyond && (walked.empty() || walked.back() != i)) walked.push_back(i);
+            continue;
+        }
+        if (program.snapshot != nullptr && !ProgramWritesMemory(*program.snapshot, program.codeOffset) && (program.tailContinuation == nullptr || !ProgramWritesMemory(*program.tailContinuation, 0))) continue;
+        byForms();
+        if (refused.has_value()) return kept(*refused);
+    }
+    const auto targets = DrawWriteRanges(tail.decode->state, {}, ExactDrawWrites());
+    named.assign(targets.begin(), targets.end());
+    if (!walked.empty()) {
+        struct WalkBudget {
+            std::uint64_t frame = ~std::uint64_t{0};
+            std::size_t walks = 0;
+        };
+        struct WalkBudgetStorage {};
+        auto& budget = HostThreadLocal<WalkBudget, WalkBudgetStorage>();
+        const auto frame = frameSerial.load(std::memory_order_relaxed);
+        if (budget.frame != frame) {
+            budget.frame = frame;
+            budget.walks = 0;
+        }
+        if (budget.walks + walked.size() > HeldWalksPerPresent) return kept(FrameKept::HeldLimit);
+        budget.walks += walked.size();
+        for (const auto i : walked) {
+            const auto& program = programs[i];
+            if (program.snapshot == nullptr || tail.localDevice == nullptr) return kept(FrameKept::HeldWalkFailed);
+            std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+            bool complete = false;
+            try {
+                const std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertexInfo = i < tail.vertexInfos.size() ? tail.vertexInfos[i] : std::nullopt;
+                const auto pushOffset = Graphics::StagePushOffset(0, program.binary.stage, tail.localDevice->GraphicsPipelineLibraries());
+                const auto request = drawStageRequest(program, tail.decode->state, tail.pixel, vertexInfo, tail.memory, tail.linked, *tail.localDevice, pushOffset, tail.drawParameters, std::nullopt);
+                ShaderMemory side(tail.memory, &queryPendingWrite, nullptr, nullptr, &QueryPendingSpan);
+                capture = CapturePreparedResources(side, *program.snapshot, program.codeOffset, request);
+                if (capture != nullptr) complete = CapturedWriteRanges(capture->plan.get(), capture->snapshot, named);
+            } catch (const std::exception&) {
+                return kept(FrameKept::HeldWalkFailed);
+            }
+            if (capture == nullptr) return kept(FrameKept::HeldNotPrepared);
+            if (capture->plan != nullptr && capture->plan->info.bdaWrites) return kept(FrameKept::HeldBda);
+            if (!complete) return kept(FrameKept::HeldWalkIncomplete);
+        }
+    }
+    std::sort(named.begin(), named.end());
+    std::size_t merged = 0;
+    for (std::size_t index = 0; index < named.size(); ++index) {
+        const auto range = named[index];
+        if (range.first >= range.second) continue;
+        if (merged != 0 && range.first <= named[merged - 1].second) named[merged - 1].second = std::max(named[merged - 1].second, range.second);
+        else named[merged++] = range;
+    }
+    named.resize(merged);
+    const auto ns = spent();
+    DrawFinisher::NoteFrameSite(FrameSite::HeldNamed, ns);
+    DrawFinisher::NoteHeldNaming(true, named.size(), ns);
+    return true;
+}
+
+namespace {
+
 bool EmptyIndirectSkip() {
     static const bool enabled = std::getenv("APS5_NO_EMPTY_INDIRECT_SKIP") == nullptr;
     return enabled;
@@ -915,6 +1037,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         noteFinisherHandOff(true);
         DrawFinisher::Pending held;
         if (DrawFinisher::Overlap()) held = heldWrites(tail);
+        const bool owned = DrawFinisher::OrderedSyncs();
+        if (held.unknown && owned && DrawFinisher::Overlap()) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> named;
+            if (nameHeldWrites(tail, named)) {
+                held.writes = std::move(named);
+                held.unknown = false;
+                held.named = true;
+            }
+        }
+        if (owned) tail.slotGeneration = 0;
         if (sink != nullptr) {
             sink->handed = true;
             sink->held = held;
@@ -924,8 +1056,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             sink->dataEntry = dataEntry;
             sink->device = localDevice.get();
         }
-        const auto rawHold = DrawFinisher::HoldRawReader(&submission);
-        DrawFinisher::Get().Enqueue([this, tailHolder, rawHold] {
+        const auto rawHold = owned ? nullptr : DrawFinisher::HoldRawReader(&submission);
+        DrawFinisher::Get().Enqueue([this, tailHolder, rawHold, owned, registry = owned ? submission.shaders : std::shared_ptr<const ShaderRegistry>{}] {
             struct ReaderDone {
                 const std::shared_ptr<DrawFinisher::RawReaderHold>& hold;
                 ~ReaderDone() {
@@ -933,6 +1065,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 }
             } readerDone{rawHold};
             auto& job = *tailHolder;
+            if (owned) {
+                struct OwnedSubmissionStorage {};
+                auto& scratch = HostThreadLocal<Submission, OwnedSubmissionStorage>();
+                if (scratch.shaders.get() != registry.get()) scratch.shaders = registry;
+                scratch.serial = job.submissionSerial;
+                scratch.queue = job.submissionQueue;
+                job.submission = &scratch;
+            }
             checkSegmentSlot(job, "started");
             DrawPipeline::FollowEpoch(job.epoch);
             DrawPipeline::Active() = job.pipelined;
@@ -949,7 +1089,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
             checkSegmentSlot(job, "finished");
         }, std::move(held));
-        DrawFinisher::Get().NoteRawReader();
+        if (owned) DrawFinisher::NoteFrameSite(FrameSite::ExitOwned);
+        else DrawFinisher::Get().NoteRawReader();
         timing.Mark("draw_handed_off");
         return drawn();
     }

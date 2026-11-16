@@ -300,6 +300,7 @@ struct ShaderSnapshot {
     std::shared_ptr<std::atomic<std::uint8_t>> memoryWrites = std::make_shared<std::atomic<std::uint8_t>>(0u);
     std::shared_ptr<std::atomic<bool>> rawGraphicsNoted = std::make_shared<std::atomic<bool>>(false);
     std::optional<std::uint32_t> userDataTailRegister;
+    std::shared_ptr<std::atomic<std::uint8_t>> writeForms = std::make_shared<std::atomic<std::uint8_t>>(0u);
 };
 
 
@@ -313,6 +314,11 @@ bool ProgramUsesWorkgroup(const ShaderSnapshot& snapshot, std::size_t codeOffset
 bool ProgramWritesMemory(const ShaderSnapshot& snapshot, std::size_t codeOffset);
 std::uint32_t ProgramWriteCause(const ShaderSnapshot& snapshot, std::size_t codeOffset);
 std::uint32_t ProgramWriteKinds(const ShaderSnapshot& snapshot, std::size_t codeOffset);
+inline constexpr std::uint8_t ProgramWriteDescriptors = 1u;
+inline constexpr std::uint8_t ProgramWriteGds = 2u;
+inline constexpr std::uint8_t ProgramWriteUnbounded = 4u;
+inline constexpr std::uint8_t ProgramWriteScratch = 8u;
+std::uint8_t ProgramWriteForms(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderSnapshot* continuation);
 // The PA_CL_VS_OUT_CNTL position export bits a vertex program is compiled with: none for a program
 // without pos1..pos3 exports, so its artifact does not depend on them.
 std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t codeOffset, std::span<const std::uint32_t> code, std::uint32_t paClVsOutCntl, const ShaderSnapshot* continuation = nullptr);
@@ -353,6 +359,7 @@ ShaderRecompiler::RectListShaders DrawRectangle(const ShaderSnapshot& front, con
 std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request);
 ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request);
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> CaptureInvocation(ShaderMemory& memory, const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::PreparedShaderInvocation& invocation);
+std::shared_ptr<const ShaderRecompiler::ResourceCapture> CapturePreparedResources(ShaderMemory& memory, const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request);
 bool PreparedHeapStage(const ShaderSnapshot& snapshot, std::size_t codeOffset);
 
 }

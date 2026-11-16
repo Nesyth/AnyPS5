@@ -250,6 +250,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_FRAME_FLOW",
     "APS5_XP_NO_RESOLVE_WAITS",
     "APS5_WRITE_VALIDATION",
+    "APS5_ORDERED_SYNCS",
 };
 static_assert(SwitchNames.back() != nullptr, "every runtime switch needs a name");
 
@@ -500,6 +501,7 @@ struct SwitchValues {
             std::getenv("APS5_FRAME_FLOW") != nullptr,
             std::getenv("APS5_XP_NO_RESOLVE_WAITS") != nullptr,
             std::getenv("APS5_WRITE_VALIDATION") != nullptr,
+            std::getenv("APS5_ORDERED_SYNCS") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

@@ -83,10 +83,10 @@ struct LabelRun {
 };
 
 enum class DeepSite : std::uint32_t { PacketVerdict, Predication, IndirectArguments, FillInputs, FillByTurn, DispatchReads, LateDispatchReads, Decode, HeapStages, Variant, WriteEvidence, ShaderCode, SameKey, EarlierKey, ItemsByTurn, ItemsWithReadsByTurn, PacketFinisher, Count };
-enum class DeepKept : std::uint32_t { Flip, RenderingWait, Wait, WorkerLabel, PacketVerdict, SegmentEnd, Submission, Settle, DeferredLabels, WorkerDraw, WorkerDispatch, MetadataPass, WorkerNote, Relocation, IndirectCpu, DispatchNotPipelined, Fallback, Shutdown, Other, NoteNotCandidate, NoteMultisampleClear, NoteMemoryValueFill, NoteHtileDepthClear, NoteHtileMaskClear, NoteHtileZmaskFixup, NoteDepthControl, Count };
-enum class FrameKept : std::uint32_t { NotLatched, AbPhase, SyncFlip, TimingLog, Predicated, LabelForm, DeferredLabels, FullLoopSegmentEnd, FullLoopSettle, FrontChange, Exception, IndirectGpu, IndexInconsistent, DmaCopy, DmaGds, DmaRefused, ResolveLimit, ExactUnsure, WorkerBehindFlip, Count };
-enum class FrameSite : std::uint32_t { OrderedFlip, RenderingWait, SegmentEnd, ExitWait, ExitFree, ArgumentWait, WriteScan, KeyScan, QueuedScan, DmaBeside, ListWait, ResolvedSkip, ResolveWait, Count };
-enum class FrameCheck : std::uint32_t { FlipOrder, ItemOrder, Lifetime, FlipState, DispatchArguments, FallbackScan, SegmentEnd, AbPhase, ListBytes, DmaOrder, Count };
+enum class DeepKept : std::uint32_t { Flip, RenderingWait, Wait, WorkerLabel, PacketVerdict, SegmentEnd, Submission, Settle, DeferredLabels, WorkerDraw, WorkerDispatch, MetadataPass, WorkerNote, Relocation, IndirectCpu, DispatchNotPipelined, Fallback, Shutdown, Other, NoteNotCandidate, NoteMultisampleClear, NoteMemoryValueFill, NoteHtileDepthClear, NoteHtileMaskClear, NoteHtileZmaskFixup, NoteDepthControl, WorkerDispatchReads, WorkerDispatchWrites, WorkerDispatchNotPlain, WorkerDispatchLate, WorkerDispatchCopy, Count };
+enum class FrameKept : std::uint32_t { NotLatched, AbPhase, SyncFlip, TimingLog, Predicated, LabelForm, DeferredLabels, FullLoopSegmentEnd, FullLoopSettle, FrontChange, Exception, IndirectGpu, IndexInconsistent, DmaCopy, DmaGds, DmaRefused, ResolveLimit, ExactUnsure, WorkerBehindFlip, SuspendNotLatched, SuspendTimingLog, SuspendDrainEnv, SuspendDeferredLabels, SuspendUnordered, IndirectNotLatched, IndirectPredicated, IndirectNoAddress, IndirectDeferredLabels, IndirectItemsOff, IndirectNotCandidate, IndirectNotPlain, IndirectUnbounded, IndirectFallback, IndirectNote, IndirectArgumentFallback, HeldNoDecode, HeldSize, HeldUnbounded, HeldScratch, HeldBda, HeldHeap, HeldWalkFailed, HeldWalkIncomplete, HeldLimit, WorkerBehindIndirect, HeldNotPrepared, Count };
+enum class FrameSite : std::uint32_t { OrderedFlip, RenderingWait, SegmentEnd, ExitWait, ExitFree, ArgumentWait, WriteScan, KeyScan, QueuedScan, DmaBeside, ListWait, ResolvedSkip, ResolveWait, SuspendOrdered, IndirectQueued, IndirectArgumentWait, HeldNamed, ExitOwned, Count };
+enum class FrameCheck : std::uint32_t { FlipOrder, ItemOrder, Lifetime, FlipState, DispatchArguments, FallbackScan, SegmentEnd, AbPhase, ListBytes, DmaOrder, SuspendOrder, SuspendCompletion, IndirectOrder, IndirectArguments, HeldWrites, Count };
 enum class FrameTail : std::uint32_t { RenderingWait, RewindTail, NoSubmission, Count };
 
 class DrawPipeline {
@@ -107,7 +107,7 @@ public:
     };
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
     enum class QueuedWrite : std::uint8_t { None, Stored, Unknown };
-    enum class CommitKind : std::uint8_t { Other, Draw, IndirectDraw, ColorMetadata, Dispatch, SampleDump, DmaFill, DmaWrite, DmaCopy, Store, EndOfPipe, Seal, SubmitEnd, Completion, BufferFill, Flip, Count };
+    enum class CommitKind : std::uint8_t { Other, Draw, IndirectDraw, ColorMetadata, Dispatch, SampleDump, DmaFill, DmaWrite, DmaCopy, Store, EndOfPipe, Seal, SubmitEnd, Completion, BufferFill, Flip, Suspend, IndirectDispatch, Count };
 
     static DrawPipeline& Queue0();
     static std::size_t Depth();
@@ -124,6 +124,7 @@ public:
     void EnqueueQuiet(Commit commit);
     void EnqueueKept(Commit commit, std::vector<Range> writes, std::vector<Range> reads, std::shared_ptr<const void> keep);
     void EnqueueFlip(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes);
+    void EnqueueSuspend(Commit commit);
     class FlipCommitScope {
     public:
         FlipCommitScope();
@@ -294,6 +295,7 @@ public:
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
         std::shared_ptr<const LabelRun> labelRun;
+        bool named = false;
     };
     enum class LabelLookup : std::uint8_t { NotHeld, Value, Unknown };
     struct DepositCounts {
@@ -367,6 +369,11 @@ public:
     static std::uint64_t TakeDeepestRelease();
     static bool FrameFlowWanted();
     static bool FrameFlow();
+    static bool OrderedSyncsWanted();
+    static bool OrderedSyncs();
+    static void NoteHeldNaming(bool named, std::size_t ranges, std::uint64_t ns);
+    static std::uint64_t HeldNamedTotal();
+    static std::uint64_t HeldUnknownTotal();
     static bool FrameCensus();
     bool FrameLatch() const { return frameLatch.load(std::memory_order_acquire); }
     void LatchFrameFlow();
@@ -380,6 +387,9 @@ public:
     std::uint64_t FlipsQueued() const { return flipsQueued.load(std::memory_order_acquire); }
     std::uint64_t FlipsCommitted() const { return flipsCommitted.load(std::memory_order_acquire); }
     std::uint64_t LastFlipSeq() const { return lastFlipSeq.load(std::memory_order_acquire); }
+    void NoteIndirectQueued() { indirectsQueued.fetch_add(1, std::memory_order_acq_rel); }
+    void NoteIndirectCommitted() { indirectsCommitted.fetch_add(1, std::memory_order_acq_rel); }
+    bool IndirectsInFlight() const { return indirectsQueued.load(std::memory_order_acquire) != indirectsCommitted.load(std::memory_order_acquire); }
     void NoteRawReader() { rawReader = nextSeq - 1; }
     std::uint64_t RawReader() const { return rawReader; }
     bool AwaitRawReaders();
@@ -467,6 +477,7 @@ private:
     static void forwardMerged(std::vector<Deposit>& deposits, std::size_t& sent);
     const std::vector<Deposit>& ownDeposits();
     bool depositsWrite(std::span<const Range> ranges);
+    void verifyNamedWrites(const DrawPipeline::Item& item);
     bool depositsRead(std::uint64_t address, std::size_t bytes);
     void checkDrainDeposits();
     void retireLean();
@@ -558,6 +569,8 @@ private:
     std::atomic<std::uint64_t> flipsQueued{0};
     std::atomic<std::uint64_t> flipsCommitted{0};
     std::atomic<std::uint64_t> lastFlipSeq{0};
+    std::atomic<std::uint64_t> indirectsQueued{0};
+    std::atomic<std::uint64_t> indirectsCommitted{0};
     std::atomic<std::uint32_t> resolveWaiters{0};
     std::vector<Range> openRunWrites;
     mutable std::mutex verifySlots;

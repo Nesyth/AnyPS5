@@ -524,6 +524,90 @@ bool ProgramWritesMemory(const ShaderSnapshot& snapshot, std::size_t codeOffset)
     return writes;
 }
 
+namespace {
+
+constexpr std::uint8_t WriteFormsKnown = 0x80u;
+constexpr std::uint8_t WriteFormsSetpc = 0x10u;
+constexpr std::uint8_t WriteFormsMask = ProgramWriteDescriptors | ProgramWriteGds | ProgramWriteUnbounded | ProgramWriteScratch;
+
+std::uint8_t decodedWriteForms(std::span<const std::uint32_t> code) {
+    using Family = ShaderRecompiler::RdnaInstructionFamily;
+    using Op = ShaderRecompiler::RdnaOpcode;
+    std::uint8_t forms = 0;
+    try {
+        const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
+        for (const auto& instruction : decoded.instructions) {
+            switch (instruction.family) {
+            case Family::MUBUF: case Family::MTBUF: case Family::MIMG:
+                if (!readOnlyMemoryOp(instruction.op)) forms |= ProgramWriteDescriptors;
+                break;
+            case Family::SMEM:
+                if (!readOnlyMemoryOp(instruction.op)) forms |= ProgramWriteUnbounded;
+                break;
+            case Family::FLAT:
+                if (!readOnlyMemoryOp(instruction.op)) forms |= instruction.memorySegment == 1u ? ProgramWriteScratch : ProgramWriteUnbounded;
+                break;
+            case Family::DS:
+                if (instruction.gds || instruction.op == Op::DsGwsInit || instruction.op == Op::DsGwsBarrier || instruction.op == Op::DsGwsSemaV || instruction.op == Op::DsGwsSemaP || instruction.op == Op::DsGwsSemaBr || instruction.op == Op::DsGwsSemaReleaseAll || instruction.op == Op::DsOrderedCount || instruction.op == Op::DsAppend || instruction.op == Op::DsConsume) forms |= ProgramWriteGds;
+                break;
+            case Family::Unknown:
+                forms |= ProgramWriteUnbounded;
+                break;
+            default:
+                if (instruction.op == Op::SSetpcB64) forms |= WriteFormsSetpc;
+                else if (instruction.op == Op::SSwappcB64 || instruction.op == Op::SRfeB64) forms |= ProgramWriteUnbounded;
+                break;
+            }
+        }
+    } catch (const std::exception&) {
+        forms |= ProgramWriteUnbounded;
+    }
+    return forms;
+}
+
+struct WriteFormsMemo {
+    std::weak_ptr<std::atomic<std::uint8_t>> owner;
+    std::size_t codeOffset = 0;
+    std::uint8_t forms = 0;
+};
+
+std::uint8_t codeWriteForms(const ShaderSnapshot& snapshot, std::size_t codeOffset) {
+    if (codeOffset > snapshot.code.size()) return ProgramWriteUnbounded;
+    const auto& owner = snapshot.writeForms;
+    if (codeOffset == 0 && owner != nullptr) {
+        const auto cached = owner->load(std::memory_order_acquire);
+        if ((cached & WriteFormsKnown) != 0) return static_cast<std::uint8_t>(cached & ~WriteFormsKnown);
+    }
+    struct WriteFormsMemoStorage {};
+    auto& memo = HostThreadLocal<std::vector<WriteFormsMemo>, WriteFormsMemoStorage>();
+    if (codeOffset != 0 && owner != nullptr) {
+        const auto found = std::find_if(memo.begin(), memo.end(), [&](const WriteFormsMemo& entry) { return entry.codeOffset == codeOffset && !entry.owner.owner_before(owner) && !owner.owner_before(entry.owner); });
+        if (found != memo.end()) return found->forms;
+    }
+    const auto forms = decodedWriteForms(std::span(snapshot.code).subspan(codeOffset));
+    if (owner == nullptr) return forms;
+    if (codeOffset == 0) {
+        owner->store(static_cast<std::uint8_t>(forms | WriteFormsKnown), std::memory_order_release);
+        return forms;
+    }
+    if (memo.size() >= 256u) memo.erase(memo.begin());
+    memo.push_back({owner, codeOffset, forms});
+    return forms;
+}
+
+}
+
+std::uint8_t ProgramWriteForms(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderSnapshot* continuation) {
+    auto forms = codeWriteForms(snapshot, codeOffset);
+    if ((forms & WriteFormsSetpc) != 0 && snapshot.userDataTailRegister.has_value() && continuation == nullptr) forms |= ProgramWriteUnbounded;
+    if (continuation != nullptr) {
+        auto more = codeWriteForms(*continuation, 0);
+        if ((more & WriteFormsSetpc) != 0 && continuation->userDataTailRegister.has_value()) more |= ProgramWriteUnbounded;
+        forms |= more;
+    }
+    return static_cast<std::uint8_t>(forms & WriteFormsMask);
+}
+
 std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t codeOffset, std::span<const std::uint32_t> code, std::uint32_t paClVsOutCntl, const ShaderSnapshot* continuation) {
     constexpr std::uint8_t Unknown = 0, Unused = 1, Used = 2;
     const auto bits = paClVsOutCntl & Graphics::PositionExportLayoutBits;
@@ -1285,6 +1369,37 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> CaptureInvocation(Shade
         }
         invocation = InvocationFor(snapshot, codeOffset, request);
     }
+}
+
+std::shared_ptr<const ShaderRecompiler::ResourceCapture> CapturePreparedResources(ShaderMemory& memory, const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
+    if (snapshot.prepared == nullptr || codeOffset >= snapshot.code.size()) return nullptr;
+    const auto code = std::span(snapshot.code).subspan(codeOffset);
+    if (request.shader.code.data() != code.data() || request.shader.code.size() != code.size()) return nullptr;
+    const auto shared = LinkUserDataCallees(request, snapshot, codeOffset);
+    ShaderRecompiler::LinkedCalls tail;
+    if (shared == nullptr || shared->code.empty()) tail.code = LinkGraphicsUserDataTail(request, snapshot);
+    const auto& linked = shared != nullptr && tail.code.empty() ? *shared : tail;
+    auto source = request;
+    if (!linked.code.empty()) {
+        source.shader.code = linked.code;
+        source.context.linkedCallFallbacks = linked.fallbacks;
+    }
+    std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+    {
+        std::lock_guard lock(snapshot.prepared->mutex);
+        if (snapshot.prepared->pending || snapshot.prepared->failure != nullptr) return nullptr;
+        if (std::ranges::find(snapshot.prepared->convertedSamples, codeOffset) != snapshot.prepared->convertedSamples.end()) source.context.convertedSamples = true;
+        if (std::ranges::find(snapshot.prepared->layerRowSamples, codeOffset) != snapshot.prepared->layerRowSamples.end()) source.context.layerRowSamples = true;
+        for (const auto& entry : snapshot.prepared->entries) {
+            if (entry.codeOffset != codeOffset || entry.handle == nullptr || entry.handle->source == nullptr || entry.handle->artifact == nullptr) continue;
+            if (!std::ranges::equal(ShaderRecompiler::GetPreparedCode(*entry.handle), source.shader.code)) continue;
+            handle = entry.handle;
+            break;
+        }
+    }
+    if (handle == nullptr) return nullptr;
+    const ShaderRecompiler::SourceHandle side{handle->source, nullptr, {}};
+    return memory.Capture(source, &side);
 }
 namespace {
 

@@ -36,7 +36,7 @@ namespace {
 
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainNames{"packet", "flush", "labels", "capture", "indirect", "submission"};
 
-constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)> KindNames{"other", "draw", "indirect", "colormeta", "dispatch", "sampledump", "dmafill", "dmawrite", "dmacopy", "store", "endofpipe", "seal", "submitend", "completion", "bufferfill", "flip"};
+constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)> KindNames{"other", "draw", "indirect", "colormeta", "dispatch", "sampledump", "dmafill", "dmawrite", "dmacopy", "store", "endofpipe", "seal", "submitend", "completion", "bufferfill", "flip", "suspend", "indirectdispatch"};
 
 std::atomic<unsigned> runningCommitters{0};
 std::atomic<unsigned> runningFinishers{0};
@@ -1022,7 +1022,7 @@ void noteRingDepth(std::uint64_t depth) {
 }
 
 namespace {
-constexpr std::array<const char*, static_cast<std::size_t>(DeepKept::Count)> DeepKeptNames{"flip", "rendering wait", "wait", "worker label", "packet verdict", "segment end", "submission", "settle", "deferred labels", "worker draw", "worker dispatch", "metadata pass", "worker note", "relocation", "indirect cpu", "dispatch not pipelined", "fallback", "shutdown", "other", "note: dispatch not a candidate", "note: multisampled clear", "note: memory value fill", "note: HTILE depth clear", "note: HTILE mask clear", "note: HTILE zmask fix-up", "note: depth render control"};
+constexpr std::array<const char*, static_cast<std::size_t>(DeepKept::Count)> DeepKeptNames{"flip", "rendering wait", "wait", "worker label", "packet verdict", "segment end", "submission", "settle", "deferred labels", "worker draw", "worker dispatch", "metadata pass", "worker note", "relocation", "indirect cpu", "dispatch not pipelined", "fallback", "shutdown", "other", "note: dispatch not a candidate", "note: multisampled clear", "note: memory value fill", "note: HTILE depth clear", "note: HTILE mask clear", "note: HTILE zmask fix-up", "note: depth render control", "worker dispatch: no entry or reads", "worker dispatch: writes or recipe", "worker dispatch: not plain", "worker dispatch: late item refused", "worker dispatch: copy kernel"};
 constexpr std::array<const char*, static_cast<std::size_t>(DeepSite::Count)> DeepSiteNames{"packet verdict", "predication", "indirect arguments", "fill inputs", "fill by turn", "dispatch reads", "late dispatch reads", "decode", "heap stages", "variant", "write evidence", "shader code", "same key", "earlier key", "items by turn", "items with reads by turn", "packet finisher"};
 static_assert(DeepKeptNames.back() != nullptr && DeepSiteNames.back() != nullptr, "every deep flow census entry needs a name");
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DeepKept::Count)> deepKept{};
@@ -1040,8 +1040,8 @@ void noteDeepDepth(std::uint64_t depth) {
 }
 
 namespace {
-constexpr std::array<const char*, static_cast<std::size_t>(FrameKept::Count)> FrameKeptNames{"not latched", "ab phase", "sync flip", "timing log", "predicated", "label form", "deferred labels", "full loop segment end", "full loop settle", "front change", "exception", "indirect gpu", "index inconsistent", "dma copy", "dma to gds", "dma refused", "unknown chain limit", "exact index unsure", "worker dma, sample dump or note behind a flip"};
-constexpr std::array<const char*, static_cast<std::size_t>(FrameSite::Count)> FrameSiteNames{"ordered flip", "rendering wait", "segment end", "exit wait", "exit free", "argument wait", "write scan", "key scan", "queued scan", "dma beside", "register list wait", "resolved unknown jobs passed", "resolve wait"};
+constexpr std::array<const char*, static_cast<std::size_t>(FrameKept::Count)> FrameKeptNames{"not latched", "ab phase", "sync flip", "timing log", "predicated", "label form", "deferred labels", "full loop segment end", "full loop settle", "front change", "exception", "indirect gpu", "index inconsistent", "dma copy", "dma to gds", "dma refused", "unknown chain limit", "exact index unsure", "worker dma, sample dump or note behind a flip", "suspend: not latched", "suspend: timing log", "suspend: drain asked", "suspend: deferred labels", "suspend: unordered completion", "indirect: not latched", "indirect: predicated", "indirect: no address", "indirect: deferred labels", "indirect: dispatch items off", "indirect: not a candidate", "indirect: not plain", "indirect: unbounded writes", "indirect: no entry, reads or recipe", "indirect: dispatch note", "indirect: argument wait fell back", "held draw: no decode", "held draw: stage count", "held draw: unbounded writes", "held draw: scratch writes", "held draw: BDA stores", "held draw: descriptor heap", "held draw: walk failed", "held draw: walk incomplete", "held draw: walk limit", "worker dma, sample dump or note behind an indirect dispatch", "held draw: program not prepared"};
+constexpr std::array<const char*, static_cast<std::size_t>(FrameSite::Count)> FrameSiteNames{"ordered flip", "rendering wait", "segment end", "exit wait", "exit free", "argument wait", "write scan", "key scan", "queued scan", "dma beside", "register list wait", "resolved unknown jobs passed", "resolve wait", "suspend ordered", "indirect queued", "indirect argument wait", "held writes named", "exit owned"};
 static_assert(FrameKeptNames.back() != nullptr && FrameSiteNames.back() != nullptr, "every frame flow census entry needs a name");
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrameKept::Count)> frameKept{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrameSite::Count)> frameSites{};
@@ -1053,12 +1053,18 @@ std::atomic<std::uint64_t> flipItemsSum{0};
 std::atomic<std::uint64_t> flipItemsHighest{0};
 std::atomic<std::uint64_t> flipsInFlightSum{0};
 std::atomic<std::uint64_t> flipsInFlightHighest{0};
+std::atomic<std::uint64_t> heldNamedTotal{0};
+std::atomic<std::uint64_t> heldUnknownTotal{0};
+std::atomic<std::uint64_t> heldNamedWindow{0};
+std::atomic<std::uint64_t> heldUnknownWindow{0};
+std::atomic<std::uint64_t> heldRangesWindow{0};
+std::atomic<std::uint64_t> heldNamingNs{0};
 
 void noteFrameHighest(std::atomic<std::uint64_t>& highest, std::uint64_t value) {
     if (value > highest.load(std::memory_order_relaxed)) highest.store(value, std::memory_order_relaxed);
 }
 
-constexpr std::array<const char*, static_cast<std::size_t>(FrameCheck::Count)> FrameCheckNames{"flip order", "item order", "lifetime", "flip state", "dispatch arguments", "fallback scan", "segment end", "ab phase", "register list", "dma order"};
+constexpr std::array<const char*, static_cast<std::size_t>(FrameCheck::Count)> FrameCheckNames{"flip order", "item order", "lifetime", "flip state", "dispatch arguments", "fallback scan", "segment end", "ab phase", "register list", "dma order", "suspend order", "suspend completion", "indirect order", "indirect arguments", "held writes"};
 static_assert(FrameCheckNames.back() != nullptr, "every frame flow check needs a name");
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrameCheck::Count)> frameCheckOrdinals{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrameCheck::Count)> frameChecked{};
@@ -1388,6 +1394,30 @@ bool DrawFinisher::FrameFlow() {
     return finisher.frameLatch.load(std::memory_order_acquire) && finisher.frameGeneration.load(std::memory_order_relaxed) == Graphics::RuntimeSwitches::Generation() && FrameFlowWanted();
 }
 
+bool DrawFinisher::OrderedSyncsWanted() {
+    return FrameFlowWanted() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::OrderedSyncs);
+}
+
+bool DrawFinisher::OrderedSyncs() {
+    return FrameFlow() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::OrderedSyncs);
+}
+
+void DrawFinisher::NoteHeldNaming(bool named, std::size_t ranges, std::uint64_t ns) {
+    (named ? heldNamedTotal : heldUnknownTotal).fetch_add(1, std::memory_order_relaxed);
+    if (!pipelineStats()) return;
+    (named ? heldNamedWindow : heldUnknownWindow).fetch_add(1, std::memory_order_relaxed);
+    if (named) heldRangesWindow.fetch_add(ranges, std::memory_order_relaxed);
+    heldNamingNs.fetch_add(ns, std::memory_order_relaxed);
+}
+
+std::uint64_t DrawFinisher::HeldNamedTotal() {
+    return heldNamedTotal.load(std::memory_order_relaxed);
+}
+
+std::uint64_t DrawFinisher::HeldUnknownTotal() {
+    return heldUnknownTotal.load(std::memory_order_relaxed);
+}
+
 bool DrawFinisher::FrameCensus() {
     return pipelineStats();
 }
@@ -1503,6 +1533,13 @@ std::string DrawFinisher::FrameText() {
     std::snprintf(head, sizeof(head), "switch %s, latch %s; flips ordered %llu (%.1f ms queueing them on the worker), queued %llu and committed %llu in all",
         FrameFlowWanted() ? "set" : "unset", FrameFlow() ? "on" : "off", sites[0], ms(siteNs[0]), static_cast<unsigned long long>(finisher.FlipsQueued()), static_cast<unsigned long long>(finisher.FlipsCommitted()));
     std::string text = head;
+    const auto namedHeld = take(heldNamedWindow);
+    const auto unknownHeld = take(heldUnknownWindow);
+    const auto namedRanges = take(heldRangesWindow);
+    char syncs[256];
+    std::snprintf(syncs, sizeof(syncs), "; ordered syncs %s, %s; held draws named %llu (%.1f ranges each), still unknown %llu, %.2f ms naming them on the worker",
+        Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::OrderedSyncs) ? "set" : "unset", OrderedSyncs() ? "on" : "off", namedHeld, namedHeld == 0 ? 0.0 : static_cast<double>(namedRanges) / static_cast<double>(namedHeld), unknownHeld, ms(take(heldNamingNs)));
+    text += syncs;
     text += "; kept drains by reason:";
     bool shown = false;
     for (std::size_t index = 0; index < frameKept.size(); ++index) {
@@ -2523,6 +2560,7 @@ void DrawFinisher::PublishLean(LeanRunner runner, std::span<const Range> writes,
     held.shape = shape;
     held.inserts = true;
     held.unknown = false;
+    held.named = false;
     held.writes.assign(writes.begin(), writes.end());
     held.labelAddress = 0;
     held.labelBytes.clear();
@@ -3207,6 +3245,14 @@ void DrawPipeline::EnqueueFlip(Commit commit, std::vector<Range> writes, std::ui
     enqueue(std::move(item));
 }
 
+void DrawPipeline::EnqueueSuspend(Commit commit) {
+    Item item;
+    item.commit = std::move(commit);
+    item.kind = CommitKind::Suspend;
+    item.quiet = true;
+    enqueue(std::move(item));
+}
+
 namespace {
 struct ItemTurnSlot {};
 using ItemTurn = HostThreadSlot<bool, ItemTurnSlot>;
@@ -3236,8 +3282,35 @@ DrawPipeline::OrderProbe::~OrderProbe() {
     OrderProbing::Set(previous);
 }
 
+void DrawFinisher::verifyNamedWrites(const DrawPipeline::Item& item) {
+    const auto seq = FinisherSeq::Get();
+    if (seq == 0 || lean == nullptr || !ringMode.load(std::memory_order_acquire)) return;
+    const auto& slot = leanSlot(seq);
+    if (slot.seq.load(std::memory_order_acquire) != seq || !slot.pending.named) return;
+    if (!FrameVerifyDue(FrameCheck::HeldWrites)) return;
+    const auto& named = slot.pending.writes;
+    const auto covered = [&](const Range& range) {
+        if (range.first >= range.second) return true;
+        return std::any_of(named.begin(), named.end(), [&](const Range& held) { return held.first <= range.first && range.second <= held.second; });
+    };
+    std::optional<Range> missing;
+    for (const auto& write : item.writes) {
+        if (covered(write)) continue;
+        missing = write;
+        break;
+    }
+    if (!missing.has_value() && item.labelAddress != 0 && !item.labelBytes.empty()) {
+        const Range label{item.labelAddress, item.labelAddress + item.labelBytes.size()};
+        if (!covered(label)) missing = label;
+    }
+    char text[320];
+    std::snprintf(text, sizeof(text), "the draw job %llu, published with %zu write ranges named on the worker, queued a %s item that writes [0x%llx, 0x%llx) outside them", static_cast<unsigned long long>(seq), named.size(), KindNames[static_cast<std::size_t>(item.kind)], static_cast<unsigned long long>(missing.has_value() ? missing->first : 0), static_cast<unsigned long long>(missing.has_value() ? missing->second : 0));
+    NoteFrameCheck(FrameCheck::HeldWrites, missing.has_value(), text);
+}
+
 void DrawPipeline::enqueue(Item item) {
     if (!DrawFinisher::OnFinisherThread()) DrawFinisher::Get().FlushOpenRun();
+    else if (DrawFinisher::FrameVerifyEvery() != 0) DrawFinisher::Get().verifyNamedWrites(item);
     if (const auto probe = OrderProbing::Get(); probe != 0 && !DrawFinisher::OnFinisherThread()) {
         OrderProbing::Set(0);
         const auto check = static_cast<FrameCheck>(probe - 1u);

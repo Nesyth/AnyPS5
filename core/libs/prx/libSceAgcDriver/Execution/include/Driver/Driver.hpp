@@ -216,6 +216,11 @@ private:
         bool releases = false;
         std::shared_ptr<FlipProbe> probe;
     };
+    struct IndirectProbe {
+        std::uint64_t arguments = 0;
+        std::uint32_t initiator = 0;
+        std::array<std::uint32_t, 3> expected{};
+    };
     void stop();
     Driver();
     void rethrowFailure() const;
@@ -352,6 +357,7 @@ private:
     void resolveDrawDecode(const QueueState& queue, const Submission& submission, const Graphics::Context& context, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile);
     void lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData);
     enum class HeapDirect { Declined, Unmapped, Taken };
+    bool nameHeldWrites(const DrawTail& tail, std::vector<std::pair<std::uint64_t, std::uint64_t>>& named);
     static ShaderRecompiler::RecompileRequest drawStageRequest(const DrawProgram& program, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const ShaderRecompiler::MemoryRegion> memory, std::span<const ShaderRecompiler::LinkedProgram> linked, const VulkanDevice& device, std::uint32_t pushOffset, const Pm4::DrawParameters& drawParameters, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics);
     std::shared_ptr<const ShaderRecompiler::RecompileResult> materializeDrawStage(const DrawStageContext& context, std::size_t i, std::uint32_t pushOffset, const Pm4::DrawParameters& drawParameters, bool heapPartners);
     HeapDirect materializeHeapDirect(const DrawStageContext& context, std::size_t i, const ShaderRecompiler::PreparedShaderInvocation& invocation, const ShaderRecompiler::RecompileRequest& request, PerformanceTimer& timing);
@@ -449,13 +455,14 @@ private:
     void traceCopyPending(const char* what, std::uint64_t address, std::size_t bytes, std::uint64_t source, std::uint64_t destination, std::size_t copyBytes, const std::shared_ptr<VulkanDevice>& localDevice);
     static void countIndirect(int path, double readMs);
     static int indirectArgumentsPath(std::span<const std::uint32_t> packet, std::uint64_t arguments);
-    void dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
+    void dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, bool ordered = false);
     enum class AheadArguments { None, Matched, Differed };
     struct IndirectSource {
         std::uint64_t arguments = 0;
         int path = IndirectGpu;
         std::uint32_t queue = 0;
         AheadArguments ahead = AheadArguments::None;
+        bool ordered = false;
     };
     static IndirectSource& indirectSource();
     static std::string describeIndirectSource();
@@ -601,8 +608,16 @@ private:
     bool flipOrdered(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool predicated, PacketRules::FlipForm& form, double& abSeconds);
     void queueOrderedFlip(FlipCommit commit);
     void commitFlip(const FlipCommit& flip);
+    bool suspendOrdered();
+    void queueOrderedSuspend(const Submission& submission);
+    void commitSuspend(std::uint64_t serial, std::uint64_t after);
+    void verifySuspendCommit(std::uint64_t serial, std::uint64_t after);
     PacketRules::DmaForm dmaPacketForm(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue);
     bool argumentWaitWanted(std::span<const std::uint32_t> packet, const QueueState& queue, bool predicated, std::pair<std::uint64_t, std::uint64_t>& range);
+    bool orderedIndirectWanted(std::span<const std::uint32_t> packet, const QueueState& queue, bool predicated, std::pair<std::uint64_t, std::uint64_t>& range);
+    void awaitIndirectArguments(const std::pair<std::uint64_t, std::uint64_t>& range);
+    std::shared_ptr<IndirectProbe> makeIndirectProbe(std::uint64_t arguments, std::uint32_t initiator);
+    void verifyIndirectCommit(const std::shared_ptr<IndirectProbe>& probe);
     static std::optional<std::uint32_t> releaseInterrupt(std::span<const std::uint32_t> packet, std::uint32_t opcode, bool carriesFlip);
     void markCompleted(std::uint64_t serial);
     static const std::atomic<std::uint64_t>*& workerQueued();

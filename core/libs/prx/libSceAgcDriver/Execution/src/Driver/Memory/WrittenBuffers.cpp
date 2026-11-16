@@ -7,7 +7,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include "IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
+#include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -169,6 +172,47 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graph
         }
     }
     return ranges;
+}
+
+bool CapturedWriteRanges(const ShaderRecompiler::IrResourcePlan* plan, const ShaderRecompiler::ResourceSnapshot& snapshot, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    constexpr std::uint64_t UnknownBytes = 64ull * 1024 * 1024;
+    const auto add = [&](std::uint64_t begin, std::uint64_t bytes) {
+        if (begin != 0 && bytes != 0) ranges.emplace_back(begin, begin + bytes);
+    };
+    const auto bufferWritten = [&](std::size_t resource) {
+        if (plan == nullptr || resource >= plan->info.buffers.size()) return true;
+        const auto& buffer = plan->info.buffers[resource];
+        return buffer.written || buffer.atomic;
+    };
+    const auto imageWritten = [&](std::size_t resource) {
+        if (plan == nullptr || resource >= plan->info.images.size()) return true;
+        const auto& image = plan->info.images[resource];
+        return image.written || image.atomic || image.atomic64;
+    };
+    for (std::size_t resource = 0; resource < snapshot.buffers.size(); ++resource) {
+        const auto& buffer = snapshot.buffers[resource];
+        if (buffer.dwordCount == 0 || !bufferWritten(resource)) continue;
+        if (buffer.dwordCount != 4 || (buffer.availableDwordMask & 0xfu) != 0xfu) return false;
+        const ShaderRecompiler::ShaderBufferResource descriptor{{buffer.dwords[0], buffer.dwords[1], buffer.dwords[2], buffer.dwords[3]}};
+        add(descriptor.Base48(), descriptor.GetSize());
+    }
+    for (std::size_t resource = 0; resource < snapshot.images.size(); ++resource) {
+        const auto& image = snapshot.images[resource];
+        if (image.dwordCount == 0 || !imageWritten(resource)) continue;
+        if (image.dwordCount != 8 || image.availableDwordMask != 0xffu) return false;
+        std::array<std::uint32_t, 8> words{};
+        std::copy_n(image.dwords.begin(), words.size(), words.begin());
+        for (const bool identity : {false, true}) {
+            if (identity) words[3] = (words[3] & ~0xfffu) | ShaderRecompiler::ShaderImageIdentitySwizzle;
+            if (Graphics::IsNullTextureResource(words)) continue;
+            const auto decoded = Graphics::DecodeTextureResource(words);
+            if (decoded.baseAddress == 0) continue;
+            const auto surfaceBytes = Graphics::DescribeSurface(decoded).guestBytes;
+            add(decoded.baseAddress, surfaceBytes != 0 ? surfaceBytes : UnknownBytes);
+            add(decoded.dccAddress, surfaceBytes != 0 ? surfaceBytes / 256 + 1 : UnknownBytes);
+        }
+    }
+    return true;
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages) {

@@ -244,6 +244,7 @@ enum class RuntimeSwitch : std::size_t {
     FrameFlow,
     XpNoResolveWaits,
     WriteValidation,
+    OrderedSyncs,
     Count,
 };
 
