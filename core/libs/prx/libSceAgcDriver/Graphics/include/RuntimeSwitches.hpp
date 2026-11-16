@@ -245,6 +245,7 @@ enum class RuntimeSwitch : std::size_t {
     XpNoResolveWaits,
     WriteValidation,
     OrderedSyncs,
+    DeepShallow,
     Count,
 };
 

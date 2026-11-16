@@ -2502,10 +2502,30 @@ void DrawFinisher::latchDeepRing(bool deep) {
     deepRing.store(deep, std::memory_order_seq_cst);
 }
 
+namespace {
+std::uint64_t shallowCount(const char* name, std::uint64_t fallback) {
+    const char* text = std::getenv(name);
+    if (text == nullptr || *text == 0) return fallback;
+    const auto value = std::strtoull(text, nullptr, 10);
+    return std::clamp<std::uint64_t>(value, 16, DrawFinisher::LeanSlots);
+}
+
+std::uint64_t shallowJobs() {
+    static const std::uint64_t jobs = shallowCount("APS5_DEEP_SHALLOW_JOBS", 128);
+    return jobs;
+}
+
+std::uint64_t shallowItems() {
+    static const std::uint64_t items = shallowCount("APS5_DEEP_SHALLOW_ITEMS", shallowJobs());
+    return items;
+}
+}
+
 void DrawFinisher::awaitLeanRoom(bool helping) {
     static_assert(PublishedKeys::Capacity <= NarrowLeanSlots && 16 <= NarrowLeanSlots && NarrowLeanSlots <= LeanSlots && (NarrowLeanSlots & (NarrowLeanSlots - 1)) == 0 && (LeanSlots & (LeanSlots - 1)) == 0, "the finisher ring must hold the deepest finisher queue, in a power-of-two number of slots");
     fitLeanSpan();
-    const std::uint64_t depth = (Flow() || (Deep() && deepRing.load(std::memory_order_relaxed))) && leanMask.load(std::memory_order_relaxed) + 1 == LeanSlots ? LeanSlots : finisherDepth();
+    const std::uint64_t deepDepth = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DeepShallow) && !Flow() ? shallowJobs() : LeanSlots;
+    const std::uint64_t depth = (Flow() || (Deep() && deepRing.load(std::memory_order_relaxed))) && leanMask.load(std::memory_order_relaxed) + 1 == LeanSlots ? deepDepth : finisherDepth();
     const auto full = [&] { return nextSeq - frontSeq.load(std::memory_order_seq_cst) >= depth && !closed.load(std::memory_order_acquire); };
     if (!full()) {
         retireLean();
@@ -3531,7 +3551,8 @@ void DrawPipeline::queueItem(Item item) {
         item.commit();
         return;
     }
-    const auto roomLimit = DrawFinisher::Flow() || (DrawFinisher::Deep() && deepQueue.load(std::memory_order_relaxed)) ? DrawFinisher::LeanSlots : deepQueues() ? std::max<std::size_t>(Depth(), 32) : Depth();
+    const std::size_t deepLimit = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DeepShallow) && !DrawFinisher::Flow() ? static_cast<std::size_t>(shallowItems()) : DrawFinisher::LeanSlots;
+    const auto roomLimit = DrawFinisher::Flow() || (DrawFinisher::Deep() && deepQueue.load(std::memory_order_relaxed)) ? deepLimit : deepQueues() ? std::max<std::size_t>(Depth(), 32) : Depth();
     if (items.size() >= roomLimit) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const TailWatch watch(true, TailExtra::QueueRoom);
