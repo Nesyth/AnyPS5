@@ -457,7 +457,7 @@ std::uint32_t ProgramWriteCause(const ShaderSnapshot& snapshot, std::size_t code
                 writes = !readOnlyMemoryOp(instruction.op);
                 break;
             case Family::DS:
-                writes = decodedWritesMemory(std::span(snapshot.code).subspan(codeOffset));
+                writes = instruction.gds || instruction.op == Op::DsGwsInit || instruction.op == Op::DsGwsBarrier || instruction.op == Op::DsGwsSemaV || instruction.op == Op::DsGwsSemaP || instruction.op == Op::DsGwsSemaBr || instruction.op == Op::DsGwsSemaReleaseAll || instruction.op == Op::DsOrderedCount || instruction.op == Op::DsAppend || instruction.op == Op::DsConsume;
                 break;
             case Family::Unknown:
                 writes = true;
@@ -466,12 +466,50 @@ std::uint32_t ProgramWriteCause(const ShaderSnapshot& snapshot, std::size_t code
                 writes = instruction.op == Op::SSetpcB64 || instruction.op == Op::SSwappcB64 || instruction.op == Op::SRfeB64;
                 break;
             }
-            if (writes) return (static_cast<std::uint32_t>(instruction.family) << 16u) | (static_cast<std::uint32_t>(instruction.op) & 0xffffu);
+            if (writes) return ((instruction.family == Family::FLAT ? instruction.memorySegment & 0xfu : 0u) << 28u) | (static_cast<std::uint32_t>(instruction.family) << 16u) | (static_cast<std::uint32_t>(instruction.op) & 0xffffu);
         }
     } catch (const std::exception&) {
         return 0xffffffffu;
     }
     return 0;
+}
+
+std::uint32_t ProgramWriteKinds(const ShaderSnapshot& snapshot, std::size_t codeOffset) {
+    using Family = ShaderRecompiler::RdnaInstructionFamily;
+    using Op = ShaderRecompiler::RdnaOpcode;
+    if (codeOffset > snapshot.code.size()) return 0x100u;
+    std::uint32_t kinds = 0;
+    try {
+        const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(std::span(snapshot.code).subspan(codeOffset));
+        for (const auto& instruction : decoded.instructions) {
+            switch (instruction.family) {
+            case Family::MUBUF: case Family::MTBUF:
+                if (!readOnlyMemoryOp(instruction.op)) kinds |= 1u;
+                break;
+            case Family::MIMG:
+                if (!readOnlyMemoryOp(instruction.op)) kinds |= 2u;
+                break;
+            case Family::SMEM:
+                if (!readOnlyMemoryOp(instruction.op)) kinds |= 4u;
+                break;
+            case Family::FLAT:
+                if (!readOnlyMemoryOp(instruction.op)) kinds |= instruction.memorySegment == 1u ? 8u : 16u;
+                break;
+            case Family::DS:
+                if (instruction.gds || instruction.op == Op::DsGwsInit || instruction.op == Op::DsGwsBarrier || instruction.op == Op::DsGwsSemaV || instruction.op == Op::DsGwsSemaP || instruction.op == Op::DsGwsSemaBr || instruction.op == Op::DsGwsSemaReleaseAll || instruction.op == Op::DsOrderedCount || instruction.op == Op::DsAppend || instruction.op == Op::DsConsume) kinds |= 32u;
+                break;
+            case Family::Unknown:
+                kinds |= 64u;
+                break;
+            default:
+                if (instruction.op == Op::SSetpcB64 || instruction.op == Op::SSwappcB64 || instruction.op == Op::SRfeB64) kinds |= 128u;
+                break;
+            }
+        }
+    } catch (const std::exception&) {
+        return 0x200u;
+    }
+    return kinds;
 }
 
 bool ProgramWritesMemory(const ShaderSnapshot& snapshot, std::size_t codeOffset) {

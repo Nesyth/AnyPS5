@@ -277,20 +277,25 @@ void noteHeldProgram(const Program& program) {
     static const bool profile = std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (!profile) return;
     static std::mutex mutex;
-    static std::map<std::uint32_t, std::uint64_t> causes;
+    static std::map<std::uint64_t, std::uint64_t> causes;
     static std::uint64_t total = 0;
-    std::uint32_t cause = 0xfffffffdu;
+    std::uint64_t cause = 0xfffffffdu;
     if (program.snapshot != nullptr) {
-        cause = ProgramWriteCause(*program.snapshot, program.codeOffset);
-        if (cause == 0 && program.tailContinuation != nullptr) cause = 0x80000000u | ProgramWriteCause(*program.tailContinuation, 0);
+        std::uint32_t first = ProgramWriteCause(*program.snapshot, program.codeOffset);
+        std::uint32_t kinds = ProgramWriteKinds(*program.snapshot, program.codeOffset);
+        if (program.tailContinuation != nullptr) {
+            if (first == 0) first = 0x08000000u | ProgramWriteCause(*program.tailContinuation, 0);
+            kinds |= ProgramWriteKinds(*program.tailContinuation, 0) << 12u;
+        }
+        cause = (static_cast<std::uint64_t>(kinds) << 32u) | first;
     }
     std::lock_guard lock(mutex);
     ++causes[cause];
     if (++total % 4096u != 0) return;
     std::string text;
     for (const auto& [key, count] : causes) {
-        char item[48];
-        std::snprintf(item, sizeof(item), " 0x%08x x%llu", key, static_cast<unsigned long long>(count));
+        char item[80];
+        std::snprintf(item, sizeof(item), " first 0x%08x kinds 0x%06x x%llu", static_cast<std::uint32_t>(key), static_cast<std::uint32_t>(key >> 32u), static_cast<unsigned long long>(count));
         text += item;
     }
     std::fprintf(stderr, "[finisher-held] programs counted as writing memory, by the first such instruction (family << 16 | opcode; 0xffffffff decode failed, 0xfffffffe offset past the code, 0xfffffffd no snapshot, 0x8... found in the continuation):%s\n", text.c_str());
