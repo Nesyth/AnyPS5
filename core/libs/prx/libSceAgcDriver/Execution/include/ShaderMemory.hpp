@@ -94,6 +94,9 @@ public:
     // generation), for a walk over another reader.
     static void SetImageViewHooks(ShaderRecompiler::SrtRuntime& runtime);
     void RecordReadNodes(std::vector<std::uint32_t>* nodes) { readNodes = nodes; }
+    [[nodiscard]] std::uint32_t ForcedSyncs() const { return forcedSyncs; }
+    [[nodiscard]] std::uint32_t SyncedReads() const { return syncedReads; }
+    void DisableStamps() { stamps = false; }
 
 private:
     std::vector<std::uint32_t>* readNodes = nullptr;
@@ -182,6 +185,9 @@ private:
     std::size_t descriptorSpanBytes = 0;
     std::uint64_t rawInvalidations = 0;
     std::uint32_t forceSync = 0;
+    std::uint32_t forcedSyncs = 0;
+    std::uint32_t syncedReads = 0;
+    bool stamps = true;
     std::uint64_t branchReadsRefused = 0;
     bool waitBranches = false;
 };

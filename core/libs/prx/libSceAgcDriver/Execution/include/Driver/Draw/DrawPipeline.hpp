@@ -84,7 +84,7 @@ struct LabelRun {
 
 enum class DeepSite : std::uint32_t { PacketVerdict, Predication, IndirectArguments, FillInputs, FillByTurn, DispatchReads, LateDispatchReads, Decode, HeapStages, Variant, WriteEvidence, ShaderCode, SameKey, EarlierKey, ItemsByTurn, ItemsWithReadsByTurn, PacketFinisher, Count };
 enum class DeepKept : std::uint32_t { Flip, RenderingWait, Wait, WorkerLabel, PacketVerdict, SegmentEnd, Submission, Settle, DeferredLabels, WorkerDraw, WorkerDispatch, MetadataPass, WorkerNote, Relocation, IndirectCpu, DispatchNotPipelined, Fallback, Shutdown, Other, NoteNotCandidate, NoteMultisampleClear, NoteMemoryValueFill, NoteHtileDepthClear, NoteHtileMaskClear, NoteHtileZmaskFixup, NoteDepthControl, WorkerDispatchReads, WorkerDispatchWrites, WorkerDispatchNotPlain, WorkerDispatchLate, WorkerDispatchCopy, Count };
-enum class FrameKept : std::uint32_t { NotLatched, AbPhase, SyncFlip, TimingLog, Predicated, LabelForm, DeferredLabels, FullLoopSegmentEnd, FullLoopSettle, FrontChange, Exception, IndirectGpu, IndexInconsistent, DmaCopy, DmaGds, DmaRefused, ResolveLimit, ExactUnsure, WorkerBehindFlip, SuspendNotLatched, SuspendTimingLog, SuspendDrainEnv, SuspendDeferredLabels, SuspendUnordered, IndirectNotLatched, IndirectPredicated, IndirectNoAddress, IndirectDeferredLabels, IndirectItemsOff, IndirectNotCandidate, IndirectNotPlain, IndirectUnbounded, IndirectFallback, IndirectNote, IndirectArgumentFallback, HeldNoDecode, HeldSize, HeldUnbounded, HeldScratch, HeldBda, HeldHeap, HeldWalkFailed, HeldWalkIncomplete, HeldLimit, WorkerBehindIndirect, HeldNotPrepared, Count };
+enum class FrameKept : std::uint32_t { NotLatched, AbPhase, SyncFlip, TimingLog, Predicated, LabelForm, DeferredLabels, FullLoopSegmentEnd, FullLoopSettle, FrontChange, Exception, IndirectGpu, IndexInconsistent, DmaCopy, DmaGds, DmaRefused, ResolveLimit, ExactUnsure, WorkerBehindFlip, SuspendNotLatched, SuspendTimingLog, SuspendDrainEnv, SuspendDeferredLabels, SuspendUnordered, IndirectNotLatched, IndirectPredicated, IndirectNoAddress, IndirectDeferredLabels, IndirectItemsOff, IndirectNotCandidate, IndirectNotPlain, IndirectUnbounded, IndirectFallback, IndirectNote, IndirectArgumentFallback, HeldNoDecode, HeldSize, HeldUnbounded, HeldScratch, HeldBda, HeldHeap, HeldWalkFailed, HeldWalkIncomplete, HeldLimit, WorkerBehindIndirect, HeldNotPrepared, HeldTableImage, HeldQueuedWrite, HeldGpuWrite, HeldForcedSync, HeldIndirectWord, Count };
 enum class FrameSite : std::uint32_t { OrderedFlip, RenderingWait, SegmentEnd, ExitWait, ExitFree, ArgumentWait, WriteScan, KeyScan, QueuedScan, DmaBeside, ListWait, ResolvedSkip, ResolveWait, SuspendOrdered, IndirectQueued, IndirectArgumentWait, HeldNamed, ExitOwned, Count };
 enum class FrameCheck : std::uint32_t { FlipOrder, ItemOrder, Lifetime, FlipState, DispatchArguments, FallbackScan, SegmentEnd, AbPhase, ListBytes, DmaOrder, SuspendOrder, SuspendCompletion, IndirectOrder, IndirectArguments, HeldWrites, Count };
 enum class FrameTail : std::uint32_t { RenderingWait, RewindTail, NoSubmission, Count };
@@ -376,11 +376,14 @@ public:
     static bool FrameFlow();
     static bool OrderedSyncsWanted();
     static bool& NamingWalk();
+    enum class NamingRefused : std::uint8_t { None, QueuedWrite, GpuWrite };
+    static NamingRefused& NamingRefusal();
     static std::string& NamingTrace();
     static void NoteNamingBlocker(std::uint64_t begin, std::uint64_t end);
     std::uint32_t describePendingWriter(std::uint64_t begin, std::uint64_t end);
     static bool OrderedSyncs();
     static void NoteHeldNaming(bool named, std::size_t ranges, std::uint64_t ns);
+    static void NoteHeldWalk(bool named, FrameKept reason, std::uint64_t ns);
     static std::uint64_t HeldNamedTotal();
     static std::uint64_t HeldUnknownTotal();
     static bool FrameCensus();

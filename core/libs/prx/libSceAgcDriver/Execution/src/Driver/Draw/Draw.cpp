@@ -384,8 +384,9 @@ constexpr std::uint32_t HeldWalksPerPresent = 64;
 
 }
 
-bool Driver::nameHeldWrites(const DrawTail& tail, std::vector<std::pair<std::uint64_t, std::uint64_t>>& named) {
+bool Driver::nameHeldWrites(const DrawTail& tail, std::vector<std::pair<std::uint64_t, std::uint64_t>>& named, bool& walkedAny) {
     using Role = ShaderRecompiler::ProgramRole;
+    walkedAny = false;
     const auto start = std::chrono::steady_clock::now();
     const auto spent = [&] { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()); };
     const auto kept = [&](FrameKept reason) {
@@ -459,53 +460,110 @@ bool Driver::nameHeldWrites(const DrawTail& tail, std::vector<std::pair<std::uin
             budget.frame = frame;
             budget.walks = 0;
         }
-        if (budget.walks + walked.size() > HeldWalksPerPresent) return kept(FrameKept::HeldLimit);
+        if (budget.walks + walked.size() > HeldWalksPerPresent) {
+            for (std::size_t walk = 0; walk < walked.size(); ++walk) DrawFinisher::NoteHeldWalk(false, FrameKept::HeldLimit, 0);
+            return kept(FrameKept::HeldLimit);
+        }
         budget.walks += walked.size();
+        DrawFinisher::Get().FlushOpenRun();
+        static const bool walkTraces = std::getenv("APS5_PIPELINE_STATS") != nullptr;
         for (const auto i : walked) {
+            const auto walkStart = std::chrono::steady_clock::now();
+            const auto walkSpent = [&] { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count()); };
+            const auto keptWalk = [&](FrameKept reason) {
+                DrawFinisher::NoteHeldWalk(false, reason, walkSpent());
+                return kept(reason);
+            };
             const auto& program = programs[i];
-            if (program.snapshot == nullptr || tail.localDevice == nullptr) return kept(FrameKept::HeldWalkFailed);
+            if (program.snapshot == nullptr || tail.localDevice == nullptr) return keptWalk(FrameKept::HeldWalkFailed);
+            struct NamingScope {
+                NamingScope() {
+                    DrawFinisher::NamingWalk() = true;
+                    DrawFinisher::NamingRefusal() = DrawFinisher::NamingRefused::None;
+                    DrawFinisher::NamingTrace().clear();
+                }
+                ~NamingScope() {
+                    DrawFinisher::NamingWalk() = false;
+                    DrawFinisher::NamingRefusal() = DrawFinisher::NamingRefused::None;
+                }
+                NamingScope(const NamingScope&) = delete;
+                NamingScope& operator=(const NamingScope&) = delete;
+            } naming;
             std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
-            bool complete = false;
+            auto outcome = CapturedWrites::NoPlan;
+            std::uint32_t forcedSyncs = 0;
+            bool exactKey = false;
+            bool failed = false;
+            const auto namedBefore = named.size();
             try {
                 const std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertexInfo = i < tail.vertexInfos.size() ? tail.vertexInfos[i] : std::nullopt;
                 const auto pushOffset = Graphics::StagePushOffset(0, program.binary.stage, tail.localDevice->GraphicsPipelineLibraries());
                 const auto request = drawStageRequest(program, tail.decode->state, tail.pixel, vertexInfo, tail.memory, tail.linked, *tail.localDevice, pushOffset, tail.drawParameters, std::nullopt);
                 ShaderMemory side(tail.memory, &queryNamingWrite, nullptr, nullptr, &QueryPendingSpan);
-                struct NamingScope {
-                    NamingScope() {
-                        DrawFinisher::NamingWalk() = true;
-                        DrawFinisher::NamingTrace().clear();
-                    }
-                    ~NamingScope() { DrawFinisher::NamingWalk() = false; }
-                } naming;
-                capture = CapturePreparedResources(side, *program.snapshot, program.codeOffset, request);
-                if (capture != nullptr) complete = CapturedWriteRanges(capture->plan.get(), capture->snapshot, named);
-                static std::atomic<std::uint32_t> traces{0};
-                if (capture != nullptr && !complete && std::getenv("APS5_PIPELINE_STATS") != nullptr && traces.fetch_add(1, std::memory_order_relaxed) < 12u) {
-                    std::string missing;
-                    for (std::size_t resource = 0; resource < capture->snapshot.buffers.size(); ++resource) {
-                        const auto& buffer = capture->snapshot.buffers[resource];
-                        if (buffer.dwordCount == 0 || (buffer.dwordCount == 4 && (buffer.availableDwordMask & 0xfu) == 0xfu)) continue;
-                        char item[64];
-                        std::snprintf(item, sizeof(item), " buffer %zu count %u mask 0x%x", resource, static_cast<unsigned>(buffer.dwordCount), static_cast<unsigned>(buffer.availableDwordMask));
-                        missing += item;
-                    }
-                    for (std::size_t resource = 0; resource < capture->snapshot.images.size(); ++resource) {
-                        const auto& image = capture->snapshot.images[resource];
-                        if (image.dwordCount == 0 || (image.dwordCount == 8 && image.availableDwordMask == 0xffu)) continue;
-                        char item[64];
-                        std::snprintf(item, sizeof(item), " image %zu count %u mask 0x%x", resource, static_cast<unsigned>(image.dwordCount), static_cast<unsigned>(image.availableDwordMask));
-                        missing += item;
-                    }
-                    std::fprintf(stderr, "[held-naming] incomplete walk: stage %zu, %zu buffers, %zu images; not fully available:%s; queries:%s\n", static_cast<std::size_t>(i), capture->snapshot.buffers.size(), capture->snapshot.images.size(), missing.c_str(), DrawFinisher::NamingTrace().c_str());
-                }
+                side.DisableStamps();
+                capture = CapturePreparedResources(side, *program.snapshot, program.codeOffset, request, &exactKey);
+                forcedSyncs = side.ForcedSyncs() + side.SyncedReads();
+                if (capture != nullptr && DrawFinisher::NamingRefusal() == DrawFinisher::NamingRefused::None && forcedSyncs == 0) outcome = CapturedWriteRanges(capture->plan.get(), capture->snapshot, named);
             } catch (const std::exception&) {
-                return kept(FrameKept::HeldWalkFailed);
+                failed = true;
             }
-            if (capture == nullptr) return kept(FrameKept::HeldNotPrepared);
-            if (capture->plan != nullptr && capture->plan->info.bdaWrites) return kept(FrameKept::HeldBda);
-            if (!complete) return kept(FrameKept::HeldWalkIncomplete);
+            const auto indirectWordWalked = [&] {
+                if (!tail.drawParameters.indirect || capture == nullptr) return false;
+                if (roles.size() != programs.size()) return true;
+                const auto& indirect = *tail.drawParameters.indirect;
+                const auto walkedWords = capture->userDataUse.asValue | capture->userDataUse.asBase;
+                const auto walks = [&](std::uint32_t location) {
+                    for (const auto& [programIndex, word] : UserDataWords(programs, roles, location)) {
+                        if (programIndex == i && (word >= ShaderRecompiler::SrtUserDataUse::TrackedWords || ((walkedWords >> word) & 1u) != 0)) return true;
+                    }
+                    return false;
+                };
+                return walks(indirect.baseVertexLocation) || walks(indirect.startInstanceLocation) || (indirect.drawIndexEnabled && walks(indirect.drawIndexLocation));
+            };
+            const auto refusal = DrawFinisher::NamingRefusal();
+            auto reason = FrameKept::Count;
+            if (refusal == DrawFinisher::NamingRefused::QueuedWrite) reason = FrameKept::HeldQueuedWrite;
+            else if (refusal == DrawFinisher::NamingRefused::GpuWrite) reason = FrameKept::HeldGpuWrite;
+            else if (failed) reason = FrameKept::HeldWalkFailed;
+            else if (capture == nullptr) reason = FrameKept::HeldNotPrepared;
+            else if (forcedSyncs != 0) reason = FrameKept::HeldForcedSync;
+            else if (capture->plan != nullptr && capture->plan->info.bdaWrites) reason = FrameKept::HeldBda;
+            else if (indirectWordWalked()) reason = FrameKept::HeldIndirectWord;
+            else if (outcome == CapturedWrites::TableImage) reason = FrameKept::HeldTableImage;
+            else if (outcome != CapturedWrites::Named) reason = FrameKept::HeldWalkIncomplete;
+            if (walkTraces) {
+                static std::atomic<std::uint32_t> namedTraces{0};
+                static std::atomic<std::uint32_t> keptTraces{0};
+                const bool namedWalk = reason == FrameKept::Count;
+                if ((namedWalk ? namedTraces : keptTraces).fetch_add(1, std::memory_order_relaxed) < (namedWalk ? 4u : 12u)) {
+                    const char* why = namedWalk ? "named" : reason == FrameKept::HeldQueuedWrite ? "descriptor behind a queued write" : reason == FrameKept::HeldGpuWrite ? "descriptor behind GPU work" : reason == FrameKept::HeldWalkFailed ? "walk failed" : reason == FrameKept::HeldNotPrepared ? "not prepared" : reason == FrameKept::HeldForcedSync ? "read through a sync" : reason == FrameKept::HeldBda ? "BDA stores" : reason == FrameKept::HeldIndirectWord ? "indirect record word walked" : reason == FrameKept::HeldTableImage ? "written image in a table" : "incomplete";
+                    std::string written;
+                    const auto* plan = capture != nullptr ? capture->plan.get() : nullptr;
+                    if (plan != nullptr) {
+                        for (std::size_t resource = 0; resource < plan->info.buffers.size() && resource < capture->snapshot.buffers.size(); ++resource) {
+                            const auto& info = plan->info.buffers[resource];
+                            if (!info.written && !info.atomic) continue;
+                            const auto& words = capture->snapshot.buffers[resource].dwords;
+                            char item[96];
+                            std::snprintf(item, sizeof(item), " buffer %zu %08x %08x %08x %08x", resource, words[0], words[1], words[2], words[3]);
+                            written += item;
+                        }
+                        for (std::size_t resource = 0; resource < plan->info.images.size() && resource < capture->snapshot.images.size(); ++resource) {
+                            const auto& info = plan->info.images[resource];
+                            if (!info.written && !info.atomic && !info.atomic64) continue;
+                            const auto& words = capture->snapshot.images[resource].dwords;
+                            char item[112];
+                            std::snprintf(item, sizeof(item), " image %zu table 0x%x device %d %08x %08x %08x %08x", resource, static_cast<unsigned>(info.table), info.deviceTable ? 1 : 0, words[0], words[1], words[2], words[3]);
+                            written += item;
+                        }
+                    }
+                    std::fprintf(stderr, "[held-naming] walk %s: stage %zu, %s, refusal %u, synced reads %u, %zu ranges named by it; written:%s; queries:%s\n", why, static_cast<std::size_t>(i), exactKey ? "prepared key exact" : "prepared key by code only", static_cast<unsigned>(refusal), static_cast<unsigned>(forcedSyncs), named.size() - namedBefore, written.empty() ? " none" : written.c_str(), DrawFinisher::NamingTrace().c_str());
+                }
+            }
+            if (reason != FrameKept::Count) return keptWalk(reason);
+            DrawFinisher::NoteHeldWalk(true, FrameKept::Count, walkSpent());
         }
+        walkedAny = true;
     }
     std::sort(named.begin(), named.end());
     std::size_t merged = 0;
@@ -1066,9 +1124,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const bool owned = DrawFinisher::OrderedSyncs();
         if (held.unknown && owned && DrawFinisher::Overlap()) {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> named;
-            if (nameHeldWrites(tail, named)) {
+            bool walked = false;
+            if (nameHeldWrites(tail, named, walked)) {
                 held.writes = std::move(named);
                 held.unknown = false; held.origin = 4;
+                held.originKind = static_cast<std::uint8_t>(walked ? 1u : 0u);
                 held.named = true;
             }
         }

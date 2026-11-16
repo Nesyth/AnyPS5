@@ -1371,7 +1371,8 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> CaptureInvocation(Shade
     }
 }
 
-std::shared_ptr<const ShaderRecompiler::ResourceCapture> CapturePreparedResources(ShaderMemory& memory, const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
+std::shared_ptr<const ShaderRecompiler::ResourceCapture> CapturePreparedResources(ShaderMemory& memory, const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, bool* exactKey) {
+    if (exactKey != nullptr) *exactKey = false;
     if (snapshot.prepared == nullptr || codeOffset >= snapshot.code.size()) return nullptr;
     const auto code = std::span(snapshot.code).subspan(codeOffset);
     if (request.shader.code.data() != code.data() || request.shader.code.size() != code.size()) return nullptr;
@@ -1390,12 +1391,20 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> CapturePreparedResource
         if (snapshot.prepared->pending || snapshot.prepared->failure != nullptr) return nullptr;
         if (std::ranges::find(snapshot.prepared->convertedSamples, codeOffset) != snapshot.prepared->convertedSamples.end()) source.context.convertedSamples = true;
         if (std::ranges::find(snapshot.prepared->layerRowSamples, codeOffset) != snapshot.prepared->layerRowSamples.end()) source.context.layerRowSamples = true;
+        struct CaptureKeyStorage {};
+        auto& key = HostThreadLocal<std::vector<std::uint64_t>, CaptureKeyStorage>();
+        ShaderRecompiler::BuildPreparedShaderKey(source, key);
+        std::shared_ptr<const ShaderRecompiler::SourceHandle> sameCode;
         for (const auto& entry : snapshot.prepared->entries) {
             if (entry.codeOffset != codeOffset || entry.handle == nullptr || entry.handle->source == nullptr || entry.handle->artifact == nullptr) continue;
             if (!std::ranges::equal(ShaderRecompiler::GetPreparedCode(*entry.handle), source.shader.code)) continue;
+            if (sameCode == nullptr) sameCode = entry.handle;
+            if (!std::ranges::equal(entry.handle->staticKey, key)) continue;
             handle = entry.handle;
             break;
         }
+        if (exactKey != nullptr) *exactKey = handle != nullptr;
+        if (handle == nullptr) handle = std::move(sameCode);
     }
     if (handle == nullptr) return nullptr;
     const ShaderRecompiler::SourceHandle side{handle->source, nullptr, {}};

@@ -459,6 +459,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             if (CaptureProfiled()) ++CaptureTotals().branchReadsRefused;
             return false;
         } else {
+            if (policy == PendingWrite::Sync) ++self.syncedReads;
             // On a word-wise page the bytes before the hook's wait are kept for the observer.
             const bool observed = page.wordwise && policy == PendingWrite::Sync && self.observe != nullptr && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word));
             std::uint32_t before = 0;
@@ -550,7 +551,10 @@ bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t
     } scopeReset{self, savedSpanBytes, savedForceSync};
     const auto strideWords = savedSpanBytes / sizeof(std::uint32_t);
     for (std::uint32_t attempt = 0; attempt < 3u; ++attempt) {
-        if (attempt == 2u) ++self.forceSync;
+        if (attempt == 2u) {
+            ++self.forceSync;
+            ++self.forcedSyncs;
+        }
         address = startAddress;
         values = startValues;
         count = startCount;
@@ -613,6 +617,7 @@ bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t
 std::uint64_t ShaderMemory::descriptorScope(void* context, std::size_t bytes) {
     auto& self = *static_cast<ShaderMemory*>(context);
     if (bytes == ShaderRecompiler::SrtDescriptorForceSync) {
+        ++self.forcedSyncs;
         if (self.forceSync++ == 0u && self.invalidateRawPages()) ++self.rawInvalidations;
         self.descriptorSpanBytes = 0;
         return self.rawInvalidations;
@@ -659,7 +664,7 @@ bool ShaderMemory::pending(void* context, std::uint64_t address, std::uint64_t b
 
 ShaderRecompiler::SrtWriteStamp ShaderMemory::stampWrites(void* context, std::uint64_t address, std::uint64_t bytes) {
     const auto& self = *static_cast<const ShaderMemory*>(context);
-    if (bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes || self.overlapsInitial(address, address + bytes)) return {};
+    if (!self.stamps || bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes || self.overlapsInitial(address, address + bytes)) return {};
     const auto fetched = self.pageAtOrAfter(address & ~static_cast<std::uint64_t>(PageBytes - 1));
     const bool anyFetched = fetched != self.pages.size() && self.pages[fetched].first < address + bytes;
     if (anyFetched && !self.spanQuery) return {};
@@ -691,7 +696,9 @@ bool ShaderMemory::Vouched(PendingWriteQuery pending, std::uint64_t address, std
 }
 
 bool ShaderMemory::unchangedSince(void* context, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp) {
-    return Vouched(static_cast<const ShaderMemory*>(context)->pendingSpan, address, bytes, stamp);
+    const auto& self = *static_cast<const ShaderMemory*>(context);
+    if (!self.stamps) return false;
+    return Vouched(self.pendingSpan, address, bytes, stamp);
 }
 
 bool ShaderMemory::place(std::uint64_t address, const std::uint32_t* values, std::uint64_t count, bool overwrite, bool recent) {

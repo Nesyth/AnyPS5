@@ -1063,7 +1063,7 @@ void noteDeepDepth(std::uint64_t depth) {
 }
 
 namespace {
-constexpr std::array<const char*, static_cast<std::size_t>(FrameKept::Count)> FrameKeptNames{"not latched", "ab phase", "sync flip", "timing log", "predicated", "label form", "deferred labels", "full loop segment end", "full loop settle", "front change", "exception", "indirect gpu", "index inconsistent", "dma copy", "dma to gds", "dma refused", "unknown chain limit", "exact index unsure", "worker dma, sample dump or note behind a flip", "suspend: not latched", "suspend: timing log", "suspend: drain asked", "suspend: deferred labels", "suspend: unordered completion", "indirect: not latched", "indirect: predicated", "indirect: no address", "indirect: deferred labels", "indirect: dispatch items off", "indirect: not a candidate", "indirect: not plain", "indirect: unbounded writes", "indirect: no entry, reads or recipe", "indirect: dispatch note", "indirect: argument wait fell back", "held draw: no decode", "held draw: stage count", "held draw: unbounded writes", "held draw: scratch writes", "held draw: BDA stores", "held draw: descriptor heap", "held draw: walk failed", "held draw: walk incomplete", "held draw: walk limit", "worker dma, sample dump or note behind an indirect dispatch", "held draw: program not prepared"};
+constexpr std::array<const char*, static_cast<std::size_t>(FrameKept::Count)> FrameKeptNames{"not latched", "ab phase", "sync flip", "timing log", "predicated", "label form", "deferred labels", "full loop segment end", "full loop settle", "front change", "exception", "indirect gpu", "index inconsistent", "dma copy", "dma to gds", "dma refused", "unknown chain limit", "exact index unsure", "worker dma, sample dump or note behind a flip", "suspend: not latched", "suspend: timing log", "suspend: drain asked", "suspend: deferred labels", "suspend: unordered completion", "indirect: not latched", "indirect: predicated", "indirect: no address", "indirect: deferred labels", "indirect: dispatch items off", "indirect: not a candidate", "indirect: not plain", "indirect: unbounded writes", "indirect: no entry, reads or recipe", "indirect: dispatch note", "indirect: argument wait fell back", "held draw: no decode", "held draw: stage count", "held draw: unbounded writes", "held draw: scratch writes", "held draw: BDA stores", "held draw: descriptor heap", "held draw: walk failed", "held draw: walk incomplete", "held draw: walk limit", "worker dma, sample dump or note behind an indirect dispatch", "held draw: program not prepared", "held draw: written image in a table", "held draw: descriptor behind a queued write", "held draw: descriptor behind GPU work", "held draw: walk read through a sync", "held draw: walk reads an indirect record word"};
 constexpr std::array<const char*, static_cast<std::size_t>(FrameSite::Count)> FrameSiteNames{"ordered flip", "rendering wait", "segment end", "exit wait", "exit free", "argument wait", "write scan", "key scan", "queued scan", "dma beside", "register list wait", "resolved unknown jobs passed", "resolve wait", "suspend ordered", "indirect queued", "indirect argument wait", "held writes named", "exit owned"};
 static_assert(FrameKeptNames.back() != nullptr && FrameSiteNames.back() != nullptr, "every frame flow census entry needs a name");
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrameKept::Count)> frameKept{};
@@ -1082,6 +1082,9 @@ std::atomic<std::uint64_t> heldNamedWindow{0};
 std::atomic<std::uint64_t> heldUnknownWindow{0};
 std::atomic<std::uint64_t> heldRangesWindow{0};
 std::atomic<std::uint64_t> heldNamingNs{0};
+std::atomic<std::uint64_t> heldWalksNamed{0};
+std::atomic<std::uint64_t> heldWalkNs{0};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrameKept::Count)> heldWalksKept{};
 
 void noteFrameHighest(std::atomic<std::uint64_t>& highest, std::uint64_t value) {
     if (value > highest.load(std::memory_order_relaxed)) highest.store(value, std::memory_order_relaxed);
@@ -1433,6 +1436,13 @@ void DrawFinisher::NoteHeldNaming(bool named, std::size_t ranges, std::uint64_t 
     heldNamingNs.fetch_add(ns, std::memory_order_relaxed);
 }
 
+void DrawFinisher::NoteHeldWalk(bool named, FrameKept reason, std::uint64_t ns) {
+    if (!pipelineStats()) return;
+    if (named) heldWalksNamed.fetch_add(1, std::memory_order_relaxed);
+    else if (reason < FrameKept::Count) heldWalksKept[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    heldWalkNs.fetch_add(ns, std::memory_order_relaxed);
+}
+
 std::uint64_t DrawFinisher::HeldNamedTotal() {
     return heldNamedTotal.load(std::memory_order_relaxed);
 }
@@ -1563,6 +1573,25 @@ std::string DrawFinisher::FrameText() {
     std::snprintf(syncs, sizeof(syncs), "; ordered syncs %s, %s; held draws named %llu (%.1f ranges each), still unknown %llu, %.2f ms naming them on the worker",
         Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::OrderedSyncs) ? "set" : "unset", OrderedSyncs() ? "on" : "off", namedHeld, namedHeld == 0 ? 0.0 : static_cast<double>(namedRanges) / static_cast<double>(namedHeld), unknownHeld, ms(take(heldNamingNs)));
     text += syncs;
+    const auto presents = sites[0];
+    const auto perPresent = [&](unsigned long long count) { return presents == 0 ? 0.0 : static_cast<double>(count) / static_cast<double>(presents); };
+    const auto walksNamed = take(heldWalksNamed);
+    const auto walkNs = take(heldWalkNs);
+    std::string walksKeptText;
+    unsigned long long walksKept = 0;
+    for (std::size_t index = 0; index < heldWalksKept.size(); ++index) {
+        const auto count = take(heldWalksKept[index]);
+        if (count == 0) continue;
+        walksKept += count;
+        char item[112];
+        std::snprintf(item, sizeof(item), "%s %s %llu (%.2f)", walksKeptText.empty() ? "" : ",", FrameKeptNames[index], count, perPresent(count));
+        walksKeptText += item;
+    }
+    char walks[320];
+    std::snprintf(walks, sizeof(walks), "; held walks (per present over %llu ordered flips): named %llu (%.2f), kept unknown %llu (%.2f), %.2f ms walking on the worker (%.3f); walks kept by reason:",
+        presents, walksNamed, perPresent(walksNamed), walksKept, perPresent(walksKept), ms(walkNs), presents == 0 ? 0.0 : ms(walkNs) / static_cast<double>(presents));
+    text += walks;
+    text += walksKeptText.empty() ? std::string(" none") : walksKeptText;
     text += "; kept drains by reason:";
     bool shown = false;
     for (std::size_t index = 0; index < frameKept.size(); ++index) {
@@ -1731,6 +1760,11 @@ std::string& DrawFinisher::NamingTrace() {
 bool& DrawFinisher::NamingWalk() {
     struct NamingWalkStorage {};
     return HostThreadLocal<bool, NamingWalkStorage>();
+}
+
+DrawFinisher::NamingRefused& DrawFinisher::NamingRefusal() {
+    struct NamingRefusalStorage {};
+    return HostThreadLocal<NamingRefused, NamingRefusalStorage>();
 }
 
 std::uint32_t DrawFinisher::describePendingWriter(std::uint64_t begin, std::uint64_t end) {
@@ -3371,7 +3405,8 @@ void DrawFinisher::verifyNamedWrites(const DrawPipeline::Item& item) {
     if (seq == 0 || lean == nullptr || !ringMode.load(std::memory_order_acquire)) return;
     const auto& slot = leanSlot(seq);
     if (slot.seq.load(std::memory_order_acquire) != seq || !slot.pending.named) return;
-    if (!FrameVerifyDue(FrameCheck::HeldWrites)) return;
+    const bool walked = slot.pending.origin == 4 && slot.pending.originKind != 0;
+    if (!walked && !FrameVerifyDue(FrameCheck::HeldWrites)) return;
     const auto& named = slot.pending.writes;
     const auto covered = [&](const Range& range) {
         if (range.first >= range.second) return true;
@@ -3388,7 +3423,7 @@ void DrawFinisher::verifyNamedWrites(const DrawPipeline::Item& item) {
         if (!covered(label)) missing = label;
     }
     char text[320];
-    std::snprintf(text, sizeof(text), "the draw job %llu, published with %zu write ranges named on the worker, queued a %s item that writes [0x%llx, 0x%llx) outside them", static_cast<unsigned long long>(seq), named.size(), KindNames[static_cast<std::size_t>(item.kind)], static_cast<unsigned long long>(missing.has_value() ? missing->first : 0), static_cast<unsigned long long>(missing.has_value() ? missing->second : 0));
+    std::snprintf(text, sizeof(text), "the draw job %llu, published with %zu write ranges named on the worker%s, queued a %s item that writes [0x%llx, 0x%llx) outside them", static_cast<unsigned long long>(seq), named.size(), walked ? " by a resource walk" : "", KindNames[static_cast<std::size_t>(item.kind)], static_cast<unsigned long long>(missing.has_value() ? missing->first : 0), static_cast<unsigned long long>(missing.has_value() ? missing->second : 0));
     NoteFrameCheck(FrameCheck::HeldWrites, missing.has_value(), text);
 }
 

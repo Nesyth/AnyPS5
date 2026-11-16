@@ -266,6 +266,20 @@ ShaderMemory::PendingWrite Driver::queryNamingWrite(std::uint64_t address, std::
 
 ShaderMemory::PendingWrite Driver::queryNamingWriteUntraced(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     static const bool readThrough = std::getenv("APS5_NAMING_NO_LABEL_BYTES") == nullptr;
+    const bool walking = DrawFinisher::NamingWalk();
+    constexpr std::size_t NamingPageBytes = 4096;
+    const bool span = known.empty() && bytes > 64;
+    const bool page = span && bytes == NamingPageBytes && (address & (NamingPageBytes - 1)) == 0;
+    const auto refuse = [&](DrawFinisher::NamingRefused reason) {
+        auto& refusal = DrawFinisher::NamingRefusal();
+        if (refusal == DrawFinisher::NamingRefused::None) {
+            refusal = reason;
+            if (reason == DrawFinisher::NamingRefused::QueuedWrite) DrawFinisher::NoteNamingBlocker(address, address + bytes);
+        }
+        if (!known.empty()) std::memset(known.data(), 0, known.size());
+        return ShaderMemory::PendingWrite::KnownValue;
+    };
+    if (walking && DrawFinisher::NamingRefusal() != DrawFinisher::NamingRefused::None) return refuse(DrawFinisher::NamingRefusal());
     if (readThrough && bytes != 0 && DrawPipeline::Active()) {
         if (known.size() == bytes) {
             if (DrawFinisher::Get().PendingLabelBytes(address, known)) return ShaderMemory::PendingWrite::KnownValue;
@@ -277,7 +291,17 @@ ShaderMemory::PendingWrite Driver::queryNamingWriteUntraced(std::uint64_t addres
             }
         }
     }
-    return queryPendingWrite(address, bytes, known);
+    if (!walking) return queryPendingWrite(address, bytes, known);
+    if (bytes != 0 && DrawPipeline::Active()) {
+        auto& pipeline = DrawPipeline::Queue0();
+        if (pipeline.Busy() && pipeline.StoredBytes(address, bytes, known.size() == bytes ? known : std::span<std::byte>{}) == DrawPipeline::QueuedWrite::Unknown) {
+            if (span) return ShaderMemory::PendingWrite::Sync;
+            return refuse(DrawFinisher::NamingRefused::QueuedWrite);
+        }
+    }
+    const auto answer = queryPendingWrite(address, bytes, known);
+    if (!page && answer == ShaderMemory::PendingWrite::Sync) return refuse(DrawFinisher::NamingRefused::GpuWrite);
+    return answer;
 }
 
 ShaderMemory::PendingWrite Driver::QueryPendingSpan(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
