@@ -380,6 +380,7 @@ public:
     static NamingRefused& NamingRefusal();
     static std::string& NamingTrace();
     static void NoteNamingBlocker(std::uint64_t begin, std::uint64_t end);
+    static void NoteEvidenceWait(std::uint64_t begin, std::uint64_t end, bool buffered);
     std::uint32_t describePendingWriter(std::uint64_t begin, std::uint64_t end);
     static bool OrderedSyncs();
     static void NoteHeldNaming(bool named, std::size_t ranges, std::uint64_t ns);

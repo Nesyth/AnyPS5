@@ -1791,6 +1791,28 @@ std::uint32_t DrawFinisher::describePendingWriter(std::uint64_t begin, std::uint
     return DrawPipeline::Queue0().DescribeQueuedWriter(begin, end);
 }
 
+void DrawFinisher::NoteEvidenceWait(std::uint64_t begin, std::uint64_t end, bool buffered) {
+    if (!pipelineStats() || NamingWalk() || OnFinisherThread()) return;
+    static std::mutex mutex;
+    static std::map<std::uint64_t, std::uint64_t> waits;
+    static std::uint64_t total = 0;
+    const auto code = Get().describePendingWriter(begin, end);
+    const auto bytes = end - begin;
+    const std::uint64_t sizeClass = bytes == 4096 && (begin & 4095u) == 0 ? 3 : bytes > 64 ? 2 : buffered ? 0 : 1;
+    std::lock_guard lock(mutex);
+    if (total < 40) AgcDriver::ProfilePrint_nid_no_patch("[write-evidence] sample: asked 0x%llx +%llu (%s); blocker %u\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(bytes), buffered ? "word" : "span", code);
+    ++waits[(sizeClass << 32u) | code];
+    if (++total % 512u != 0) return;
+    std::string text;
+    for (const auto& [key, count] : waits) {
+        char item[64];
+        std::snprintf(item, sizeof(item), " class %u blocker %u x%llu", static_cast<unsigned>(key >> 32u), static_cast<unsigned>(key & 0xffffffffu), static_cast<unsigned long long>(count));
+        text += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[write-evidence] waits on the worker by size class (0 word, 1 span up to 64 bytes, 2 larger span, 3 a whole page) and blocker (as [held-naming]):%s\n", text.c_str());
+    waits.clear();
+}
+
 void DrawFinisher::NoteNamingBlocker(std::uint64_t begin, std::uint64_t end) {
     if (!pipelineStats() || !NamingWalk()) return;
     static std::mutex mutex;
