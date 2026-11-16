@@ -470,7 +470,7 @@ bool Driver::nameHeldWrites(const DrawTail& tail, std::vector<std::pair<std::uin
                 const std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertexInfo = i < tail.vertexInfos.size() ? tail.vertexInfos[i] : std::nullopt;
                 const auto pushOffset = Graphics::StagePushOffset(0, program.binary.stage, tail.localDevice->GraphicsPipelineLibraries());
                 const auto request = drawStageRequest(program, tail.decode->state, tail.pixel, vertexInfo, tail.memory, tail.linked, *tail.localDevice, pushOffset, tail.drawParameters, std::nullopt);
-                ShaderMemory side(tail.memory, &queryPendingWrite, nullptr, nullptr, &QueryPendingSpan);
+                ShaderMemory side(tail.memory, &queryNamingWrite, nullptr, nullptr, &QueryPendingSpan);
                 struct NamingScope {
                     NamingScope() { DrawFinisher::NamingWalk() = true; }
                     ~NamingScope() { DrawFinisher::NamingWalk() = false; }

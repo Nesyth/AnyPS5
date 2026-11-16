@@ -249,6 +249,12 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
     return queued == DrawPipeline::QueuedWrite::Stored && policy == Policy::None ? Policy::KnownValue : policy;
 }
 
+ShaderMemory::PendingWrite Driver::queryNamingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
+    static const bool readThrough = std::getenv("APS5_NAMING_NO_LABEL_BYTES") == nullptr;
+    if (readThrough && bytes != 0 && known.size() == bytes && DrawPipeline::Active() && DrawFinisher::Get().PendingLabelBytes(address, known)) return ShaderMemory::PendingWrite::KnownValue;
+    return queryPendingWrite(address, bytes, known);
+}
+
 ShaderMemory::PendingWrite Driver::QueryPendingSpan(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();

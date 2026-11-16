@@ -780,6 +780,18 @@ bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
     return false;
 }
 
+bool DrawFinisher::PendingLabelBytes(std::uint64_t address, std::span<std::byte> out) {
+    if (out.empty() || !Busy() || !FinisherProducer::Get()) return false;
+    for (std::size_t offset = 0; offset < out.size();) {
+        const auto chunk = std::min<std::size_t>(8, out.size() - offset);
+        std::uint64_t value = 0;
+        if (PendingLabel(address + offset, chunk, value) != LabelLookup::Value) return false;
+        std::memcpy(out.data() + offset, &value, chunk);
+        offset += chunk;
+    }
+    return true;
+}
+
 DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value) {
     if (!Busy()) return LabelLookup::NotHeld;
     const auto end = address + bytes;
