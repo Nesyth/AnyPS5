@@ -385,10 +385,30 @@ std::atomic<std::uint64_t> publicationFillsChecked{0};
 std::atomic<std::uint64_t> publicationFillsDiffering{0};
 std::atomic<std::uint64_t> publicationFillsMoved{0};
 std::atomic<std::uint64_t> publicationFillSyncsKept{0};
+std::atomic<std::uint64_t> publicationFillDebtsFree{0};
+std::atomic<std::uint64_t> publicationFillDebtsWaited{0};
+std::atomic<std::uint64_t> publicationFillsAdopted{0};
+std::atomic<std::uint64_t> publicationAdoptionsChecked{0};
+std::atomic<std::uint64_t> publicationAdoptionsDiffering{0};
+
+int publicationFillsVerifyLevel() {
+    static const int level = [] {
+        const char* text = std::getenv("APS5_VERIFY_PUBLICATION_FILLS");
+        return text == nullptr ? 0 : std::strtol(text, nullptr, 10) == 2 ? 2 : 1;
+    }();
+    return level;
+}
 
 bool publicationFillsVerify() {
-    static const bool on = std::getenv("APS5_VERIFY_PUBLICATION_FILLS") != nullptr;
-    return on;
+    return publicationFillsVerifyLevel() == 1;
+}
+
+bool planeHoldsWord(const GuestMemory::UnchangedQuery& range, std::uint32_t word) {
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(range.address);
+    for (std::size_t offset = 0u; offset + sizeof(word) <= range.bytes; offset += sizeof(word)) {
+        if (std::memcmp(bytes + offset, &word, sizeof(word)) != 0) return false;
+    }
+    return range.bytes % sizeof(word) == 0u;
 }
 
 void notePublicationFill(bool rebased) {
@@ -397,8 +417,9 @@ void notePublicationFill(bool rebased) {
     if (!stats || !rebased) return;
     const auto count = publicationsFromFills.load(std::memory_order_relaxed);
     if (count % 512u != 0u) return;
-    std::fprintf(stderr, "[publication-fills] %llu publications rebased on a pending fill without a GPU wait, %llu later checks without a sync for the same fill, %llu syncs kept because another plane had a pending write; verify %llu checked, %llu differing in content, %llu with a generation that no longer held after the fill landed\n",
+    std::fprintf(stderr, "[publication-fills] %llu publications rebased on a pending fill without a GPU wait, %llu later checks without a sync for the same fill, %llu syncs kept because another plane had a pending write, %llu owed syncs paid after the fill's batch signaled and %llu paid with a possible wait, %llu clears noted again for the same pending fill adopted it (level 2 verify: %llu landed and compared with the clear's word, %llu differing); verify %llu checked, %llu differing in content, %llu with a generation that no longer held after the fill landed\n",
         static_cast<unsigned long long>(count), static_cast<unsigned long long>(publicationFillSkips.load(std::memory_order_relaxed)), static_cast<unsigned long long>(publicationFillSyncsKept.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(publicationFillDebtsFree.load(std::memory_order_relaxed)), static_cast<unsigned long long>(publicationFillDebtsWaited.load(std::memory_order_relaxed)), static_cast<unsigned long long>(publicationFillsAdopted.load(std::memory_order_relaxed)), static_cast<unsigned long long>(publicationAdoptionsChecked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(publicationAdoptionsDiffering.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(publicationFillsChecked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(publicationFillsDiffering.load(std::memory_order_relaxed)), static_cast<unsigned long long>(publicationFillsMoved.load(std::memory_order_relaxed)));
 }
 
@@ -520,6 +541,15 @@ std::uint64_t fillNoteAfter(const Recorder& recorder, const GuestMemory::Unchang
         if (write.note <= floor) continue;
         if (found != 0u || write.begin > range.address || write.end < range.address + range.bytes || write.word != static_cast<std::int64_t>(word)) return 0u;
         found = write.note;
+    }
+    return found;
+}
+
+bool newestFillIs(const Recorder& recorder, const GuestMemory::UnchangedQuery& range, std::uint64_t note, std::uint32_t word) {
+    bool found = false;
+    for (const auto& write : recorder.PendingWritesOver(range.address, range.bytes)) {
+        if (write.note > note) return false;
+        if (write.note == note) found = write.begin <= range.address && write.end >= range.address + range.bytes && write.word == static_cast<std::int64_t>(word);
     }
     return found;
 }
@@ -1030,6 +1060,23 @@ public:
         if (recorder != nullptr && ((clearGeneration != 0u && clearPattern.has_value() && clearFillNote == 0u) || (stencilClearGeneration != 0u && stencilFillNote == 0u))) check.Note(DepthCheck::FillNotes);
         if (recorder != nullptr && clearGeneration != 0u && clearPattern.has_value() && clearFillNote == 0u) clearFillNote = fillNoteAfter(*recorder, sampling.initial[1], clearFillFloor, *clearPattern);
         if (recorder != nullptr && stencilClearGeneration != 0u && stencilFillNote == 0u) stencilFillNote = fillNoteAfter(*recorder, sampling.initial[2], stencilFillFloor, *stencilClearValue * 0x01010101u);
+        if (recorder != nullptr && RuntimeSwitches::Set(RuntimeSwitch::PublicationFromFills)) {
+            const auto adopts = [&](std::size_t index, std::uint32_t word) {
+                if (!publicationFillOwed[index] || !newestFillIs(*recorder, sampling.initial[index], publicationFill[index], word)) return false;
+                publicationFillsAdopted.fetch_add(1, std::memory_order_relaxed);
+                if (publicationFillsVerifyLevel() != 2) return true;
+                const auto& plane = sampling.initial[index];
+                RecorderFor(context)->SyncThrough(plane.address, plane.bytes);
+                publicationFillOwed[index] = false;
+                publicationAdoptionsChecked.fetch_add(1, std::memory_order_relaxed);
+                if (!planeHoldsWord(plane, word) && publicationAdoptionsDiffering.fetch_add(1, std::memory_order_relaxed) < 16u) {
+                    std::fprintf(stderr, "[publication-fills-verify] adoption differs: plane %zu (0x%llx, %zu bytes) does not hold the clear's word 0x%x after its pending fill %llu landed\n", index, static_cast<unsigned long long>(plane.address), static_cast<std::size_t>(plane.bytes), word, static_cast<unsigned long long>(publicationFill[index]));
+                }
+                return false;
+            };
+            if (clearGeneration != 0u && clearPattern.has_value() && clearFillNote == 0u && adopts(1u, *clearPattern)) clearFillNote = publicationFill[1];
+            if (stencilClearGeneration != 0u && stencilFillNote == 0u && sampling.initial.size() > 2u && adopts(2u, static_cast<std::uint32_t>(*stencilClearValue) * 0x01010101u)) stencilFillNote = publicationFill[2];
+        }
         bool htileFromFill = false;
         bool stencilFromFill = false;
         if (!publication.empty()) {
@@ -1054,8 +1101,24 @@ public:
                     }
                     if ((htileFromFill && clearGeneration == 0u) || (stencilFromFill && stencilClearGeneration == 0u)) notePublicationFill(false);
                 }
-                const bool htileSync = clearFillNote != 0u && !htileFromFill;
-                const bool stencilSync = stencilFillNote != 0u && !stencilFromFill;
+                const auto owed = [&](std::size_t index, bool fromFill, std::uint64_t fillNote) {
+                    if (!publicationFillOwed[index]) return false;
+                    const auto& plane = sampling.initial[index];
+                    if (pending->NewestStoreNote(plane.address, plane.bytes) != publicationFill[index]) {
+                        publicationFillOwed[index] = false;
+                        return false;
+                    }
+                    const auto described = pending->DescribePendingWrite(plane.address, plane.bytes);
+                    const bool signaled = described.has_value() && described->signaled;
+                    if (!signaled && fromFill && fillNote == publicationFill[index]) return false;
+                    publicationFillOwed[index] = false;
+                    (signaled ? publicationFillDebtsFree : publicationFillDebtsWaited).fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                };
+                const bool htileOwed = owed(1u, htileFromFill, clearFillNote);
+                const bool stencilOwed = sampling.initial.size() > 2u && owed(2u, stencilFromFill, stencilFillNote);
+                const bool htileSync = (clearFillNote != 0u && !htileFromFill) || htileOwed;
+                const bool stencilSync = (stencilFillNote != 0u && !stencilFromFill) || stencilOwed;
                 if (htileSync || stencilSync) check.Note(DepthCheck::PublicationSync);
                 if (htileSync) pending->SyncThrough(sampling.initial[1].address, sampling.initial[1].bytes);
                 if (stencilSync) pending->SyncThrough(sampling.initial[2].address, sampling.initial[2].bytes);
@@ -1069,16 +1132,33 @@ public:
         const bool queuedStencilFill = stencilClearValue.has_value() && stencilFillNote != 0u && newestStencilNote == stencilFillNote;
         const bool separatePlane = target.stencilAddress != 0u && !target.htileStencil && target.htileDepthOnly && sampling.initial.size() > 2u;
         bool stencilPlaneAliased = false;
+        const auto refusalArguments = [&](const char* where, std::size_t refused) {
+            std::fprintf(stderr, "[depth-external] %s at plane %zu of %zu (0x%llx, %zu bytes), samples %u, publication %zu planes, from fills switch %d, htile from fill %d, stencil from fill %d, queued fill %d, queued stencil fill %d, clear generation %llu, stencil clear generation %llu, fill notes %llu and %llu, newest store notes %llu and %llu, publication fills %llu and %llu, clear pending %d\n",
+                where, refused, sampling.initial.size(), static_cast<unsigned long long>(sampling.initial[refused].address), static_cast<std::size_t>(sampling.initial[refused].bytes), target.samples, publication.size(), RuntimeSwitches::Set(RuntimeSwitch::PublicationFromFills) ? 1 : 0, htileFromFill ? 1 : 0, stencilFromFill ? 1 : 0, queuedFill ? 1 : 0, queuedStencilFill ? 1 : 0,
+                static_cast<unsigned long long>(clearGeneration), static_cast<unsigned long long>(stencilClearGeneration), static_cast<unsigned long long>(clearFillNote), static_cast<unsigned long long>(stencilFillNote), static_cast<unsigned long long>(newestHtileNote), static_cast<unsigned long long>(newestStencilNote),
+                static_cast<unsigned long long>(publicationFill[1]), static_cast<unsigned long long>(publicationFill[2]), clearPending ? 1 : 0);
+            for (std::size_t plane = 0u; recorder != nullptr && plane < sampling.initial.size(); ++plane) {
+                const auto writes = recorder->PendingWritesOver(sampling.initial[plane].address, sampling.initial[plane].bytes);
+                std::fprintf(stderr, "[depth-external]   plane %zu 0x%llx..0x%llx: %zu pending writes, any %d, a store %d\n", plane, static_cast<unsigned long long>(sampling.initial[plane].address), static_cast<unsigned long long>(sampling.initial[plane].address + sampling.initial[plane].bytes), writes.size(),
+                    recorder->PendingWriteOverlaps(sampling.initial[plane].address, sampling.initial[plane].bytes) ? 1 : 0, recorder->PendingStoreOverlaps(sampling.initial[plane].address, sampling.initial[plane].bytes) ? 1 : 0);
+                for (std::size_t shown = 0u; shown < writes.size() && shown < 8u; ++shown) {
+                    const auto& write = writes[writes.size() - 1u - shown];
+                    std::fprintf(stderr, "[depth-external]     0x%llx..0x%llx note %llu value %d word %lld\n", static_cast<unsigned long long>(write.begin), static_cast<unsigned long long>(write.end), static_cast<unsigned long long>(write.note), write.value, static_cast<long long>(write.word));
+                }
+            }
+        };
         for (std::size_t index = 0u; index < sampling.initial.size(); ++index) {
             const auto& range = sampling.initial[index];
             Require(GuestMemory::Accessible(reinterpret_cast<const void*>(range.address), range.bytes) && GuestMemory::Watched(range.address, range.bytes), "native multisample depth requires watched accessible guest memory");
             if (recorder != nullptr && !(index == 1u && queuedFill) && !(index == 2u && queuedStencilFill) && recorder->PendingWriteOverlaps(range.address, range.bytes)) {
                 check.Pending(*recorder, index, range.address, range.bytes);
+                if (recorder->PendingStoreOverlaps(range.address, range.bytes)) refusalArguments("a pending store", index);
                 Require(!recorder->PendingStoreOverlaps(range.address, range.bytes), "external GPU writes over native multisample depth are not implemented");
                 const auto settled = GuestMemory::TrackerGeneration();
                 const auto syncStart = check.Now();
                 RecorderFor(context)->SyncThrough(range.address, range.bytes);
                 check.Synced(syncStart);
+                if (GuestMemory::WrittenSince(range.address, range.bytes, settled)) refusalArguments("written while the pending writes landed", index);
                 Require(!GuestMemory::WrittenSince(range.address, range.bytes, settled), "external GPU writes over native multisample depth are not implemented");
             }
             const auto collectStart = check.Now();
@@ -2040,6 +2120,7 @@ private:
     };
     std::vector<PublicationPlane> publication;
     std::array<std::uint64_t, 3> publicationFill{};
+    std::array<bool, 3> publicationFillOwed{};
     bool publicationInProgress = false;
     bool publicationFailed = false;
     std::exception_ptr publicationFailure;
@@ -2163,6 +2244,7 @@ private:
             }
             publication[index] = std::move(plane);
             publicationFill[index] = note;
+            publicationFillOwed[index] = !publicationFillsVerify();
             notePublicationFill(true);
         } catch (...) {
             publicationFailure = std::current_exception();
