@@ -260,13 +260,22 @@ constexpr int CensusPrinted = 60;
 struct CensusEntry {
     void* site;
     std::size_t bytes;
+    void* outer[2];
 };
 
 struct CensusSite {
     void* site;
     std::uint64_t bytes;
     std::uint64_t samples;
+    void* outer[2];
 };
+
+struct CensusFrames {
+    void* site;
+    void* outer[2];
+};
+
+constexpr std::size_t CensusOuterBytes = std::size_t{1} << 20;
 
 std::atomic<void*> censusKeys[CensusBuckets][CensusWays];
 CensusEntry censusEntries[CensusBuckets][CensusWays];
@@ -398,6 +407,10 @@ void CensusReport() noexcept {
             censusSites[at].site = entry.site;
             censusSites[at].bytes += entry.bytes;
             ++censusSites[at].samples;
+            if (censusSites[at].outer[0] == nullptr) {
+                censusSites[at].outer[0] = entry.outer[0];
+                censusSites[at].outer[1] = entry.outer[1];
+            }
         }
     }
     ReleaseSRWLockShared(&censusLock);
@@ -417,21 +430,85 @@ void CensusReport() noexcept {
         for (const char* at = path; *at != 0; ++at) {
             if (*at == '\\' || *at == '/') name = at + 1;
         }
-        std::snprintf(text, sizeof(text), "[heap-census] %2d. %8.1f MiB in %llu samples: %s+0x%llx\n", rank + 1, static_cast<double>(censusSites[best].bytes) / 1048576.0, static_cast<unsigned long long>(censusSites[best].samples), name, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(censusSites[best].site) - reinterpret_cast<std::uintptr_t>(module)));
+        int length = std::snprintf(text, sizeof(text), "[heap-census] %2d. %8.1f MiB in %llu samples: %s+0x%llx", rank + 1, static_cast<double>(censusSites[best].bytes) / 1048576.0, static_cast<unsigned long long>(censusSites[best].samples), name, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(censusSites[best].site) - reinterpret_cast<std::uintptr_t>(module)));
+        for (const void* outer : censusSites[best].outer) {
+            if (outer == nullptr || length <= 0 || static_cast<std::size_t>(length) >= sizeof(text) - 96) continue;
+            HMODULE outerModule = nullptr;
+            char outerPath[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(outer), &outerModule) && outerModule != nullptr) GetModuleFileNameA(outerModule, outerPath, sizeof(outerPath));
+            const char* outerName = outerPath;
+            for (const char* at = outerPath; *at != 0; ++at) {
+                if (*at == '\\' || *at == '/') outerName = at + 1;
+            }
+            length += std::snprintf(text + length, sizeof(text) - static_cast<std::size_t>(length), " < %.48s+0x%llx", outerName, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(outer) - reinterpret_cast<std::uintptr_t>(outerModule)));
+        }
         std::fputs(text, stderr);
+        std::fputs("\n", stderr);
         censusSites[best].bytes = 0;
     }
     if (CensusWalks()) CensusWalkHeaps();
     ReleaseSRWLockExclusive(&censusReportLock);
 }
 
-void CensusAdd(void* block, std::size_t bytes, void* site) noexcept {
+CensusFrames CensusFramesOf(void* site, std::size_t bytes) noexcept {
+    static const unsigned long above = [] {
+        const char* text = std::getenv("APS5_HEAP_CENSUS_FRAME");
+        return text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul;
+    }();
+    CensusFrames frames{site, {nullptr, nullptr}};
+    if (above == 0 || bytes < CensusOuterBytes) return frames;
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(site), &module) || module == nullptr) return frames;
+    const auto base = reinterpret_cast<std::uintptr_t>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + static_cast<std::uintptr_t>(dos->e_lfanew));
+    std::uintptr_t low = 0;
+    std::uintptr_t end = 0;
+    const auto* sections = IMAGE_FIRST_SECTION(headers);
+    for (unsigned index = 0; index < headers->FileHeader.NumberOfSections && end == 0; ++index) {
+        if ((sections[index].Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+        low = base + sections[index].VirtualAddress;
+        end = low + sections[index].Misc.VirtualSize;
+    }
+    if (end == 0) return frames;
+    const auto* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+    const auto* slot = reinterpret_cast<const std::uintptr_t*>((reinterpret_cast<std::uintptr_t>(&frames) + 7u) & ~std::uintptr_t{7});
+    const auto* top = static_cast<const std::uintptr_t*>(tib->StackBase);
+    if (slot == nullptr || slot >= top) return frames;
+    if (top - slot > 2048) top = slot + 2048;
+    bool started = false;
+    unsigned long found = 0;
+    for (; slot < top; ++slot) {
+        const auto value = *slot;
+        if (!started) {
+            started = value == reinterpret_cast<std::uintptr_t>(site);
+            continue;
+        }
+        if (value < low + 7 || value >= end) continue;
+        const auto* code = reinterpret_cast<const unsigned char*>(value);
+        const bool direct = code[-5] == 0xe8;
+        const bool indirect = code[-2] == 0xff || code[-3] == 0xff || code[-6] == 0xff || code[-7] == 0xff;
+        if (!direct && !indirect) continue;
+        ++found;
+        if (found == above) frames.site = reinterpret_cast<void*>(value);
+        else if (found == above + 1) frames.outer[0] = reinterpret_cast<void*>(value);
+        else if (found == above + 2) {
+            frames.outer[1] = reinterpret_cast<void*>(value);
+            break;
+        }
+    }
+    return frames;
+}
+
+void CensusAdd(void* block, std::size_t bytes, void* caller) noexcept {
+    const auto frames = CensusFramesOf(caller, bytes);
+    void* const site = frames.site;
     const auto bucket = CensusBucket(block);
     bool placed = false;
     AcquireSRWLockExclusive(&censusLock);
     for (std::size_t way = 0; way < CensusWays && !placed; ++way) {
         if (censusKeys[bucket][way].load(std::memory_order_relaxed) != nullptr) continue;
-        censusEntries[bucket][way] = {site, bytes > CensusInterval ? bytes : CensusInterval};
+        censusEntries[bucket][way] = {site, bytes > CensusInterval ? bytes : CensusInterval, {frames.outer[0], frames.outer[1]}};
         censusKeys[bucket][way].store(block, std::memory_order_release);
         placed = true;
     }
