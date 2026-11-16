@@ -3,7 +3,9 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include <cstdint>
 #include <set>
+#include <stdexcept>
 
 namespace AgcDriver::Graphics {
 
@@ -108,6 +110,38 @@ private:
     std::vector<CachedFramebuffer> framebuffers;
 };
 
+class PipelinePending final : public std::runtime_error {
+public:
+    PipelinePending() : std::runtime_error("AGC graphics: the draw's pipeline is being built on a background thread") {}
+};
+
+enum class PipelineDefer : std::uint8_t { Never, Refuse, Skip };
+
+class PendingPipelineScope {
+public:
+    explicit PendingPipelineScope(bool allowed = true);
+    ~PendingPipelineScope();
+    PendingPipelineScope(const PendingPipelineScope&) = delete;
+    PendingPipelineScope& operator=(const PendingPipelineScope&) = delete;
+
+private:
+    bool active = false;
+    bool previous = false;
+};
+
+struct PendingPipelineCounts {
+    std::uint64_t started = 0;
+    std::uint64_t completed = 0;
+    std::uint64_t failed = 0;
+    std::uint64_t refused = 0;
+    std::uint64_t skipped = 0;
+    std::uint64_t synchronous = 0;
+    double longestMs = 0.0;
+};
+
+PendingPipelineCounts PendingPipelineStatistics();
+void WaitForPendingPipelines(VkDevice device);
+
 // The pipeline for this configuration, shared across draws and frames: keyed by the stages'
 // identities (the rect-list tessellation pair and the geometry stage by the vertex and fragment
 // results that generate them), the vertex input layout, the descriptor set layout key, push constant
@@ -118,9 +152,9 @@ private:
 // doubles up to 4096 for a journal replay that does not fit and while pipelines it evicted keep
 // coming back; it never shrinks during a run. APS5_PIPELINE_STORE_ENTRIES fixes it. Debug aid:
 // APS5_NO_PIPELINE_CACHE=1 builds one per draw as before.
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, PipelineDefer defer = PipelineDefer::Never);
 // `created` reports whether this call built the pipeline (false: served from the store or private).
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, bool* created = nullptr, std::uint64_t* storeHash = nullptr);
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, bool* created = nullptr, std::uint64_t* storeHash = nullptr, PipelineDefer defer = PipelineDefer::Never);
 std::shared_ptr<Pipeline> TouchCachedPipeline(const Context& context, std::uint64_t hash, const std::weak_ptr<Pipeline>& expected);
 // Cumulative pipeline store outcomes since start-up (the [pipecache] line reports 10 s windows).
 struct PipelineStoreCounters {

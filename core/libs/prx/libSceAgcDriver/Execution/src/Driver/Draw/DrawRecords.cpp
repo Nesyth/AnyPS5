@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRecords.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectDraws.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/LeanDraw.hpp"
@@ -2186,6 +2187,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    const Graphics::PendingPipelineScope pendingPipelines;
     auto fragmentOutputs = hit.record->fragmentOutputs;
     if (auto current = device.Load(); current != nullptr && current != localDevice) {
         localDevice = std::move(current);
@@ -2388,7 +2390,13 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
     if (hit.addressed) DirectDraws::Add(DirectDraws::Counter::AddressedCommits);
     {
         const Graphics::FullDrawCauseScope cause(verify ? Cause::RecordVerify : heavyVerify ? Cause::SpaceVerify : spaceUnused != Cause::Count ? spaceUnused : recipeUsable ? Cause::RecordMissed : hit.addressed && commit.spaceRefused ? Cause::SpaceRefused : hit.addressed ? Cause::RecordFirstAddressed : Cause::RecordFirst);
-        localDevice->Draw(graphics, hit.parameters, hit.stages, hit.snapshots, &built, tracePtr, shape, keyWords, fragmentOutputs ? &*fragmentOutputs : nullptr, true);
+        try {
+            localDevice->Draw(graphics, hit.parameters, hit.stages, hit.snapshots, &built, tracePtr, shape, keyWords, fragmentOutputs ? &*fragmentOutputs : nullptr, true);
+        } catch (const Graphics::PipelinePending& pending) {
+            CaptureTrace::Log("draw-refused submission=%llu offset=%zu committer=1 reason=%.256s", static_cast<unsigned long long>(trace.submission), trace.offset, pending.what());
+            ReportRefusedDraw(RefusedDraw(0, pending.what(), true));
+            return;
+        }
     }
     DrawCommitViewSlot::Set(nullptr);
     bool differs = false;

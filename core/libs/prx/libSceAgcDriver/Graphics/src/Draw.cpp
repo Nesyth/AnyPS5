@@ -5988,7 +5988,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         selected.stencilReplayReference = reference;
         selected.stencilFront.reference = reference;
         selected.stencilBack.reference = reference;
-        auto selectedPipeline = stencilReplay.empty() ? CachedPipeline(context, selected, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+        auto selectedPipeline = stencilReplay.empty() ? CachedPipeline(context, selected, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, PipelineDefer::Refuse) : stencilReplay.front().second;
         Require(!selectedPipeline->SplitsFaces() && !selectedPipeline->SplitsSecondChannel(), "stencil replay refuses pipeline face or channel splits");
         stencilReplay.emplace_back(reference, std::move(selectedPipeline));
     }
@@ -6006,7 +6006,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             noteShapeMemoVerified(true);
         }
         const bool repeated = pipeline != nullptr;
-        if (!repeated) pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash);
+        if (!repeated) pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash, PipelineDefer::Refuse);
         if (memoized) rememberShape(context, prepared.shape, targets, repeated ? nullptr : &pipeline, storeHash, inputs.VertexLayout(), layouts, shaders, attachmentLayout, inputs.fragmentOutputs);
     }
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
@@ -6717,6 +6717,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 color.layers = window.renderLayers;
             }
             if (!window.colors.empty()) window.color = window.colors.front();
+            std::optional<PendingPipelineScope> laterWindow;
+            if (base != 0) laterWindow.emplace(false);
             Draw(context, window, draw, shaders, snapshots, nullptr, trace);
             base += window.renderLayers;
         }
@@ -7868,7 +7870,7 @@ DrawRecipeOutcome drawWithRecord(const Context& context, const State& state, con
         movesPushed = std::ranges::any_of(moved, [&](const ShaderResources::MovedBuffer& entry) { return entry.allocation < push->allocationSets.size() && push->allocationSets[entry.allocation] == push->set; });
         if (pushPipeline == nullptr && movesPushed) {
             const State& pipelineState = recipe.masked.has_value() ? *recipe.masked : state;
-            pushPipeline = CachedPipeline(context, pipelineState, recipe.vertexInput, push->layouts, shaders, VK_IMAGE_LAYOUT_GENERAL);
+            pushPipeline = CachedPipeline(context, pipelineState, recipe.vertexInput, push->layouts, shaders, VK_IMAGE_LAYOUT_GENERAL, nullptr, nullptr, PipelineDefer::Skip);
             record.pushPipeline = pushPipeline;
             record.pushTemplate = resources.get();
             pushFramebuffer.reset();
@@ -7896,7 +7898,7 @@ DrawRecipeOutcome drawWithRecord(const Context& context, const State& state, con
             }
             if (made == nullptr) {
                 const State& pipelineState = recipe.masked.has_value() ? *recipe.masked : state;
-                made = CachedPipeline(context, pipelineState, recipe.vertexInput, layouts, shaders, VK_IMAGE_LAYOUT_GENERAL);
+                made = CachedPipeline(context, pipelineState, recipe.vertexInput, layouts, shaders, VK_IMAGE_LAYOUT_GENERAL, nullptr, nullptr, PipelineDefer::Skip);
                 keptPipeline = made;
                 keptTemplate = resources.get();
                 madeFramebuffer.reset();

@@ -256,6 +256,7 @@ enum class RuntimeSwitch : std::size_t {
     ReplayStateAcrossBinds,
     SpreadDestruction,
     StorageCopyRelease,
+    SkipPendingPipelines,
     Count,
 };
 

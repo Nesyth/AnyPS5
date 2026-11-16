@@ -2322,7 +2322,14 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, contentKey, fragmentOutputs ? &*fragmentOutputs : nullptr);
+    try {
+        const Graphics::PendingPipelineScope pendingPipelines;
+        localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, contentKey, fragmentOutputs ? &*fragmentOutputs : nullptr);
+    } catch (const Graphics::PipelinePending& pending) {
+        CaptureTrace::Log("draw-refused submission=%llu offset=%zu committer=1 reason=%.256s", static_cast<unsigned long long>(trace.submission), trace.offset, pending.what());
+        ReportRefusedDraw(RefusedDraw(0, pending.what(), true));
+        return;
+    }
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor);
 }
 

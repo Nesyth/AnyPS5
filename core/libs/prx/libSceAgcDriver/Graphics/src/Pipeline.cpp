@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -19,18 +20,25 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <optional>
 #include <cstring>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
+#include <functional>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <spirv/unified1/spirv.hpp>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -1290,6 +1298,16 @@ struct PipelineStore {
     std::unordered_map<std::uint64_t, std::list<std::uint64_t>::iterator> evictedKeys;
     std::size_t evictionsSinceCheck = 0;
     std::size_t returnsSinceCheck = 0;
+    struct Pending {
+        VkDevice device = VK_NULL_HANDLE;
+        std::vector<std::byte> key;
+        const void* ticket = nullptr;
+        bool failed = false;
+    };
+    std::unordered_map<std::uint64_t, Pending> pending;
+    std::size_t building = 0;
+    std::chrono::steady_clock::time_point pendingReport = std::chrono::steady_clock::now();
+    PendingPipelineCounts pendingReported;
     static constexpr std::size_t BaseEntries = 1024;
     static constexpr std::size_t MaximumEntries = 4096;
 };
@@ -1368,13 +1386,245 @@ void reportPipelines(PipelineStore& store) {
     store.hits = store.misses = store.uncached = store.evicted = 0;
 }
 
+struct PendingPipelineThread {
+    bool allowed = false;
+};
+
+PendingPipelineThread& pendingPipelineThread() {
+    struct PendingPipelineStorage {};
+    return HostThreadLocal<PendingPipelineThread, PendingPipelineStorage>();
 }
 
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
-    return CachedPipeline(context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout);
+struct PendingPipelineCounters {
+    std::atomic<std::uint64_t> started{0};
+    std::atomic<std::uint64_t> completed{0};
+    std::atomic<std::uint64_t> failed{0};
+    std::atomic<std::uint64_t> refused{0};
+    std::atomic<std::uint64_t> skipped{0};
+    std::atomic<std::uint64_t> synchronous{0};
+    std::atomic<std::uint64_t> nanoseconds{0};
+    std::atomic<std::uint64_t> longestNs{0};
+    std::atomic<std::uint64_t> windowLongestNs{0};
+    std::atomic<std::uint64_t> windowLongestPendingNs{0};
+};
+
+PendingPipelineCounters& pendingPipelineCounters() {
+    static auto* counters = new PendingPipelineCounters();
+    return *counters;
 }
 
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool* created, std::uint64_t* storeHash) {
+void noteLongestBuild(std::atomic<std::uint64_t>& longest, std::uint64_t nanoseconds) {
+    auto seen = longest.load(std::memory_order_relaxed);
+    while (seen < nanoseconds && !longest.compare_exchange_weak(seen, nanoseconds, std::memory_order_relaxed)) {}
+}
+
+std::uint64_t pendingPipelineQueue() {
+    static const auto bound = PipelineSwitch("APS5_PENDING_PIPELINE_QUEUE", 64u);
+    return bound;
+}
+
+void reportPendingPipelines(PipelineStore& store) {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!stats) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - store.pendingReport < std::chrono::seconds(10)) return;
+    store.pendingReport = now;
+    const auto counts = PendingPipelineStatistics();
+    const auto& last = store.pendingReported;
+    const auto longest = pendingPipelineCounters().windowLongestNs.exchange(0, std::memory_order_relaxed);
+    const auto longestPending = pendingPipelineCounters().windowLongestPendingNs.exchange(0, std::memory_order_relaxed);
+    const bool moved = counts.started != last.started || counts.completed != last.completed || counts.failed != last.failed || counts.refused != last.refused || counts.skipped != last.skipped || counts.synchronous != last.synchronous || store.building != 0;
+    if (moved || RuntimeSwitches::Set(RuntimeSwitch::SkipPendingPipelines)) {
+        const auto since = [](std::uint64_t total, std::uint64_t before) { return static_cast<unsigned long long>(total - before); };
+        AgcDriver::ProfilePrint_nid_no_patch("[pending-pipelines] 10 s: %llu pipeline builds started on background threads, %llu completed, %llu failed (the next draw of a failed one builds it on the drawing thread), %llu draws refused and %llu push or dynamic variants left out while their pipeline was built, %llu built on the drawing thread with %llu builds in flight (APS5_PENDING_PIPELINE_QUEUE), longest build %.1f ms, longest from the first refused draw to the finished build %.1f ms; %zu in flight now\n", since(counts.started, last.started), since(counts.completed, last.completed), since(counts.failed, last.failed), since(counts.refused, last.refused), since(counts.skipped, last.skipped), since(counts.synchronous, last.synchronous), static_cast<unsigned long long>(pendingPipelineQueue()), static_cast<double>(longest) / 1e6, static_cast<double>(longestPending) / 1e6, store.building);
+    }
+    store.pendingReported = counts;
+}
+
+struct PendingBuild {
+    PendingBuild(const Context& context, const State& state, const VertexInputLayout& vertexInput, VkImageLayout attachmentLayout, std::uint64_t hash) : context(context), state(state), vertexInput(vertexInput), attachmentLayout(attachmentLayout), hash(hash) {}
+    Context context;
+    State state;
+    VertexInputLayout vertexInput;
+    VkImageLayout attachmentLayout;
+    std::uint64_t hash;
+    std::vector<std::uint32_t> mainKey;
+    std::vector<std::uint32_t> fragmentKey;
+    PipelineSetLayouts layouts;
+    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> programs;
+    std::vector<CompiledShader> shaders;
+    std::chrono::steady_clock::time_point queued = std::chrono::steady_clock::now();
+};
+
+void runPendingBuild(const std::shared_ptr<PendingBuild>& build) {
+    const auto began = std::chrono::steady_clock::now();
+    std::string failure;
+    try {
+        static_cast<void>(CachedPipeline(build->context, build->state, build->vertexInput, build->layouts, build->shaders, build->attachmentLayout));
+    } catch (const std::exception& error) {
+        failure = error.what();
+        if (failure.empty()) failure = "an exception without a message";
+    } catch (...) {
+        failure = "an exception of an unknown type";
+    }
+    const auto finished = std::chrono::steady_clock::now();
+    const auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - began).count());
+    auto& counters = pendingPipelineCounters();
+    counters.nanoseconds.fetch_add(spent, std::memory_order_relaxed);
+    noteLongestBuild(counters.longestNs, spent);
+    noteLongestBuild(counters.windowLongestNs, spent);
+    noteLongestBuild(counters.windowLongestPendingNs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - build->queued).count()));
+    (failure.empty() ? counters.completed : counters.failed).fetch_add(1, std::memory_order_relaxed);
+    auto& store = Pipelines();
+    {
+        std::lock_guard lock(store.mutex);
+        const auto found = store.pending.find(build->hash);
+        if (found != store.pending.end() && found->second.ticket == build.get()) {
+            --store.building;
+            if (failure.empty()) {
+                store.pending.erase(found);
+            } else {
+                found->second.ticket = nullptr;
+                found->second.failed = true;
+            }
+        }
+        reportPendingPipelines(store);
+    }
+    const auto count = counters.completed.load(std::memory_order_relaxed) + counters.failed.load(std::memory_order_relaxed);
+    if (count > 16u && count % 64u != 0u) return;
+    if (!failure.empty()) {
+        std::fprintf(stderr, "[pending-pipelines] pipeline build %llu failed on a background thread after %.1f ms; the next draw that needs it builds it on the drawing thread: %.256s\n", static_cast<unsigned long long>(count), static_cast<double>(spent) / 1e6, failure.c_str());
+        return;
+    }
+    std::fprintf(stderr, "[pending-pipelines] pipeline build %llu done on a background thread in %.1f ms; %.1f ms in all, %llu draws refused and %llu push or dynamic variants left out so far while their pipeline was built\n", static_cast<unsigned long long>(count), static_cast<double>(spent) / 1e6, static_cast<double>(counters.nanoseconds.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(counters.refused.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.skipped.load(std::memory_order_relaxed)));
+}
+
+class PendingPipelineWorkers {
+public:
+    static PendingPipelineWorkers& Get() {
+        static auto* workers = new PendingPipelineWorkers();
+        return *workers;
+    }
+
+    bool Submit(VkDevice device, std::function<void()> job) {
+        std::lock_guard lock(mutex);
+        if (threads < Threads() && jobs.size() >= idle) {
+            try {
+                std::thread([this] { run(); }).detach();
+                ++threads;
+            } catch (const std::system_error&) {
+                if (threads == 0) return false;
+            }
+        }
+        jobs.emplace_back(device, std::move(job));
+        wake.notify_one();
+        return true;
+    }
+
+    void Cancel(VkDevice device) {
+        std::vector<std::function<void()>> dropped;
+        std::unique_lock lock(mutex);
+        for (auto it = jobs.begin(); it != jobs.end();) {
+            if (it->first != device) {
+                ++it;
+                continue;
+            }
+            dropped.push_back(std::move(it->second));
+            it = jobs.erase(it);
+        }
+        done.wait(lock, [&] { return !running.contains(device); });
+        lock.unlock();
+        dropped.clear();
+    }
+
+    void Wait(VkDevice device) {
+        std::unique_lock lock(mutex);
+        done.wait(lock, [&] { return !running.contains(device) && std::none_of(jobs.begin(), jobs.end(), [&](const std::pair<VkDevice, std::function<void()>>& job) { return job.first == device; }); });
+    }
+
+private:
+    static unsigned Threads() {
+        static const auto count = static_cast<unsigned>(std::max<std::uint64_t>(PipelineSwitch("APS5_PENDING_PIPELINE_THREADS", 2u), 1u));
+        return count;
+    }
+
+    void run() {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            ++idle;
+            wake.wait(lock, [&] { return !jobs.empty(); });
+            --idle;
+            auto job = std::move(jobs.front());
+            jobs.pop_front();
+            ++running[job.first];
+            lock.unlock();
+            job.second();
+            job.second = nullptr;
+            lock.lock();
+            if (--running[job.first] == 0) running.erase(job.first);
+            done.notify_all();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable done;
+    std::deque<std::pair<VkDevice, std::function<void()>>> jobs;
+    std::unordered_map<VkDevice, std::size_t> running;
+    unsigned threads = 0;
+    std::size_t idle = 0;
+};
+
+bool deferrable(const Context& context, const State& state, PipelineDefer defer) {
+    if (defer == PipelineDefer::Never || !RuntimeSwitches::Set(RuntimeSwitch::SkipPendingPipelines) || !pendingPipelineThread().allowed) return false;
+    static const bool ownedLayouts = std::getenv("APS5_NO_LAYOUT_CACHE") != nullptr;
+    return context.descriptorCache != nullptr && !ownedLayouts && state.tessellationCapture == nullptr && !PipelineJournalReplaying();
+}
+
+bool deferPipeline(PipelineStore& store, const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, std::uint64_t hash, const std::vector<std::byte>& key, PipelineDefer defer) {
+    auto& counters = pendingPipelineCounters();
+    const auto refuse = [&] {
+        (defer == PipelineDefer::Refuse ? counters.refused : counters.skipped).fetch_add(1, std::memory_order_relaxed);
+        return true;
+    };
+    if (const auto found = store.pending.find(hash); found != store.pending.end()) {
+        if (found->second.key != key) return false;
+        if (!found->second.failed) return refuse();
+        store.pending.erase(found);
+        return false;
+    }
+    if (store.building >= pendingPipelineQueue()) {
+        counters.synchronous.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    auto build = std::make_shared<PendingBuild>(context, state, vertexInput, attachmentLayout, hash);
+    build->mainKey.assign(resources.mainKey.begin(), resources.mainKey.end());
+    build->fragmentKey.assign(resources.fragmentKey.begin(), resources.fragmentKey.end());
+    build->layouts = resources;
+    build->layouts.mainKey = build->mainKey;
+    build->layouts.fragmentKey = build->fragmentKey;
+    build->programs.reserve(shaders.size());
+    build->shaders.reserve(shaders.size());
+    for (const auto& shader : shaders) {
+        auto program = std::make_shared<const ShaderRecompiler::RecompileResult>(*shader.program);
+        build->shaders.push_back({shader.stage, program.get(), shader.pushConstantOffset});
+        build->programs.push_back(std::move(program));
+    }
+    const void* ticket = build.get();
+    if (!PendingPipelineWorkers::Get().Submit(context.device, [build = std::move(build)] { runPendingBuild(build); })) return false;
+    store.pending[hash] = PipelineStore::Pending{context.device, key, ticket, false};
+    ++store.building;
+    counters.started.fetch_add(1, std::memory_order_relaxed);
+    return refuse();
+}
+
+}
+
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, PipelineDefer defer) {
+    return CachedPipeline(context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout, nullptr, nullptr, defer);
+}
+
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool* created, std::uint64_t* storeHash, PipelineDefer defer) {
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (created != nullptr) *created = false;
     if (storeHash != nullptr) *storeHash = 0;
@@ -1410,9 +1660,11 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         abandon(store, it);
         return nullptr;
     };
+    bool pending = false;
     {
         std::lock_guard lock(store.mutex);
         reportPipelines(store);
+        reportPendingPipelines(store);
         bool collision = false;
         if (auto pipeline = lookup(collision)) {
             ++store.hits;
@@ -1426,9 +1678,16 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             ++store.totals.uncached;
             return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
         }
-        ++store.misses;
-        ++store.totals.misses;
-        noteStoreReturn(store, hash);
+        pending = deferrable(context, state, defer) && !store.evictedKeys.contains(hash) && !ShadersWriteMemory(shaders) && deferPipeline(store, context, state, vertexInput, resources, shaders, attachmentLayout, hash, key, defer);
+        if (!pending) {
+            ++store.misses;
+            ++store.totals.misses;
+            noteStoreReturn(store, hash);
+        }
+    }
+    if (pending) {
+        if (defer == PipelineDefer::Refuse) throw PipelinePending();
+        return nullptr;
     }
     // Built outside the mutex: a draw that finds its pipeline resident is not held behind another
     // thread's build (the journal replay builds here too), and a device's driver compiles in
@@ -1487,6 +1746,7 @@ std::shared_ptr<Pipeline> TouchCachedPipeline(const Context& context, std::uint6
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
     reportPipelines(store);
+    reportPendingPipelines(store);
     const auto found = store.index.find(hash);
     if (found == store.index.end()) return nullptr;
     const auto it = found->second;
@@ -1517,8 +1777,17 @@ bool PipelineStoreCanGrow() {
 }
 
 void ClearCachedPipelines(VkDevice device) {
+    PendingPipelineWorkers::Get().Cancel(device);
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
+    for (auto it = store.pending.begin(); it != store.pending.end();) {
+        if (it->second.device != device) {
+            ++it;
+            continue;
+        }
+        if (!it->second.failed) --store.building;
+        it = store.pending.erase(it);
+    }
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         if (it->device != device) {
             ++it;
@@ -1538,6 +1807,27 @@ void ClearCachedPipelines(VkDevice device) {
     ReleasePixelFunctionLds(device);
     ReleaseMeshWindow(device);
     ReleaseGuestPageTable(device);
+}
+
+PendingPipelineScope::PendingPipelineScope(bool allowed) {
+    if (!RuntimeSwitches::Set(RuntimeSwitch::SkipPendingPipelines)) return;
+    auto& thread = pendingPipelineThread();
+    active = true;
+    previous = thread.allowed;
+    thread.allowed = allowed;
+}
+
+PendingPipelineScope::~PendingPipelineScope() {
+    if (active) pendingPipelineThread().allowed = previous;
+}
+
+PendingPipelineCounts PendingPipelineStatistics() {
+    const auto& counters = pendingPipelineCounters();
+    return {counters.started.load(std::memory_order_relaxed), counters.completed.load(std::memory_order_relaxed), counters.failed.load(std::memory_order_relaxed), counters.refused.load(std::memory_order_relaxed), counters.skipped.load(std::memory_order_relaxed), counters.synchronous.load(std::memory_order_relaxed), static_cast<double>(counters.longestNs.load(std::memory_order_relaxed)) / 1e6};
+}
+
+void WaitForPendingPipelines(VkDevice device) {
+    PendingPipelineWorkers::Get().Wait(device);
 }
 
 }

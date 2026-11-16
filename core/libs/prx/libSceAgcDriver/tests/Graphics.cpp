@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -13120,6 +13121,108 @@ void pipelineStoreTouchTests() {
     Require(mock.live == 0, "pipeline store touch tests leaked Vulkan objects");
 }
 
+void pendingPipelineTests() {
+    using namespace AgcDriver::Graphics;
+#ifdef _WIN32
+    _putenv_s("APS5_PENDING_PIPELINE_QUEUE", "1");
+#else
+    setenv("APS5_PENDING_PIPELINE_QUEUE", "1", 1);
+#endif
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.device = makeHandle<VkDevice>();
+    context.graphicsPipelineLibrary = true;
+    context.pipelineLinkTimeOptimization = false;
+    context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    auto cache = std::make_unique<DescriptorCache>(context);
+    context.descriptorCache = cache.get();
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.spirv = makeModule({});
+    fragment.spirv = makeModule({.fragment = true});
+    vertex.variantId = 501;
+    fragment.variantId = 502;
+    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
+    std::array<std::uint32_t, 1> mainKey{61}, fragmentKey{62};
+    const PipelineSetLayouts resources{makeHandle<VkDescriptorSetLayout>(), makeHandle<VkDescriptorSetLayout>(), true, mainKey, fragmentKey};
+    const auto lookup = [&](const State& state, std::uint32_t configuration, PipelineDefer defer, bool* created = nullptr) {
+        VertexInputLayout input;
+        input.bindings.push_back({0, 4u * (configuration + 1u), VK_VERTEX_INPUT_RATE_VERTEX});
+        return CachedPipeline(context, state, input, resources, shaders, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, created, nullptr, defer);
+    };
+    const auto refused = [&](const State& state, std::uint32_t configuration) {
+        try {
+            static_cast<void>(lookup(state, configuration, PipelineDefer::Refuse));
+        } catch (const PipelinePending&) {
+            return true;
+        }
+        return false;
+    };
+    const bool wasSet = RuntimeSwitches::Set(RuntimeSwitch::SkipPendingPipelines);
+    RuntimeSwitches::Assign(RuntimeSwitch::SkipPendingPipelines, true);
+    const auto before = PendingPipelineStatistics();
+    {
+        bool created = false;
+        const auto built = lookup(State{}, 0, PipelineDefer::Refuse, &created);
+        Require(built != nullptr && created && PendingPipelineStatistics().started == before.started, "a refusable miss outside a pending scope was not built on the drawing thread");
+    }
+    {
+        std::lock_guard lock(pipelineCreateMutex);
+        blockLibraryCreate = true;
+        libraryCreateEntered = false;
+        releaseLibraryCreate = false;
+    }
+    const PendingPipelineScope scope;
+    Require(refused(State{}, 1), "a store miss under a pending scope was built on the drawing thread");
+    {
+        std::unique_lock lock(pipelineCreateMutex);
+        pipelineCreateCondition.wait(lock, [] { return libraryCreateEntered; });
+        blockLibraryCreate = false;
+    }
+    auto counts = PendingPipelineStatistics();
+    Require(counts.started == before.started + 1 && counts.refused == before.refused + 1, "the background build did not start once with its draw refused");
+    Require(refused(State{}, 1), "a draw whose pipeline is being built was not refused");
+    Require(lookup(State{}, 1, PipelineDefer::Skip) == nullptr, "a variant whose pipeline is being built was not left out");
+    counts = PendingPipelineStatistics();
+    Require(counts.started == before.started + 1 && counts.refused == before.refused + 2 && counts.skipped == before.skipped + 1, "a key in flight started another build");
+    {
+        bool created = false;
+        const auto full = lookup(State{}, 2, PipelineDefer::Refuse, &created);
+        Require(full != nullptr && created && PendingPipelineStatistics().synchronous == before.synchronous + 1, "a miss with the queue full was not built on the drawing thread");
+    }
+    {
+        std::lock_guard lock(pipelineCreateMutex);
+        releaseLibraryCreate = true;
+    }
+    pipelineCreateCondition.notify_all();
+    WaitForPendingPipelines(context.device);
+    Require(PendingPipelineStatistics().completed == before.completed + 1, "the background build did not complete");
+    {
+        bool created = true;
+        const auto stored = lookup(State{}, 1, PipelineDefer::Refuse, &created);
+        Require(stored != nullptr && !created, "the pipeline built in the background was not served from the store");
+    }
+    State failing{};
+    failing.perSampleShading = true;
+    Require(refused(failing, 3), "a configuration whose build fails was not deferred");
+    WaitForPendingPipelines(context.device);
+    Require(PendingPipelineStatistics().failed == before.failed + 1, "the failed background build was not counted");
+    expectFailure([&] { static_cast<void>(lookup(failing, 3, PipelineDefer::Refuse)); }, "sampleRateShading");
+    Require(refused(failing, 3), "after the drawing thread surfaced the failure the next miss did not go to the background again");
+    WaitForPendingPipelines(context.device);
+    Require(PendingPipelineStatistics().failed == before.failed + 2, "the second failed background build was not counted");
+    RuntimeSwitches::Assign(RuntimeSwitch::SkipPendingPipelines, false);
+    {
+        bool created = false;
+        const auto built = lookup(State{}, 4, PipelineDefer::Refuse, &created);
+        Require(built != nullptr && created, "with the switch off a refusable miss was not built on the drawing thread");
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::SkipPendingPipelines, wasSet);
+    ClearCachedPipelines(context.device);
+    context.descriptorCache = nullptr;
+    cache.reset();
+    Require(mock.live == 0, "pending pipeline tests leaked Vulkan objects");
+}
+
 // A journal longer than the store's starting bound: 1032 recorded pipelines replayed into an empty
 // store all stay resident (the replay grows the bound instead of dropping what does not fit).
 void pipelineStoreReplayGrowthTests() {
@@ -13695,6 +13798,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-store-touch") {
             pipelineStoreTouchTests();
             std::cout << "a touched pipeline is returned as a hit and stays recently used\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--pending-pipelines") {
+            pendingPipelineTests();
+            std::cout << "a store miss in the pending mode is built on a background thread and its draws are refused until it is stored\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-store-lazy-buffer-pool") {
