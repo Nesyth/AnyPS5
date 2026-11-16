@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LockProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -394,8 +395,31 @@ bool spinHandoff() {
 
 constexpr std::chrono::microseconds HandoffLockSpin{20};
 
+struct ProbedOwner {
+    std::atomic<const void*> lock{nullptr};
+    std::atomic<std::uint32_t> thread{0};
+};
+
+std::atomic<std::uint32_t>& probedOwner(const void* lock) {
+    static std::array<ProbedOwner, 8> owners;
+    for (auto& entry : owners) {
+        const void* held = entry.lock.load(std::memory_order_acquire);
+        if (held == lock) return entry.thread;
+        if (held == nullptr && entry.lock.compare_exchange_strong(held, lock)) return entry.thread;
+        if (held == lock) return entry.thread;
+    }
+    return owners.back().thread;
+}
+
 template<typename TMutex>
 std::unique_lock<TMutex> lockFor(TMutex& mutex) {
+    if (LockProbeMs() > 0.0) {
+        static const std::atomic<std::uint32_t> none{0};
+        auto& owner = probedOwner(&mutex);
+        if (!mutex.try_lock()) AwaitProbedLock("pipeline or finisher mutex", &mutex, owner, none, [&] { return mutex.try_lock(); });
+        owner.store(LockProbeThread(), std::memory_order_relaxed);
+        return std::unique_lock<TMutex>(mutex, std::adopt_lock);
+    }
     if (!spinHandoff()) return std::unique_lock<TMutex>(mutex);
     LockSpinning(mutex, HandoffLockSpin);
     return std::unique_lock<TMutex>(mutex, std::adopt_lock);
@@ -4199,6 +4223,7 @@ void DrawPipeline::run() {
             }
         }
         taken = false;
+        const SampledHitch hitch(isDraw ? "committer draw" : "committer item");
         const auto start = std::chrono::steady_clock::now();
         const auto idleTo = ThreadReport::Enabled() && lastEnd != ThreadReport::Clock::time_point{} ? ThreadReport::SnapshotStates(start) : ThreadReport::StateTimes{};
         std::exception_ptr fatal;

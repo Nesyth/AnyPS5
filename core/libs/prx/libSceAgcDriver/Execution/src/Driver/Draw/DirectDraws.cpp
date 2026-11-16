@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/WriteValidation.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -4539,6 +4540,7 @@ void Driver::verifyAddressedHit(const LeanDrawJob& job, const LeanAnchor& anchor
 }
 
 void Driver::finishDirectDraw(const LeanDrawJob& job) {
+    const SampledHitch hitch("finisher job");
     const auto& anchor = leanDraws.AnchorAt(job.anchor);
     DirectDraws::Add(Counter::Draws);
     const bool replaying = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::XpJobReplay);

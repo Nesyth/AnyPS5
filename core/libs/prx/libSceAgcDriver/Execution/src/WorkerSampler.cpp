@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LockProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -57,6 +58,29 @@ std::FILE* OpenForWriting(const std::string& path) {
     return _wfopen(NativePath(path).c_str(), L"w");
 }
 
+double HitchMs() {
+    static const double configured = [] {
+        const char* text = std::getenv("APS5_SAMPLE_HITCH_MS");
+        return text != nullptr ? std::strtod(text, nullptr) : 0.0;
+    }();
+    return configured;
+}
+
+double HitchAfterMs() {
+    static const double configured = [] {
+        const char* text = std::getenv("APS5_SAMPLE_HITCH_AFTER_S");
+        return text != nullptr ? std::strtod(text, nullptr) * 1e3 : 0.0;
+    }();
+    return configured;
+}
+
+struct Sampler;
+struct ProcessSampler;
+std::atomic<ProcessSampler*> hitchProcess{nullptr};
+constexpr std::size_t HitchThreads = 3;
+std::array<std::atomic<DWORD>, HitchThreads> hitchThreadIds{};
+std::array<std::atomic<Sampler*>, HitchThreads> hitchSamplers{};
+
 // Debug aid: APS5_SAMPLE_WORKER=<file> samples the calling thread every millisecond and, every 20 s,
 // writes "module+offset self inclusive" lines to <file> for offline symbolization with nm.
 struct Sampler {
@@ -77,6 +101,18 @@ struct Sampler {
     std::uint64_t samples = 0;
     std::int64_t suspendedTicks = 0;
     std::int64_t longestSuspendedTicks = 0;
+    static constexpr int KeptDepth = 48;
+    static constexpr std::uint64_t HitchLimit = 400;
+    struct Kept {
+        std::int64_t ticks = 0;
+        int count = 0;
+        std::array<std::uint64_t, KeptDepth> frames{};
+    };
+    std::vector<Kept> ring;
+    std::size_t ringNext = 0;
+    std::string hitchPath;
+    std::int64_t startedTicks = 0;
+    std::uint64_t hitches = 0;
 
     ~Sampler() noexcept(false) {
         if (target != nullptr && !CloseHandle(target)) throw std::system_error(GetLastError(), std::system_category(), "Closing sampler thread handle");
@@ -182,6 +218,33 @@ struct Sampler {
             ++entry.second;
         }
         if (keepStacks && count != 0) stacks.Add({frames.data(), static_cast<std::size_t>(count)}, context.Rip != 0);
+        if (!ring.empty()) {
+            auto& kept = ring[ringNext++ % ring.size()];
+            kept.ticks = suspended.QuadPart;
+            kept.count = std::min(count, KeptDepth);
+            std::copy_n(frames.begin(), kept.count, kept.frames.begin());
+        }
+    }
+
+    void writeHitch(std::int64_t from, std::int64_t to, const char* label, std::uint32_t value);
+
+    std::size_t ringCount(std::int64_t from, std::int64_t to) {
+        std::lock_guard lock(mutex);
+        std::size_t inside = 0;
+        for (const auto& kept : ring) inside += kept.count != 0 && kept.ticks >= from && kept.ticks <= to;
+        return inside;
+    }
+
+    void writeRing(std::FILE* file, std::int64_t from, std::int64_t to, double tickMs) {
+        std::lock_guard lock(mutex);
+        std::map<std::uint64_t, std::string> loaded;
+        for (std::size_t step = 0; step < ring.size(); ++step) {
+            const auto& kept = ring[(ringNext + step) % ring.size()];
+            if (kept.count == 0 || kept.ticks < from || kept.ticks > to) continue;
+            std::fprintf(file, "  %.2f", static_cast<double>(kept.ticks - from) * tickMs);
+            for (int i = 0; i < kept.count; ++i) std::fprintf(file, "%c%s", i == 0 ? ' ' : ';', frameName(kept.frames[i], loaded).c_str());
+            std::fputc('\n', file);
+        }
     }
 
     static std::string frameName(std::uint64_t address, std::map<std::uint64_t, std::string>& loaded) {
@@ -246,13 +309,71 @@ struct Sampler {
     }
 };
 
+void Sampler::writeHitch(std::int64_t from, std::int64_t to, const char* label, std::uint32_t value) {
+    std::lock_guard lock(mutex);
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    const double tickMs = 1e3 / static_cast<double>(frequency.QuadPart);
+    if (hitches >= HitchLimit || static_cast<double>(from - startedTicks) * tickMs < HitchAfterMs()) return;
+    std::FILE* file = _wfopen(NativePath(hitchPath).c_str(), hitches == 0 ? L"w" : L"a");
+    if (file == nullptr) return;
+    ++hitches;
+    std::size_t inside = 0;
+    for (const auto& kept : ring) inside += kept.count != 0 && kept.ticks >= from && kept.ticks <= to;
+    std::fprintf(file, "hitch %llu %s 0x%x %.2f ms at %.1f ms, %zu samples\n", static_cast<unsigned long long>(hitches), label, value, static_cast<double>(to - from) * tickMs, static_cast<double>(from - startedTicks) * tickMs, inside);
+    std::map<std::uint64_t, std::string> loaded;
+    for (std::size_t step = 0; step < ring.size(); ++step) {
+        const auto& kept = ring[(ringNext + step) % ring.size()];
+        if (kept.count == 0 || kept.ticks < from || kept.ticks > to) continue;
+        std::fprintf(file, "  %.2f", static_cast<double>(kept.ticks - from) * tickMs);
+        for (int i = 0; i < kept.count; ++i) std::fprintf(file, "%c%s", i == 0 ? ' ' : ';', frameName(kept.frames[i], loaded).c_str());
+        std::fputc('\n', file);
+    }
+    std::fclose(file);
+}
+
 // Debug aid: APS5_SAMPLE_THREADS=<file> samples every thread in the process every 2 ms and, every
 // 20 s, writes each busy thread's hottest frames ("module+offset self inclusive") to <file>.
 struct ProcessSampler {
+    static constexpr int HitchDepth = 24;
+    static constexpr std::size_t HitchRing = 256;
+
     std::string path;
     DWORD self = 0;
     std::map<DWORD, Sampler> threads;
     std::uint64_t rounds = 0;
+    AgcDriver::Mutex mapMutex;
+    std::string hitchPath;
+    std::int64_t startedTicks = 0;
+    std::uint64_t hitches = 0;
+
+    void writeHitch(DWORD caller, std::int64_t from, std::int64_t to, const char* label, std::uint32_t value) {
+        std::lock_guard lock(mapMutex);
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+        const double tickMs = 1e3 / static_cast<double>(frequency.QuadPart);
+        if (hitches >= Sampler::HitchLimit || static_cast<double>(from - startedTicks) * tickMs < HitchAfterMs()) return;
+        std::FILE* file = _wfopen(NativePath(hitchPath).c_str(), hitches == 0 ? L"w" : L"a");
+        if (file == nullptr) return;
+        ++hitches;
+        std::fprintf(file, "hitch %llu %s 0x%x %.2f ms at %.1f ms, caller %lu\n", static_cast<unsigned long long>(hitches), label, value, static_cast<double>(to - from) * tickMs, static_cast<double>(from - startedTicks) * tickMs, static_cast<unsigned long>(caller));
+        for (auto& [id, thread] : threads) {
+            if (thread.target == nullptr || thread.ringCount(from, to) == 0) continue;
+            std::string name;
+            PWSTR description = nullptr;
+            if (SUCCEEDED(GetThreadDescription(thread.target, &description)) && description != nullptr) {
+                const int bytes = WideCharToMultiByte(CP_UTF8, 0, description, -1, nullptr, 0, nullptr, nullptr);
+                if (bytes > 1) {
+                    name.resize(static_cast<std::size_t>(bytes - 1));
+                    WideCharToMultiByte(CP_UTF8, 0, description, -1, name.data(), bytes, nullptr, nullptr);
+                }
+                LocalFree(description);
+            }
+            std::fprintf(file, " thread %lu %s\n", static_cast<unsigned long>(id), name.c_str());
+            thread.writeRing(file, from, to, tickMs);
+        }
+        std::fclose(file);
+    }
 
     std::chrono::steady_clock::time_point enumerated{};
 
@@ -264,10 +385,15 @@ struct ProcessSampler {
         THREADENTRY32 entry{};
         entry.dwSize = sizeof(entry);
         const DWORD process = GetCurrentProcessId();
+        std::lock_guard lock(mapMutex);
         for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
             if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
             auto& thread = threads[entry.th32ThreadID];
             if (thread.target == nullptr) thread.target = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+            if (HitchMs() > 0.0 && thread.ring.empty()) {
+                thread.ring.resize(HitchRing);
+                thread.depth = HitchDepth;
+            }
         }
         CloseHandle(snapshot);
         enumerated = std::chrono::steady_clock::now();
@@ -326,6 +452,15 @@ void StartProcessSampler() {
         auto sampler = std::make_unique<ProcessSampler>();
         sampler->path = path;
         sampler->self = GetCurrentThreadId();
+        if (HitchMs() > 0.0) {
+            const auto dot = path.rfind('.');
+            const auto slash = path.find_last_of("\\/");
+            sampler->hitchPath = (dot != std::string::npos && (slash == std::string::npos || dot > slash) ? path.substr(0, dot) : path) + ".hitches.txt";
+            LARGE_INTEGER now{};
+            QueryPerformanceCounter(&now);
+            sampler->startedTicks = now.QuadPart;
+            hitchProcess.store(sampler.get(), std::memory_order_release);
+        }
         auto flushed = std::chrono::steady_clock::now();
         while (!token.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -352,6 +487,21 @@ void StartCallingThreadSampler(const std::optional<std::string>& path, std::jthr
         sampler->stackHigh = reinterpret_cast<std::uint64_t>(block->StackBase);
     }
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &sampler->target, THREAD_ALL_ACCESS, FALSE, 0)) throw std::system_error(GetLastError(), std::system_category(), "Duplicating sampler thread handle");
+    if (HitchMs() > 0.0) {
+        const auto dot = path->rfind('.');
+        const auto slash = path->find_last_of("\\/");
+        sampler->hitchPath = (dot != std::string::npos && (slash == std::string::npos || dot > slash) ? path->substr(0, dot) : *path) + ".hitches.txt";
+        sampler->ring.resize(1024);
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        sampler->startedTicks = now.QuadPart;
+        for (std::size_t index = 0; index < HitchThreads; ++index) {
+            DWORD free = 0;
+            if (!hitchThreadIds[index].compare_exchange_strong(free, GetCurrentThreadId())) continue;
+            hitchSamplers[index].store(sampler.get(), std::memory_order_release);
+            break;
+        }
+    }
     slot = std::jthread([sampler = std::move(sampler)](std::stop_token token) {
         auto flushed = std::chrono::steady_clock::now();
         while (!token.stop_requested()) {
@@ -385,7 +535,90 @@ void StartFinisherSampler() {
     StartCallingThreadSampler(ConfiguredPath(_wgetenv(L"APS5_SAMPLE_FINISHER")), finisherSamplerThread);
 }
 
+SampledHitch::SampledHitch(const char* label, std::uint32_t value, bool armed) noexcept : label(label), value(value), began(0) {
+    if (!armed || HitchMs() <= 0.0) return;
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    began = now.QuadPart;
+}
+
+SampledHitch::~SampledHitch() {
+    if (began == 0) return;
+    LARGE_INTEGER now{};
+    LARGE_INTEGER frequency{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    if (static_cast<double>(now.QuadPart - began) * 1e3 / static_cast<double>(frequency.QuadPart) < HitchMs()) return;
+    const DWORD self = GetCurrentThreadId();
+    for (std::size_t index = 0; index < HitchThreads; ++index) {
+        if (hitchThreadIds[index].load(std::memory_order_relaxed) != self) continue;
+        if (auto* sampler = hitchSamplers[index].load(std::memory_order_acquire)) sampler->writeHitch(began, now.QuadPart, label, value);
+        break;
+    }
+    if (auto* process = hitchProcess.load(std::memory_order_acquire)) process->writeHitch(self, began, now.QuadPart, label, value);
+}
+
+double LockProbeMs() noexcept {
+    static const double configured = [] {
+        const char* text = std::getenv("APS5_SAMPLE_LOCK_WAIT_MS");
+        return text != nullptr ? std::strtod(text, nullptr) : 0.0;
+    }();
+    return configured;
+}
+
+std::uint32_t LockProbeThread() noexcept {
+    return GetCurrentThreadId();
+}
+
+void ReportLockWait(const char* lock, const void* address, std::uint32_t owner, std::uint32_t reader, double waitedMs) {
+    static const auto path = ConfiguredPath(_wgetenv(L"APS5_SAMPLE_LOCK_WAITS"));
+    static AgcDriver::Mutex mutex;
+    static std::uint64_t reports = 0;
+    if (!path) return;
+    std::lock_guard guard(mutex);
+    if (reports >= 300u) return;
+    std::FILE* file = _wfopen(NativePath(*path).c_str(), reports == 0 ? L"w" : L"a");
+    if (file == nullptr) return;
+    ++reports;
+    const auto nameOf = [](HANDLE thread) {
+        std::string name;
+        PWSTR description = nullptr;
+        if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
+            const int bytes = WideCharToMultiByte(CP_UTF8, 0, description, -1, nullptr, 0, nullptr, nullptr);
+            if (bytes > 1) {
+                name.resize(static_cast<std::size_t>(bytes - 1));
+                WideCharToMultiByte(CP_UTF8, 0, description, -1, name.data(), bytes, nullptr, nullptr);
+            }
+            LocalFree(description);
+        }
+        return name;
+    };
+    const DWORD self = GetCurrentThreadId();
+    std::fprintf(file, "wait %llu on %s (%p): thread %lu '%s' has waited %.1f ms; last exclusive owner %lu, last shared owner %lu\n", static_cast<unsigned long long>(reports), lock, address, static_cast<unsigned long>(self), nameOf(GetCurrentThread()).c_str(), waitedMs, static_cast<unsigned long>(owner), static_cast<unsigned long>(reader));
+    std::map<std::uint64_t, std::string> loaded;
+    const std::array<DWORD, 2> holders{static_cast<DWORD>(owner), reader != owner ? static_cast<DWORD>(reader) : 0u};
+    for (const DWORD id : holders) {
+        if (id == 0 || id == self) continue;
+        Sampler probe;
+        probe.target = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, id);
+        if (probe.target == nullptr) {
+            std::fprintf(file, " thread %lu: gone\n", static_cast<unsigned long>(id));
+            continue;
+        }
+        probe.depth = Sampler::KeptDepth;
+        probe.ring.resize(1);
+        probe.sample();
+        const auto& kept = probe.ring[0];
+        std::fprintf(file, " thread %lu '%s' (%s):", static_cast<unsigned long>(id), nameOf(probe.target).c_str(), id == owner ? "exclusive" : "shared");
+        for (int i = 0; i < kept.count; ++i) std::fprintf(file, "%c%s", i == 0 ? ' ' : ';', Sampler::frameName(kept.frames[i], loaded).c_str());
+        std::fputc('\n', file);
+    }
+    std::fclose(file);
+}
+
 void StopWorkerSampler() {
+    hitchProcess.store(nullptr, std::memory_order_release);
+    for (auto& sampler : hitchSamplers) sampler.store(nullptr, std::memory_order_release);
     processSamplerThread.request_stop();
     workerSamplerThread.request_stop();
     committerSamplerThread.request_stop();
@@ -397,6 +630,18 @@ void StopWorkerSampler() {
 }
 #else
 bool ReadableStackRegion(std::uint64_t, std::uint64_t&, std::uint64_t&) { return false; }
+double LockProbeMs() noexcept {
+    return 0.0;
+}
+
+std::uint32_t LockProbeThread() noexcept {
+    return 0;
+}
+
+void ReportLockWait(const char*, const void*, std::uint32_t, std::uint32_t, double) {}
+
+SampledHitch::SampledHitch(const char* label, std::uint32_t value, bool) noexcept : label(label), value(value), began(0) {}
+SampledHitch::~SampledHitch() {}
 void StartWorkerSampler(std::uint32_t) {}
 void StartCommitterSampler() {}
 void StartFinisherSampler() {}

@@ -19,6 +19,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTextureLayout.hpp"
 #include "IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LockProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -930,8 +931,8 @@ struct GuardedRange {
     const char* plane = "multisampled color target";
 };
 
-std::shared_mutex& guardedMutex() {
-    static PrimedSharedMutex mutex;
+AgcDriver::ProbedSharedMutex<std::shared_mutex>& guardedMutex() {
+    static AgcDriver::ProbedSharedMutex<std::shared_mutex> mutex("guarded multisample ranges");
     return mutex;
 }
 

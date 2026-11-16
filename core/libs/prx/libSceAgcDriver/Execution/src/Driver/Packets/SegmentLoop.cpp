@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -1065,6 +1066,7 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
             if (APS5_ENABLE_TIMING_LOG && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         }
         Context timingContext(pendingFrameTiming.get());
+        const SampledHitch hitch("worker packet", opcode, !entry.Has(LeanPacket::Wait) && !entry.Has(LeanPacket::RenderingWait));
         Timer timing("Driver.Packet");
         if (!predicated && entry.Has(LeanPacket::LabelIssue)) noteLabelIssue(packet, submission.queue);
         if (!predicated && !entry.Has(LeanPacket::FlipHeader) && !entry.Has(LeanPacket::RenderingWait) && !flip && (entry.Has(LeanPacket::Enqueues) || verifyPacket)) {
