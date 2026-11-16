@@ -379,6 +379,27 @@ bool htileProvesClear(std::uint32_t word, bool depthOnly, float clearDepth) {
     return false;
 }
 
+std::atomic<std::uint64_t> publicationsFromFills{0};
+std::atomic<std::uint64_t> publicationFillSkips{0};
+std::atomic<std::uint64_t> publicationFillsChecked{0};
+std::atomic<std::uint64_t> publicationFillsDiffering{0};
+
+bool publicationFillsVerify() {
+    static const bool on = std::getenv("APS5_VERIFY_PUBLICATION_FILLS") != nullptr;
+    return on;
+}
+
+void notePublicationFill(bool rebased) {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    (rebased ? publicationsFromFills : publicationFillSkips).fetch_add(1, std::memory_order_relaxed);
+    if (!stats || !rebased) return;
+    const auto count = publicationsFromFills.load(std::memory_order_relaxed);
+    if (count % 512u != 0u) return;
+    std::fprintf(stderr, "[publication-fills] %llu publications rebased on a pending fill without a GPU wait, %llu later checks without a sync for the same fill; verify %llu checked, %llu differing\n",
+        static_cast<unsigned long long>(count), static_cast<unsigned long long>(publicationFillSkips.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(publicationFillsChecked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(publicationFillsDiffering.load(std::memory_order_relaxed)));
+}
+
 enum class DepthCheck : std::size_t { Calls, Worked, FillNotes, PublicationSync, PendingSync, PendingDepth, PendingHtile, PendingStencil, Alias, StencilClear, DepthClear, HtileStore, Count };
 enum class DepthScan : std::size_t { Stencil, StencilSkipped, Htile, HtileQueued, Count };
 enum class DepthWriter : std::size_t { Dispatch, HtileClear, Untagged, Other, Untold, Count };
@@ -1007,12 +1028,23 @@ public:
         if (recorder != nullptr && ((clearGeneration != 0u && clearPattern.has_value() && clearFillNote == 0u) || (stencilClearGeneration != 0u && stencilFillNote == 0u))) check.Note(DepthCheck::FillNotes);
         if (recorder != nullptr && clearGeneration != 0u && clearPattern.has_value() && clearFillNote == 0u) clearFillNote = fillNoteAfter(*recorder, sampling.initial[1], clearFillFloor, *clearPattern);
         if (recorder != nullptr && stencilClearGeneration != 0u && stencilFillNote == 0u) stencilFillNote = fillNoteAfter(*recorder, sampling.initial[2], stencilFillFloor, *stencilClearValue * 0x01010101u);
+        bool htileFromFill = false;
+        bool stencilFromFill = false;
         if (!publication.empty()) {
             if (auto* pending = RecorderFor(context)) {
                 const auto syncStart = check.Now();
-                if (clearFillNote != 0u || stencilFillNote != 0u) check.Note(DepthCheck::PublicationSync);
-                if (clearFillNote != 0u) pending->SyncThrough(sampling.initial[1].address, sampling.initial[1].bytes);
-                if (stencilFillNote != 0u) pending->SyncThrough(sampling.initial[2].address, sampling.initial[2].bytes);
+                if (RuntimeSwitches::Set(RuntimeSwitch::PublicationFromFills)) {
+                    const bool htileNewest = clearFillNote != 0u && clearPattern.has_value() && sampling.initial[1].address % 4u == 0u && pending->NewestStoreNote(sampling.initial[1].address, sampling.initial[1].bytes) == clearFillNote;
+                    htileFromFill = htileNewest && (clearGeneration != 0u || publicationFill[1] == clearFillNote);
+                    const bool stencilNewest = stencilFillNote != 0u && stencilClearValue.has_value() && sampling.initial.size() > 2u && pending->NewestStoreNote(sampling.initial[2].address, sampling.initial[2].bytes) == stencilFillNote;
+                    stencilFromFill = stencilNewest && (stencilClearGeneration != 0u || publicationFill[2] == stencilFillNote);
+                    if ((htileFromFill && clearGeneration == 0u) || (stencilFromFill && stencilClearGeneration == 0u)) notePublicationFill(false);
+                }
+                const bool htileSync = clearFillNote != 0u && !htileFromFill;
+                const bool stencilSync = stencilFillNote != 0u && !stencilFromFill;
+                if (htileSync || stencilSync) check.Note(DepthCheck::PublicationSync);
+                if (htileSync) pending->SyncThrough(sampling.initial[1].address, sampling.initial[1].bytes);
+                if (stencilSync) pending->SyncThrough(sampling.initial[2].address, sampling.initial[2].bytes);
                 check.Synced(syncStart);
             }
         }
@@ -1077,7 +1109,15 @@ public:
             stencilFill = *stencilClearValue;
             RecordClear(VK_IMAGE_ASPECT_STENCIL_BIT);
             plane.generation = generation;
-            RebasePublication(2u);
+            if (stencilFromFill && !stencilPlaneAliased) {
+                RebasePublicationOnFill(2u, static_cast<std::uint32_t>(*stencilClearValue) * 0x01010101u, stencilFillNote);
+            } else {
+                if (stencilFromFill) {
+                    if (auto* pending = RecorderFor(context)) pending->SyncThrough(plane.address, plane.bytes);
+                }
+                RebasePublication(2u);
+                publicationFill[2] = stencilFillNote;
+            }
             stencilClearGeneration = 0u;
             sampling.unprovenStencil.reset();
         }
@@ -1110,7 +1150,12 @@ public:
             Require(GuestMemory::UnchangedSinceCollected(metadata.address, metadata.bytes, clearGeneration), "CPU writes raced native multisample depth clear");
             RecordClear(clearAspects);
             sampling.initial = current;
-            RebasePublication(1u);
+            if (htileFromFill) {
+                RebasePublicationOnFill(1u, *clearPattern, clearFillNote);
+            } else {
+                RebasePublication(1u);
+                publicationFill[1] = clearFillNote;
+            }
             clearGeneration = 0u;
             clearAspects = 0u;
             pendingClear = 0u;
@@ -1980,6 +2025,7 @@ private:
         }
     };
     std::vector<PublicationPlane> publication;
+    std::array<std::uint64_t, 3> publicationFill{};
     bool publicationInProgress = false;
     bool publicationFailed = false;
     std::exception_ptr publicationFailure;
@@ -1998,6 +2044,7 @@ private:
             for (const auto& range : sampling.initial) Require(GuestMemory::UnchangedSinceCollected(range.address, range.bytes, range.generation), "guest writes raced native multisample depth publication capture");
             Require(GuestMemory::UnchangedSinceAll(sampling.initial), "guest writes raced native multisample depth publication capture");
             publication = std::move(captured);
+            publicationFill = {};
         } catch (...) {
             publicationFailure = std::current_exception();
             publication.clear();
@@ -2060,6 +2107,47 @@ private:
         if (publication.empty()) return;
         try {
             publication[index] = CapturePublication(sampling.initial[index]);
+        } catch (...) {
+            publicationFailure = std::current_exception();
+            publication.clear();
+        }
+    }
+
+    PublicationPlane PublicationOfFill(const GuestMemory::UnchangedQuery& range, std::uint32_t word) {
+        PublicationPlane plane;
+        plane.range = range;
+        plane.range.generation = GuestMemory::CollectWritesUncached(range.address, range.bytes);
+        const auto pages = (range.bytes + PublicationPlane::PageBytes - 1u) / PublicationPlane::PageBytes;
+        plane.words.assign(pages, 0u);
+        plane.starts.assign(pages, PublicationPlane::Repeated);
+        for (std::size_t index = 0u; index < pages; ++index) {
+            const auto length = std::min(PublicationPlane::PageBytes, range.bytes - index * PublicationPlane::PageBytes);
+            std::memcpy(&plane.words[index], &word, std::min<std::size_t>(length, 4u));
+        }
+        Require(GuestMemory::UnchangedSinceCollected(range.address, range.bytes, plane.range.generation) && GuestMemory::UnchangedSince(range.address, range.bytes, plane.range.generation), "guest writes raced native multisample depth publication capture");
+        return plane;
+    }
+
+    void RebasePublicationOnFill(std::size_t index, std::uint32_t word, std::uint64_t note) {
+        if (publication.empty()) return;
+        try {
+            auto plane = PublicationOfFill(sampling.initial[index], word);
+            if (publicationFillsVerify()) {
+                if (auto* pending = RecorderFor(context)) pending->SyncThrough(sampling.initial[index].address, sampling.initial[index].bytes);
+                const auto captured = CapturePublication(sampling.initial[index]);
+                publicationFillsChecked.fetch_add(1, std::memory_order_relaxed);
+                const bool same = captured.words == plane.words && captured.starts == plane.starts && captured.stored == plane.stored && captured.range.generation == plane.range.generation && captured.range.address == plane.range.address && captured.range.bytes == plane.range.bytes;
+                if (!same && publicationFillsDiffering.fetch_add(1, std::memory_order_relaxed) < 16u) {
+                    std::size_t page = 0u;
+                    while (page < captured.words.size() && page < plane.words.size() && captured.words[page] == plane.words[page] && captured.starts[page] == plane.starts[page]) ++page;
+                    std::fprintf(stderr, "[publication-fills-verify] plane %zu differs: fill word 0x%x, %zu pages, first differing page %zu (captured word 0x%x, stored bytes %zu), generation from the fill %llu and captured %llu\n", index, word, plane.words.size(), page,
+                        page < captured.words.size() ? captured.words[page] : 0u, captured.stored.size(), static_cast<unsigned long long>(plane.range.generation), static_cast<unsigned long long>(captured.range.generation));
+                }
+                plane = captured;
+            }
+            publication[index] = std::move(plane);
+            publicationFill[index] = note;
+            notePublicationFill(true);
         } catch (...) {
             publicationFailure = std::current_exception();
             publication.clear();
