@@ -1770,6 +1770,97 @@ void CommitBindings(bool ring) {
     RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, repeatEnvironment);
 }
 
+constexpr std::uint32_t FeedDroppedCommits = 4;
+
+struct FeedTotals {
+    DirectTotals direct;
+    std::uint64_t kept = 0;
+    std::uint64_t withdrawn = 0;
+    std::uint64_t followerCards = 0;
+    std::uint64_t leaderCards = 0;
+    std::uint64_t guardCards = 0;
+    std::uint64_t withoutCards = 0;
+    std::uint64_t aheadSteps = 0;
+    std::uint64_t verifyChecked = 0;
+    std::uint64_t verifyDiffering = 0;
+    std::uint64_t drops = 0;
+
+    static FeedTotals Now() {
+        using Count = AgcDriver::Graphics::CommitFeedCount;
+        using AgcDriver::Graphics::CommitFeedTotal;
+        FeedTotals totals;
+        totals.direct = DirectTotals::Now();
+        totals.kept = CommitFeedTotal(Count::BlocksKept);
+        totals.withdrawn = CommitFeedTotal(Count::BlocksWithdrawn);
+        totals.followerCards = CommitFeedTotal(Count::CardFollowerUses);
+        totals.leaderCards = CommitFeedTotal(Count::CardLeaderUses);
+        totals.guardCards = CommitFeedTotal(Count::CardGuardUses);
+        totals.withoutCards = CommitFeedTotal(Count::HitsWithoutCard);
+        for (std::size_t level = 0; level < 6; ++level) totals.aheadSteps += CommitFeedTotal(static_cast<Count>(static_cast<std::size_t>(Count::AheadLevel0) + level));
+        const auto verify = AgcDriver::Graphics::CommitFeedVerifyTotals();
+        totals.verifyChecked = verify[0];
+        totals.verifyDiffering = verify[1];
+        totals.drops = AgcDriver::DriverDetail::CommitBufferDropsForTest();
+        return totals;
+    }
+};
+
+void CommitFeedMode(bool ring) {
+    const bool feedEnvironment = RuntimeSwitches::Set(RuntimeSwitch::CommitFeed);
+    const bool repeatEnvironment = RuntimeSwitches::Set(RuntimeSwitch::DirectRepeat);
+    const bool passTargets = RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets);
+    const bool census = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    const bool committed = ring && RuntimeSwitches::Set(RuntimeSwitch::CommitFragments) && RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) && RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) && DirectReport::VerifyEvery() != 1 && DrawRecords::VerifyEvery() != 1 && DirectReport::BufferVerifyEvery() == 0 && DirectReport::InputVerifyEvery() == 0;
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectPassTargets, true);
+    const auto scene = RepeatScene::Constants;
+    const std::string name = std::string("commit feed, ") + RepeatSceneName(scene);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
+    std::vector<std::vector<std::uint8_t>> today;
+    for (std::uint32_t round = 0; round < RepeatRounds; ++round) today.push_back(RenderScene(scene, round));
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, true);
+    const auto arm = [&](bool on) {
+        const std::string what = name + (on ? ", switch on" : ", switch off");
+        RuntimeSwitches::Assign(RuntimeSwitch::CommitFeed, on);
+        Require(RenderScene(scene, 0) == today[0], what + ": the first round rendered differently from today's path");
+        const auto before = FeedTotals::Now();
+        for (std::uint32_t round = 1; round < RepeatRounds; ++round) {
+            AgcDriver::DriverDetail::SetCommitBufferDropsForTest(RepeatDraws - FeedDroppedCommits, FeedDroppedCommits);
+            const auto image = RenderScene(scene, round);
+            AgcDriver::DriverDetail::SetCommitBufferDropsForTest(0, 0);
+            Require(image == today[round], what + ": round " + std::to_string(round) + ", whose last commits had no prepared buffers, rendered differently from today's path" + DescribeDirect(DirectTotals::Now(), before.direct));
+        }
+        Require(RenderScene(scene, 0) == today[0], what + ": the round after the commits without prepared buffers rendered differently from today's path");
+        const auto after = FeedTotals::Now();
+        std::cout << what << ": " << after.drops - before.drops << " commits without prepared buffers, " << after.kept - before.kept << " fragment blocks kept, " << after.withdrawn - before.withdrawn << " withdrawn, " << after.direct.Since(before.direct, DirectCounter::FragmentsNoBlock) << " hits without a block, " << after.direct.Since(before.direct, DirectCounter::FeedCardsMade) << " zone cards made, " << after.direct.Since(before.direct, DirectCounter::FeedCardsOverCapacity) << " over capacity, " << after.followerCards - before.followerCards << " used by followers, " << after.leaderCards - before.leaderCards << " by leaders, " << after.guardCards - before.guardCards << " for guards, " << after.withoutCards - before.withoutCards << " uses without a card, " << after.aheadSteps - before.aheadSteps << " lookahead steps, verify " << after.verifyChecked - before.verifyChecked << " checked" << DescribeDirect(after.direct, before.direct) << '\n';
+        Require(after.verifyDiffering == before.verifyDiffering, what + ": the commit feed verify found a difference");
+        Require(after.direct.Since(before.direct, DirectCounter::FragmentsVerifyDiffering) == 0 && after.direct.Since(before.direct, DirectCounter::ExpressVerifyDiffering) == 0, what + ": the fragment or express verify found a difference" + DescribeDirect(after.direct, before.direct));
+        return std::pair{before, after};
+    };
+    const auto [offBefore, offAfter] = arm(false);
+    const auto [onBefore, onAfter] = arm(true);
+    if (committed) {
+        Require(offAfter.drops > offBefore.drops && onAfter.drops > onBefore.drops, name + ": no commit lost its prepared buffers to the test hook");
+        const auto offMissing = offAfter.direct.Since(offBefore.direct, DirectCounter::FragmentsNoBlock);
+        const auto onMissing = onAfter.direct.Since(onBefore.direct, DirectCounter::FragmentsNoBlock);
+        Require(offMissing != 0, name + ": with the switch off no hit found its record's fragment block withdrawn by a commit without prepared buffers" + DescribeDirect(offAfter.direct, offBefore.direct));
+        Require(onMissing < offMissing, name + ": with the switch on " + std::to_string(onMissing) + " hits found no fragment block, with it off " + std::to_string(offMissing) + DescribeDirect(onAfter.direct, onBefore.direct));
+        Require(onAfter.direct.Since(onBefore.direct, DirectCounter::FeedCardsMade) != 0 && offAfter.direct.Since(offBefore.direct, DirectCounter::FeedCardsMade) == 0, name + ": no zone card was made with the switch on, or one was made with it off");
+        if (census) {
+            Require(onAfter.kept > onBefore.kept && offAfter.kept == offBefore.kept, name + ": no fragment block was kept with the switch on, or one was kept with it off");
+            Require(offAfter.withdrawn > offBefore.withdrawn, name + ": with the switch off no commit without prepared buffers withdrew a fragment block");
+        }
+        if (AgcDriver::Graphics::CommitFeedVerifyEvery() != 0) Require(onAfter.verifyChecked > onBefore.verifyChecked, name + ": the commit feed verify checked nothing");
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::CommitFeed, feedEnvironment);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, repeatEnvironment);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectPassTargets, passTargets);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
+}
+
 constexpr std::uint32_t PlannedBufferBytes = 256;
 constexpr std::uint32_t LargeBufferBytes = 8192;
 constexpr std::size_t KeptBufferOffset = 0x1000;
@@ -2211,6 +2302,7 @@ int main(int argc, char** argv) {
         const bool injectCommit = argc > 1 && std::string_view(argv[1]) == "--inject-commit";
         const bool injectPlans = argc > 1 && std::string_view(argv[1]) == "--inject-plans";
         const bool texturesOnly = argc > 1 && std::string_view(argv[1]) == "--textures";
+        const bool commitFeed = argc > 1 && std::string_view(argv[1]) == "--commit-feed";
         using AgcDriver::DriverDetail::DrawFinisher;
         using AgcDriver::DriverDetail::DrawPipeline;
         const bool leanEnvironment = RuntimeSwitches::Set(RuntimeSwitch::LeanFront);
@@ -2233,6 +2325,17 @@ int main(int argc, char** argv) {
         Blocks blocks;
         Scene = &blocks;
         Prepare();
+        if (commitFeed) {
+            CommitFeedMode(arms.ring);
+            AgcDriver::DriverDetail::DirectDraws::Report(true);
+            RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, leanEnvironment);
+            RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, recordsEnvironment);
+            RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, plansEnvironment);
+            RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, directEnvironment);
+            AgcDriverShutdown_nid_postfix();
+            std::cout << "commit feed: records whose commits lost their prepared buffers render as today's path in both arms; with the switch on their fragment blocks stay and zone cards are made" << (arms.ring ? "" : " (no finisher ring: records never ran)") << '\n';
+            return 0;
+        }
         if (directEnvironment) Direct(arms.ring);
         if (directEnvironment && RuntimeSwitches::Set(RuntimeSwitch::DirectRepeat)) Repeats(arms.ring);
         if (directEnvironment && RuntimeSwitches::Set(RuntimeSwitch::CommitBindings)) CommitBindings(arms.ring);

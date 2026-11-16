@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -89,7 +90,8 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "jobs replayed", "replayed without a fragment", "no earlier hit", "class new or refused", "not a direct draw",
     "verify sampled", "no prepared buffers, inputs, bindings or fragments", "indirect", "another device", "forget, import or mapping serial moved", "buffer plan or inputs recipe moved", "class refused or evicted", "placement refused or thrown",
     "replay sources kept", "no fragment or prepared buffers and inputs", "addressed, rect list or indirect", "class no longer in the class store", "template checks shader faults", "replay stores cleared",
-    "replay nanoseconds", "replay copy nanoseconds", "replay fragment nanoseconds", "replay hand-off nanoseconds", "replays timed"
+    "replay nanoseconds", "replay copy nanoseconds", "replay fragment nanoseconds", "replay hand-off nanoseconds", "replays timed",
+    "zone cards made", "zone cards over capacity", "zone cards refused"
 };
 static_assert(static_cast<std::size_t>(Counter::ExpressReprovedStaging) - static_cast<std::size_t>(Counter::ExpressReprovedNotProved) == static_cast<std::size_t>(Graphics::ShaderResources::ExpressMiss::Staging) - static_cast<std::size_t>(Graphics::ShaderResources::ExpressMiss::NotProved), "every reason an express commit reproves its template needs a counter");
 static_assert(static_cast<std::size_t>(Counter::BindingsLeftUnpushedRebound) - static_cast<std::size_t>(Counter::BindingsLeftUnpushedRefused) + 2 == static_cast<std::size_t>(Graphics::ShaderResources::DynamicLeave::Count), "every way an unpushed draw leaves the dynamic route needs a counter");
@@ -647,6 +649,10 @@ void Report(bool force) {
     }
     if (sum(Counter::FragmentsBlockNotReusable, Counter::FragmentsBlockModes) != 0) {
         AgcDriver::ProfilePrint_nid_no_patch("[direct-commits] fragment blocks not published: %llu commits%s\n", static_cast<unsigned long long>(sum(Counter::FragmentsBlockNotReusable, Counter::FragmentsBlockModes)), reasons(counts, Counter::FragmentsBlockNotReusable, Counter::FragmentsBlockModes).c_str());
+    }
+    if (const auto feed = Graphics::TakeCommitFeedText(); !feed.empty() || sum(Counter::FeedCardsMade, Counter::FeedCardsRefused) != 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[commit-feed] 10 s, switch %s: zone cards made on the finisher %llu, over capacity %llu, refused %llu; %s\n", Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::CommitFeed) ? "on" : "off",
+            static_cast<unsigned long long>(at(Counter::FeedCardsMade)), static_cast<unsigned long long>(at(Counter::FeedCardsOverCapacity)), static_cast<unsigned long long>(at(Counter::FeedCardsRefused)), feed.empty() ? "nothing on the committer" : feed.c_str());
     }
     {
         static std::array<std::uint64_t, Graphics::PassBreakCount + 3> lastPasses{};

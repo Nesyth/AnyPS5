@@ -205,6 +205,18 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
 void NoteCommitterTrusted(std::uint64_t count = 1);
 std::uint64_t TakeCommitterTrusted();
 std::uint64_t ExpressVerifyEvery();
+inline constexpr std::uint32_t CommitFeedBlocks = 1;
+inline constexpr std::uint32_t CommitFeedCards = 2;
+inline constexpr std::uint32_t CommitFeedAhead = 4;
+enum class CommitFeedCount : std::uint8_t { BlocksKept, BlocksWithdrawn, CardFollowerUses, CardLeaderUses, CardGuardUses, HitsWithoutCard, AheadEntries, AheadNoHint, AheadLevel0, AheadLevel1, AheadLevel2, AheadLevel3, AheadLevel4, AheadLevel5, LeadAttachments, LeadTargets, LeadShort, LeadPassClosed, LeadNotAppendable, LeadMultisample, NotDirectHit, NotDirectTraced, NotDirectRecipe, NotDirectWriters, NotDirectPlan, NotDirectInputsRecipe, NotDirectFragment, NotDirectBuffers, NotDirectInputs, Count };
+bool CommitFeedOn(std::uint32_t part);
+bool CommitFeedCensus();
+std::uint64_t CommitFeedVerifyEvery();
+void NoteCommitFeed(CommitFeedCount count, std::uint64_t amount = 1);
+void NoteCommitFeedVerify(bool same, const char* what, const std::string& detail);
+std::uint64_t CommitFeedTotal(CommitFeedCount count);
+std::array<std::uint64_t, 2> CommitFeedVerifyTotals();
+std::string TakeCommitFeedText();
 enum class RepeatRefusal : std::uint8_t { NoBlock, NotSimple, VerifyDue, Shape, Objects, Batch, Pass, Epoch, ProofSerial, Pending, Depth, Target, Access, Stores, Linear, Buffers, Selection, DepthGuards, Inputs, Changed, MovedHazard, UnmovedHazard, Count };
 inline constexpr std::array<const char*, static_cast<std::size_t>(RepeatRefusal::Count)> RepeatRefusalNames{"no block", "not simple", "verify due", "shape", "objects", "another batch", "pass", "collect epoch", "proof serial", "pending stores", "depth surfaces", "target changed", "pass access", "queued stores", "drawn linear targets", "no prepared buffers", "selection", "depth guards", "inputs", "changed by the inputs", "moved-range hazard", "unmoved-range hazard"};
 inline constexpr std::array<const char*, static_cast<std::size_t>(DrawRepeatClass::Count)> RepeatClassNames{"simple", "not recorded", "template", "stages", "pipeline", "targets", "not pushed", "sets", "buffers", "inputs", "keep", "pass", "access", "notes", "modes"};

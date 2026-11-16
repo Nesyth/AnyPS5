@@ -435,7 +435,20 @@ public:
         std::uint8_t shortcuts = 0;
         std::uint32_t lookupsDeferred = 0;
         std::uint32_t lookupsForced = 0;
+        struct ZoneCard {
+            static constexpr std::size_t Capacity = 32;
+            static constexpr std::uint64_t Moved = std::uint64_t{1} << 63u;
+            const BufferPlan* plan = nullptr;
+            std::uint8_t zones = 0;
+            std::uint8_t guards = 0;
+            bool valid = false;
+            std::array<std::pair<std::uint64_t, std::uint64_t>, Capacity> entries{};
+        };
+        ZoneCard card;
     };
+    enum class ZoneCardBuild : std::uint8_t { Made, OverCapacity, Refused };
+    static ZoneCardBuild BuildZoneCard(PreparedBuffers& prepared);
+    void PrefetchExpressHot() const;
     enum class BindingTaken : std::uint8_t { None, Placed, Copied, OtherDevice, Count };
     enum class DynamicLeave : std::uint8_t { None, Refused, Prepared, Stages, HeapPipeline, Heap, Address, AfterBind, Addressed, Faults, Shape, Uniform, OtherType, Flags, NoStorage, Limit, PushHeld, OtherSet, First, Repeats, Pipeline, Rebound, Count };
     struct BindingRoute {
@@ -1408,6 +1421,9 @@ private:
     static std::uint64_t NextPlanSerial();
     std::uint64_t planSerial = NextPlanSerial();
     bool preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched = false, const GuardTests* guards = nullptr, bool trusted = false, CommitterTrustCheck* trust = nullptr) const;
+    enum class ZoneCardUse : std::uint8_t { Follower, Leader, Guards };
+    bool zoneCardUsable(const PreparedBuffers& prepared, ZoneCardUse use) const;
+    bool zoneCardHolds(const PreparedBuffers& prepared, bool guards) const;
     void pushBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const;
     void writeOwnDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::int32_t pushedSet = -1) const;
     mutable std::unique_ptr<PushPlan> pushPlan;

@@ -547,6 +547,9 @@ enum class Counter : std::uint16_t {
     ReplayFragmentNanoseconds,
     ReplayHandoffNanoseconds,
     ReplayTimed,
+    FeedCardsMade,
+    FeedCardsOverCapacity,
+    FeedCardsRefused,
     Count,
 };
 

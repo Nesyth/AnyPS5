@@ -1497,6 +1497,145 @@ struct HitRelease {
     }
 };
 
+constexpr std::size_t PrefetchLine = 64;
+constexpr std::size_t PrefetchSpan = 4 * PrefetchLine;
+
+void prefetchLines(const void* at, std::size_t bytes) {
+    if (at == nullptr) return;
+    const auto* first = static_cast<const char*>(at);
+    for (std::size_t offset = 0; offset < bytes; offset += PrefetchLine) __builtin_prefetch(first + offset);
+}
+
+template <typename Object>
+void prefetchEnds(const Object& object) {
+    const auto* first = reinterpret_cast<const char*>(&object);
+    prefetchLines(first, std::min<std::size_t>(sizeof(Object), PrefetchSpan));
+    if constexpr (sizeof(Object) > PrefetchSpan) __builtin_prefetch(first + sizeof(Object) - 1u);
+}
+
+template <typename Element>
+void prefetchElements(const std::vector<Element>& elements) {
+    prefetchLines(elements.data(), std::min<std::size_t>(elements.size() * sizeof(Element), PrefetchSpan));
+}
+
+const DrawRecordCommit* prefetchedCommit(const DrawRecordHit& hit) {
+    const auto* record = hit.record.get();
+    return record != nullptr ? record->commit.get() : nullptr;
+}
+
+void prefetchRecordCommit(const void* object, std::uint32_t level) {
+    const auto& hit = *static_cast<const DrawRecordHit*>(object);
+    switch (level) {
+    case 0:
+        prefetchLines(&hit, PrefetchSpan);
+        prefetchEnds(hit.preparedBuffers);
+        prefetchEnds(hit.preparedInputs);
+        prefetchEnds(hit.fragment);
+        return;
+    case 1: {
+        const auto* record = hit.record.get();
+        if (record != nullptr) {
+            __builtin_prefetch(record);
+            __builtin_prefetch(&record->commit);
+        }
+        prefetchElements(hit.stages);
+        if (hit.preparedBuffers.has_value()) {
+            const auto& prepared = *hit.preparedBuffers;
+            prefetchLines(prepared.plan.get(), PrefetchLine);
+            const auto& card = prepared.card;
+            if (card.valid) {
+                prefetchLines(card.entries.data(), (static_cast<std::size_t>(card.zones) + static_cast<std::size_t>(card.guards)) * sizeof(card.entries[0]));
+            } else {
+                prefetchElements(prepared.moved);
+                prefetchElements(prepared.selected);
+            }
+        }
+        if (hit.preparedInputs.has_value()) {
+            prefetchElements(hit.preparedInputs->ranges);
+            prefetchElements(hit.preparedInputs->inPlaceReads);
+        }
+        if (hit.fragment.has_value()) {
+            prefetchLines(hit.fragment->bindings.get(), PrefetchLine);
+            prefetchLines(hit.fragment->pipeline.get(), PrefetchLine);
+        }
+        return;
+    }
+    case 2: {
+        const auto* commit = prefetchedCommit(hit);
+        if (commit == nullptr) return;
+        prefetchLines(commit, 2 * PrefetchLine);
+        __builtin_prefetch(&commit->express);
+        __builtin_prefetch(&commit->writers);
+        __builtin_prefetch(&commit->touchedPresent);
+        __builtin_prefetch(&commit->access);
+        __builtin_prefetch(&commit->pass);
+        __builtin_prefetch(&commit->effects);
+        __builtin_prefetch(&commit->expressRefused);
+        return;
+    }
+    case 3: {
+        const auto* commit = prefetchedCommit(hit);
+        if (commit == nullptr) return;
+        if (const auto* express = commit->express.get(); express != nullptr) prefetchLines(express, sizeof(DrawExpress));
+        prefetchLines(commit->recipe.get(), 2 * PrefetchLine);
+        return;
+    }
+    case 4: {
+        const auto* commit = prefetchedCommit(hit);
+        const auto* express = commit != nullptr ? commit->express.get() : nullptr;
+        if (express == nullptr) return;
+        prefetchLines(express->keep.get(), sizeof(DrawExpressKeep));
+        prefetchElements(express->targetVersions);
+        prefetchElements(express->dccAddresses);
+        prefetchElements(express->slices);
+        prefetchElements(express->reads);
+        prefetchElements(express->images);
+        prefetchElements(express->multisampleImages);
+        return;
+    }
+    case 5: {
+        const auto* commit = prefetchedCommit(hit);
+        const auto* express = commit != nullptr ? commit->express.get() : nullptr;
+        const auto* keep = express != nullptr ? express->keep.get() : nullptr;
+        if (keep == nullptr) return;
+        for (const auto& target : keep->targets) {
+            if (target != nullptr) target->PrefetchHot();
+        }
+        if (keep->resources != nullptr) keep->resources->PrefetchExpressHot();
+        prefetchLines(keep->framebuffer.get(), PrefetchLine);
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+std::atomic<std::uint32_t> commitDropsArmed{0};
+std::atomic<std::uint32_t> commitDropsSkip{0};
+std::atomic<std::uint64_t> commitDropsDone{0};
+
+void dropCommitBuffersForTest(DrawRecordHit& hit) {
+    if (commitDropsSkip.load(std::memory_order_relaxed) != 0) {
+        commitDropsSkip.fetch_sub(1, std::memory_order_relaxed);
+        return;
+    }
+    commitDropsArmed.fetch_sub(1, std::memory_order_relaxed);
+    if (!hit.preparedBuffers.has_value()) return;
+    hit.fragment.reset();
+    hit.preparedBuffers.reset();
+    commitDropsDone.fetch_add(1, std::memory_order_release);
+}
+
+}
+
+void SetCommitBufferDropsForTest(std::uint32_t skip, std::uint32_t count) {
+    commitDropsArmed.store(0, std::memory_order_release);
+    commitDropsSkip.store(skip, std::memory_order_relaxed);
+    commitDropsArmed.store(count, std::memory_order_release);
+}
+
+std::uint64_t CommitBufferDropsForTest() {
+    return commitDropsDone.load(std::memory_order_acquire);
 }
 
 void Driver::commitRecordDraw(const LeanDrawJob& job, const LeanAnchor& anchor, std::shared_ptr<DrawRecordHit> hit) {
@@ -1550,7 +1689,9 @@ void Driver::commitRecordDraw(const LeanDrawJob& job, const LeanAnchor& anchor, 
         DrawPipeline::Queue0().Enqueue(std::move(released), std::move(writes), 0, {}, std::move(reads), true);
         return;
     }
+    const void* aheadObject = hit.get();
     auto commit = [this, hit = std::move(hit), localDevice = anchor.device, decode = job.shape->decode, queue = job.queue, opcode = job.opcode, epoch = job.epoch, trace, shape = job.shapeKey] {
+        if (commitDropsArmed.load(std::memory_order_acquire) != 0) dropCommitBuffersForTest(*hit);
         DrawPipeline::FollowEpoch(epoch);
         GuestMemory::SetCurrentPacket(opcode, queue);
         const bool following = localDevice != nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RunFollow);
@@ -1564,7 +1705,7 @@ void Driver::commitRecordDraw(const LeanDrawJob& job, const LeanAnchor& anchor, 
         if (timed) Graphics::NoteExpressNonFollower(attempted, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(committing - began).count()), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - committing).count()));
         if (following) Graphics::DropExpressFollowVerify();
     };
-    DrawPipeline::Queue0().Enqueue(std::move(commit), std::move(writes), 0, {}, std::move(reads), true);
+    DrawPipeline::Queue0().Enqueue(std::move(commit), std::move(writes), 0, {}, std::move(reads), true, &prefetchRecordCommit, aheadObject);
 }
 
 namespace {
@@ -1952,6 +2093,19 @@ bool ordinalDue(std::uint64_t ordinal, std::uint64_t every) {
     return every != 0 && (ordinal + 1) % every == 0;
 }
 
+Graphics::CommitFeedCount notDirectCause(const DrawRecordHit& hit, const DrawRecordCommit& commit, const VulkanDevice::DrawTraceContext& trace) {
+    using Count = Graphics::CommitFeedCount;
+    if (!hit.direct) return Count::NotDirectHit;
+    if (trace.token != 0) return Count::NotDirectTraced;
+    if (commit.recipe == nullptr) return Count::NotDirectRecipe;
+    if (commit.writers != 1) return Count::NotDirectWriters;
+    if (!commit.bufferPlanAsked) return Count::NotDirectPlan;
+    if (!commit.inputsRecipeAsked) return Count::NotDirectInputsRecipe;
+    if (!hit.fragment.has_value()) return Count::NotDirectFragment;
+    if (!hit.preparedBuffers.has_value()) return Count::NotDirectBuffers;
+    return Count::NotDirectInputs;
+}
+
 }
 
 bool Driver::followRecord(VulkanDevice& localDevice, std::uint32_t queue, const Graphics::State& graphics, DrawRecordHit& hit, const VulkanDevice::DrawTraceContext& trace) {
@@ -1966,7 +2120,11 @@ bool Driver::followRecord(VulkanDevice& localDevice, std::uint32_t queue, const 
         return false;
     };
     auto& commit = *hit.record->commit;
-    if (!hit.direct || trace.token != 0 || commit.recipe == nullptr || commit.writers != 1 || !commit.bufferPlanAsked || !commit.inputsRecipeAsked || !hit.fragment.has_value() || !hit.preparedBuffers.has_value() || !hit.preparedInputs.has_value()) return refuse(Refusal::NotDirect);
+    if (!hit.direct || trace.token != 0 || commit.recipe == nullptr || commit.writers != 1 || !commit.bufferPlanAsked || !commit.inputsRecipeAsked || !hit.fragment.has_value() || !hit.preparedBuffers.has_value() || !hit.preparedInputs.has_value()) {
+        if (Graphics::CommitFeedCensus()) Graphics::NoteCommitFeed(notDirectCause(hit, commit, trace));
+        return refuse(Refusal::NotDirect);
+    }
+    if (commit.feedVerify) return refuse(Refusal::Verifies);
     static const bool verifies = DrawRecords::VerifyEvery() != 0 || DirectDraws::BufferVerifyEvery() != 0 || DirectDraws::InputVerifyEvery() != 0 || Graphics::CommitFragmentsVerifyEvery() != 0 || Graphics::ExpressVerifyEvery() != 0;
     auto& ordinals = commitOrdinals;
     bool expressDue = false;
@@ -2136,7 +2294,7 @@ void Driver::commitRecord(std::shared_ptr<VulkanDevice> localDevice, std::uint32
         std::shared_ptr<DrawExpressKeep> verifyKeep;
         bool verifyReprove = false;
         std::vector<std::uint64_t> verifyVersions;
-        if (fragment != nullptr && !repeatedOutcome.has_value() && tracePtr == nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ExpressCommits)) {
+        if (fragment != nullptr && !repeatedOutcome.has_value() && tracePtr == nullptr && !commit.feedVerify && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ExpressCommits)) {
             using DirectDraws::Counter;
             auto& expressOrdinal = commitOrdinals.express;
             const auto expressEvery = Graphics::ExpressVerifyEvery();

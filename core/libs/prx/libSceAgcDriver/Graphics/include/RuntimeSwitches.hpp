@@ -250,6 +250,8 @@ enum class RuntimeSwitch : std::size_t {
     HostDeepCache,
     CommitRing,
     PublicationFromFills,
+    CommitFeed,
+    DeepRuns,
     Count,
 };
 

@@ -238,6 +238,9 @@ struct DrawRecordHit {
     std::shared_ptr<const void> replayed;
 };
 
+void SetCommitBufferDropsForTest(std::uint32_t skip, std::uint32_t count);
+std::uint64_t CommitBufferDropsForTest();
+
 namespace DrawRecordFlags {
 
 constexpr std::uint8_t On = 1;

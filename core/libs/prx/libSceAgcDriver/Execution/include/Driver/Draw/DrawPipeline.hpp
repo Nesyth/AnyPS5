@@ -117,8 +117,9 @@ public:
     static void FollowEpoch(std::uint64_t token);
     static unsigned Committers();
 
-    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
-    void Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
+    using Ahead = void (*)(const void* object, std::uint32_t level);
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, Ahead ahead = nullptr, const void* aheadObject = nullptr);
+    void Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, Ahead ahead = nullptr, const void* aheadObject = nullptr);
     void EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes);
     void EnqueueLabelRun(Commit commit, std::vector<Range> writes, std::shared_ptr<const LabelRun> run);
     void EnqueueQuiet(Commit commit);
@@ -198,6 +199,8 @@ private:
         bool counted = true;
         std::uint64_t parked = 0;
         std::uint64_t ringOrdinal = 0;
+        Ahead ahead = nullptr;
+        const void* aheadObject = nullptr;
     };
     class QueuedView {
     public:

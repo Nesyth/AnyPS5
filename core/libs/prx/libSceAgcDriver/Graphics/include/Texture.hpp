@@ -356,6 +356,7 @@ public:
         std::uint32_t layers = 0;
     };
     PassRenote ProbeRenote(std::uint64_t recorder, std::uint64_t pass, std::uint32_t slice, std::uint32_t count) const;
+    void PrefetchHot() const;
     bool NotedInPass(std::uint64_t recorder, std::uint64_t pass) const { return passNote.valid && passNote.recorder == recorder && passNote.pass == pass; }
     bool RenoteInPass(std::uint64_t recorder, std::uint64_t pass, std::uint32_t slice, std::uint32_t count);
     std::pair<std::uint32_t, std::uint32_t> MarkedLayers() const { return {markedFirst, markedLayers}; }

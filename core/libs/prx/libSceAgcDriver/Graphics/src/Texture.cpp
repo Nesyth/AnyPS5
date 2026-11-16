@@ -5299,6 +5299,15 @@ bool StorageTexture::FirstWriteStoresKeys() const {
     return descriptor.dccAddress != 0 && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle) && !IsDccClear(filledKeys);
 }
 
+void StorageTexture::PrefetchHot() const {
+    __builtin_prefetch(this);
+    __builtin_prefetch(&image);
+    __builtin_prefetch(&uploads);
+    __builtin_prefetch(&passNote);
+    __builtin_prefetch(&cached);
+    __builtin_prefetch(&layerPendingSince);
+}
+
 bool StorageTexture::RenoteInPass(std::uint64_t recorder, std::uint64_t pass, std::uint32_t slice, std::uint32_t count) {
     if (!ProbeRenote(recorder, pass, slice, count).renote) return false;
     const auto& note = passNote;

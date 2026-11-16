@@ -2,6 +2,7 @@ if(BUILD_TESTING)
     agc_add_draw_pipeline_test(agc_driver_pipelined_dma LATE)
     agc_add_deep_flow_test(agc_driver_pipelined_dma)
     agc_add_write_validation_test(agc_driver_pipelined_dma)
+    agc_add_commit_feed_test(agc_driver_pipelined_dma)
 endif()
 
 if(BUILD_TESTING)

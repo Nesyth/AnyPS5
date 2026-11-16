@@ -7257,14 +7257,37 @@ void recordFragmentDraw(const Context& context, VkCommandBuffer commands, const 
     context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, draw.indexCount, draw.instanceCount, draw.firstVertex, draw.firstInstance);
 }
 
-void publishFragmentBlock(const Context& context, DrawRecordCommit& record, const std::shared_ptr<ShaderResources>& resources, const std::weak_ptr<Pipeline>& pipeline, const std::weak_ptr<Pipeline>& pushPipeline, const void* pipelineKey, const void* pushKey, const ShaderResources::PushPlan* push, bool eligible) {
+std::uint64_t keptBlockVerifyOrdinal = 0;
+
+bool keepFragmentBlock(const Context& context, DrawRecordCommit& record, const std::shared_ptr<ShaderResources>& resources, const void* pipelineKey, const void* pushKey, const ShaderResources::PushPlan* push) {
+    if (!CommitFeedOn(CommitFeedBlocks) || record.fragmentsRefused || resources == nullptr || !resources->FragmentEligible() || !fragmentModes()) return false;
+    if (record.fragmentResources != resources.get() || record.fragmentPipeline != pipelineKey || record.fragmentPushPipeline != pushKey) return false;
+    const auto block = record.fragmentBlock.load(std::memory_order_acquire);
+    if (block == nullptr || block->device != context.device || block->push != push) return false;
+    if (block->resources.expired() || block->pipeline.expired() || (pushKey != nullptr && block->pushPipeline.expired())) return false;
+    if (const auto every = CommitFeedVerifyEvery(); every != 0 && ++keptBlockVerifyOrdinal % every == 0) {
+        const void* blockResources = block->resources.lock().get();
+        const void* blockPipeline = block->pipeline.lock().get();
+        const void* blockPushPipeline = block->pushPipeline.lock().get();
+        const char* field = blockResources != static_cast<const void*>(resources.get()) ? "its template" : blockPipeline != pipelineKey ? "its pipeline" : blockPushPipeline != pushKey ? "its push pipeline" : nullptr;
+        NoteCommitFeedVerify(field == nullptr, "kept block", field == nullptr ? std::string() : std::string(field) + " is not the object of the commit without prepared buffers; the block is withdrawn");
+        if (field != nullptr) return false;
+        record.feedVerify = true;
+    }
+    if (CommitFeedCensus()) NoteCommitFeed(CommitFeedCount::BlocksKept);
+    return true;
+}
+
+void publishFragmentBlock(const Context& context, DrawRecordCommit& record, const std::shared_ptr<ShaderResources>& resources, const std::weak_ptr<Pipeline>& pipeline, const std::weak_ptr<Pipeline>& pushPipeline, const void* pipelineKey, const void* pushKey, const ShaderResources::PushPlan* push, bool eligible, bool withoutBuffers) {
     const bool wanted = eligible && !record.fragmentsRefused && resources != nullptr && resources->FragmentEligible() && fragmentModes();
     if (!wanted) {
         if (record.fragmentResources != nullptr) {
+            if (withoutBuffers && keepFragmentBlock(context, record, resources, pipelineKey, pushKey, push)) return;
             record.fragmentBlock.store(nullptr);
             record.fragmentResources = nullptr;
             record.fragmentPipeline = nullptr;
             record.fragmentPushPipeline = nullptr;
+            if (CommitFeedCensus()) NoteCommitFeed(CommitFeedCount::BlocksWithdrawn);
         }
         return;
     }
@@ -8062,6 +8085,7 @@ DrawRecipeOutcome drawWithRecord(const Context& context, const State& state, con
     if (usableFragment != nullptr) {
         const auto every = CommitFragmentsVerifyEvery();
         drawn.fragmentVerify = every != 0 && ++commitFragmentVerifyOrdinal % every == 0;
+        if (std::exchange(record.feedVerify, false)) drawn.fragmentVerify = true;
     }
     const bool expressWanted = usableFragment != nullptr && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits) && lean && !record.expressRefused && PixelFunctionLdsSubgroup(shaders) == 0u;
     if (!expressWanted && usableFragment != nullptr && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits)) {
@@ -8087,7 +8111,7 @@ DrawRecipeOutcome drawWithRecord(const Context& context, const State& state, con
     const void* blockPipelineKey = drawn.pipeline.get();
     const void* blockPushKey = drawn.pushPipeline.get();
     recordDraw(context, state, draw, shaders, inputs, drawn, outcome, timer, ownWaitedMs, trace);
-    if (RuntimeSwitches::Set(RuntimeSwitch::CommitFragments) || record.fragmentResources != nullptr) publishFragmentBlock(context, record, drawn.resources, blockPipeline, blockPushPipeline, blockPipelineKey, blockPushKey, push, lean && bound != nullptr && !stencilReferences && !UsesMeshWindow(shaders));
+    if (RuntimeSwitches::Set(RuntimeSwitch::CommitFragments) || record.fragmentResources != nullptr) publishFragmentBlock(context, record, drawn.resources, blockPipeline, blockPushPipeline, blockPipelineKey, blockPushKey, push, lean && bound != nullptr && !stencilReferences && !UsesMeshWindow(shaders), lean && bound == nullptr && !stencilReferences && !UsesMeshWindow(shaders));
     if (RuntimeSwitches::Set(RuntimeSwitch::CommitFragments) && drawn.resources != nullptr) {
         auto& blockMiss = record.effects.fragment.blockMiss;
         if (!lean) blockMiss = static_cast<DrawFragmentBlockMiss>(std::max<std::uint8_t>(drawn.resources->LeanMiss(), 1u));
@@ -8661,6 +8685,95 @@ std::uint64_t ExpressVerifyEvery() {
 
 namespace {
 
+std::uint32_t commitFeedParts() {
+    static const std::uint32_t parts = [] {
+        const char* text = std::getenv("APS5_COMMIT_FEED_PARTS");
+        return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : CommitFeedBlocks | CommitFeedCards | CommitFeedAhead;
+    }();
+    return parts;
+}
+
+constexpr std::size_t CommitFeedCounts = static_cast<std::size_t>(CommitFeedCount::Count);
+std::array<std::atomic<std::uint64_t>, CommitFeedCounts> commitFeedTotals{};
+std::atomic<std::uint64_t> commitFeedChecked{0};
+std::atomic<std::uint64_t> commitFeedDiffering{0};
+std::atomic<std::int64_t> commitFeedWindow{0};
+std::atomic<std::uint32_t> commitFeedPrinted{0};
+
+}
+
+bool CommitFeedOn(std::uint32_t part) {
+    return RuntimeSwitches::Set(RuntimeSwitch::CommitFeed) && (commitFeedParts() & part) != 0;
+}
+
+bool CommitFeedCensus() {
+    static const bool census = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return census;
+}
+
+std::uint64_t CommitFeedVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_COMMIT_FEED");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+void NoteCommitFeed(CommitFeedCount count, std::uint64_t amount) {
+    auto& total = commitFeedTotals[static_cast<std::size_t>(count)];
+    total.store(total.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+}
+
+void NoteCommitFeedVerify(bool same, const char* what, const std::string& detail) {
+    const auto checked = commitFeedChecked.fetch_add(1, std::memory_order_relaxed) + 1u;
+    const auto differing = same ? commitFeedDiffering.load(std::memory_order_relaxed) : commitFeedDiffering.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (!same) {
+        const auto now = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
+        if (commitFeedWindow.exchange(now, std::memory_order_relaxed) != now) commitFeedPrinted.store(0, std::memory_order_relaxed);
+        if (commitFeedPrinted.fetch_add(1, std::memory_order_relaxed) < 16u) std::fprintf(stderr, "[commit-feed-verify] %s differs: %s\n", what, detail.c_str());
+    }
+    if (checked % 4096u == 0u) std::fprintf(stderr, "[commit-feed-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing));
+}
+
+std::uint64_t CommitFeedTotal(CommitFeedCount count) {
+    return commitFeedTotals[static_cast<std::size_t>(count)].load(std::memory_order_relaxed);
+}
+
+std::array<std::uint64_t, 2> CommitFeedVerifyTotals() {
+    return {commitFeedChecked.load(std::memory_order_relaxed), commitFeedDiffering.load(std::memory_order_relaxed)};
+}
+
+std::string TakeCommitFeedText() {
+    static std::mutex takeMutex;
+    static std::array<std::uint64_t, CommitFeedCounts> reported{};
+    static std::array<std::uint64_t, 2> verifyReported{};
+    const std::lock_guard lock(takeMutex);
+    std::array<unsigned long long, CommitFeedCounts> since{};
+    bool any = false;
+    for (std::size_t index = 0; index < CommitFeedCounts; ++index) {
+        const auto now = commitFeedTotals[index].load(std::memory_order_relaxed);
+        since[index] = static_cast<unsigned long long>(now - reported[index]);
+        reported[index] = now;
+        any = any || since[index] != 0;
+    }
+    const auto verify = CommitFeedVerifyTotals();
+    const auto checked = static_cast<unsigned long long>(verify[0] - verifyReported[0]);
+    const auto differing = static_cast<unsigned long long>(verify[1] - verifyReported[1]);
+    verifyReported = verify;
+    if (!any && checked == 0 && !RuntimeSwitches::Set(RuntimeSwitch::CommitFeed)) return {};
+    const auto at = [&](CommitFeedCount count) { return since[static_cast<std::size_t>(count)]; };
+    std::array<char, 2048> text{};
+    std::snprintf(text.data(), text.size(), "fragment blocks kept over a commit without prepared buffers %llu, withdrawn %llu; zone cards used by followers %llu, by leaders %llu, for depth guards %llu, prepared buffers without a usable card %llu; lookahead %llu items noted, %llu without a hint, steps by level %llu, %llu, %llu, %llu, %llu, %llu; verify %llu checked, %llu differing; express leads refused: attachments not held %llu, more than 9 targets %llu, target versions or DCC addresses short %llu, pass not open %llu, pass not appendable %llu, multisample owner %llu; follows refused as not a direct record hit: not direct %llu, traced %llu, no recipe %llu, writers %llu, no buffer plan %llu, no inputs recipe %llu, no fragment %llu, no prepared buffers %llu, no prepared inputs %llu",
+        at(CommitFeedCount::BlocksKept), at(CommitFeedCount::BlocksWithdrawn), at(CommitFeedCount::CardFollowerUses), at(CommitFeedCount::CardLeaderUses), at(CommitFeedCount::CardGuardUses), at(CommitFeedCount::HitsWithoutCard),
+        at(CommitFeedCount::AheadEntries), at(CommitFeedCount::AheadNoHint), at(CommitFeedCount::AheadLevel0), at(CommitFeedCount::AheadLevel1), at(CommitFeedCount::AheadLevel2), at(CommitFeedCount::AheadLevel3), at(CommitFeedCount::AheadLevel4), at(CommitFeedCount::AheadLevel5),
+        checked, differing,
+        at(CommitFeedCount::LeadAttachments), at(CommitFeedCount::LeadTargets), at(CommitFeedCount::LeadShort), at(CommitFeedCount::LeadPassClosed), at(CommitFeedCount::LeadNotAppendable), at(CommitFeedCount::LeadMultisample),
+        at(CommitFeedCount::NotDirectHit), at(CommitFeedCount::NotDirectTraced), at(CommitFeedCount::NotDirectRecipe), at(CommitFeedCount::NotDirectWriters), at(CommitFeedCount::NotDirectPlan), at(CommitFeedCount::NotDirectInputsRecipe), at(CommitFeedCount::NotDirectFragment), at(CommitFeedCount::NotDirectBuffers), at(CommitFeedCount::NotDirectInputs));
+    return std::string(text.data());
+}
+
+namespace {
+
 struct ExpressRunRanges {
     std::uint64_t recorder = 0;
     std::uint64_t first = 0;
@@ -9033,7 +9146,10 @@ bool leadExpressRun(ExpressRun& run, Recorder& recorder, const DrawExpress& expr
         finishRun(run, ExpressRunEnd::Refusal);
         return false;
     };
-    if (!attachmentsHeld || count > ExpressRun::Targets || express.targetVersions.size() < count || express.dccAddresses.size() < count || !recorder.RenderPassOpen() || recorder.AppendablePass(express.passKey) == VK_NULL_HANDLE) return fail();
+    if (!attachmentsHeld || count > ExpressRun::Targets || express.targetVersions.size() < count || express.dccAddresses.size() < count || !recorder.RenderPassOpen() || recorder.AppendablePass(express.passKey) == VK_NULL_HANDLE) {
+        if (CommitFeedCensus()) NoteCommitFeed(!attachmentsHeld ? CommitFeedCount::LeadAttachments : count > ExpressRun::Targets ? CommitFeedCount::LeadTargets : (express.targetVersions.size() < count || express.dccAddresses.size() < count) ? CommitFeedCount::LeadShort : !recorder.RenderPassOpen() ? CommitFeedCount::LeadPassClosed : CommitFeedCount::LeadNotAppendable);
+        return fail();
+    }
     run.recorder = recorder.Id();
     run.batch = recorder.OpenSerial();
     run.generation = recorder.RenderPassGeneration();
@@ -9052,7 +9168,10 @@ bool leadExpressRun(ExpressRun& run, Recorder& recorder, const DrawExpress& expr
     run.targets = count;
     for (std::size_t index = 0; index < count; ++index) {
         const auto* target = keep.targets[index].get();
-        if (target == nullptr && (index >= keep.multisample.size() || keep.multisample[index] == nullptr || index >= express.multisampleImages.size())) return fail();
+        if (target == nullptr && (index >= keep.multisample.size() || keep.multisample[index] == nullptr || index >= express.multisampleImages.size())) {
+            if (CommitFeedCensus()) NoteCommitFeed(CommitFeedCount::LeadMultisample);
+            return fail();
+        }
         run.owners[index] = target != nullptr ? static_cast<const void*>(target) : static_cast<const void*>(keep.multisample[index].get());
         run.versions[index] = target != nullptr ? target->UploadVersion() : 0u;
         run.dcc[index] = express.dccAddresses[index];

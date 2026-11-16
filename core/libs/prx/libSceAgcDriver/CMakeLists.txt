@@ -891,6 +891,22 @@ function(agc_add_write_validation_test agcTestName)
     set_tests_properties(${agcTestName}_write_validation PROPERTIES FAIL_REGULAR_EXPRESSION "${agcLeanFrontDifference};\\[draw-records-verify\\] [-a-z ]+ differs:;\\[express-commits-verify\\] ;${agcWriteValidationDifference}")
 endfunction()
 
+set(agcCommitFeedDifference "\\[commit-feed-verify\\] [-a-z ]+ differs:")
+set(agcCommitFeedEnvironment ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1 ${agcLateStackEnvironment} ${agcLeanFrontEnvironment}
+        APS5_DIRECT_DRAWS=1 APS5_DIRECT_BUFFERS=1 APS5_DIRECT_INPUTS=1 APS5_COMMIT_BINDINGS=1 APS5_COMMIT_BINDINGS_STAMPS=1 APS5_COMMIT_FRAGMENTS=1
+        APS5_ASYNC_SUBMIT=1 APS5_DEFERRED_ENCODE=1 APS5_DIRECT_CLEAN_PROOFS=1 APS5_CLEAN_PRECISE_SERIALS=1 APS5_EXPRESS_COMMITS=1
+        APS5_RUN_FOLLOW=1 APS5_PROOF_KEEPS=1 APS5_APPEND_COMMITS=1 APS5_PIPELINE_STATS=1)
+set(agcCommitFeedFailures "${agcLeanFrontDifference};\\[draw-records-verify\\] [-a-z ]+ differs:;\\[express-commits-verify\\] ;\\[commit-fragments-verify\\] ;\\[run-follow-verify\\] a ;${agcCommitFeedDifference}")
+
+function(agc_add_commit_feed_test agcTestName)
+    set(agcCommitFeedVerifies APS5_VERIFY_COMMIT_FEED=1 APS5_VERIFY_COMMIT_FRAGMENTS=7 APS5_VERIFY_APPEND_COMMITS=16)
+    agc_add_env_test(${agcTestName}_commit_feed ${agcTestName}_tests
+            ENV ${agcCommitFeedEnvironment} ${agcCommitFeedVerifies} APS5_COMMIT_FEED=1)
+    agc_add_env_test(${agcTestName}_commit_feed_off ${agcTestName}_tests
+            ENV ${agcCommitFeedEnvironment} ${agcCommitFeedVerifies})
+    set_tests_properties(${agcTestName}_commit_feed ${agcTestName}_commit_feed_off PROPERTIES FAIL_REGULAR_EXPRESSION "${agcCommitFeedFailures}")
+endfunction()
+
 set(agcDrawRecordsDifference "\\[draw-records-verify\\] [-a-z ]+ differs:")
 
 function(agc_add_draw_records_test agcTestName)

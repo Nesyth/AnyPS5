@@ -9228,6 +9228,22 @@ bool ShaderResources::PreparedMovesClear(const PreparedBuffers& prepared, Record
 
 bool ShaderResources::PreparedZonesClear(const PreparedBuffers& prepared, const Recorder& recorder) const {
     if ((prepared.forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared.forget) return false;
+    if (zoneCardUsable(prepared, ZoneCardUse::Leader)) {
+        const auto& card = prepared.card;
+        for (std::size_t index = 0; index < card.zones; ++index) {
+            const auto begin = card.entries[index].first;
+            const auto packed = card.entries[index].second;
+            const auto bytes = static_cast<std::size_t>(packed & ~PreparedBuffers::ZoneCard::Moved);
+            if ((packed & PreparedBuffers::ZoneCard::Moved) != 0) {
+                if (!PendingZones::Clear(begin, bytes) && (recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr))) return false;
+                if (guestMemory.WritesOverlap(begin, bytes) || AnyShadowedOverlaps(begin, bytes)) return false;
+            } else {
+                if (!PendingZones::Clear(begin, bytes) && recorder.PendingWriteOverlaps(begin, bytes)) return false;
+                if (guestMemory.WritesOverlap(begin, bytes)) return false;
+            }
+        }
+        return true;
+    }
     for (const auto& entry : prepared.moved) {
         const auto& item = allocations[entry.allocation];
         if (!item.guest || entry.inPlace != VK_NULL_HANDLE) continue;
@@ -9348,6 +9364,16 @@ std::optional<ShaderResources::MovedCount> ShaderResources::inPlaceRefusalByWind
 
 bool ShaderResources::PreparedZonesClearBy(const PreparedBuffers& prepared, ZoneClear clear, void* tests) const {
     if ((prepared.forget & 1u) != 0 || GuestMemory::ForgetSerial() != prepared.forget) return false;
+    if (zoneCardUsable(prepared, ZoneCardUse::Follower)) {
+        const auto& card = prepared.card;
+        for (std::size_t index = 0; index < card.zones; ++index) {
+            const auto begin = card.entries[index].first;
+            const auto packed = card.entries[index].second;
+            const auto bytes = static_cast<std::size_t>(packed & ~PreparedBuffers::ZoneCard::Moved);
+            if (guestMemory.WritesOverlap(begin, bytes) || !clear(tests, begin, bytes, (packed & PreparedBuffers::ZoneCard::Moved) != 0)) return false;
+        }
+        return true;
+    }
     for (const auto& entry : prepared.moved) {
         const auto& item = allocations[entry.allocation];
         if (!item.guest || entry.inPlace != VK_NULL_HANDLE) continue;
@@ -9361,6 +9387,125 @@ bool ShaderResources::PreparedZonesClearBy(const PreparedBuffers& prepared, Zone
         if (guestMemory.WritesOverlap(allocation.address, allocation.size) || !clear(tests, allocation.address, static_cast<std::size_t>(allocation.size), false)) return false;
     }
     return true;
+}
+
+ShaderResources::ZoneCardBuild ShaderResources::BuildZoneCard(PreparedBuffers& prepared) {
+    using Card = PreparedBuffers::ZoneCard;
+    auto& card = prepared.card;
+    card.valid = false;
+    card.zones = 0;
+    card.guards = 0;
+    card.plan = prepared.plan.get();
+    if (card.plan == nullptr) return ZoneCardBuild::Refused;
+    const auto& planned = card.plan->allocations;
+    std::size_t count = 0;
+    auto outcome = ZoneCardBuild::Made;
+    const auto add = [&](std::uint64_t begin, std::uint64_t bytes, bool moved) {
+        if ((bytes & Card::Moved) != 0) {
+            outcome = ZoneCardBuild::Refused;
+            return false;
+        }
+        if (count == Card::Capacity) {
+            outcome = ZoneCardBuild::OverCapacity;
+            return false;
+        }
+        card.entries[count++] = {begin, moved ? bytes | Card::Moved : bytes};
+        return true;
+    };
+    std::size_t zones = 0;
+    try {
+        for (const auto& entry : prepared.moved) {
+            if (entry.allocation >= planned.size()) return ZoneCardBuild::Refused;
+            const auto& item = planned[entry.allocation];
+            if (!item.guest || entry.inPlace != VK_NULL_HANDLE) continue;
+            const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment));
+            if (!add(entry.address - item.adjustment, static_cast<std::uint64_t>(bytes), true)) return outcome;
+        }
+        for (const auto& item : prepared.selected) {
+            if (item.moved) continue;
+            if (item.allocation >= planned.size()) return ZoneCardBuild::Refused;
+            const auto& allocation = planned[item.allocation];
+            if (!add(allocation.address, static_cast<std::uint64_t>(allocation.size), false)) return outcome;
+        }
+        zones = count;
+        for (const auto& item : prepared.selected) {
+            if (item.begin == 0 || item.inPlace) continue;
+            if (!add(item.begin, static_cast<std::uint64_t>(item.bytes), false)) return outcome;
+        }
+    } catch (const std::exception&) {
+        return ZoneCardBuild::Refused;
+    }
+    card.zones = static_cast<std::uint8_t>(zones);
+    card.guards = static_cast<std::uint8_t>(count - zones);
+    card.valid = true;
+    return ZoneCardBuild::Made;
+}
+
+namespace {
+
+std::uint64_t zoneCardVerifyOrdinal = 0;
+
+}
+
+bool ShaderResources::zoneCardUsable(const PreparedBuffers& prepared, ZoneCardUse use) const {
+    if (!CommitFeedOn(CommitFeedCards)) return false;
+    const auto& card = prepared.card;
+    const bool usable = card.valid && card.plan != nullptr && card.plan == prepared.plan.get() && card.plan == bufferPlan.get();
+    if (CommitFeedCensus()) NoteCommitFeed(!usable ? CommitFeedCount::HitsWithoutCard : use == ZoneCardUse::Follower ? CommitFeedCount::CardFollowerUses : use == ZoneCardUse::Leader ? CommitFeedCount::CardLeaderUses : CommitFeedCount::CardGuardUses);
+    if (!usable) return false;
+    const auto every = CommitFeedVerifyEvery();
+    if (every == 0 || ++zoneCardVerifyOrdinal % every != 0) return true;
+    return zoneCardHolds(prepared, use == ZoneCardUse::Guards);
+}
+
+bool ShaderResources::zoneCardHolds(const PreparedBuffers& prepared, bool guards) const {
+    using Card = PreparedBuffers::ZoneCard;
+    const auto& card = prepared.card;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> today;
+    if (guards) {
+        for (const auto& item : prepared.selected) {
+            if (item.begin == 0 || item.inPlace) continue;
+            today.emplace_back(item.begin, static_cast<std::uint64_t>(item.bytes));
+        }
+    } else {
+        for (const auto& entry : prepared.moved) {
+            const auto& item = allocations[entry.allocation];
+            if (!item.guest || entry.inPlace != VK_NULL_HANDLE) continue;
+            const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment));
+            today.emplace_back(entry.address - item.adjustment, static_cast<std::uint64_t>(bytes) | Card::Moved);
+        }
+        for (const auto& item : prepared.selected) {
+            if (item.moved) continue;
+            const auto& allocation = allocations[item.allocation];
+            today.emplace_back(allocation.address, static_cast<std::uint64_t>(allocation.size));
+        }
+    }
+    const std::size_t first = guards ? card.zones : 0u;
+    const std::size_t count = guards ? card.guards : card.zones;
+    std::string detail;
+    if (today.size() != count) detail = std::to_string(count) + " entries on the card, " + std::to_string(today.size()) + " in today's walk";
+    for (std::size_t index = 0; detail.empty() && index < count; ++index) {
+        const auto& mine = card.entries[first + index];
+        const auto& theirs = today[index];
+        if (mine.first == theirs.first && mine.second == theirs.second) continue;
+        detail = "entry " + std::to_string(index) + ": the card holds " + std::to_string(mine.first) + " for " + std::to_string(mine.second & ~Card::Moved) + (((mine.second & Card::Moved) != 0) ? " bytes moved" : " bytes") + ", today's walk " + std::to_string(theirs.first) + " for " + std::to_string(theirs.second & ~Card::Moved) + (((theirs.second & Card::Moved) != 0) ? " bytes moved" : " bytes");
+    }
+    NoteCommitFeedVerify(detail.empty(), guards ? "guard list" : "zone card", detail.empty() ? detail : detail + "; today's walk answers this commit");
+    return detail.empty();
+}
+
+void ShaderResources::PrefetchExpressHot() const {
+    __builtin_prefetch(this);
+    __builtin_prefetch(&expressValid);
+    __builtin_prefetch(&expressWatch);
+    __builtin_prefetch(&expressAt);
+    __builtin_prefetch(&expressSources);
+    __builtin_prefetch(&expressViewsAt);
+    __builtin_prefetch(&directRegions);
+    __builtin_prefetch(&bufferPlan);
+    __builtin_prefetch(&touchedPresent);
+    __builtin_prefetch(&faultGeneration);
+    __builtin_prefetch(&guestMemory);
 }
 
 bool ShaderResources::PreparedInPlaceHolds(const PreparedBuffers& prepared, const Recorder& recorder, bool& behind, CommitterTrustCheck* trust, std::optional<WriteValidation::Test> validation) const {
@@ -10402,7 +10547,17 @@ bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const
         return false;
     };
     const bool guardsMoved = !skipped && DepthGuardsGeneration_nid_no_patch() != prepared.depthGuards;
-    if (!skipped && (guardsMoved || HasResidentDepthGuards_nid_no_patch()) && std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && !item.inPlace && (guardsMoved || (guards != nullptr ? guards->depth(guards->tests, item.begin, item.bytes) : MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes))); })) {
+    const auto depthGuardHit = [&](std::uint64_t begin, std::uint64_t bytes) { return guardsMoved || (guards != nullptr ? guards->depth(guards->tests, begin, bytes) : MayOverlapDepthGuards_nid_no_patch(begin, static_cast<std::size_t>(bytes))); };
+    const auto depthGuarded = [&]() -> bool {
+        if (!zoneCardUsable(prepared, ZoneCardUse::Guards)) return std::ranges::any_of(prepared.selected, [&](const PreparedBuffers::Selected& item) { return item.begin != 0 && !item.inPlace && depthGuardHit(item.begin, item.bytes); });
+        const auto& card = prepared.card;
+        const std::size_t end = static_cast<std::size_t>(card.zones) + static_cast<std::size_t>(card.guards);
+        for (std::size_t index = card.zones; index < end; ++index) {
+            if (depthGuardHit(card.entries[index].first, card.entries[index].second)) return true;
+        }
+        return false;
+    };
+    if (!skipped && (guardsMoved || HasResidentDepthGuards_nid_no_patch()) && depthGuarded()) {
         selection = Selection::DepthGuards;
         return failed();
     }

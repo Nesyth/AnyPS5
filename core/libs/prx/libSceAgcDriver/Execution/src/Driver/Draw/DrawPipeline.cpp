@@ -3531,8 +3531,8 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
-void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw) {
-    enqueue({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw});
+void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw, Ahead ahead, const void* aheadObject) {
+    enqueue({.commit = std::move(commit), .writes = std::move(writes), .labelAddress = labelAddress, .labelBytes = std::move(labelBytes), .reads = std::move(reads), .draw = draw, .ahead = ahead, .aheadObject = aheadObject});
 }
 
 void DrawPipeline::EnqueueQuiet(Commit commit) {
@@ -3543,8 +3543,8 @@ void DrawPipeline::EnqueueKept(Commit commit, std::vector<Range> writes, std::ve
     enqueue({std::move(commit), std::move(writes), 0, {}, std::move(reads), true, false, CommitKind::Other, false, 0, 1, std::move(keep)});
 }
 
-void DrawPipeline::Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw) {
-    enqueue({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, false, kind});
+void DrawPipeline::Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw, Ahead ahead, const void* aheadObject) {
+    enqueue({.commit = std::move(commit), .writes = std::move(writes), .labelAddress = labelAddress, .labelBytes = std::move(labelBytes), .reads = std::move(reads), .draw = draw, .store = false, .kind = kind, .ahead = ahead, .aheadObject = aheadObject});
 }
 
 void DrawPipeline::NoteDrawKey(std::uint64_t key, std::uint64_t shape) {
@@ -4167,6 +4167,40 @@ void DrawPipeline::run() {
         }
     };
     const auto takeFront = [&] { takeItem(items.front()); };
+    struct AheadHint {
+        Ahead ahead = nullptr;
+        const void* object = nullptr;
+    };
+    std::array<AheadHint, 3> aheadHints{};
+    bool aheadOn = false;
+    const bool aheadCensus = Graphics::CommitFeedCensus();
+    const auto noteAhead = [&](const auto& itemAt, std::uint64_t available) {
+        aheadOn = Graphics::CommitFeedOn(Graphics::CommitFeedAhead);
+        if (!aheadOn) return;
+        for (std::size_t distance = 1; distance <= aheadHints.size(); ++distance) {
+            auto& hint = aheadHints[distance - 1];
+            hint = {};
+            if (distance >= available) continue;
+            const Item& ahead = itemAt(distance);
+            hint.ahead = ahead.ahead;
+            hint.object = ahead.aheadObject;
+            if (aheadCensus) Graphics::NoteCommitFeed(hint.ahead != nullptr ? Graphics::CommitFeedCount::AheadEntries : Graphics::CommitFeedCount::AheadNoHint);
+        }
+    };
+    const auto noteAheadQueued = [&] { noteAhead([&](std::size_t distance) -> const Item& { return items[distance]; }, static_cast<std::uint64_t>(items.size())); };
+    const auto noteAheadRing = [&] {
+        const auto enqueuedNow = enqueuedItems.load(std::memory_order_acquire);
+        noteAhead([&](std::size_t distance) -> const Item& { return ringSlot(head + distance); }, enqueuedNow > head ? enqueuedNow - head : 0u);
+    };
+    const auto stepAhead = [&](bool after) {
+        for (std::size_t distance = 1; distance <= aheadHints.size(); ++distance) {
+            const auto& hint = aheadHints[distance - 1];
+            if (hint.ahead == nullptr) continue;
+            const auto level = static_cast<std::uint32_t>(2u * (aheadHints.size() - distance) + (after ? 1u : 0u));
+            hint.ahead(hint.object, level);
+            if (aheadCensus) Graphics::NoteCommitFeed(static_cast<Graphics::CommitFeedCount>(static_cast<std::size_t>(Graphics::CommitFeedCount::AheadLevel0) + level));
+        }
+    };
     for (;;) {
         if (!taken) {
             static const bool idleCensus = std::getenv("APS5_PIPELINE_STATS") != nullptr;
@@ -4205,6 +4239,7 @@ void DrawPipeline::run() {
                     continue;
                 }
                 takeItem(ringSlot(head));
+                noteAheadRing();
             } else {
                 SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
                 auto lock = lockFor(mutex);
@@ -4220,6 +4255,7 @@ void DrawPipeline::run() {
                     continue;
                 }
                 takeFront();
+                noteAheadQueued();
             }
         }
         taken = false;
@@ -4241,6 +4277,7 @@ void DrawPipeline::run() {
             runLength = 0;
             if (holdTimed) Graphics::NoteExpressRunHold(elapsedNs(holdBegan));
         }
+        if (aheadOn && commit != nullptr) stepAhead(false);
         try {
             if (commit != nullptr) (*commit)();
             if (quietItem) {
@@ -4258,6 +4295,7 @@ void DrawPipeline::run() {
         } catch (...) {
             fatal = std::current_exception();
         }
+        if (aheadOn && commit != nullptr && fatal == nullptr) stepAhead(true);
         const auto spent = elapsedNs(start);
         if (ThreadReport::Enabled()) {
             const auto end = start + std::chrono::nanoseconds(spent);
@@ -4336,6 +4374,7 @@ void DrawPipeline::run() {
             if (!keepRun) ended = stopped || closingNow ? Graphics::ExpressRunEnd::Stop : !queued ? Graphics::ExpressRunEnd::NotQueued : !ringSlot(head).draw ? Graphics::ExpressRunEnd::NotDraw : runLength >= LeanRunCap ? Graphics::ExpressRunEnd::Cap : Graphics::ExpressRunEnd::IdleWaiter;
             if (mergedTake && queued) {
                 takeItem(ringSlot(head));
+                noteAheadRing();
                 taken = true;
             }
         } else {
@@ -4364,6 +4403,7 @@ void DrawPipeline::run() {
             if (!keepRun) ended = stopped || closing ? Graphics::ExpressRunEnd::Stop : items.empty() ? Graphics::ExpressRunEnd::NotQueued : !items.front().draw ? Graphics::ExpressRunEnd::NotDraw : runLength >= LeanRunCap ? Graphics::ExpressRunEnd::Cap : Graphics::ExpressRunEnd::IdleWaiter;
             if (mergedTake && !items.empty()) {
                 takeFront();
+                noteAheadQueued();
                 taken = true;
             }
         }

@@ -415,6 +415,7 @@ struct DrawRecordCommit {
     const void* fragmentPushPipeline = nullptr;
     bool fragmentsRefused = false;
     bool spaceRefused = false;
+    bool feedVerify = false;
 
     void Adopt(std::shared_ptr<const DrawRecipe> built) {
         recipe = std::move(built);
