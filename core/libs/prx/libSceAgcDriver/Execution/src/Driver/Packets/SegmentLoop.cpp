@@ -1537,7 +1537,7 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                 const bool streamSeal = LeanFront::SwitchSet(frontLatch, RuntimeSwitch::XpStreamSegments);
                 if (streamSeal && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
                     DrawFinisher::Pending held;
-                    held.unknown = false;
+                    held.unknown = false; held.origin = 11;
                     DrawFinisher::Get().Enqueue([sealPass] { DrawPipeline::Queue0().EnqueueQuiet(sealPass); }, std::move(held));
                     PacketRules::noteXpStream(true);
                 } else if (streamSeal && DrawPipeline::Queue0().Busy()) {

@@ -555,7 +555,7 @@ bool Driver::endSegment(const Submission& submission, FlipHold& flipHold, bool p
         };
         if (DrawFinisher::Overlap() && DrawFinisher::Busy()) {
             DrawFinisher::Pending held;
-            held.unknown = false;
+            held.unknown = false; held.origin = 6;
             DrawFinisher::Get().Enqueue(std::move(enqueue), std::move(held));
         } else {
             enqueue();
@@ -1133,7 +1133,7 @@ void Driver::execute(const Submission& submission) {
                 const bool streamSeal = pipelined && switchSet(Graphics::RuntimeSwitch::XpStreamSegments);
                 if (streamSeal && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
                     DrawFinisher::Pending held;
-                    held.unknown = false;
+                    held.unknown = false; held.origin = 7;
                     DrawFinisher::Get().Enqueue([seal] { DrawPipeline::Queue0().EnqueueQuiet(seal); }, std::move(held));
                     noteXpStream(true);
                 } else if (streamSeal && DrawPipeline::Queue0().Busy()) {

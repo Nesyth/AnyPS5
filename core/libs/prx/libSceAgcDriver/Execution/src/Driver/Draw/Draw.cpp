@@ -372,7 +372,7 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
     }
     noteHeld(HeldReason::Known);
     held.writes = DrawWriteRanges(tail.decode->state, {}, ExactDrawWrites());
-    held.unknown = false;
+    held.unknown = false; held.origin = 3;
     return held;
 }
 
@@ -471,6 +471,10 @@ bool Driver::nameHeldWrites(const DrawTail& tail, std::vector<std::pair<std::uin
                 const auto pushOffset = Graphics::StagePushOffset(0, program.binary.stage, tail.localDevice->GraphicsPipelineLibraries());
                 const auto request = drawStageRequest(program, tail.decode->state, tail.pixel, vertexInfo, tail.memory, tail.linked, *tail.localDevice, pushOffset, tail.drawParameters, std::nullopt);
                 ShaderMemory side(tail.memory, &queryPendingWrite, nullptr, nullptr, &QueryPendingSpan);
+                struct NamingScope {
+                    NamingScope() { DrawFinisher::NamingWalk() = true; }
+                    ~NamingScope() { DrawFinisher::NamingWalk() = false; }
+                } naming;
                 capture = CapturePreparedResources(side, *program.snapshot, program.codeOffset, request);
                 if (capture != nullptr) complete = CapturedWriteRanges(capture->plan.get(), capture->snapshot, named);
             } catch (const std::exception&) {
@@ -1042,7 +1046,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             std::vector<std::pair<std::uint64_t, std::uint64_t>> named;
             if (nameHeldWrites(tail, named)) {
                 held.writes = std::move(named);
-                held.unknown = false;
+                held.unknown = false; held.origin = 4;
                 held.named = true;
             }
         }

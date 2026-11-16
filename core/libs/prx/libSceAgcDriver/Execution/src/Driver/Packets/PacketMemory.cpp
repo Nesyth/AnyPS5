@@ -367,7 +367,7 @@ bool Driver::enqueueSampleDumpPacket(std::span<const std::uint32_t> packet, std:
     };
     if ((Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::BesideSampleDumps) || DrawFinisher::Flow() || DrawFinisher::Deep()) && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
         DrawFinisher::Pending held;
-        held.unknown = false;
+        held.unknown = false; held.origin = 8;
         held.writes = {{address, address + Pm4::SampleDumpBytes}};
         DrawFinisher::Get().Enqueue(std::move(enqueue), std::move(held));
     } else {
@@ -552,7 +552,7 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
     };
     if (queue == 0 && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
         DrawFinisher::Pending held;
-        held.unknown = false;
+        held.unknown = false; held.origin = 9;
         held.writes = std::move(writes);
         held.labelAddress = address;
         held.labelBytes = std::move(labelBytes);
@@ -602,7 +602,7 @@ void Driver::enqueueLabelRun(std::uint32_t queue, std::shared_ptr<const LabelRun
     DrawFinisher::Pending held;
     const bool beside = queue == 0 && DrawFinisher::Overlap() && DrawFinisher::Busy();
     if (beside) {
-        held.unknown = false;
+        held.unknown = false; held.origin = 10;
         held.writes = writes;
         held.labelRun = run;
     }

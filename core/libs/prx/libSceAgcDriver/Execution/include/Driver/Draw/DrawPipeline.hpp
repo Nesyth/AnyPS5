@@ -125,6 +125,7 @@ public:
     void EnqueueKept(Commit commit, std::vector<Range> writes, std::vector<Range> reads, std::shared_ptr<const void> keep);
     void EnqueueFlip(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes);
     void EnqueueSuspend(Commit commit);
+    std::uint32_t DescribeQueuedWriter(std::uint64_t begin, std::uint64_t end);
     class FlipCommitScope {
     public:
         FlipCommitScope();
@@ -296,6 +297,8 @@ public:
         std::vector<std::byte> labelBytes;
         std::shared_ptr<const LabelRun> labelRun;
         bool named = false;
+        std::uint8_t origin = 0;
+        std::uint8_t originKind = 0;
     };
     enum class LabelLookup : std::uint8_t { NotHeld, Value, Unknown };
     struct DepositCounts {
@@ -370,6 +373,9 @@ public:
     static bool FrameFlowWanted();
     static bool FrameFlow();
     static bool OrderedSyncsWanted();
+    static bool& NamingWalk();
+    static void NoteNamingBlocker(std::uint64_t begin, std::uint64_t end);
+    std::uint32_t describePendingWriter(std::uint64_t begin, std::uint64_t end);
     static bool OrderedSyncs();
     static void NoteHeldNaming(bool named, std::size_t ranges, std::uint64_t ns);
     static std::uint64_t HeldNamedTotal();

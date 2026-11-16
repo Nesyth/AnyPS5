@@ -227,6 +227,7 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
         auto& pipeline = DrawPipeline::Queue0();
         if (pipeline.Busy()) queued = pipeline.StoredBytes(address, bytes, known.size() == bytes ? known : std::span<std::byte>{});
         if (queued == DrawPipeline::QueuedWrite::Unknown && DrawFinisher::Deep()) {
+            DrawFinisher::NoteNamingBlocker(address, address + bytes);
             const DrawPipeline::Range range{address, address + bytes};
             for (unsigned round = 0; round < 2 && queued == DrawPipeline::QueuedWrite::Unknown; ++round) {
                 pipeline.AwaitWriters({&range, 1}, DrawPipeline::DrainReason::Capture, 0x100, DeepSite::WriteEvidence);

@@ -191,7 +191,7 @@ std::shared_ptr<VulkanDevice> Driver::pipelinedColorMetadataDevice(const Graphic
 
 void Driver::queueLeanColorMetadataPass(const Graphics::ColorMetadataPass& pass, std::vector<DrawPipeline::Range> writes, std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queueId, std::uint32_t opcode) {
     DrawFinisher::Pending held;
-    held.unknown = false;
+    held.unknown = false; held.origin = 5;
     held.writes = writes;
     DrawFinisher::Get().Enqueue([commit = colorMetadataCommit(std::move(localDevice), queueId, opcode, pass), writes = std::move(writes)]() mutable {
         DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::ColorMetadata, std::move(commit), std::move(writes));

@@ -19,6 +19,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <array>
@@ -1700,6 +1701,54 @@ void DrawFinisher::AwaitPending(std::span<const Range> ranges, DeepSite site) {
     }
 }
 
+bool& DrawFinisher::NamingWalk() {
+    struct NamingWalkStorage {};
+    return HostThreadLocal<bool, NamingWalkStorage>();
+}
+
+std::uint32_t DrawFinisher::describePendingWriter(std::uint64_t begin, std::uint64_t end) {
+    const Range range{begin, end};
+    if (deepRing.load(std::memory_order_relaxed)) {
+        const auto front = frontSeq.load(std::memory_order_acquire);
+        const auto found = deepWrites->Newest({&range, 1}, front);
+        if (found.answer == DeepAnswer::Unsure) return 5000u;
+        if (found.answer == DeepAnswer::Hit) {
+            const auto& slot = leanSlot(found.stamp);
+            return 1000u + static_cast<std::uint32_t>(slot.pending.origin) * 100u + slot.pending.originKind;
+        }
+        if (lastUnknown.load(std::memory_order_relaxed) >= front) return 2000u;
+    }
+    if (FinisherDeposits::Get() && depositsWrite({&range, 1})) return 3000u;
+    return DrawPipeline::Queue0().DescribeQueuedWriter(begin, end);
+}
+
+void DrawFinisher::NoteNamingBlocker(std::uint64_t begin, std::uint64_t end) {
+    if (!pipelineStats() || !NamingWalk()) return;
+    static std::mutex mutex;
+    static std::map<std::uint32_t, std::uint64_t> blockers;
+    static std::uint64_t total = 0;
+    const auto code = Get().describePendingWriter(begin, end);
+    std::lock_guard lock(mutex);
+    ++blockers[code];
+    if (++total % 512u != 0) return;
+    std::string text;
+    for (const auto& [key, count] : blockers) {
+        char item[48];
+        std::snprintf(item, sizeof(item), " %u x%llu", key, static_cast<unsigned long long>(count));
+        text += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[held-naming] blockers of the resource walk (1000 + origin * 100 + kind in the ring, 2000 a job with unknown writes, 3000 deposits, 4000 + kind queued, 5000 unsure, 6000 none):%s\n", text.c_str());
+    blockers.clear();
+}
+
+std::uint32_t DrawPipeline::DescribeQueuedWriter(std::uint64_t begin, std::uint64_t end) {
+    const auto lock = lockFor(mutex);
+    for (auto item = items.rbegin(); item != items.rend(); ++item) {
+        if (std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& write) { return begin < write.second && write.first < end; })) return 4000u + static_cast<std::uint32_t>(item->kind);
+    }
+    return 6000u;
+}
+
 DrawFinisher::ExactFound DrawFinisher::exactPending(std::span<const Range> ranges) {
     constexpr std::uint32_t ResolveSteps = 64;
     ExactFound result;
@@ -2559,7 +2608,7 @@ void DrawFinisher::PublishLean(LeanRunner runner, std::span<const Range> writes,
     held.key = key;
     held.shape = shape;
     held.inserts = true;
-    held.unknown = false;
+    held.unknown = false; held.origin = 1;
     held.named = false;
     held.writes.assign(writes.begin(), writes.end());
     held.labelAddress = 0;
@@ -3337,7 +3386,8 @@ void DrawPipeline::enqueue(Item item) {
         const bool dispatchTurn = item.kind == CommitKind::Dispatch && (flow || deep || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DispatchBeside));
         if ((item.reads.empty() || dispatchTurn || flow || deep) && !ItemTurn::Get() && FinisherProducer::Get() && DrawFinisher::Overlap() && !GuestMemory::GpuMutex().HeldByThisThread() && (dispatchTurn || flow || deep || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ItemsByTurn))) {
             DrawFinisher::Pending held;
-            held.unknown = false;
+            held.unknown = false; held.origin = 2;
+            held.originKind = static_cast<std::uint8_t>(item.kind);
             held.writes = item.writes;
             held.labelAddress = item.labelAddress;
             held.labelBytes = item.labelBytes;
