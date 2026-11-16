@@ -314,6 +314,7 @@ public:
     bool ParkedReadsOverlap(std::uint64_t address, std::size_t bytes);
     LabelLookup PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value);
     bool PendingLabelBytes(std::uint64_t address, std::span<std::byte> out);
+    bool PendingLabelSpan(std::uint64_t address, std::size_t bytes);
     bool PendingOverlapsAny(std::span<const Range> ranges);
     bool PendingClearForValidation(std::span<const Range> ranges);
     static bool UnknownWritesAhead();

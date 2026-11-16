@@ -254,9 +254,8 @@ ShaderMemory::PendingWrite Driver::queryNamingWrite(std::uint64_t address, std::
     if (readThrough && bytes != 0 && DrawPipeline::Active()) {
         if (known.size() == bytes) {
             if (DrawFinisher::Get().PendingLabelBytes(address, known)) return ShaderMemory::PendingWrite::KnownValue;
-        } else if (known.empty() && bytes <= 64) {
-            std::array<std::byte, 64> scratch{};
-            if (DrawFinisher::Get().PendingLabelBytes(address, std::span(scratch).first(bytes))) return ShaderMemory::PendingWrite::KnownValue;
+        } else if (known.empty()) {
+            if (DrawFinisher::Get().PendingLabelSpan(address, bytes)) return ShaderMemory::PendingWrite::KnownValue;
         }
     }
     return queryPendingWrite(address, bytes, known);

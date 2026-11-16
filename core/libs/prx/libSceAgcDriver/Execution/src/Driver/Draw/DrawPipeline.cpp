@@ -781,15 +781,25 @@ bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
 }
 
 bool DrawFinisher::PendingLabelBytes(std::uint64_t address, std::span<std::byte> out) {
-    if (out.empty() || !Busy() || !FinisherProducer::Get()) return false;
-    for (std::size_t offset = 0; offset < out.size();) {
-        const auto chunk = std::min<std::size_t>(8, out.size() - offset);
+    if (out.empty() || (address & 3u) != 0 || (out.size() & 3u) != 0 || !Busy() || !FinisherProducer::Get()) return false;
+    for (std::size_t offset = 0; offset < out.size(); offset += 4) {
         std::uint64_t value = 0;
-        if (PendingLabel(address + offset, chunk, value) != LabelLookup::Value) return false;
-        std::memcpy(out.data() + offset, &value, chunk);
-        offset += chunk;
+        if (PendingLabel(address + offset, 4, value) != LabelLookup::Value) return false;
+        std::memcpy(out.data() + offset, &value, 4);
     }
     return true;
+}
+
+bool DrawFinisher::PendingLabelSpan(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > 64 || (address & 3u) != 0 || (bytes & 3u) != 0 || !Busy() || !FinisherProducer::Get()) return false;
+    bool known = false;
+    for (std::size_t offset = 0; offset < bytes; offset += 4) {
+        std::uint64_t value = 0;
+        const auto found = PendingLabel(address + offset, 4, value);
+        if (found == LabelLookup::Unknown) return false;
+        known = known || found == LabelLookup::Value;
+    }
+    return known;
 }
 
 DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value) {
