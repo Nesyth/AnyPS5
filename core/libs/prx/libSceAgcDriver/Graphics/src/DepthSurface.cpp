@@ -383,6 +383,8 @@ std::atomic<std::uint64_t> publicationsFromFills{0};
 std::atomic<std::uint64_t> publicationFillSkips{0};
 std::atomic<std::uint64_t> publicationFillsChecked{0};
 std::atomic<std::uint64_t> publicationFillsDiffering{0};
+std::atomic<std::uint64_t> publicationFillsMoved{0};
+std::atomic<std::uint64_t> publicationFillSyncsKept{0};
 
 bool publicationFillsVerify() {
     static const bool on = std::getenv("APS5_VERIFY_PUBLICATION_FILLS") != nullptr;
@@ -395,9 +397,9 @@ void notePublicationFill(bool rebased) {
     if (!stats || !rebased) return;
     const auto count = publicationsFromFills.load(std::memory_order_relaxed);
     if (count % 512u != 0u) return;
-    std::fprintf(stderr, "[publication-fills] %llu publications rebased on a pending fill without a GPU wait, %llu later checks without a sync for the same fill; verify %llu checked, %llu differing\n",
-        static_cast<unsigned long long>(count), static_cast<unsigned long long>(publicationFillSkips.load(std::memory_order_relaxed)),
-        static_cast<unsigned long long>(publicationFillsChecked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(publicationFillsDiffering.load(std::memory_order_relaxed)));
+    std::fprintf(stderr, "[publication-fills] %llu publications rebased on a pending fill without a GPU wait, %llu later checks without a sync for the same fill, %llu syncs kept because another plane had a pending write; verify %llu checked, %llu differing in content, %llu with a generation that no longer held after the fill landed\n",
+        static_cast<unsigned long long>(count), static_cast<unsigned long long>(publicationFillSkips.load(std::memory_order_relaxed)), static_cast<unsigned long long>(publicationFillSyncsKept.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(publicationFillsChecked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(publicationFillsDiffering.load(std::memory_order_relaxed)), static_cast<unsigned long long>(publicationFillsMoved.load(std::memory_order_relaxed)));
 }
 
 enum class DepthCheck : std::size_t { Calls, Worked, FillNotes, PublicationSync, PendingSync, PendingDepth, PendingHtile, PendingStencil, Alias, StencilClear, DepthClear, HtileStore, Count };
@@ -1038,6 +1040,18 @@ public:
                     htileFromFill = htileNewest && (clearGeneration != 0u || publicationFill[1] == clearFillNote);
                     const bool stencilNewest = stencilFillNote != 0u && stencilClearValue.has_value() && sampling.initial.size() > 2u && pending->NewestStoreNote(sampling.initial[2].address, sampling.initial[2].bytes) == stencilFillNote;
                     stencilFromFill = stencilNewest && (stencilClearGeneration != 0u || publicationFill[2] == stencilFillNote);
+                    if (htileFromFill || stencilFromFill) {
+                        bool othersPending = false;
+                        for (std::size_t index = 0u; index < sampling.initial.size() && !othersPending; ++index) {
+                            if ((index == 1u && htileFromFill) || (index == 2u && stencilFromFill)) continue;
+                            othersPending = pending->PendingWriteOverlaps(sampling.initial[index].address, sampling.initial[index].bytes);
+                        }
+                        if (othersPending) {
+                            htileFromFill = false;
+                            stencilFromFill = false;
+                            publicationFillSyncsKept.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
                     if ((htileFromFill && clearGeneration == 0u) || (stencilFromFill && stencilClearGeneration == 0u)) notePublicationFill(false);
                 }
                 const bool htileSync = clearFillNote != 0u && !htileFromFill;
@@ -2136,7 +2150,9 @@ private:
                 if (auto* pending = RecorderFor(context)) pending->SyncThrough(sampling.initial[index].address, sampling.initial[index].bytes);
                 const auto captured = CapturePublication(sampling.initial[index]);
                 publicationFillsChecked.fetch_add(1, std::memory_order_relaxed);
-                const bool same = captured.words == plane.words && captured.starts == plane.starts && captured.stored == plane.stored && captured.range.generation == plane.range.generation && captured.range.address == plane.range.address && captured.range.bytes == plane.range.bytes;
+                const bool same = captured.words == plane.words && captured.starts == plane.starts && captured.stored == plane.stored && captured.range.address == plane.range.address && captured.range.bytes == plane.range.bytes;
+                const bool held = GuestMemory::UnchangedSinceCollected(plane.range.address, plane.range.bytes, plane.range.generation) && GuestMemory::UnchangedSince(plane.range.address, plane.range.bytes, plane.range.generation);
+                if (!held && publicationFillsMoved.fetch_add(1, std::memory_order_relaxed) < 16u) std::fprintf(stderr, "[publication-fills-verify] plane %zu differs: the generation %llu taken before the fill landed no longer holds after it landed\n", index, static_cast<unsigned long long>(plane.range.generation));
                 if (!same && publicationFillsDiffering.fetch_add(1, std::memory_order_relaxed) < 16u) {
                     std::size_t page = 0u;
                     while (page < captured.words.size() && page < plane.words.size() && captured.words[page] == plane.words[page] && captured.starts[page] == plane.starts[page]) ++page;
