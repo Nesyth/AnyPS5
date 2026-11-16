@@ -96,6 +96,8 @@ Driver::HeapDirect Driver::materializeHeapDirect(const DrawStageContext& context
             fixedWords = index + 1u < 64u ? std::uint64_t{3} << index : ~std::uint64_t{0};
         }
         materialized = MaterializeHeapStage(invocation, program.userData, program.binary.codeAddress, fixedWords);
+    } catch (const ShaderRecompiler::ShaderPending&) {
+        throw;
     } catch (const std::exception& error) {
         throw stageFailure(program, request, error, request.context.memory);
     }
@@ -171,6 +173,7 @@ ShaderRecompiler::RecompileRequest Driver::drawStageRequest(const DrawProgram& p
 
 std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(const DrawStageContext& context, std::size_t i, std::uint32_t pushOffset, const Pm4::DrawParameters& drawParameters, bool heapPartners) try {
     PerformanceTimer timing("Shader.DrawStage");
+    const ShaderRecompiler::PendingShaderScope pendingShaders;
     using Stage = ShaderRecompiler::ShaderStage;
     context.phaseTiming.Phase(DrawRowVectors);
     const auto& program = context.programs[i];
@@ -306,6 +309,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     if (stageCapture.heapWords == nullptr) {
         try {
             stageCapture.compiled = invocation.Materialize(*capture);
+        } catch (const ShaderRecompiler::ShaderPending&) {
+            throw;
         } catch (const std::exception& error) {
             TraceMaterializationFailure(context.traceToken, context.submission, context.packetOffset, i, "capture-or-materialize", std::current_exception());
             throw stageFailure(program, request, error, request.context.memory);
@@ -318,6 +323,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     stageCapture.userDataMask = walked == 0 ? ~std::uint64_t{0} : UserDataMask(program, context.vertexInfos[i], walked, *stageCapture.compiled);
     context.phaseTiming.Phase(DrawRowRecompile);
     return stageCapture.compiled;
+} catch (const ShaderRecompiler::ShaderPending& pending) {
+    throw RefusedDraw(context.programs[i].binary.codeAddress, pending.what(), true);
 } catch (const std::exception& error) {
     if (!SkipRefusedDraws()) throw;
     throw RefusedDraw(context.programs[i].binary.codeAddress, error.what());

@@ -18,7 +18,10 @@
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "ShaderDiskCache.hpp"
 #include <list>
+#include <condition_variable>
+#include <deque>
 #include <functional>
+#include <thread>
 #include <map>
 #include <memory>
 #include <set>
@@ -1101,6 +1104,98 @@ struct PreparedModuleEntry {
     std::exception_ptr failure;
     std::shared_ptr<const SpecializedModule> module;
     DescriptorBindingPlan bindings;
+    std::atomic<bool> deferred{false};
+    std::atomic<bool> done{false};
+};
+
+bool pendingShadersEnabled() {
+    static const bool enabled = std::getenv("APS5_SKIP_PENDING_SHADERS") != nullptr;
+    return enabled;
+}
+
+struct PendingShaderThread {
+    bool allowed = false;
+    const std::shared_ptr<const void>* keep = nullptr;
+};
+
+PendingShaderThread& pendingShaderThread() {
+    struct PendingShaderStorage {};
+    return HostThreadLocal<PendingShaderThread, PendingShaderStorage>();
+}
+
+struct PendingShaderCounters {
+    std::atomic<std::uint64_t> started{0};
+    std::atomic<std::uint64_t> finished{0};
+    std::atomic<std::uint64_t> refused{0};
+    std::atomic<std::uint64_t> nanoseconds{0};
+};
+
+PendingShaderCounters& pendingShaderCounters() {
+    static PendingShaderCounters counters;
+    return counters;
+}
+
+struct PendingKeepScope {
+    explicit PendingKeepScope(const std::shared_ptr<const SourceHandle>& handle) {
+        if (!pendingShadersEnabled()) return;
+        auto& current = pendingShaderThread();
+        if (!current.allowed) return;
+        thread = &current;
+        keep = handle;
+        previous = current.keep;
+        current.keep = &keep;
+    }
+    ~PendingKeepScope() {
+        if (thread != nullptr) thread->keep = previous;
+    }
+    PendingKeepScope(const PendingKeepScope&) = delete;
+    PendingKeepScope& operator=(const PendingKeepScope&) = delete;
+
+    PendingShaderThread* thread = nullptr;
+    std::shared_ptr<const void> keep;
+    const std::shared_ptr<const void>* previous = nullptr;
+};
+
+class DeferredModules {
+public:
+    static DeferredModules& Get() {
+        static auto* modules = new DeferredModules();
+        return *modules;
+    }
+
+    void Submit(std::function<void()> task) {
+        std::lock_guard lock(mutex);
+        tasks.push_back(std::move(task));
+        if (threads < Threads && tasks.size() > idle) {
+            ++threads;
+            std::thread([this] { run(); }).detach();
+        }
+        wake.notify_one();
+    }
+
+private:
+    static constexpr unsigned Threads = 2;
+
+    void run() {
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::unique_lock lock(mutex);
+                ++idle;
+                wake.wait(lock, [&] { return !tasks.empty(); });
+                --idle;
+                task = std::move(tasks.front());
+                tasks.pop_front();
+            }
+            task();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::deque<std::function<void()>> tasks;
+    unsigned threads = 0;
+    unsigned idle = 0;
 };
 
 struct PreparedBindingPlan {
@@ -1413,7 +1508,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             const auto found = plan->modules.find(moduleKey);
             entry = found != plan->modules.end() ? found->second : plan->modules.emplace(moduleKey, std::make_shared<PreparedModuleEntry>()).first->second;
         }
-        const auto specialize = [&] {
+        const auto moduleConstants = [&] {
             auto constants = plan->bindings.specialization;
             constants.push_back({PipelineSpecialization::MeshLayerBase, 0u});
             constants.push_back({PipelineSpecialization::MeshLayerCount, 0xffffffffu});
@@ -1440,6 +1535,10 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                     constants.push_back({first + 5u, kind});
                 }
             }
+            return constants;
+        };
+        const auto specialize = [&] {
+            const auto constants = moduleConstants();
             return artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target);
         };
         SharedSpirv built;
@@ -1452,6 +1551,36 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             entry->module = module;
             built = std::move(specialized.spirv);
         };
+        if (pendingShadersEnabled() && !entry->done.load(std::memory_order_acquire)) {
+            if (const auto* keep = pendingShaderThread().keep; keep != nullptr) {
+                auto& counters = pendingShaderCounters();
+                bool idle = false;
+                if (entry->deferred.compare_exchange_strong(idle, true)) {
+                    counters.started.fetch_add(1, std::memory_order_relaxed);
+                    DeferredModules::Get().Submit([keep = *keep, entry, plan, compiled = &variant.artifact, key = std::vector<std::uint32_t>(moduleKey.begin(), moduleKey.end()), classes = vertexClasses, constants = moduleConstants(), target = request.target, registration = artifact.registrationModule && plan->bindings.specialization.empty(), push = UsesRootOrPush(variant.bindings.layout)] {
+                        const auto began = std::chrono::steady_clock::now();
+                        std::call_once(entry->ready, [&] {
+                            try {
+                                auto specialized = registration ? registrationModule(compiled->variantId, key, [&] { return specializeModule(*compiled, classes, constants, target); }) : specializeModule(*compiled, classes, constants, target);
+                                if (push && !specialized.module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
+                                entry->bindings = DescriptorBindingBuilder{}.Select(plan->bindings, specialized.module->bindings);
+                                entry->module = specialized.module;
+                            } catch (...) {
+                                entry->failure = std::current_exception();
+                            }
+                        });
+                        entry->done.store(true, std::memory_order_release);
+                        auto& finished = pendingShaderCounters();
+                        const auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
+                        finished.nanoseconds.fetch_add(spent, std::memory_order_relaxed);
+                        const auto count = finished.finished.fetch_add(1, std::memory_order_relaxed) + 1u;
+                        if (count <= 16u || count % 64u == 0u) std::fprintf(stderr, "[pending-shaders] module %llu of variant 0x%llx specialized on a background thread in %.1f ms%s; %.1f ms in all, %llu draw stages skipped so far while their module was pending\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(compiled->variantId), static_cast<double>(spent) / 1e6, entry->failure ? " (failed)" : "", static_cast<double>(finished.nanoseconds.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(finished.refused.load(std::memory_order_relaxed)));
+                    });
+                }
+                counters.refused.fetch_add(1, std::memory_order_relaxed);
+                throw ShaderPending();
+            }
+        }
         std::call_once(entry->ready, [&] {
             try {
                 prepare();
@@ -1459,6 +1588,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                 entry->failure = std::current_exception();
             }
         });
+        if (!entry->done.load(std::memory_order_relaxed)) entry->done.store(true, std::memory_order_release);
         if (entry->failure) std::rethrow_exception(entry->failure);
         const auto& module = entry->module;
         if (built.empty()) built = lockedWords(*module);
@@ -2503,8 +2633,25 @@ void HeapBindingWords(const RecompileRequest& request, const CompiledVariant& va
 
 }
 
+PendingShaderScope::PendingShaderScope() {
+    if (!pendingShadersEnabled()) return;
+    auto& thread = pendingShaderThread();
+    previous = thread.allowed;
+    thread.allowed = true;
+}
+
+PendingShaderScope::~PendingShaderScope() {
+    if (pendingShadersEnabled()) pendingShaderThread().allowed = previous;
+}
+
+PendingShaderCounts PendingShaderStatistics() {
+    const auto& counters = pendingShaderCounters();
+    return {counters.started.load(std::memory_order_relaxed), counters.finished.load(std::memory_order_relaxed), counters.refused.load(std::memory_order_relaxed), static_cast<double>(counters.nanoseconds.load(std::memory_order_relaxed)) / 1e6};
+}
+
 std::shared_ptr<const RecompileResult> PreparedShaderInvocation::MaterializeHeap(const ResourceCapture& capture, HeapStageWords& words) const {
     if (capture.source != handle->source || capture.plan != handle->source->plan) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
+    const PendingKeepScope pendingKeep(handle);
     const auto& variant = handle->artifact;
     if (!variant->artifact.gpuResolvedImages || !variant->artifact.registrationModule || variant->bindings.layout.UsesPushData()) return nullptr;
     const auto& snapshot = capture.snapshot;
@@ -2563,6 +2710,7 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::MaterializeHeap
 
 std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(const ResourceCapture& capture) const {
     if (capture.source != handle->source) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
+    const PendingKeepScope pendingKeep(handle);
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle->source, handle->artifact, request, capture.snapshot, true, nullptr);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot));
     result->cacheHit = true;
@@ -2596,6 +2744,7 @@ std::optional<std::uint64_t> PreparedShaderInvocation::SharedKey(const ResourceC
 
 SharedStage PreparedShaderInvocation::ShareStage(const ResourceCapture& capture) const {
     if (capture.source != handle->source) return {};
+    const PendingKeepScope pendingKeep(handle);
     auto& source = *handle->source;
     const auto& variant = handle->artifact;
     const auto variantId = variant->artifact.variantId;

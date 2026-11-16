@@ -16,13 +16,15 @@ bool SkippedShader(std::uint64_t address);
 
 class RefusedDraw final : public std::runtime_error {
 public:
-    RefusedDraw(std::uint64_t address, const std::string& what) : std::runtime_error(what), address(address) {}
+    RefusedDraw(std::uint64_t address, const std::string& what, bool pending = false) : std::runtime_error(what), address(address), pending(pending) {}
     std::uint64_t address;
+    bool pending;
 };
 
 bool SkipRefusedDraws();
 
 void ReportRefusedDraw(const RefusedDraw& refused);
+std::uint64_t PendingDrawsSkipped();
 std::optional<std::size_t> RefusedShaderCount();
 
 void require(bool condition, const char* reason);

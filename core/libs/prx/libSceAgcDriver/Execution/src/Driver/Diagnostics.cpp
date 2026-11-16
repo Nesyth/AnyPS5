@@ -109,7 +109,21 @@ RefusedShaders& refusedShaders() {
 
 }
 
+namespace {
+
+std::atomic<std::uint64_t> pendingDrawsSkipped{0};
+
+}
+
+std::uint64_t PendingDrawsSkipped() {
+    return pendingDrawsSkipped.load(std::memory_order_relaxed);
+}
+
 void ReportRefusedDraw(const RefusedDraw& refused) {
+    if (refused.pending) {
+        pendingDrawsSkipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     auto& shaders = refusedShaders();
     {
         std::lock_guard lock(shaders.mutex);

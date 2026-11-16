@@ -6,6 +6,7 @@
 #include "Optimization/SrtWalker.hpp"
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 
 namespace ShaderRecompiler {
 
@@ -128,6 +129,27 @@ private:
     RecompileRequest request;
     std::shared_ptr<const SourceHandle> handle;
 };
+class ShaderPending final : public std::runtime_error {
+public:
+    ShaderPending() : std::runtime_error("ShaderRecompiler: the shader's module is being specialized on a background thread") {}
+};
+class PendingShaderScope {
+public:
+    PendingShaderScope();
+    ~PendingShaderScope();
+    PendingShaderScope(const PendingShaderScope&) = delete;
+    PendingShaderScope& operator=(const PendingShaderScope&) = delete;
+
+private:
+    bool previous = false;
+};
+struct PendingShaderCounts {
+    std::uint64_t started = 0;
+    std::uint64_t finished = 0;
+    std::uint64_t refused = 0;
+    double milliseconds = 0.0;
+};
+[[nodiscard]] PendingShaderCounts PendingShaderStatistics();
 [[nodiscard]] std::span<const std::uint32_t> GetPreparedCode(const SourceHandle& handle);
 [[nodiscard]] bool HeapFragmentEligible(const IrResourcePlan& plan);
 void CompleteHeapDataWords(const RecompileResult& shared, HeapStageWords& words);
