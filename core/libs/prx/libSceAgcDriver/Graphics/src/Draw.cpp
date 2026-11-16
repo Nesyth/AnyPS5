@@ -8774,6 +8774,291 @@ std::string TakeCommitFeedText() {
 
 namespace {
 
+std::uint32_t followAheadParts() {
+    static const std::uint32_t parts = [] {
+        const char* text = std::getenv("APS5_FOLLOW_AHEAD_PARTS");
+        return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : FollowAheadGuards | FollowAheadRenotes;
+    }();
+    return parts;
+}
+
+constexpr std::size_t FollowAheadCounts = static_cast<std::size_t>(FollowAheadCount::Count);
+std::array<std::atomic<std::uint64_t>, FollowAheadCounts> followAheadTotals{};
+std::atomic<std::uint64_t> followAheadChecked{0};
+std::atomic<std::uint64_t> followAheadDiffering{0};
+std::atomic<std::int64_t> followAheadWindow{0};
+std::atomic<std::uint32_t> followAheadPrinted{0};
+std::uint64_t followAheadVerifyOrdinal = 0;
+
+void noteFollowAhead(FollowAheadCount count, std::uint64_t amount = 1) {
+    auto& total = followAheadTotals[static_cast<std::size_t>(count)];
+    total.store(total.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+}
+
+void noteFollowAheadVerify(bool same, const char* what, const std::string& detail) {
+    const auto checked = followAheadChecked.fetch_add(1, std::memory_order_relaxed) + 1u;
+    const auto differing = same ? followAheadDiffering.load(std::memory_order_relaxed) : followAheadDiffering.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (!same) {
+        const auto now = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
+        if (followAheadWindow.exchange(now, std::memory_order_relaxed) != now) followAheadPrinted.store(0, std::memory_order_relaxed);
+        if (followAheadPrinted.fetch_add(1, std::memory_order_relaxed) < 16u) std::fprintf(stderr, "[follow-ahead-verify] %s differs: %s\n", what, detail.c_str());
+    }
+    if (checked % 4096u == 0u) std::fprintf(stderr, "[follow-ahead-verify] %llu checked, %llu differing\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differing));
+}
+
+bool followAheadVerifyDue() {
+    const auto every = FollowAheadVerifyEvery();
+    return every != 0 && ++followAheadVerifyOrdinal % every == 0;
+}
+
+struct GuardBoards {
+    GuardSpanBoard::View depth;
+    GuardSpanBoard::View multisample;
+};
+
+GuardAnswerMade openGuardBoards(GuardAnswer& answer, GuardBoards& views, std::uint64_t stamp, bool stamped) {
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoGuardSpans) || VerifyGuardSpans()) return GuardAnswerMade::SpansOff;
+    if (DepthOverwriteProofsPending_nid_no_patch() != 0u) return GuardAnswerMade::ProofPending;
+    answer.depth = DepthGuardsGeneration_nid_no_patch();
+    answer.multisample = MultisampleGuardsGeneration();
+    if (stamped && answer.depth != stamp) return GuardAnswerMade::StampMoved;
+    if (!DepthGuardBoard().Open(answer.depth, views.depth) || !MultisampleGuardBoard().Open(answer.multisample, views.multisample)) return GuardAnswerMade::BoardStale;
+    return GuardAnswerMade::Made;
+}
+
+GuardAnswerMade closeGuardBoards(const GuardAnswer& answer, const GuardBoards& views) {
+    if (!DepthGuardBoard().Holds(views.depth) || !MultisampleGuardBoard().Holds(views.multisample)) return GuardAnswerMade::BoardStale;
+    if (DepthGuardsGeneration_nid_no_patch() != answer.depth || MultisampleGuardsGeneration() != answer.multisample) return GuardAnswerMade::GenerationMoved;
+    if (DepthOverwriteProofsPending_nid_no_patch() != 0u) return GuardAnswerMade::ProofPending;
+    return GuardAnswerMade::Made;
+}
+
+bool depthBoardHit(const GuardBoards& views, std::uint64_t begin, std::uint64_t bytes) {
+    return bytes != 0u && (begin > std::numeric_limits<std::uint64_t>::max() - bytes || DepthGuardBoard().Overlaps(views.depth, begin, bytes));
+}
+
+bool multisampleBoardHit(const GuardBoards& views, std::uint64_t begin, std::uint64_t bytes) {
+    return bytes != 0u && MultisampleGuardBoard().Overlaps(views.multisample, begin, bytes);
+}
+
+std::string guardAnswerDetail(const char* what, std::uint64_t begin, std::uint64_t bytes, const GuardAnswer& answer) {
+    char text[256];
+    std::snprintf(text, sizeof(text), "%s 0x%llx+0x%llx, stamps depth %llu multisample %llu, live depth %llu multisample %llu", what, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(answer.depth), static_cast<unsigned long long>(answer.multisample), static_cast<unsigned long long>(DepthGuardsGeneration_nid_no_patch()), static_cast<unsigned long long>(MultisampleGuardsGeneration()));
+    return text;
+}
+
+std::uint8_t carriedGuards(const GuardAnswer& answer, std::uint8_t wanted, bool census) {
+    if (!answer.valid || (answer.clear & wanted) == 0) {
+        if (census) noteFollowAhead(FollowAheadCount::NoAnswer);
+        return 0;
+    }
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoGuardSpans)) {
+        if (census) noteFollowAhead(FollowAheadCount::SpansOff);
+        return 0;
+    }
+    if (DepthGuardsGeneration_nid_no_patch() != answer.depth) {
+        if (census) noteFollowAhead(FollowAheadCount::DepthMoved);
+        return 0;
+    }
+    if (MultisampleGuardsGeneration() != answer.multisample) {
+        if (census) noteFollowAhead(FollowAheadCount::MultisampleMoved);
+        return 0;
+    }
+    if (DepthOverwriteProofsPending_nid_no_patch() != 0u) {
+        if (census) noteFollowAhead(FollowAheadCount::ProofPending);
+        return 0;
+    }
+    return static_cast<std::uint8_t>(answer.clear & wanted);
+}
+
+enum class FollowAheadSite : std::uint8_t { Follower, Leader };
+
+std::uint8_t carriedBufferGuards(const ShaderResources::PreparedBuffers& prepared, FollowAheadSite site) {
+    if (!FollowAheadOn(FollowAheadGuards)) return 0;
+    const bool census = FollowAheadCensus();
+    const auto bits = carriedGuards(prepared.guardAnswer, GuardAnswer::DepthClear | GuardAnswer::MultisampleClear, census);
+    if (bits == 0) return 0;
+    if (followAheadVerifyDue()) {
+        std::string detail;
+        if ((bits & GuardAnswer::DepthClear) != 0) {
+            for (const auto& item : prepared.selected) {
+                if (item.begin == 0 || item.inPlace || !MayOverlapDepthGuards_nid_no_patch(item.begin, item.bytes)) continue;
+                detail = guardAnswerDetail("depth", item.begin, item.bytes, prepared.guardAnswer);
+                break;
+            }
+        }
+        if (detail.empty() && (bits & GuardAnswer::MultisampleClear) != 0) {
+            for (const auto& entry : prepared.moved) {
+                if (!MayOverlapMultisampleGuards(entry.address, entry.size)) continue;
+                detail = guardAnswerDetail("multisample", entry.address, entry.size, prepared.guardAnswer);
+                break;
+            }
+        }
+        noteFollowAheadVerify(detail.empty(), "guard answer", detail);
+        if (!detail.empty()) {
+            if (census) noteFollowAhead(FollowAheadCount::VerifyDiffers);
+            return 0;
+        }
+    }
+    if (census) {
+        const bool follower = site == FollowAheadSite::Follower;
+        if ((bits & GuardAnswer::DepthClear) != 0) noteFollowAhead(follower ? FollowAheadCount::FollowerDepth : FollowAheadCount::LeaderDepth);
+        if ((bits & GuardAnswer::MultisampleClear) != 0) noteFollowAhead(follower ? FollowAheadCount::FollowerMultisample : FollowAheadCount::LeaderMultisample);
+    }
+    return bits;
+}
+
+bool carriedInputGuards(const PreparedInputs& prepared, FollowAheadSite site) {
+    if (!FollowAheadOn(FollowAheadGuards)) return false;
+    const bool census = FollowAheadCensus();
+    if (carriedGuards(prepared.guardAnswer, GuardAnswer::InputsClear, census) == 0) return false;
+    if (followAheadVerifyDue()) {
+        std::string detail;
+        for (const auto& range : prepared.ranges) {
+            const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+            if (DepthReadGuardIdle_nid_no_patch(range.begin, bytes) && !MayOverlapMultisampleGuards(range.begin, bytes)) continue;
+            detail = guardAnswerDetail("inputs", range.begin, bytes, prepared.guardAnswer);
+            break;
+        }
+        noteFollowAheadVerify(detail.empty(), "guard answer", detail);
+        if (!detail.empty()) {
+            if (census) noteFollowAhead(FollowAheadCount::VerifyDiffers);
+            return false;
+        }
+    }
+    if (census) noteFollowAhead(site == FollowAheadSite::Follower ? FollowAheadCount::FollowerInputs : FollowAheadCount::LeaderInputs);
+    return true;
+}
+
+}
+
+std::uint32_t FollowAheadParts() {
+    return followAheadParts();
+}
+
+bool FollowAheadOn(std::uint32_t part) {
+    return RuntimeSwitches::Set(RuntimeSwitch::FollowAhead) && (followAheadParts() & part) != 0;
+}
+
+bool FollowAheadCensus() {
+    static const bool census = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return census;
+}
+
+std::uint64_t FollowAheadVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_FOLLOW_AHEAD");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+GuardAnswerNote AnswerPreparedGuards(ShaderResources::PreparedBuffers& prepared) {
+    GuardAnswerNote note;
+    auto& answer = prepared.guardAnswer;
+    answer = {};
+    if (!FollowAheadOn(FollowAheadGuards)) return note;
+    GuardBoards views;
+    note.made = openGuardBoards(answer, views, prepared.depthGuards, true);
+    if (note.made != GuardAnswerMade::Made) return note;
+    auto clear = static_cast<std::uint8_t>(GuardAnswer::DepthClear | GuardAnswer::MultisampleClear);
+    for (const auto& item : prepared.selected) {
+        if (item.begin == 0 || item.inPlace) continue;
+        ++note.depthRanges;
+        if ((clear & GuardAnswer::DepthClear) != 0 && depthBoardHit(views, item.begin, item.bytes)) clear = static_cast<std::uint8_t>(clear & ~GuardAnswer::DepthClear);
+    }
+    for (const auto& entry : prepared.moved) {
+        ++note.multisampleRanges;
+        if ((clear & GuardAnswer::MultisampleClear) != 0 && multisampleBoardHit(views, entry.address, entry.size)) clear = static_cast<std::uint8_t>(clear & ~GuardAnswer::MultisampleClear);
+    }
+    note.made = closeGuardBoards(answer, views);
+    if (note.made != GuardAnswerMade::Made) return note;
+    answer.clear = clear;
+    answer.valid = true;
+    note.clear = clear;
+    return note;
+}
+
+GuardAnswerNote AnswerPreparedInputGuards(PreparedInputs& prepared) {
+    GuardAnswerNote note;
+    auto& answer = prepared.guardAnswer;
+    answer = {};
+    if (!FollowAheadOn(FollowAheadGuards)) return note;
+    GuardBoards views;
+    note.made = openGuardBoards(answer, views, 0, false);
+    if (note.made != GuardAnswerMade::Made) return note;
+    bool clear = true;
+    for (const auto& range : prepared.ranges) {
+        const auto bytes = range.end - range.begin;
+        ++note.depthRanges;
+        if (clear && (depthBoardHit(views, range.begin, bytes) || multisampleBoardHit(views, range.begin, bytes))) clear = false;
+    }
+    note.made = closeGuardBoards(answer, views);
+    if (note.made != GuardAnswerMade::Made) return note;
+    answer.clear = clear ? GuardAnswer::InputsClear : std::uint8_t{0};
+    answer.valid = true;
+    note.clear = answer.clear;
+    return note;
+}
+
+std::uint64_t FollowAheadTotal(FollowAheadCount count) {
+    return followAheadTotals[static_cast<std::size_t>(count)].load(std::memory_order_relaxed);
+}
+
+std::array<std::uint64_t, 2> FollowAheadVerifyTotals() {
+    return {followAheadChecked.load(std::memory_order_relaxed), followAheadDiffering.load(std::memory_order_relaxed)};
+}
+
+std::string TakeFollowAheadText() {
+    static std::mutex takeMutex;
+    static std::array<std::uint64_t, FollowAheadCounts> reported{};
+    static std::array<std::uint64_t, 2> verifyReported{};
+    static std::array<std::uint64_t, 2> proofsReported{};
+    static std::uint64_t presentsReported = 0;
+    static std::uint64_t depthReported = 0;
+    static std::uint64_t multisampleReported = 0;
+    const std::lock_guard lock(takeMutex);
+    std::array<unsigned long long, FollowAheadCounts> since{};
+    bool any = false;
+    for (std::size_t index = 0; index < FollowAheadCounts; ++index) {
+        const auto now = followAheadTotals[index].load(std::memory_order_relaxed);
+        since[index] = static_cast<unsigned long long>(now - reported[index]);
+        reported[index] = now;
+        any = any || since[index] != 0;
+    }
+    const auto verify = FollowAheadVerifyTotals();
+    const auto checked = static_cast<unsigned long long>(verify[0] - verifyReported[0]);
+    const auto differing = static_cast<unsigned long long>(verify[1] - verifyReported[1]);
+    verifyReported = verify;
+    const auto presentsNow = Recorder::Presents();
+    const auto depthNow = DepthGuardsGeneration_nid_no_patch();
+    const auto multisampleNow = MultisampleGuardsGeneration();
+    const auto proofsNow = DepthOverwriteProofCounts();
+    const auto presents = static_cast<unsigned long long>(presentsNow - presentsReported);
+    const auto depthBumps = static_cast<unsigned long long>(depthNow - depthReported);
+    const auto multisampleBumps = static_cast<unsigned long long>(multisampleNow - multisampleReported);
+    const auto proofs = static_cast<unsigned long long>(proofsNow[0] - proofsReported[0]);
+    const auto published = static_cast<unsigned long long>(proofsNow[1] - proofsReported[1]);
+    presentsReported = presentsNow;
+    depthReported = depthNow;
+    multisampleReported = multisampleNow;
+    proofsReported = proofsNow;
+    if (!any && checked == 0 && !RuntimeSwitches::Set(RuntimeSwitch::FollowAhead)) return {};
+    const auto at = [&](FollowAheadCount count) { return since[static_cast<std::size_t>(count)]; };
+    const auto per = [](unsigned long long value, unsigned long long over) { return over == 0 ? 0.0 : static_cast<double>(value) / static_cast<double>(over); };
+    const auto followers = at(FollowAheadCount::Followers);
+    std::array<char, 2048> text{};
+    std::snprintf(text.data(), text.size(), "committer answers used: followers' depth guards %llu, multisample guards %llu, input guards %llu, leaders' depth guards %llu, multisample guards %llu, input guards %llu; today's walk: no clear answer %llu, depth generation moved %llu, multisample generation moved %llu, overwrite proof pending %llu, guard spans off %llu, verify difference %llu; verify %llu checked, %llu differing; hold segments %llu with %llu followers (%.2f per segment), followers with the template of the follower before %llu (%.1f%%), unmoved zone card entries per follower %.2f, followers with queued stores %llu, followers whose target renotes a merge would take %llu; per present (%llu presents): depth guard generation moves %.2f, multisample %.2f, overwrite proofs %.2f of which published guards %.2f",
+        at(FollowAheadCount::FollowerDepth), at(FollowAheadCount::FollowerMultisample), at(FollowAheadCount::FollowerInputs), at(FollowAheadCount::LeaderDepth), at(FollowAheadCount::LeaderMultisample), at(FollowAheadCount::LeaderInputs),
+        at(FollowAheadCount::NoAnswer), at(FollowAheadCount::DepthMoved), at(FollowAheadCount::MultisampleMoved), at(FollowAheadCount::ProofPending), at(FollowAheadCount::SpansOff), at(FollowAheadCount::VerifyDiffers),
+        checked, differing,
+        at(FollowAheadCount::Segments), followers, per(followers, at(FollowAheadCount::Segments)), at(FollowAheadCount::SameTemplate), 100.0 * per(at(FollowAheadCount::SameTemplate), followers), per(at(FollowAheadCount::UnmovedEntries), followers), at(FollowAheadCount::QueuedStores), at(FollowAheadCount::MergeableRenotes),
+        presents, per(depthBumps, presents), per(multisampleBumps, presents), per(proofs, presents), per(published, presents));
+    return std::string(text.data());
+}
+
+namespace {
+
 struct ExpressRunRanges {
     std::uint64_t recorder = 0;
     std::uint64_t first = 0;
@@ -8913,6 +9198,11 @@ struct ExpressRun {
     ExpressResume resume;
     ExpressRunCensus census;
     std::uint64_t wvAttachments = 0;
+    bool segmentOpen = false;
+    bool segmentRenoted = false;
+    const void* segmentResources = nullptr;
+    std::size_t segmentTargets = 0;
+    std::array<std::pair<std::uint32_t, std::uint32_t>, Targets> segmentSlices{};
 };
 
 struct ExpressRunStorage {};
@@ -8921,6 +9211,36 @@ std::atomic<std::uint64_t> expressRunAttachments{0};
 
 ExpressRun& expressRun() {
     return HostThreadLocal<ExpressRun, ExpressRunStorage>();
+}
+
+void noteFollowSegment(ExpressRun& run, const DrawExpress& express, const DrawExpressKeep& keep, const ShaderResources::PreparedBuffers& prepared, Recorder& recorder, std::size_t renoted) {
+    noteFollowAhead(FollowAheadCount::Followers);
+    std::size_t targets = 0;
+    for (const auto& target : keep.targets) {
+        if (target != nullptr) ++targets;
+    }
+    const bool renotedAll = targets != 0 && renoted == targets && express.slices.size() >= keep.targets.size() && keep.targets.size() <= ExpressRun::Targets;
+    if (!run.segmentOpen) {
+        run.segmentOpen = true;
+        noteFollowAhead(FollowAheadCount::Segments);
+    } else {
+        if (run.segmentResources == static_cast<const void*>(keep.resources.get())) noteFollowAhead(FollowAheadCount::SameTemplate);
+        bool merged = renotedAll && run.segmentRenoted && run.segmentTargets == keep.targets.size();
+        for (std::size_t index = 0; merged && index < keep.targets.size(); ++index) {
+            if (keep.targets[index] != nullptr && run.segmentSlices[index] != express.slices[index]) merged = false;
+        }
+        if (merged) noteFollowAhead(FollowAheadCount::MergeableRenotes);
+    }
+    std::uint64_t unmoved = 0;
+    for (const auto& item : prepared.selected) {
+        if (!item.moved) ++unmoved;
+    }
+    noteFollowAhead(FollowAheadCount::UnmovedEntries, unmoved);
+    if (recorder.HasQueuedStores() || recorder.HasQueuedKeyStores()) noteFollowAhead(FollowAheadCount::QueuedStores);
+    run.segmentResources = keep.resources.get();
+    run.segmentRenoted = renotedAll;
+    run.segmentTargets = keep.targets.size();
+    for (std::size_t index = 0; renotedAll && index < keep.targets.size(); ++index) run.segmentSlices[index] = express.slices[index];
 }
 
 void keyRunRanges(ExpressRunRanges& memo, std::uint64_t recorder, std::uint64_t first, std::uint64_t second, std::uint64_t third) {
@@ -9090,6 +9410,7 @@ void finishRun(ExpressRun& run, ExpressRunEnd reason) {
     run.dropped = false;
     run.itemsBetween = false;
     run.windows.valid = false;
+    run.segmentOpen = false;
     if (!run.led) return;
     run.led = false;
     run.overItems = false;
@@ -9123,6 +9444,7 @@ bool runRefusalEnds(ExpressRunRefusal why) {
 
 void refuseRun(ExpressRun& run, ExpressRunRefusal why) {
     run.refused = why;
+    run.segmentOpen = false;
     ++run.census.refusals[static_cast<std::size_t>(why)];
     if (runRefusalEnds(why)) finishRun(run, ExpressRunEnd::Refusal);
     noteRunFollow(run, false);
@@ -9801,10 +10123,11 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     if (appended) {
         inputs.indexBytes = preparedInputs->indexBytes;
         const bool guardsSkipped = trusted || inputsCheck.Skip();
+        const bool inputsAnswered = !guardsSkipped && !audit && !validation && carriedInputGuards(*preparedInputs, FollowAheadSite::Leader);
         for (std::size_t at = 0; at < preparedInputs->ranges.size(); ++at) {
             const auto& range = preparedInputs->ranges[at];
             const auto bytes = static_cast<std::size_t>(range.end - range.begin);
-            if (!guardsSkipped && at + preparedInputs->indirectRanges < preparedInputs->ranges.size() && !(validation && inputGuardsAnswered(recorder, range.begin, bytes, WriteValidation::Test::LeaderGuards))) requireInputGuards(&inputsCheck, range.begin, bytes, at == 0 && draw.indexed ? "an index buffer read" : "a vertex buffer read");
+            if (!guardsSkipped && !inputsAnswered && at + preparedInputs->indirectRanges < preparedInputs->ranges.size() && !(validation && inputGuardsAnswered(recorder, range.begin, bytes, WriteValidation::Test::LeaderGuards))) requireInputGuards(&inputsCheck, range.begin, bytes, at == 0 && draw.indexed ? "an index buffer read" : "a vertex buffer read");
             recorder->NotePendingRead(range.begin, bytes, Recorder::ReadKind::DrawInput);
         }
         if (trusted) NoteCommitterTrusted();
@@ -9888,7 +10211,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     }
     ValidationGuards selectionGuards{*recorder, WriteValidation::Test::LeaderSelection};
     const ShaderResources::GuardTests selectionTests{&validationDepthGuards, &validationMultisampleGuards, &selectionGuards, &validationWrites};
-    if ((validation ? resources.FragmentSelectionHoldsBy(*recorder, prepared->moved, *prepared, untouched, &selectionTests, &buffersCheck) : resources.FragmentSelectionHolds(*recorder, prepared->moved, *prepared, nullptr, untouched, &buffersCheck)) != ShaderResources::PreparedBuffers::Selection::Taken) return giveBack(DrawExpressMiss::Selection);
+    if ((validation ? resources.FragmentSelectionHoldsBy(*recorder, prepared->moved, *prepared, untouched, &selectionTests, &buffersCheck) : resources.FragmentSelectionHolds(*recorder, prepared->moved, *prepared, nullptr, untouched, &buffersCheck, !trusted && !audit ? carriedBufferGuards(*prepared, FollowAheadSite::Leader) : std::uint8_t{0})) != ShaderResources::PreparedBuffers::Selection::Taken) return giveBack(DrawExpressMiss::Selection);
     if (resources.ChecksFaults() && fragment->faultGeneration != resources.FaultGeneration()) resources.RewriteFragmentFaults(*fragment->bindings);
     try {
         if (!reprove) resources.ExpressStage(*recorder);
@@ -10104,6 +10427,7 @@ void BeginExpressRun() {
 void EndExpressRun(ExpressRunEnd reason) {
     auto& run = expressRun();
     if (run.open == 0 || --run.open != 0) return;
+    run.segmentOpen = false;
     run.expectAppend = false;
     run.expectKind = 0;
     run.resume.record = nullptr;
@@ -10505,7 +10829,8 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     ValidationGuards selectionGuards{*recorder, WriteValidation::Test::FollowerSelection};
     const ShaderResources::GuardTests selectionTests{&validationDepthGuards, &validationMultisampleGuards, &selectionGuards, &validationWrites};
     if (windows) keyRunGuardWindows(run, *recorder);
-    const auto selection = windows ? resources.FragmentSelectionHoldsBy(*recorder, prepared.moved, prepared, true, &guardTests, &buffersCheck) : validation ? resources.FragmentSelectionHoldsBy(*recorder, prepared.moved, prepared, true, &selectionTests, &buffersCheck) : resources.FragmentSelectionHolds(*recorder, prepared.moved, prepared, nullptr, true, &buffersCheck);
+    const bool plainGuards = !trusted && !audit && !windows && !validation;
+    const auto selection = windows ? resources.FragmentSelectionHoldsBy(*recorder, prepared.moved, prepared, true, &guardTests, &buffersCheck) : validation ? resources.FragmentSelectionHoldsBy(*recorder, prepared.moved, prepared, true, &selectionTests, &buffersCheck) : resources.FragmentSelectionHolds(*recorder, prepared.moved, prepared, nullptr, true, &buffersCheck, plainGuards ? carriedBufferGuards(prepared, FollowAheadSite::Follower) : std::uint8_t{0});
     if (selection != ShaderResources::PreparedBuffers::Selection::Taken) return late(ExpressRunRefusal::Selection);
     mark(5);
     try {
@@ -10516,7 +10841,8 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     if (windows) keyRunGuardWindows(run, *recorder);
     if (trusted) NoteCommitterTrusted();
     const bool guardsSkipped = trusted || inputsCheck.Skip();
-    for (std::size_t at = 0; !guardsSkipped && at < preparedInputs.ranges.size(); ++at) {
+    const bool inputsAnswered = !guardsSkipped && plainGuards && carriedInputGuards(preparedInputs, FollowAheadSite::Follower);
+    for (std::size_t at = 0; !guardsSkipped && !inputsAnswered && at < preparedInputs.ranges.size(); ++at) {
         const auto& range = preparedInputs.ranges[at];
         const auto bytes = static_cast<std::size_t>(range.end - range.begin);
         if (validation && inputGuardsAnswered(recorder, range.begin, bytes, WriteValidation::Test::FollowerGuards)) continue;
@@ -10593,14 +10919,19 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     NoteGuestWorkIn(context, commands);
     express->passSeenRecorder = recorderId;
     express->passSeenGeneration = generation;
+    std::size_t renoted = 0;
     for (std::size_t index = 0; index < keep.targets.size(); ++index) {
         auto* target = keep.targets[index].get();
         if (target == nullptr) continue;
         const auto [slice, count] = express->slices[index];
-        if (target->RenoteInPass(recorderId, generation, slice, count)) continue;
+        if (target->RenoteInPass(recorderId, generation, slice, count)) {
+            ++renoted;
+            continue;
+        }
         target->MarkSliceDirty(slice, count);
         if (recorder->RenderPassOpen()) target->RememberPassNote(recorderId, generation, slice, count);
     }
+    if (FollowAheadCensus() && RuntimeSwitches::Set(RuntimeSwitch::FollowAhead)) noteFollowSegment(run, *express, keep, prepared, *recorder, renoted);
     if (resources.ChecksFaults() && resources.TakeFaultCheck(recorderId, batch)) recorder->OnComplete([kept = keep.resources] { kept->CheckFaults(); });
     record.pass.valid = false;
     if (RuntimeSwitches::Set(RuntimeSwitch::AppendCommits)) noteAppendCommit(true);

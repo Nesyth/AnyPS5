@@ -91,7 +91,10 @@ constexpr std::array<const char*, CounterCount> CounterNames{
     "verify sampled", "no prepared buffers, inputs, bindings or fragments", "indirect", "another device", "forget, import or mapping serial moved", "buffer plan or inputs recipe moved", "class refused or evicted", "placement refused or thrown",
     "replay sources kept", "no fragment or prepared buffers and inputs", "addressed, rect list or indirect", "class no longer in the class store", "template checks shader faults", "replay stores cleared",
     "replay nanoseconds", "replay copy nanoseconds", "replay fragment nanoseconds", "replay hand-off nanoseconds", "replays timed",
-    "zone cards made", "zone cards over capacity", "zone cards refused"
+    "zone cards made", "zone cards over capacity", "zone cards refused",
+    "buffer guard answers made", "with the depth guards clear", "with the multisample guards clear", "input guard answers made", "with the input guards clear",
+    "guard spans off", "overwrite proof pending", "depth guards moved since the buffers were read", "guard board not current", "guard generation moved during the walk",
+    "guard entries walked", "moved entries walked", "input ranges walked"
 };
 static_assert(static_cast<std::size_t>(Counter::ExpressReprovedStaging) - static_cast<std::size_t>(Counter::ExpressReprovedNotProved) == static_cast<std::size_t>(Graphics::ShaderResources::ExpressMiss::Staging) - static_cast<std::size_t>(Graphics::ShaderResources::ExpressMiss::NotProved), "every reason an express commit reproves its template needs a counter");
 static_assert(static_cast<std::size_t>(Counter::BindingsLeftUnpushedRebound) - static_cast<std::size_t>(Counter::BindingsLeftUnpushedRefused) + 2 == static_cast<std::size_t>(Graphics::ShaderResources::DynamicLeave::Count), "every way an unpushed draw leaves the dynamic route needs a counter");
@@ -653,6 +656,16 @@ void Report(bool force) {
     if (const auto feed = Graphics::TakeCommitFeedText(); !feed.empty() || sum(Counter::FeedCardsMade, Counter::FeedCardsRefused) != 0) {
         AgcDriver::ProfilePrint_nid_no_patch("[commit-feed] 10 s, switch %s: zone cards made on the finisher %llu, over capacity %llu, refused %llu; %s\n", Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::CommitFeed) ? "on" : "off",
             static_cast<unsigned long long>(at(Counter::FeedCardsMade)), static_cast<unsigned long long>(at(Counter::FeedCardsOverCapacity)), static_cast<unsigned long long>(at(Counter::FeedCardsRefused)), feed.empty() ? "nothing on the committer" : feed.c_str());
+    }
+    if (const auto ahead = Graphics::TakeFollowAheadText(); !ahead.empty() || sum(Counter::FollowAheadBuffersMade, Counter::FollowAheadInputRanges) != 0) {
+        const auto per = [](std::uint64_t value, std::uint64_t over) { return over == 0 ? 0.0 : static_cast<double>(value) / static_cast<double>(over); };
+        AgcDriver::ProfilePrint_nid_no_patch("[follow-ahead] 10 s, switch %s, parts %u: finisher answers for prepared buffers %llu (depth guards clear %llu, multisample guards clear %llu; per answer %.2f guard entries and %.2f moved entries walked), for prepared inputs %llu (input guards clear %llu; per answer %.2f ranges walked); answers not made: guard spans off %llu, overwrite proof pending %llu, depth guards moved since the buffers were read %llu, guard board not current %llu, guard generation moved during the walk %llu; %s\n",
+            Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FollowAhead) ? "on" : "off", static_cast<unsigned>(Graphics::FollowAheadParts()),
+            static_cast<unsigned long long>(at(Counter::FollowAheadBuffersMade)), static_cast<unsigned long long>(at(Counter::FollowAheadBuffersDepthClear)), static_cast<unsigned long long>(at(Counter::FollowAheadBuffersMultisampleClear)),
+            per(at(Counter::FollowAheadGuardEntries), at(Counter::FollowAheadBuffersMade)), per(at(Counter::FollowAheadMovedEntries), at(Counter::FollowAheadBuffersMade)),
+            static_cast<unsigned long long>(at(Counter::FollowAheadInputsMade)), static_cast<unsigned long long>(at(Counter::FollowAheadInputsClear)), per(at(Counter::FollowAheadInputRanges), at(Counter::FollowAheadInputsMade)),
+            static_cast<unsigned long long>(at(Counter::FollowAheadSpansOff)), static_cast<unsigned long long>(at(Counter::FollowAheadProofPending)), static_cast<unsigned long long>(at(Counter::FollowAheadStampMoved)), static_cast<unsigned long long>(at(Counter::FollowAheadBoardStale)), static_cast<unsigned long long>(at(Counter::FollowAheadGenerationMoved)),
+            ahead.empty() ? "nothing on the committer" : ahead.c_str());
     }
     {
         static std::array<std::uint64_t, Graphics::PassBreakCount + 3> lastPasses{};

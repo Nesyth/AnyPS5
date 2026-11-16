@@ -62,6 +62,9 @@ enum class DepthPublicationStage { ReadCaptured, GuestCopied, BeforeCommit, Plan
 void SetDepthPublicationHookForTest(void (*hook)(DepthPublicationStage));
 bool HasResidentDepthGuards_nid_no_patch();
 std::uint64_t DepthGuardsGeneration_nid_no_patch();
+std::array<std::uint64_t, 2> DepthOverwriteProofCounts();
+void AddDepthGuardForTest(std::uint64_t address, std::size_t bytes);
+void RemoveDepthGuardsForTest();
 std::uint32_t DepthOverwriteProofsPending_nid_no_patch();
 bool MayOverlapDepthGuards_nid_no_patch(std::uint64_t address, std::size_t bytes);
 bool DepthReadGuardIdle_nid_no_patch(std::uint64_t address, std::size_t bytes);

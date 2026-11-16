@@ -271,8 +271,19 @@ std::atomic<std::uint64_t>& depthGuardGeneration() {
     return generation;
 }
 
+GuardSpanBoard& depthGuardBoard() {
+    static GuardSpanBoard board;
+    return board;
+}
+
+std::atomic<std::uint64_t> overwriteProofsRun{0};
+std::atomic<std::uint64_t> overwriteProofsPublished{0};
+
 void publishDepthGuards(bool changed) {
-    if (changed) depthGuardGeneration().fetch_add(1, std::memory_order_release);
+    if (changed) {
+        const auto generation = depthGuardGeneration().fetch_add(1, std::memory_order_release) + 1u;
+        depthGuardBoard().Publish(generation, depthGuards());
+    }
     anyDepthGuard().store(!depthGuards().empty(), std::memory_order_release);
 }
 
@@ -1478,6 +1489,7 @@ public:
         const auto value = *sampling.overwriteStencil;
         sampling.overwriteStencil.reset();
         pendingOverwriteProofs().fetch_sub(1u, std::memory_order_acq_rel);
+        overwriteProofsRun.fetch_add(1, std::memory_order_relaxed);
         if (!sampleable || context.detiler == nullptr || !active->load(std::memory_order_acquire)) return;
         if (auto* recorder = RecorderFor(context)) recorder->Sync();
         for (const auto& range : sampling.initial) {
@@ -1499,8 +1511,9 @@ public:
         {
             std::unique_lock guardLock(depthGuardMutex());
             for (const auto& range : sampling.initial) depthGuards().push_back({context.device, range.address, range.bytes, active, {{range.address, range.bytes, 0u}}, hostWritten, hostEverWritten});
-            anyDepthGuard().store(true, std::memory_order_release);
+            publishDepthGuards(true);
         }
+        overwriteProofsPublished.fetch_add(1, std::memory_order_relaxed);
         InstallResidentImageReadGuard_nid_no_patch();
         samplingActive = true;
         capturePublication();
@@ -3923,6 +3936,26 @@ bool HasResidentDepthGuards_nid_no_patch() {
 
 std::uint64_t DepthGuardsGeneration_nid_no_patch() {
     return depthGuardGeneration().load(std::memory_order_acquire);
+}
+
+const GuardSpanBoard& DepthGuardBoard() {
+    return depthGuardBoard();
+}
+
+std::array<std::uint64_t, 2> DepthOverwriteProofCounts() {
+    return {overwriteProofsRun.load(std::memory_order_relaxed), overwriteProofsPublished.load(std::memory_order_relaxed)};
+}
+
+void AddDepthGuardForTest(std::uint64_t address, std::size_t bytes) {
+    std::unique_lock guardLock(depthGuardMutex());
+    depthGuards().push_back({VK_NULL_HANDLE, address, bytes, std::make_shared<std::atomic<bool>>(true), {{address, bytes, 0u}}, std::make_shared<std::atomic<bool>>(false), std::make_shared<std::atomic<bool>>(false)});
+    publishDepthGuards(true);
+}
+
+void RemoveDepthGuardsForTest() {
+    std::unique_lock guardLock(depthGuardMutex());
+    const auto removed = std::erase_if(depthGuards(), [](const DepthGuard& range) { return range.device == VK_NULL_HANDLE; });
+    publishDepthGuards(removed != 0);
 }
 
 std::uint32_t DepthOverwriteProofsPending_nid_no_patch() {

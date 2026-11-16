@@ -10,6 +10,12 @@ if(BUILD_TESTING)
     agc_add_env_test(agc_driver_draw_records_hits_commit_feed_mode_unverified agc_driver_draw_records_hits_tests ARGS --commit-feed
             ENV ${agcCommitFeedEnvironment})
     set_tests_properties(agc_driver_draw_records_hits_commit_feed_mode agc_driver_draw_records_hits_commit_feed_mode_unverified PROPERTIES FAIL_REGULAR_EXPRESSION "${agcCommitFeedFailures}")
+    agc_add_follow_ahead_test(agc_driver_draw_records_hits)
+    agc_add_env_test(agc_driver_draw_records_hits_follow_ahead_mode agc_driver_draw_records_hits_tests ARGS --follow-ahead
+            ENV ${agcFollowAheadEnvironment} APS5_VERIFY_FOLLOW_AHEAD=1)
+    agc_add_env_test(agc_driver_draw_records_hits_follow_ahead_mode_unverified agc_driver_draw_records_hits_tests ARGS --follow-ahead
+            ENV ${agcFollowAheadEnvironment})
+    set_tests_properties(agc_driver_draw_records_hits_follow_ahead_mode agc_driver_draw_records_hits_follow_ahead_mode_unverified PROPERTIES FAIL_REGULAR_EXPRESSION "${agcFollowAheadFailures}")
     set_tests_properties(agc_driver_draw_records_hits_draw_pipeline agc_driver_draw_records_hits_late PROPERTIES FAIL_REGULAR_EXPRESSION "${agcDrawRecordsDifference}")
     agc_add_env_test(agc_driver_draw_records_hits_direct_draws_deposit agc_driver_draw_records_hits_tests
             ENV ANYPS5_NO_SHADER_CACHE=1 APS5_PIPELINED_DRAWS=32 APS5_PIPELINE_DISPATCH=1 ${agcLeanFrontEnvironment} APS5_DIRECT_DRAWS=1 ${agcLateStackEnvironment}

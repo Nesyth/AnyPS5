@@ -9971,10 +9971,27 @@ std::vector<std::string> ShaderResources::VerifyInPlaceReads(std::span<const Mov
     return differences;
 }
 
-std::size_t ShaderResources::MaxDrawSnapshotBytes() {
+namespace {
+
+std::size_t readDrawSnapshotCap() {
     const char* text = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
     const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 64ull;
     return static_cast<std::size_t>(mib * 1024ull * 1024ull);
+}
+
+std::atomic<std::size_t>& drawSnapshotCap() {
+    static std::atomic<std::size_t> bytes{readDrawSnapshotCap()};
+    return bytes;
+}
+
+}
+
+std::size_t ShaderResources::MaxDrawSnapshotBytes() {
+    return drawSnapshotCap().load(std::memory_order_relaxed);
+}
+
+void ShaderResources::RereadMaxDrawSnapshotBytesForTest() {
+    drawSnapshotCap().store(readDrawSnapshotCap(), std::memory_order_relaxed);
 }
 
 std::size_t ShaderResources::DrawUploadLimit() {
@@ -10519,9 +10536,9 @@ bool ShaderResources::PlaceDirectBuffers(const Context& context, PreparedBuffers
     return true;
 }
 
-ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched, CommitterTrustCheck* trust) const {
+ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched, CommitterTrustCheck* trust, std::uint8_t answered) const {
     auto selection = PreparedBuffers::Selection::Hazard;
-    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, route, untouched, nullptr, RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter), trust));
+    static_cast<void>(preparedSelectionHolds(recorder, moved, prepared, selection, route, untouched, nullptr, RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter), trust, answered));
     return selection;
 }
 
@@ -10531,7 +10548,7 @@ ShaderResources::PreparedBuffers::Selection ShaderResources::FragmentSelectionHo
     return selection;
 }
 
-bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched, const GuardTests* guards, bool trusted, CommitterTrustCheck* trust) const {
+bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched, const GuardTests* guards, bool trusted, CommitterTrustCheck* trust, std::uint8_t answered) const {
     using Selection = PreparedBuffers::Selection;
     selection = Selection::Hazard;
     const auto& plan = *prepared.plan;
@@ -10557,7 +10574,8 @@ bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const
         }
         return false;
     };
-    if (!skipped && (guardsMoved || HasResidentDepthGuards_nid_no_patch()) && depthGuarded()) {
+    const bool depthAnswered = (answered & GuardAnswer::DepthClear) != 0 && guards == nullptr && !guardsMoved;
+    if (!skipped && (guardsMoved || HasResidentDepthGuards_nid_no_patch()) && !depthAnswered && depthGuarded()) {
         selection = Selection::DepthGuards;
         return failed();
     }
@@ -10577,7 +10595,7 @@ bool ShaderResources::preparedSelectionHolds(Recorder& recorder, std::span<const
             ++route->refuted;
             requireGuestBuffers(moved, found);
         }
-    } else if (route == nullptr && RuntimeSwitches::Set(RuntimeSwitch::CommitStamps) && requireMovedGuestBuffers(moved, guards, found)) {
+    } else if (route == nullptr && RuntimeSwitches::Set(RuntimeSwitch::CommitStamps) && requireMovedGuestBuffers(moved, guards, found, (answered & GuardAnswer::MultisampleClear) != 0)) {
     } else {
         requireGuestBuffers(moved, found);
     }
@@ -11451,12 +11469,13 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved, bo
     if (multisampleClear && !multisampleHeld) multisampleGuardsClear.store(multisampleGeneration, std::memory_order_relaxed);
 }
 
-bool ShaderResources::requireMovedGuestBuffers(std::span<const MovedBuffer> moved, const GuardTests* guards, bool* found) const {
+bool ShaderResources::requireMovedGuestBuffers(std::span<const MovedBuffer> moved, const GuardTests* guards, bool* found, bool answered) const {
     if (moved.empty() || !completed || !RuntimeSwitches::Set(RuntimeSwitch::GuardRangeMemo) || RuntimeSwitches::Set(RuntimeSwitch::NoGuardSpans) || VerifyGuardSpans()) return false;
     if (depthGuardsClear.load(std::memory_order_relaxed) != DepthGuardsGeneration_nid_no_patch() || multisampleGuardsClear.load(std::memory_order_relaxed) != MultisampleGuardsGeneration()) return false;
     for (std::size_t index = 0; index < moved.size(); ++index) {
         if (moved[index].allocation >= allocations.size() || (index != 0 && moved[index - 1].allocation >= moved[index].allocation)) return false;
     }
+    if (answered && guards == nullptr && found == nullptr) return true;
     for (const auto& entry : moved) {
         if (!allocations[entry.allocation].guest) continue;
         if (guards != nullptr ? guards->multisample(guards->tests, entry.address, entry.size) : MayOverlapMultisampleGuards(entry.address, entry.size)) {

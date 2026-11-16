@@ -907,6 +907,19 @@ function(agc_add_commit_feed_test agcTestName)
     set_tests_properties(${agcTestName}_commit_feed ${agcTestName}_commit_feed_off PROPERTIES FAIL_REGULAR_EXPRESSION "${agcCommitFeedFailures}")
 endfunction()
 
+set(agcFollowAheadDifference "\\[follow-ahead-verify\\] [-a-z ]+ differs:")
+set(agcFollowAheadEnvironment ${agcCommitFeedEnvironment} APS5_COMMIT_FEED=1)
+set(agcFollowAheadFailures "${agcCommitFeedFailures};${agcFollowAheadDifference}")
+
+function(agc_add_follow_ahead_test agcTestName)
+    set(agcFollowAheadVerifies APS5_VERIFY_FOLLOW_AHEAD=1 APS5_VERIFY_COMMIT_FRAGMENTS=7 APS5_VERIFY_APPEND_COMMITS=16)
+    agc_add_env_test(${agcTestName}_follow_ahead ${agcTestName}_tests
+            ENV ${agcFollowAheadEnvironment} ${agcFollowAheadVerifies} APS5_FOLLOW_AHEAD=1)
+    agc_add_env_test(${agcTestName}_follow_ahead_off ${agcTestName}_tests
+            ENV ${agcFollowAheadEnvironment} ${agcFollowAheadVerifies})
+    set_tests_properties(${agcTestName}_follow_ahead ${agcTestName}_follow_ahead_off PROPERTIES FAIL_REGULAR_EXPRESSION "${agcFollowAheadFailures}")
+endfunction()
+
 set(agcDrawRecordsDifference "\\[draw-records-verify\\] [-a-z ]+ differs:")
 
 function(agc_add_draw_records_test agcTestName)

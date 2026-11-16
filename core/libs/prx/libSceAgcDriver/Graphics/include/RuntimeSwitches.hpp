@@ -252,6 +252,7 @@ enum class RuntimeSwitch : std::size_t {
     PublicationFromFills,
     CommitFeed,
     DeepRuns,
+    FollowAhead,
     Count,
 };
 

@@ -3,6 +3,7 @@ if(BUILD_TESTING)
     agc_add_deep_flow_test(agc_driver_pipelined_predication_read)
     agc_add_write_validation_test(agc_driver_pipelined_predication_read)
     agc_add_commit_feed_test(agc_driver_pipelined_predication_read)
+    agc_add_follow_ahead_test(agc_driver_pipelined_predication_read)
 endif()
 
 if(BUILD_TESTING)

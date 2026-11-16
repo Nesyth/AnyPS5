@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/WriteValidation.hpp"
@@ -1861,6 +1862,131 @@ void CommitFeedMode(bool ring) {
     RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
 }
 
+constexpr std::uint64_t ResidentGuardAddress = 0x1000;
+constexpr std::uint64_t LateGuardAddress = 0x3000;
+constexpr std::size_t FollowGuardBytes = 0x1000;
+constexpr int LateGuardCommit = 2;
+
+using AheadCount = AgcDriver::Graphics::FollowAheadCount;
+constexpr std::size_t AheadCounts = static_cast<std::size_t>(AheadCount::Count);
+constexpr std::array<const char*, AheadCounts> AheadCountNames{"follower depth answers used", "follower multisample answers used", "follower input answers used", "leader depth answers used", "leader multisample answers used", "leader input answers used", "no clear answer", "depth generation moved", "multisample generation moved", "overwrite proof pending", "guard spans off", "verify difference", "followers", "hold segments", "same template as the follower before", "unmoved entries", "followers with queued stores", "renotes a merge would take"};
+static_assert(AheadCountNames.back() != nullptr, "every follow-ahead count needs a name");
+
+struct AheadTotals {
+    DirectTotals direct;
+    std::array<std::uint64_t, AheadCounts> counts{};
+    std::array<std::uint64_t, 2> verify{};
+
+    static AheadTotals Now() {
+        AheadTotals totals;
+        totals.direct = DirectTotals::Now();
+        for (std::size_t index = 0; index < AheadCounts; ++index) totals.counts[index] = AgcDriver::Graphics::FollowAheadTotal(static_cast<AheadCount>(index));
+        totals.verify = AgcDriver::Graphics::FollowAheadVerifyTotals();
+        return totals;
+    }
+
+    std::uint64_t Since(const AheadTotals& base, AheadCount count) const { return counts[static_cast<std::size_t>(count)] - base.counts[static_cast<std::size_t>(count)]; }
+
+    std::uint64_t Uses(const AheadTotals& base) const {
+        std::uint64_t total = 0;
+        for (auto index = static_cast<std::size_t>(AheadCount::FollowerDepth); index <= static_cast<std::size_t>(AheadCount::LeaderInputs); ++index) total += Since(base, static_cast<AheadCount>(index));
+        return total;
+    }
+};
+
+std::string DescribeAhead(const AheadTotals& now, const AheadTotals& base) {
+    std::string text;
+    for (std::size_t index = 0; index < AheadCounts; ++index) {
+        const auto moved = now.Since(base, static_cast<AheadCount>(index));
+        if (moved != 0) text += std::string("; ") + AheadCountNames[index] + " " + std::to_string(moved);
+    }
+    if (now.verify[0] != base.verify[0]) text += "; follow-ahead verify " + std::to_string(now.verify[0] - base.verify[0]) + " checked, " + std::to_string(now.verify[1] - base.verify[1]) + " differing";
+    return text + DescribeDirect(now.direct, base.direct);
+}
+
+namespace FollowAheadHooks {
+
+std::atomic<int> calls{0};
+std::atomic<int> fired{0};
+
+void AddGuard(AgcDriver::DrawRecordCommit&) {
+    if (calls.fetch_add(1) < LateGuardCommit || fired.load() != 0) return;
+    AgcDriver::Graphics::AddDepthGuardForTest(LateGuardAddress, FollowGuardBytes);
+    fired.fetch_add(1);
+}
+
+}
+
+void FollowAheadMode(bool ring) {
+    namespace Graphics = AgcDriver::Graphics;
+    const bool aheadEnvironment = RuntimeSwitches::Set(RuntimeSwitch::FollowAhead);
+    const bool repeatEnvironment = RuntimeSwitches::Set(RuntimeSwitch::DirectRepeat);
+    const bool passTargets = RuntimeSwitches::Set(RuntimeSwitch::DirectPassTargets);
+    const bool census = Graphics::FollowAheadCensus();
+    const bool verify = Graphics::FollowAheadVerifyEvery() != 0;
+    const bool guards = (Graphics::FollowAheadParts() & Graphics::FollowAheadGuards) != 0;
+    const bool committed = ring && RuntimeSwitches::Set(RuntimeSwitch::ExpressCommits) && RuntimeSwitches::Set(RuntimeSwitch::CommitBindings) && RuntimeSwitches::Set(RuntimeSwitch::CommitFragments) && RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) && RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) && DirectReport::VerifyEvery() != 1 && DrawRecords::VerifyEvery() != 1 && DirectReport::BufferVerifyEvery() == 0 && DirectReport::InputVerifyEvery() == 0;
+    RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectPassTargets, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::FollowAhead, false);
+    const auto scene = RepeatScene::Ring;
+    const std::string name = std::string("follow ahead, ") + RepeatSceneName(scene);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
+    std::vector<std::vector<std::uint8_t>> today;
+    for (std::uint32_t round = 0; round < RepeatRounds; ++round) today.push_back(RenderScene(scene, round));
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, true);
+    const auto arm = [&](bool on, const std::string& what) {
+        RuntimeSwitches::Assign(RuntimeSwitch::FollowAhead, on);
+        const auto before = AheadTotals::Now();
+        for (std::uint32_t pass = 0; pass < 2; ++pass) {
+            for (std::uint32_t round = 0; round < RepeatRounds; ++round) Require(RenderScene(scene, round) == today[round], name + ", " + what + ": round " + std::to_string(round) + " rendered differently from today's path" + DescribeAhead(AheadTotals::Now(), before));
+        }
+        const auto after = AheadTotals::Now();
+        std::cout << name << ", " << what << DescribeAhead(after, before) << '\n';
+        Require(after.verify[1] == before.verify[1], name + ", " + what + ": the follow-ahead verify found a difference" + DescribeAhead(after, before));
+        Require(after.direct.Since(before.direct, DirectCounter::FragmentsVerifyDiffering) == 0 && after.direct.Since(before.direct, DirectCounter::ExpressVerifyDiffering) == 0, name + ", " + what + ": the fragment or express verify found a difference" + DescribeAhead(after, before));
+        return std::pair{before, after};
+    };
+    const auto [offBefore, offAfter] = arm(false, "switch off");
+    Require(offAfter.Uses(offBefore) == 0 && offAfter.direct.Since(offBefore.direct, DirectCounter::FollowAheadBuffersMade, DirectCounter::FollowAheadInputRanges) == 0, name + ": with the switch off a guard answer was made or used" + DescribeAhead(offAfter, offBefore));
+    const auto [onBefore, onAfter] = arm(true, "switch on, no guards");
+    Graphics::AddDepthGuardForTest(ResidentGuardAddress, FollowGuardBytes);
+    const auto [guardBefore, guardAfter] = arm(true, "switch on, a resident depth guard clear of the draws");
+    FollowAheadHooks::calls.store(0);
+    FollowAheadHooks::fired.store(0);
+    const auto lateBefore = AheadTotals::Now();
+    Graphics::SetExpressHookForTest(&FollowAheadHooks::AddGuard);
+    const auto image = RenderScene(scene, 1);
+    Graphics::SetExpressHookForTest(nullptr);
+    const auto lateAfter = AheadTotals::Now();
+    Require(image == today[1], name + ", a depth guard added between the prepare and the commit: the pass rendered differently from today's path" + DescribeAhead(lateAfter, lateBefore));
+    Require(RenderScene(scene, 2) == today[2], name + ", a depth guard added between the prepare and the commit: the next pass rendered differently from today's path" + DescribeAhead(AheadTotals::Now(), lateBefore));
+    const auto nextAfter = AheadTotals::Now();
+    Graphics::RemoveDepthGuardsForTest();
+    const auto seen = FollowAheadHooks::calls.load();
+    const auto fired = FollowAheadHooks::fired.load();
+    std::cout << name << ", a depth guard added between the prepare and the commit: the hook saw " << seen << " express commits and fired " << fired << " times" << DescribeAhead(lateAfter, lateBefore) << '\n';
+    Require(nextAfter.verify[1] == lateBefore.verify[1], name + ", a depth guard added between the prepare and the commit: the follow-ahead verify found a difference" + DescribeAhead(nextAfter, lateBefore));
+    if (committed && guards) {
+        Require(onAfter.direct.Since(onBefore.direct, DirectCounter::FollowAheadBuffersMade) != 0 && onAfter.direct.Since(onBefore.direct, DirectCounter::FollowAheadInputsMade) != 0, name + ": with the switch on the finishers made no buffer or input guard answer" + DescribeAhead(onAfter, onBefore));
+        Require(guardAfter.direct.Since(guardBefore.direct, DirectCounter::FollowAheadBuffersDepthClear) != 0, name + ": with a resident depth guard clear of the draws no finisher answer found the depth guards clear" + DescribeAhead(guardAfter, guardBefore));
+        Require(seen > LateGuardCommit && fired == 1, name + ": the hook in the express commits saw " + std::to_string(seen) + " commits and fired " + std::to_string(fired) + " times, not once after " + std::to_string(LateGuardCommit) + " commits");
+        if (census) {
+            Require(onAfter.Uses(onBefore) != 0 && guardAfter.Uses(guardBefore) != 0, name + ": no committer walk took a guard answer" + DescribeAhead(guardAfter, onBefore));
+            Require(lateAfter.Since(lateBefore, AheadCount::DepthMoved) != 0, name + ": a depth guard added between the prepare and the commit sent no commit to today's walk as a moved depth generation" + DescribeAhead(lateAfter, lateBefore));
+            Require(onAfter.Since(onBefore, AheadCount::Segments) != 0 && onAfter.Since(onBefore, AheadCount::Followers) >= onAfter.Since(onBefore, AheadCount::Segments), name + ": the census counted no hold segment, or fewer followers than segments" + DescribeAhead(onAfter, onBefore));
+        }
+        if (verify) Require(guardAfter.verify[0] > guardBefore.verify[0], name + ": the follow-ahead verify checked no answer" + DescribeAhead(guardAfter, guardBefore));
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::FollowAhead, aheadEnvironment);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectRepeat, repeatEnvironment);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectPassTargets, passTargets);
+    RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, false);
+}
+
 constexpr std::uint32_t PlannedBufferBytes = 256;
 constexpr std::uint32_t LargeBufferBytes = 8192;
 constexpr std::size_t KeptBufferOffset = 0x1000;
@@ -2049,9 +2175,11 @@ int PreparedBuffersMatch() {
         expectRefused(resources, *plan, large, Refusal::UploadLimit, true, "a buffer moved to a range over the upload limit");
     }
     SetTestEnvironment("APS5_DRAW_SNAPSHOT_MAX_MIB", "0");
+    ShaderResources::RereadMaxDrawSnapshotBytesForTest();
     {
         ShaderResources capped(context, vertex, fragment, target, 0, 0);
         SetTestEnvironment("APS5_DRAW_SNAPSHOT_MAX_MIB", "64");
+        ShaderResources::RereadMaxDrawSnapshotBytesForTest();
         const auto plan = capped.DirectBufferPlan(stagesOf(vertex));
         Require(plan != nullptr, "prepared buffers: a template with no snapshot budget has no buffer plan");
         auto moving = vertex;
@@ -2303,6 +2431,7 @@ int main(int argc, char** argv) {
         const bool injectPlans = argc > 1 && std::string_view(argv[1]) == "--inject-plans";
         const bool texturesOnly = argc > 1 && std::string_view(argv[1]) == "--textures";
         const bool commitFeed = argc > 1 && std::string_view(argv[1]) == "--commit-feed";
+        const bool followAhead = argc > 1 && std::string_view(argv[1]) == "--follow-ahead";
         using AgcDriver::DriverDetail::DrawFinisher;
         using AgcDriver::DriverDetail::DrawPipeline;
         const bool leanEnvironment = RuntimeSwitches::Set(RuntimeSwitch::LeanFront);
@@ -2334,6 +2463,17 @@ int main(int argc, char** argv) {
             RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, directEnvironment);
             AgcDriverShutdown_nid_postfix();
             std::cout << "commit feed: records whose commits lost their prepared buffers render as today's path in both arms; with the switch on their fragment blocks stay and zone cards are made" << (arms.ring ? "" : " (no finisher ring: records never ran)") << '\n';
+            return 0;
+        }
+        if (followAhead) {
+            FollowAheadMode(arms.ring);
+            AgcDriver::DriverDetail::DirectDraws::Report(true);
+            RuntimeSwitches::Assign(RuntimeSwitch::LeanFront, leanEnvironment);
+            RuntimeSwitches::Assign(RuntimeSwitch::DrawRecords, recordsEnvironment);
+            RuntimeSwitches::Assign(RuntimeSwitch::StagePlans, plansEnvironment);
+            RuntimeSwitches::Assign(RuntimeSwitch::DirectDraws, directEnvironment);
+            AgcDriverShutdown_nid_postfix();
+            std::cout << "follow ahead: the guard answers fixed on the finishers render as today's path with the switch off, on, with a resident depth guard clear of the draws and with a guard added between the prepare and the commit" << (arms.ring ? "" : " (no finisher ring: records never ran)") << '\n';
             return 0;
         }
         if (directEnvironment) Direct(arms.ring);

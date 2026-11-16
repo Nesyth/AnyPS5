@@ -13,6 +13,7 @@
 #include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/WriteValidation.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuardSpans.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -445,6 +446,7 @@ public:
             std::array<std::pair<std::uint64_t, std::uint64_t>, Capacity> entries{};
         };
         ZoneCard card;
+        GuardAnswer guardAnswer;
     };
     enum class ZoneCardBuild : std::uint8_t { Made, OverCapacity, Refused };
     static ZoneCardBuild BuildZoneCard(PreparedBuffers& prepared);
@@ -560,7 +562,7 @@ public:
     ExpressMiss ExpressCurrentAudited(CommitterTrustCheck& check, bool following);
     CommitterTrustCheck TrustCheck(CommitterTrustFamily family, CommitterTrustSite site) const { return {&committerTrust[static_cast<std::size_t>(family)], site}; }
     void ExpressStage(Recorder& recorder);
-    PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched = false, CommitterTrustCheck* trust = nullptr) const;
+    PreparedBuffers::Selection FragmentSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, BindingRoute* route, bool untouched = false, CommitterTrustCheck* trust = nullptr, std::uint8_t answered = 0) const;
     struct GuardTests {
         bool (*depth)(void* tests, std::uint64_t address, std::uint64_t bytes) = nullptr;
         bool (*multisample)(void* tests, std::uint64_t address, std::uint64_t bytes) = nullptr;
@@ -721,6 +723,7 @@ public:
     enum class NotReusable : std::uint8_t { None, HtileClear, CopiedWrites, LeaseOrTable, MultisampleSources, PerUseTextures, DataBuffers, NoImportSerial, Count };
     NotReusable NotReusableReason() const { return notReusable; }
     static std::size_t MaxDrawSnapshotBytes();
+    static void RereadMaxDrawSnapshotBytesForTest();
     static std::size_t DrawUploadLimit();
     struct MovedSnapshotCounts {
         std::uint64_t cached = 0;
@@ -1065,7 +1068,7 @@ private:
     static std::uint64_t ClampedBufferBytes(std::span<const std::uint32_t> words, std::uint64_t maxStorageBufferRange);
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
     void requireGuestBuffers(std::span<const MovedBuffer> moved = {}, bool* found = nullptr) const;
-    bool requireMovedGuestBuffers(std::span<const MovedBuffer> moved, const GuardTests* guards = nullptr, bool* found = nullptr) const;
+    bool requireMovedGuestBuffers(std::span<const MovedBuffer> moved, const GuardTests* guards = nullptr, bool* found = nullptr, bool answered = false) const;
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
     // locks itself); stage B looks the sampled textures and storage images up (resolveImageBinding).
     void addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, std::span<const std::uint32_t> guest, VkShaderStageFlags flags);
@@ -1420,7 +1423,7 @@ private:
     void pushPlannedBindings(VkCommandBuffer commands, VkPipelineLayout layout, const DrawBindings& result, const PushPlan& plan) const;
     static std::uint64_t NextPlanSerial();
     std::uint64_t planSerial = NextPlanSerial();
-    bool preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched = false, const GuardTests* guards = nullptr, bool trusted = false, CommitterTrustCheck* trust = nullptr) const;
+    bool preparedSelectionHolds(Recorder& recorder, std::span<const MovedBuffer> moved, const PreparedBuffers& prepared, PreparedBuffers::Selection& selection, BindingRoute* route, bool untouched = false, const GuardTests* guards = nullptr, bool trusted = false, CommitterTrustCheck* trust = nullptr, std::uint8_t answered = 0) const;
     enum class ZoneCardUse : std::uint8_t { Follower, Leader, Guards };
     bool zoneCardUsable(const PreparedBuffers& prepared, ZoneCardUse use) const;
     bool zoneCardHolds(const PreparedBuffers& prepared, bool guards) const;

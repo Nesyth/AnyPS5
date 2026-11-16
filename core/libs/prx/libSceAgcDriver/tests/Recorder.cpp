@@ -5493,6 +5493,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
 #else
     Require(setenv("APS5_DRAW_SNAPSHOT_MAX_MIB", "1", 1) == 0, "cannot set snapshot cap");
 #endif
+    ShaderResources::RereadMaxDrawSnapshotBytesForTest();
     struct RestoreCap {
         const char* previous;
         std::string saved;
@@ -5506,6 +5507,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
                 unsetenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
             }
 #endif
+            ShaderResources::RereadMaxDrawSnapshotBytesForTest();
         }
     } restore{previous, saved};
     constexpr std::size_t bytes = 3 * 1024 * 1024;
@@ -5592,6 +5594,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
 #else
         Require(setenv("APS5_DRAW_SNAPSHOT_MAX_MIB", "64", 1) == 0, "cannot raise snapshot cap");
 #endif
+        ShaderResources::RereadMaxDrawSnapshotBytesForTest();
         const auto again = resources.PrepareDrawBindings(snapshotRecorder);
         Require(again != nullptr && again->snapshots.size() == 1 && again->snapshots[0].address == smallAddress, "built resources read the draw snapshot cap again instead of keeping the one they were built with");
         snapshotRecorder.Sync();
@@ -5600,6 +5603,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
 #else
         Require(setenv("APS5_DRAW_SNAPSHOT_MAX_MIB", "1", 1) == 0, "cannot restore snapshot cap");
 #endif
+        ShaderResources::RereadMaxDrawSnapshotBytesForTest();
     }
     const auto firstAddress = address + 4096;
     constexpr std::size_t firstBytes = 600 * 1024;

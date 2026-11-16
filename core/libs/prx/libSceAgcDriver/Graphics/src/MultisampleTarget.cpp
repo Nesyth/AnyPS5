@@ -956,8 +956,14 @@ std::atomic<std::uint64_t>& guardSpansGeneration() {
     return generation;
 }
 
+GuardSpanBoard& multisampleGuardBoard() {
+    static GuardSpanBoard board;
+    return board;
+}
+
 void moveGuardSpans() {
-    guardSpansGeneration().fetch_add(1, std::memory_order_release);
+    const auto generation = guardSpansGeneration().fetch_add(1, std::memory_order_release) + 1u;
+    multisampleGuardBoard().Publish(generation, guarded());
 }
 
 bool mayOverlapGuarded(std::uint64_t address, std::uint64_t bytes) {
@@ -1797,6 +1803,10 @@ std::uint64_t MultisampleTargetRangeGeneration() {
 
 std::uint64_t MultisampleGuardsGeneration() {
     return guardSpansGeneration().load(std::memory_order_acquire);
+}
+
+const GuardSpanBoard& MultisampleGuardBoard() {
+    return multisampleGuardBoard();
 }
 
 bool MayOverlapMultisampleGuards(std::uint64_t address, std::size_t bytes) {

@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuardSpans.hpp"
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -106,6 +107,7 @@ struct PreparedInputs {
     std::vector<Range> ranges;
     std::size_t indirectRanges = 0;
     bool exactCapacity = false;
+    GuardAnswer guardAnswer;
 };
 bool PrepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, PreparedInputs& prepared);
 enum class InputsMemoOutcome : std::uint8_t { None, Hit, MissKey, MissSerial, Indirect };
@@ -217,6 +219,25 @@ void NoteCommitFeedVerify(bool same, const char* what, const std::string& detail
 std::uint64_t CommitFeedTotal(CommitFeedCount count);
 std::array<std::uint64_t, 2> CommitFeedVerifyTotals();
 std::string TakeCommitFeedText();
+inline constexpr std::uint32_t FollowAheadGuards = 1;
+inline constexpr std::uint32_t FollowAheadRenotes = 2;
+std::uint32_t FollowAheadParts();
+bool FollowAheadOn(std::uint32_t part);
+bool FollowAheadCensus();
+std::uint64_t FollowAheadVerifyEvery();
+enum class GuardAnswerMade : std::uint8_t { Off, Made, SpansOff, ProofPending, StampMoved, BoardStale, GenerationMoved };
+struct GuardAnswerNote {
+    GuardAnswerMade made = GuardAnswerMade::Off;
+    std::uint8_t clear = 0;
+    std::uint32_t depthRanges = 0;
+    std::uint32_t multisampleRanges = 0;
+};
+GuardAnswerNote AnswerPreparedGuards(ShaderResources::PreparedBuffers& prepared);
+GuardAnswerNote AnswerPreparedInputGuards(PreparedInputs& prepared);
+enum class FollowAheadCount : std::uint8_t { FollowerDepth, FollowerMultisample, FollowerInputs, LeaderDepth, LeaderMultisample, LeaderInputs, NoAnswer, DepthMoved, MultisampleMoved, ProofPending, SpansOff, VerifyDiffers, Followers, Segments, SameTemplate, UnmovedEntries, QueuedStores, MergeableRenotes, Count };
+std::uint64_t FollowAheadTotal(FollowAheadCount count);
+std::array<std::uint64_t, 2> FollowAheadVerifyTotals();
+std::string TakeFollowAheadText();
 enum class RepeatRefusal : std::uint8_t { NoBlock, NotSimple, VerifyDue, Shape, Objects, Batch, Pass, Epoch, ProofSerial, Pending, Depth, Target, Access, Stores, Linear, Buffers, Selection, DepthGuards, Inputs, Changed, MovedHazard, UnmovedHazard, Count };
 inline constexpr std::array<const char*, static_cast<std::size_t>(RepeatRefusal::Count)> RepeatRefusalNames{"no block", "not simple", "verify due", "shape", "objects", "another batch", "pass", "collect epoch", "proof serial", "pending stores", "depth surfaces", "target changed", "pass access", "queued stores", "drawn linear targets", "no prepared buffers", "selection", "depth guards", "inputs", "changed by the inputs", "moved-range hazard", "unmoved-range hazard"};
 inline constexpr std::array<const char*, static_cast<std::size_t>(DrawRepeatClass::Count)> RepeatClassNames{"simple", "not recorded", "template", "stages", "pipeline", "targets", "not pushed", "sets", "buffers", "inputs", "keep", "pass", "access", "notes", "modes"};
