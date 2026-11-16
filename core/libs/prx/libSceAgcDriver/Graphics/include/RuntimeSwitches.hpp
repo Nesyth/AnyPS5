@@ -247,6 +247,7 @@ enum class RuntimeSwitch : std::size_t {
     OrderedSyncs,
     DeepShallow,
     HtileCarryFills,
+    HostDeepCache,
     Count,
 };
 

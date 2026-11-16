@@ -21,8 +21,18 @@ constexpr std::size_t LargeClasses = 6;
 constexpr std::size_t LargestLarge = std::size_t{2048} << (LargeClasses - 1);
 constexpr std::size_t AllClasses = Classes + LargeClasses;
 
-constexpr std::uint16_t Depth(std::size_t sizeClass) {
-    return sizeClass >= Classes ? 4 : sizeClass < 256 / Granule ? 64 : 16;
+constexpr std::size_t Modes = 2;
+
+constexpr std::uint16_t Depth(std::size_t mode, std::size_t sizeClass) {
+    if (mode == 0) return sizeClass >= Classes ? 4 : sizeClass < 256 / Granule ? 64 : 16;
+    if (sizeClass >= Classes) return sizeClass - Classes < 3 ? 32 : 8;
+    return sizeClass < 256 / Granule ? 64 : 32;
+}
+
+constexpr std::uint16_t KeptOf(std::size_t mode, std::size_t sizeClass) {
+    if (mode == 0) return sizeClass >= Classes ? 2 : 8;
+    if (sizeClass >= Classes) return sizeClass - Classes < 3 ? 16 : 8;
+    return 32;
 }
 
 enum Path : std::size_t {
@@ -43,8 +53,8 @@ enum Path : std::size_t {
 };
 
 struct Cache {
-    void* heads[AllClasses];
-    std::uint16_t counts[AllClasses];
+    void* heads[Modes][AllClasses];
+    std::uint16_t counts[Modes][AllClasses];
     std::ptrdiff_t untilSample;
     std::uint32_t paths[Paths];
     std::uint32_t pathEvents;
@@ -86,11 +96,14 @@ void NotePath(Cache* cache, std::size_t path) noexcept {
     ReportPaths();
 }
 
-constexpr std::uint16_t KeptLists = 8;
-constexpr std::uint16_t KeptLargeLists = 2;
-
 std::atomic<bool (*)()> largeCacheQuery{nullptr};
 std::atomic<bool (*)()> prefetchQuery{nullptr};
+std::atomic<bool (*)()> deepCacheQuery{nullptr};
+
+std::size_t CacheMode() noexcept {
+    const auto query = deepCacheQuery.load(std::memory_order_acquire);
+    return query != nullptr && query() ? 1 : 0;
+}
 
 bool LargeCache() noexcept {
     const auto query = largeCacheQuery.load(std::memory_order_acquire);
@@ -116,12 +129,12 @@ struct Depot {
     std::uint16_t count = 0;
 };
 
-Depot depots[AllClasses];
+Depot depots[Modes][AllClasses];
 
-bool KeepList(std::size_t sizeClass, void* list) noexcept {
-    auto& depot = depots[sizeClass];
+bool KeepList(std::size_t mode, std::size_t sizeClass, void* list) noexcept {
+    auto& depot = depots[mode][sizeClass];
     AcquireSRWLockExclusive(&depot.lock);
-    const bool kept = depot.count < (sizeClass >= Classes ? KeptLargeLists : KeptLists);
+    const bool kept = depot.count < KeptOf(mode, sizeClass);
     if (kept) {
         static_cast<void**>(list)[1] = depot.lists;
         depot.lists = list;
@@ -131,8 +144,8 @@ bool KeepList(std::size_t sizeClass, void* list) noexcept {
     return kept;
 }
 
-void* TakeList(std::size_t sizeClass) noexcept {
-    auto& depot = depots[sizeClass];
+void* TakeList(std::size_t mode, std::size_t sizeClass) noexcept {
+    auto& depot = depots[mode][sizeClass];
     AcquireSRWLockExclusive(&depot.lock);
     void* list = depot.lists;
     if (list != nullptr) {
@@ -154,12 +167,14 @@ std::atomic<DWORD> tlsSlot{Unset};
 std::atomic<DWORD> flsSlot{FLS_OUT_OF_INDEXES};
 
 void Drain(Cache* cache) noexcept {
-    for (std::size_t sizeClass = 0; sizeClass < AllClasses; ++sizeClass) {
-        while (void* block = cache->heads[sizeClass]) {
-            cache->heads[sizeClass] = *static_cast<void**>(block);
-            std::free(block);
+    for (std::size_t mode = 0; mode < Modes; ++mode) {
+        for (std::size_t sizeClass = 0; sizeClass < AllClasses; ++sizeClass) {
+            while (void* block = cache->heads[mode][sizeClass]) {
+                cache->heads[mode][sizeClass] = *static_cast<void**>(block);
+                std::free(block);
+            }
+            cache->counts[mode][sizeClass] = 0;
         }
-        cache->counts[sizeClass] = 0;
     }
 }
 
@@ -442,23 +457,24 @@ void CensusNote(void* block, std::size_t bytes, void* site) noexcept {
 
 void* TryAllocate(std::size_t bytes) noexcept {
     if (bytes == 0) bytes = 1;
-    const bool large = bytes > LargestCached && bytes <= LargestLarge && LargeCache();
+    const auto mode = CacheMode();
+    const bool large = bytes > LargestCached && bytes <= LargestLarge && (mode != 0 || LargeCache());
     if (bytes <= LargestCached || large) {
         const auto sizeClass = large ? LargeClassOf(bytes) : (bytes - 1) / Granule;
         const auto blockBytes = large ? std::size_t{2048} << (sizeClass - Classes) : (sizeClass + 1) * Granule;
         if (auto* cache = CurrentCache()) {
             bool taken = false;
-            if (cache->heads[sizeClass] == nullptr) {
-                if (void* list = TakeList(sizeClass)) {
-                    cache->heads[sizeClass] = list;
-                    cache->counts[sizeClass] = Depth(sizeClass);
+            if (cache->heads[mode][sizeClass] == nullptr) {
+                if (void* list = TakeList(mode, sizeClass)) {
+                    cache->heads[mode][sizeClass] = list;
+                    cache->counts[mode][sizeClass] = Depth(mode, sizeClass);
                     taken = true;
                 }
             }
-            if (void* block = cache->heads[sizeClass]) {
+            if (void* block = cache->heads[mode][sizeClass]) {
                 void* next = *static_cast<void**>(block);
-                cache->heads[sizeClass] = next;
-                --cache->counts[sizeClass];
+                cache->heads[mode][sizeClass] = next;
+                --cache->counts[mode][sizeClass];
                 if (next != nullptr && PrefetchNext()) PrefetchForWrite(next);
                 NotePath(cache, taken ? (large ? DepotLarge : DepotSmall) : (large ? CacheLarge : CacheSmall));
                 return block;
@@ -487,20 +503,21 @@ void Release(void* block, std::size_t bytes = 0) noexcept {
     if (block == nullptr) return;
     if (censusOn) CensusRemove(block);
     if (auto* cache = CurrentCache()) {
-        const bool large = LargeCache();
+        const auto mode = CacheMode();
+        const bool large = mode != 0 || LargeCache();
         const auto usable = bytes != 0 && bytes % Granule == 0 && (bytes <= LargestCached || !large) ? bytes : _msize(block);
         const bool largeBlock = large && usable > LargestCached && usable <= LargestLarge && std::has_single_bit(usable);
         if ((usable >= Granule && usable < LargestCached + Granule) || largeBlock) {
             const auto sizeClass = largeBlock ? LargeClassOf(usable) : usable / Granule - 1;
-            if (cache->counts[sizeClass] == Depth(sizeClass) && KeepList(sizeClass, cache->heads[sizeClass])) {
-                cache->heads[sizeClass] = nullptr;
-                cache->counts[sizeClass] = 0;
+            if (cache->counts[mode][sizeClass] == Depth(mode, sizeClass) && KeepList(mode, sizeClass, cache->heads[mode][sizeClass])) {
+                cache->heads[mode][sizeClass] = nullptr;
+                cache->counts[mode][sizeClass] = 0;
                 NotePath(cache, FreeKeptList);
             }
-            if (cache->counts[sizeClass] < Depth(sizeClass)) {
-                *static_cast<void**>(block) = cache->heads[sizeClass];
-                cache->heads[sizeClass] = block;
-                ++cache->counts[sizeClass];
+            if (cache->counts[mode][sizeClass] < Depth(mode, sizeClass)) {
+                *static_cast<void**>(block) = cache->heads[mode][sizeClass];
+                cache->heads[mode][sizeClass] = block;
+                ++cache->counts[mode][sizeClass];
                 NotePath(cache, largeBlock ? FreeCacheLarge : FreeCacheSmall);
                 return;
             }
@@ -522,6 +539,10 @@ void SetHostLargeCacheQuery(bool (*query)()) noexcept {
 
 void SetHostPrefetchQuery(bool (*query)()) noexcept {
     prefetchQuery.store(query, std::memory_order_release);
+}
+
+void SetHostDeepCacheQuery(bool (*query)()) noexcept {
+    deepCacheQuery.store(query, std::memory_order_release);
 }
 
 }

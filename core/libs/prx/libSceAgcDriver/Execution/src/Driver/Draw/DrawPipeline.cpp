@@ -365,6 +365,7 @@ void noteParkVerifyCounts() {
 const bool hostLargeCacheHooked = [] {
     SetHostLargeCacheQuery(+[] { return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::HostLargeCache); });
     SetHostPrefetchQuery(+[] { return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::HostPrefetch); });
+    SetHostDeepCacheQuery(+[] { return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::HostDeepCache); });
     return true;
 }();
 #endif

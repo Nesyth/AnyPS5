@@ -3210,7 +3210,8 @@ bool fillsUnderCarriedFixups(const Recorder& recorder, std::uint64_t address, st
     return landed.has_value() && HtileFillClears(*landed, false) == 0;
 }
 
-bool carriedOverPending(const Recorder& recorder, std::uint64_t address, std::size_t bytes) {
+bool carriedOverPending(const Recorder& recorder, std::uint64_t address, std::size_t bytes, bool& overFills) {
+    overFills = false;
     const auto writes = recorder.PendingWritesOver(address, bytes);
     if (writes.empty()) return false;
     {
@@ -3219,6 +3220,7 @@ bool carriedOverPending(const Recorder& recorder, std::uint64_t address, std::si
     }
     if (!fillsUnderCarriedFixups(recorder, address, bytes, true)) return false;
     htileCarriesOverFills.fetch_add(1, std::memory_order_relaxed);
+    overFills = true;
     return true;
 }
 
@@ -3274,16 +3276,19 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
             }
         }
     }
-    static const bool verifyCarry = std::getenv("APS5_VERIFY_HTILE_CARRY") != nullptr;
+    static const char* const verifyText = std::getenv("APS5_VERIFY_HTILE_CARRY");
+    static const bool verifyCarry = verifyText != nullptr;
+    static const bool verifyFillsOnly = verifyText != nullptr && verifyText[0] == '2' && verifyText[1] == 0;
     bool carried = false;
-    if (pending && !target.htileStencil && !RuntimeSwitches::Set(RuntimeSwitch::NoHtileFixupCarry) && carriedOverPending(*recorder, target.htileAddress, bytes)) {
+    bool overFills = false;
+    if (pending && !target.htileStencil && !RuntimeSwitches::Set(RuntimeSwitch::NoHtileFixupCarry) && carriedOverPending(*recorder, target.htileAddress, bytes, overFills)) {
         std::lock_guard lock(htileReadsMutex());
         const auto found = htileReads().find(target.htileAddress);
         carried = found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second);
     }
     if (carried) {
         noteHtileRead(HtileReadEvent::Carried);
-        if (!verifyCarry) return 0;
+        if (!verifyCarry || (verifyFillsOnly && !overFills)) return 0;
     }
     static const bool pendingFills = std::getenv("APS5_NO_PENDING_HTILE_FILLS") == nullptr;
     if (pending && pendingFills && !carried) {

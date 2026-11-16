@@ -5,6 +5,7 @@ namespace AgcDriver {
 
 void SetHostLargeCacheQuery(bool (*query)()) noexcept;
 void SetHostPrefetchQuery(bool (*query)()) noexcept;
+void SetHostDeepCacheQuery(bool (*query)()) noexcept;
 
 }
 
