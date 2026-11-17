@@ -4355,12 +4355,14 @@ std::size_t Recorder::DrawInputMirrorBudgetBytes() {
 
 void Recorder::dropDrawInputMirror(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
     if (entry->second.mirror == nullptr) return;
+    if (entry->second.publishedBuffer == entry->second.mirror.get()) unpublishDrawInput(entry);
     drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))].bytes -= std::get<2>(entry->first);
     drawInputMirrorBytes -= std::get<2>(entry->first);
     entry->second.mirror.reset();
 }
 
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
+    unpublishDrawInput(entry);
     dropDrawInputMirror(entry);
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
     pool.bytes -= std::get<2>(entry->first);
@@ -4478,14 +4480,15 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
         GuestMemory::Read(address + start, found->second.buffer->Bytes().subspan(start, found->second.from - start), 1);
         found->second.from = start;
         dropDrawInputMirror(found);
+        unpublishDrawInput(found);
     }
     auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
     recency.splice(recency.end(), recency, found->second.recent);
     if (derived != nullptr) *derived = found->second.derived;
     if (lowest != nullptr) *lowest = found->second.lowest;
-    if (!mirrored || use == SnapshotUse::Storage || !DrawInputMirrors()) return found->second.buffer;
+    if (!mirrored || use == SnapshotUse::Storage || !DrawInputMirrors()) return publishDrawInput(found, found->second.buffer);
     if (found->second.mirror == nullptr) found->second.mirror = mirrorDrawInput(found);
-    return found->second.mirror != nullptr ? found->second.mirror : found->second.buffer;
+    return publishDrawInput(found, found->second.mirror != nullptr ? found->second.mirror : found->second.buffer);
 }
 
 std::shared_ptr<Buffer> Recorder::containingDrawSnapshot(std::uint64_t address, std::size_t bytes, VkDeviceSize* offset) {
@@ -4651,7 +4654,88 @@ std::shared_ptr<Buffer> Recorder::ReusableOwnedDrawInput(std::uint64_t address, 
     if (derived != nullptr) *derived = found->second.derived;
     if (lowest != nullptr) *lowest = found->second.lowest;
     OwnedDrawTraceCount("OwnedDraw.reused");
-    return found->second.buffer;
+    return publishDrawInput(found, found->second.buffer);
+}
+
+// APS5_MIRRORED_INPUTS (see Recorder.hpp). A publication names one buffer of one snapshot: the serial moves
+// whenever another buffer is bound for the snapshot, and the table entry goes with the snapshot.
+std::shared_ptr<Buffer> Recorder::publishDrawInput(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry, std::shared_ptr<Buffer> buffer) {
+    const auto use = std::get<1>(entry->first);
+    if (use == SnapshotUse::Storage || use == SnapshotUse::PaddedVertex || !RuntimeSwitches::Set(RuntimeSwitch::MirroredInputs)) return buffer;
+    auto& snapshot = entry->second;
+    if (snapshot.published != 0 && snapshot.publishedBuffer == buffer.get()) return buffer;
+    PublishedInput replaced;
+    {
+        std::lock_guard lock(publishedInputsMutex);
+        auto& slot = publishedInputs[entry->first];
+        replaced = std::move(slot);
+        slot = {buffer, ++publishedInputSerial, snapshot.from};
+    }
+    snapshot.published = publishedInputSerial;
+    snapshot.publishedBuffer = buffer.get();
+    OwnedDrawTraceCount("OwnedDraw.mirror_published");
+    return buffer;
+}
+
+void Recorder::unpublishDrawInput(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
+    if (entry->second.published == 0) return;
+    entry->second.published = 0;
+    entry->second.publishedBuffer = nullptr;
+    std::map<DrawSnapshotKey, PublishedInput>::node_type gone;
+    std::lock_guard lock(publishedInputsMutex);
+    gone = publishedInputs.extract(entry->first);
+}
+
+Recorder::PublishedDrawInput Recorder::PublishedDrawInputFor(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::size_t from) const {
+    std::lock_guard lock(publishedInputsMutex);
+    const auto found = use == SnapshotUse::Vertex ? publishedInputs.lower_bound({address, use, bytes}) : publishedInputs.find({address, use, bytes});
+    if (found == publishedInputs.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use || found->second.from > from) return {};
+    return {found->second.buffer, found->second.serial, std::get<2>(found->first)};
+}
+
+static std::uint64_t MirroredInputsVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_MIRRORED_INPUTS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+bool Recorder::PublishedDrawInputHolds(std::uint64_t address, std::size_t bytes, const DrawInputTicket& ticket) {
+    GuestMemory::AssertGpuLockHeld("check a published draw input");
+    const auto refused = [] {
+        OwnedDrawTraceCount("OwnedDraw.mirror_refused");
+        return false;
+    };
+    if (ticket.serial == 0 || ticket.use == SnapshotUse::Storage || ticket.use == SnapshotUse::PaddedVertex || bytes > ticket.held || ticket.from >= bytes) return refused();
+    // As the copy path before it reuses a snapshot: what is pending for the range reaches guest memory
+    // (and stamps it) first. The hook can record and submit, so the snapshot is looked up after it.
+    GuestMemory::FlushGpuWrites(address, bytes);
+    const auto found = drawSnapshots.find({address, ticket.use, ticket.held});
+    if (found == drawSnapshots.end() || found->second.published != ticket.serial || found->second.from > ticket.from) return refused();
+    auto& entry = found->second;
+    // The finisher sized the vertex ranges by the index bounds it scanned in guest memory, perhaps before
+    // the published copy was made: the copy must have the same bounds.
+    if (ticket.use != SnapshotUse::Vertex && (entry.derived != ticket.derived || entry.lowest != ticket.lowest)) return refused();
+    const auto holds = [&](bool walk) {
+        if (!entry.owned.words.empty()) return !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedDrawInputs) && ownedDrawInputHolds(address, ticket.held, entry.owned);
+        if (entry.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return false;
+        if ((walk ? GuestMemory::CollectWritesUncached(address, bytes) : GuestMemory::CollectWrites(address, bytes)) == 0) return false;
+        return GuestMemory::UnchangedSince(address + ticket.from, bytes - ticket.from, entry.generation);
+    };
+    if (!holds(false)) return refused();
+    static std::uint64_t verifyOrdinal = 0;
+    if (const auto every = MirroredInputsVerifyEvery(); every != 0 && ++verifyOrdinal % every == 0) {
+        // The host snapshot is compared (a device-local mirror is a GPU copy of it and has no mapping). A
+        // store that lands during the compare fails the second proof, which walks the pages again.
+        const bool equal = GuestMemory::EqualsCommittedUnsynced(address + ticket.from, entry.buffer->Bytes().subspan(ticket.from, bytes - ticket.from));
+        if (!holds(true)) return refused();
+        Require(equal, "APS5_VERIFY_MIRRORED_INPUTS: a mirrored draw input differs from the guest bytes while its proof holds");
+    }
+    auto& recency = drawSnapshotPools[SnapshotPool(ticket.use)].recency;
+    recency.splice(recency.end(), recency, entry.recent);
+    OwnedDrawTraceCount("OwnedDraw.mirror_reused");
+    return true;
 }
 
 void Recorder::KeepOwnedDrawInput(std::uint64_t address, std::size_t bytes, const OwnedDrawInputProof& proof, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived, std::size_t from, std::uint32_t lowest) {

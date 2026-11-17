@@ -2973,6 +2973,30 @@ bool inputRangeHazard(const Recorder& recorder, std::uint64_t begin, std::size_t
     return recorder.QueuedStoreOverlaps(begin, bytes) || (!PendingZones::Clear(begin, bytes) && (recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr))) || recorder.PendingLabelIn(begin, bytes);
 }
 
+// Whether prepared inputs may be taken where draw inputs are not bound in place (APS5_MIRRORED_INPUTS).
+bool preparedInputsUsable(const Context& context, const PreparedInputs& prepared) {
+    return context.drawInputsInPlace || (prepared.mirrored && RuntimeSwitches::Set(RuntimeSwitch::MirroredInputs));
+}
+
+// The commit's test of a range bound from a published copy. A copy is not read behind a GPU write and
+// no order of commands makes it current, so nothing here is skipped by a trusted or audited committer:
+// the guards the copy path requires, no pending GPU work over the range (the copy path would wait for
+// it and copy again), then the proof that the guest bytes are still the copied ones.
+bool mirroredInputHolds(const Context& context, const PreparedInputs::Range& range, bool index) {
+    auto* recorder = context.recorder;
+    const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+    if (recorder == nullptr || range.source == nullptr || bytes == 0 || !RuntimeSwitches::Set(RuntimeSwitch::MirroredInputs)) return false;
+    RequireNoMultisampleTarget(range.begin, bytes, index ? "an index buffer read" : "a vertex buffer read");
+    const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(range.begin, bytes); };
+    const auto drawWriters = DrawCopiedWriters();
+    // The exact tests, not the zone table the in-place routes ask first.
+    if (recorder->PendingWriteOverlaps(range.begin, bytes) || PendingStorageOverlaps(range.begin, bytes, nullptr) || recorder->PendingLabelIn(range.begin, bytes) || recorder->QueuedStoreOverlaps(range.begin, bytes) || (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) || std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) {
+        PerformanceTrace::CountOwnedDraw("OwnedDraw.mirror_hazard");
+        return false;
+    }
+    return recorder->PublishedDrawInputHolds(range.begin, bytes, range.ticket);
+}
+
 bool inputRangeAnswered(const Recorder& recorder, std::uint64_t begin, std::size_t bytes, WriteValidation::Test test) {
     const auto answer = WriteValidation::CommitterClear(recorder, begin, bytes, WriteValidation::Fact::Inputs, test);
     if (answer == WriteValidation::Answer::Today) return false;
@@ -3004,7 +3028,7 @@ CommitterTrustCheck committerTrustCheck(const ShaderResources& resources, Commit
 
 DrawRecordInputs takePreparedInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, PreparedInputs& prepared, DrawInputs& inputs, DrawTimer& timer, PerformanceTimer& timing, bool atFloor = false, bool validated = false, CommitterTrustCheck* trust = nullptr) {
     const std::size_t indexRanges = draw.indexed ? 1u : 0u;
-    if (prepared.recipe.get() != &recipe || prepared.device != context.device || prepared.state != &state || prepared.draw != &draw || prepared.shaders != shaders.data() || prepared.stages != shaders.size() || prepared.ranges.size() < indexRanges || context.recorder == nullptr || !context.drawInputsInPlace) return DrawRecordInputs::Shape;
+    if (prepared.recipe.get() != &recipe || prepared.device != context.device || prepared.state != &state || prepared.draw != &draw || prepared.shaders != shaders.data() || prepared.stages != shaders.size() || prepared.ranges.size() < indexRanges || context.recorder == nullptr || !preparedInputsUsable(context, prepared)) return DrawRecordInputs::Shape;
     const bool mapped = (prepared.forget & 1u) == 0 && GuestMemory::ForgetSerial() == prepared.forget;
     const auto indexBytes = static_cast<std::size_t>(prepared.indexBytes);
     const bool trusted = !atFloor && RuntimeSwitches::Set(RuntimeSwitch::XpTrustCommitter);
@@ -3024,9 +3048,10 @@ DrawRecordInputs takePreparedInputs(const Context& context, const State& state, 
     timing.Mark("validate");
     bool rechecked = false;
     const auto served = [&](const PreparedInputs::Range& range, bool* behind) {
+        if (range.source != nullptr) return mirroredInputHolds(context, range, behind == nullptr) ? DrawRecordInputs::Used : DrawRecordInputs::Refused;
         if (atFloor) return DrawRecordInputs::Used;
         KnownImport known{range.import, prepared.imports, prepared.mapping};
-        const auto* import = inPlaceDrawInput(context, range.begin, static_cast<std::size_t>(range.end - range.begin), range.alignment, behind, &known);
+        const auto* import = inPlaceDrawInput(context, range.begin, static_cast<std::size_t>(range.end - range.begin), range.alignment, behind, &known, range.small ? std::size_t{0} : std::numeric_limits<std::size_t>::max(), range.small ? std::uint64_t{0} : std::numeric_limits<std::uint64_t>::max());
         rechecked = rechecked || known.looked;
         if (import == nullptr) return DrawRecordInputs::Refused;
         return import->buffer == range.handle && HostImportOffset(*import, range.begin) == range.offset ? DrawRecordInputs::Used : DrawRecordInputs::ImportChanged;
@@ -3054,6 +3079,13 @@ DrawRecordInputs takePreparedInputs(const Context& context, const State& state, 
     inputs.vertexHandles = std::move(prepared.vertexHandles);
     inputs.vertexOffsets = std::move(prepared.vertexOffsets);
     inputs.inPlaceReads = std::move(prepared.inPlaceReads);
+    for (std::size_t at = 0; prepared.mirrored && at < prepared.ranges.size(); ++at) {
+        const auto& source = prepared.ranges[at].source;
+        if (source == nullptr) continue;
+        context.recorder->Keep(source);
+        if (at < indexRanges) inputs.indices = source;
+        else inputs.vertexBuffers.push_back(source);
+    }
     inputs.vertexInputBehindGpuWrite = behind;
     inputs.fragmentOutputs = recipe.fragmentOutputs;
     inputs.shaderStages = recipe.shaderStages;
@@ -3288,8 +3320,16 @@ bool prepareMemoInputs(const Context& context, const State& state, const Pm4::Dr
     prepared.inPlaceReads.clear();
     prepared.ranges.clear();
     prepared.indirectRanges = 0;
+    prepared.mirrored = false;
     if (recipe == nullptr || recipe->device != context.device) return refuse(Refusal::NoRecipe);
-    if (context.recorder == nullptr || !context.drawInputsInPlace || context.hostImportAlignment == 0) return refuse(Refusal::NotInPlace);
+    // APS5_MIRRORED_INPUTS: where inputs are copied, a range is bound from the copy the committer
+    // published, or in place when the committer would bind it so (a small range). The inputs memo keys
+    // neither the lowest index nor the publications and an indirect draw's inputs are copied whole: both
+    // stay with the committer.
+    const bool mirrored = !context.drawInputsInPlace && RuntimeSwitches::Set(RuntimeSwitch::MirroredInputs);
+    if (context.recorder == nullptr || (!context.drawInputsInPlace && !mirrored) || context.hostImportAlignment == 0) return refuse(Refusal::NotInPlace);
+    if (mirrored && draw.indirect) return refuse(Refusal::NotInPlace);
+    if (mirrored) memo = nullptr;
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
     if (args != nullptr && (!RuntimeSwitches::Set(RuntimeSwitch::DirectGpuIndirect) || args->RangeBytes() == 0 || args->stride % 4u != 0 || args->arguments % 4u != 0 || (draw.indexed && !args->indexLimitKnown) || (args->countIndirect && (!context.drawIndirectCount || args->countAddress % 4u != 0)))) return refuse(Refusal::Shape);
     if (shaders.empty() || state.quadList || state.stages.mesh || state.stages.tessellation || state.stages.tessellationGeometry || state.tessellationCapture != nullptr || StripPatches(state, shaders)) return refuse(Refusal::Shape);
@@ -3315,6 +3355,8 @@ bool prepareMemoInputs(const Context& context, const State& state, const Pm4::Dr
     prepared.exactCapacity = capacity;
     if (capacity) prepared.ranges.reserve((draw.indexed ? 1u : 0u) + attributes.size() + 2u);
     std::uint32_t maxIndex = draw.indexed || args != nullptr ? 0u : draw.firstVertex + draw.indexCount - 1u;
+    std::uint32_t minIndex = draw.firstVertex;
+    Recorder::DrawInputTicket indexTicket;
     if (draw.indexed) {
         const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         if (state.primitiveRestart && !context.primitiveListRestart && listTopology) return refuse(Refusal::Shape);
@@ -3334,6 +3376,10 @@ bool prepareMemoInputs(const Context& context, const State& state, const Pm4::Dr
             Require(*highest <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
             Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - *highest, "indexed draw vertex range overflow");
             maxIndex = *highest + draw.firstVertex;
+            minIndex = bounds->lowest + draw.firstVertex;
+            indexTicket.derived = skipRestart ? *highest + 1u : *highest;
+            indexTicket.lowest = bounds->lowest;
+            indexTicket.use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
         }
         prepared.ranges.push_back({draw.indexAddress, draw.indexAddress + indexBytes, draw.indexSize});
     }
@@ -3444,18 +3490,52 @@ bool prepareMemoInputs(const Context& context, const State& state, const Pm4::Dr
         prepared.indirectRanges = args->countIndirect ? 2u : 1u;
     }
     if (capacity) prepared.inPlaceReads.reserve(prepared.ranges.size());
-    for (const auto& range : prepared.ranges) prepared.inPlaceReads.emplace_back(range.begin, range.end);
-    auto& found = scratch.found;
-    found.assign(prepared.ranges.size(), {});
-    if (!prepared.ranges.empty() && !ExistingHostImportsFor(context, prepared.inPlaceReads, found)) return refuse(Refusal::NotInPlace);
-    for (std::size_t index = 0; index < prepared.ranges.size(); ++index) {
-        auto& range = prepared.ranges[index];
-        if (found[index].offset % range.alignment != 0) return refuse(Refusal::NotInPlace);
-        range.import = found[index].import;
-        range.handle = found[index].buffer;
-        range.offset = found[index].offset;
-    }
     const std::size_t first = draw.indexed ? 1u : 0u;
+    if (mirrored) {
+        // The committer's own choices (prepareDrawInputs): the first byte a vertex copy holds, and a
+        // range the draw fetches little of bound in place.
+        const auto reads = static_cast<std::uint64_t>(draw.indexCount) * draw.instanceCount;
+        const auto starts = VertexCopyStarts(plan, fetches, minIndex, draw.firstInstance);
+        for (std::size_t index = 0; index < prepared.ranges.size(); ++index) {
+            auto& range = prepared.ranges[index];
+            const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+            const auto from = index < first ? std::size_t{0} : starts[index - first];
+            if (bytes - from <= context.drawInputsInPlaceBelow && reads <= InPlaceDrawInputMaxReads) {
+                const std::pair<std::uint64_t, std::uint64_t> read{range.begin, range.end};
+                ExistingHostImport existing{};
+                if (ExistingHostImportsFor(context, std::span(&read, 1), std::span(&existing, 1)) && existing.offset % range.alignment == 0) {
+                    range.import = existing.import;
+                    range.handle = existing.buffer;
+                    range.offset = existing.offset;
+                    range.small = true;
+                    prepared.inPlaceReads.push_back(read);
+                    continue;
+                }
+            }
+            auto ticket = index < first ? indexTicket : Recorder::DrawInputTicket{};
+            auto published = context.recorder->PublishedDrawInputFor(range.begin, bytes, ticket.use, from);
+            if (published.buffer == nullptr) return refuse(Refusal::NotInPlace);
+            ticket.serial = published.serial;
+            ticket.held = published.held;
+            ticket.from = from;
+            range.handle = published.buffer->Handle();
+            range.source = std::move(published.buffer);
+            range.ticket = ticket;
+        }
+        prepared.mirrored = true;
+    } else {
+        for (const auto& range : prepared.ranges) prepared.inPlaceReads.emplace_back(range.begin, range.end);
+        auto& found = scratch.found;
+        found.assign(prepared.ranges.size(), {});
+        if (!prepared.ranges.empty() && !ExistingHostImportsFor(context, prepared.inPlaceReads, found)) return refuse(Refusal::NotInPlace);
+        for (std::size_t index = 0; index < prepared.ranges.size(); ++index) {
+            auto& range = prepared.ranges[index];
+            if (found[index].offset % range.alignment != 0) return refuse(Refusal::NotInPlace);
+            range.import = found[index].import;
+            range.handle = found[index].buffer;
+            range.offset = found[index].offset;
+        }
+    }
     prepared.vertexHandles.reserve(attributes.size());
     prepared.vertexOffsets.reserve(attributes.size());
     for (std::size_t index = 0; index < attributes.size(); ++index) {
@@ -10280,7 +10360,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
     const bool reprove = resume != nullptr ? templateMiss != ShaderResources::ExpressMiss::None : templateMiss != ShaderResources::ExpressMiss::None && templateMiss != ShaderResources::ExpressMiss::Regions && (templateMiss != ShaderResources::ExpressMiss::NotProved || (RuntimeSwitches::Set(RuntimeSwitch::ExpressKeepState) && resources.ExpressWatchable()));
     if (templateMiss != ShaderResources::ExpressMiss::None && !reprove) return miss(DrawExpressMiss::Template);
     const bool appendOn = RuntimeSwitches::Set(RuntimeSwitch::XpAppendCommits);
-    if (appendOn && !verifyDue && !draw.indirect && templateMiss == ShaderResources::ExpressMiss::None && prepared != nullptr && !prepared->inPlace && preparedInputs != nullptr && !record.verifyBuffers && !record.verifyInputs && prepared->plan != nullptr && prepared->plan == resources.DirectBufferPlan(shaders) && !StorageTexture::DrawnLinearPending() && (!express->hasDepth || (DepthSurfacesSerial() == express->depthSerial && DepthSurfacesReleased() == express->depthReleased))) {
+    if (appendOn && !verifyDue && !draw.indirect && templateMiss == ShaderResources::ExpressMiss::None && prepared != nullptr && !prepared->inPlace && preparedInputs != nullptr && !preparedInputs->mirrored && !record.verifyBuffers && !record.verifyInputs && prepared->plan != nullptr && prepared->plan == resources.DirectBufferPlan(shaders) && !StorageTexture::DrawnLinearPending() && (!express->hasDepth || (DepthSurfacesSerial() == express->depthSerial && DepthSurfacesReleased() == express->depthReleased))) {
         if (const auto commands = recorder->AppendablePass(express->passKey); commands != VK_NULL_HANDLE) {
             if (auto* stream = CommandStream::FromHandle(commands); stream != nullptr) {
                 bool staged = true;
@@ -10354,7 +10434,7 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         const auto recorderId = conditionsRecorder;
         const auto generation = conditionsGeneration;
         AppendRefusal refusal = AppendRefusal::None;
-        if (prepared == nullptr || preparedInputs == nullptr || record.verifyBuffers || record.verifyInputs || !RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || prepared->plan == nullptr || prepared->plan != resources.DirectBufferPlan(shaders) || context.recorder == nullptr || !context.drawInputsInPlace) refusal = AppendRefusal::Prepared;
+        if (prepared == nullptr || preparedInputs == nullptr || record.verifyBuffers || record.verifyInputs || !RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || prepared->plan == nullptr || prepared->plan != resources.DirectBufferPlan(shaders) || context.recorder == nullptr || !preparedInputsUsable(context, *preparedInputs)) refusal = AppendRefusal::Prepared;
         else if (StorageTexture::DrawnLinearPending()) refusal = AppendRefusal::Linear;
         else if (recorder->AppendablePass(express->passKey) == VK_NULL_HANDLE || (draw.indirect && !recorder->PassIndirectReads())) refusal = AppendRefusal::Pass;
         else if (express->hasDepth && (DepthSurfacesSerial() != express->depthSerial || DepthSurfacesReleased() != express->depthReleased)) refusal = AppendRefusal::Depth;
@@ -10406,6 +10486,12 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
             for (std::size_t at = 0; refusal == AppendRefusal::None && at < taken.ranges.size(); ++at) {
                 const auto& range = taken.ranges[at];
                 const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+                if (range.source != nullptr) {
+                    // The proof calls the flush hook, which can end the pass the tests above held.
+                    if (!mirroredInputHolds(context, range, at < indexRanges)) refusal = AppendRefusal::Imports;
+                    else if (recorder->Id() != recorderId || recorder->RenderPassGeneration() != generation || recorder->AppendablePass(express->passKey) == VK_NULL_HANDLE) refusal = AppendRefusal::Pass;
+                    continue;
+                }
                 const bool vertexRange = at >= indexRanges && at + taken.indirectRanges < taken.ranges.size();
                 const bool rangeTrusted = vertexRange && (trusted || inputsCheck.Skip());
                 const bool rangeAnswered = validation && !rangeTrusted && range.import != nullptr && inputRangeAnswered(*recorder, range.begin, bytes, WriteValidation::Test::LeaderInputs);
@@ -10616,6 +10702,10 @@ ExpressOutcome ExpressCommit(const Context& context, const State& state, const P
         for (std::size_t at = 0; at < preparedInputs->ranges.size(); ++at) {
             const auto& range = preparedInputs->ranges[at];
             const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+            if (range.source != nullptr) {
+                recorder->Keep(range.source);
+                continue;
+            }
             if (!guardsSkipped && !inputsAnswered && at + preparedInputs->indirectRanges < preparedInputs->ranges.size() && !(validation && inputGuardsAnswered(recorder, range.begin, bytes, WriteValidation::Test::LeaderGuards))) requireInputGuards(&inputsCheck, range.begin, bytes, at == 0 && draw.indexed ? "an index buffer read" : "a vertex buffer read");
             recorder->NotePendingRead(range.begin, bytes, Recorder::ReadKind::DrawInput);
         }
@@ -11139,7 +11229,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
             templateMiss = missed;
         }
         if (first) mark(2);
-        if (!RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || prepared.plan == nullptr || prepared.plan != resources.DirectBufferPlan(shaders) || !context.drawInputsInPlace) return ExpressRunRefusal::Prepared;
+        if (!RuntimeSwitches::Set(RuntimeSwitch::DirectBuffers) || !RuntimeSwitches::Set(RuntimeSwitch::DirectInputs) || prepared.plan == nullptr || prepared.plan != resources.DirectBufferPlan(shaders) || !preparedInputsUsable(context, preparedInputs)) return ExpressRunRefusal::Prepared;
         const std::size_t indexRanges = draw.indexed ? 1u : 0u;
         if (preparedInputs.recipe.get() != recipe || preparedInputs.device != context.device || preparedInputs.state != &state || preparedInputs.draw != &draw || preparedInputs.shaders != shaders.data() || preparedInputs.stages != shaders.size() || preparedInputs.ranges.size() < indexRanges || (preparedInputs.forget & 1u) != 0 || forget != preparedInputs.forget || imports != preparedInputs.imports || mapping != preparedInputs.mapping) return ExpressRunRefusal::Inputs;
         if (trusted) NoteCommitterTrusted(2);
@@ -11187,6 +11277,10 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
         if (trusted) NoteCommitterTrusted();
         for (const auto& range : preparedInputs.ranges) {
             const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+            if (range.source != nullptr) {
+                if (!mirroredInputHolds(context, range, draw.indexed && &range == &preparedInputs.ranges.front())) return ExpressRunRefusal::Inputs;
+                continue;
+            }
             if (range.import == nullptr) return ExpressRunRefusal::Inputs;
             const bool vertexRange = !draw.indexed || &range != &preparedInputs.ranges.front();
             if (vertexRange && (trusted || inputsCheck.Skip())) continue;
@@ -11335,6 +11429,7 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     for (std::size_t at = 0; !guardsSkipped && !inputsAnswered && at < preparedInputs.ranges.size(); ++at) {
         const auto& range = preparedInputs.ranges[at];
         const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+        if (range.source != nullptr) continue;
         if (validation && inputGuardsAnswered(recorder, range.begin, bytes, WriteValidation::Test::FollowerGuards)) continue;
         if (windows && runWindowsClear(run, *recorder, WindowFact::DepthReads, range.begin, bytes) && runWindowsClear(run, *recorder, WindowFact::MultisampleSpans, range.begin, bytes)) {
             if (!windowVerifyDue()) continue;
@@ -11359,6 +11454,10 @@ bool ExpressFollowCommit(const Context& context, const State& state, const Pm4::
     const auto batch = recorder->OpenSerial();
     keyRunRanges(run.noted, recorderId, batch, recorder->OpenBatchGeneration(), 0);
     for (const auto& range : preparedInputs.ranges) {
+        if (range.source != nullptr) {
+            recorder->Keep(range.source);
+            continue;
+        }
         if (runRangesHold(run.noted, range.begin, range.end, false)) {
             ++run.census.readsSkipped;
             continue;

@@ -268,6 +268,7 @@ enum class RuntimeSwitch : std::size_t {
     SkipPendingPipelines,
     ImportAhead,
     ChangedCopyLazyRead,
+    MirroredInputs,
     Count,
 };
 

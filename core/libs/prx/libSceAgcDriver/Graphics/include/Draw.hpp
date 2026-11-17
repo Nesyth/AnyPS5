@@ -93,6 +93,13 @@ struct PreparedInputs {
         const HostImport* import = nullptr;
         VkBuffer handle = VK_NULL_HANDLE;
         VkDeviceSize offset = 0;
+        // APS5_MIRRORED_INPUTS, where draw inputs are not bound in place: `source` is the published copy
+        // bound instead of an import (handle and offset are its own) and `ticket` what the commit proves
+        // it by (Recorder::PublishedDrawInputHolds); `small` marks an import bound under the
+        // Context::drawInputsInPlaceBelow rule, which the commit applies again.
+        std::shared_ptr<Buffer> source;
+        Recorder::DrawInputTicket ticket;
+        bool small = false;
     };
     Refusal refusal = Refusal::None;
     std::shared_ptr<const DrawRecipe> recipe;
@@ -113,6 +120,9 @@ struct PreparedInputs {
     std::vector<Range> ranges;
     std::size_t indirectRanges = 0;
     bool exactCapacity = false;
+    // Prepared under APS5_MIRRORED_INPUTS: every range is a published copy or a small import, and
+    // inPlaceReads lists the imports only.
+    bool mirrored = false;
     GuardAnswer guardAnswer;
 };
 bool PrepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::shared_ptr<const DrawRecipe> recipe, PreparedInputs& prepared);
