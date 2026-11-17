@@ -25,10 +25,12 @@ void main() {
     if (index >= parameters.count) return;
     uint value = parameters.result.words[index];
     uint before = parameters.snapshot.words[index];
+    bool storeAll = (parameters.always & 1u) != 0u;
+    if (!storeAll && (parameters.always & 2u) != 0u && value == before) return;
     uint held = parameters.target.words[index];
     uint changed = differingBytes(value ^ before);
     uint kept = differingBytes(held ^ before);
-    uint stored = parameters.always != 0u ? 0xffffffffu : changed & ~kept;
+    uint stored = storeAll ? 0xffffffffu : changed & ~kept;
     if (stored != 0u) parameters.target.words[index] = (held & ~stored) | (value & stored);
     if (uint64_t(parameters.counter) != 0ul && (changed & kept) != 0u) atomicAdd(parameters.counter.words[0], 1u);
 }

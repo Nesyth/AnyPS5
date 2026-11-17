@@ -1133,7 +1133,7 @@ void copiedWriteBackTests(const Device& device, Recorder& recorder) {
     std::cout << "Copied write-backs keep the bytes the CPU wrote after the upload\n";
 }
 
-void changedCopyTests(const Device& device, Recorder& recorder) {
+void changedCopyPass(const Device& device, Recorder& recorder) {
     Require(recorder.Idle(), "the changed copy test needs an idle recorder");
     constexpr std::uint32_t words = 70000;
     constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -1206,6 +1206,16 @@ void changedCopyTests(const Device& device, Recorder& recorder) {
     for (std::uint32_t i = 0; i < words; ++i) {
         Require(stored[i] == expected[i], "changed copy word " + std::to_string(i) + " after a lead: " + std::to_string(stored[i]) + ", expected " + std::to_string(expected[i]));
     }
+}
+
+void changedCopyTests(const Device& device, Recorder& recorder) {
+    const bool was = RuntimeSwitches::Set(RuntimeSwitch::ChangedCopyLazyRead);
+    for (const bool lazy : {false, true}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::ChangedCopyLazyRead, lazy);
+        changedCopyPass(device, recorder);
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::ChangedCopyLazyRead, was);
+    std::cout << "The changed copy stores the same words with and without the lazy read of the target\n";
 }
 
 void changedLineCensusTests(const Device& device, Recorder& recorder) {

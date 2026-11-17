@@ -3604,6 +3604,7 @@ bool Recorder::RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress resul
     }
     if (changedCopyState < 0) return false;
     static const bool alwaysCopy = std::getenv("APS5_CHANGED_COPY_ALWAYS") != nullptr;
+    const std::uint32_t mode = (alwaysCopy ? 1u : 0u) | (RuntimeSwitches::Set(RuntimeSwitch::ChangedCopyLazyRead) ? 2u : 0u);
     bindPushOnlyPipeline(commands, changedCopyPipeline, changedCopyHeapPipeline);
     const auto perDispatch = static_cast<std::uint32_t>(std::min<std::uint64_t>(std::uint64_t{context.limits.maxComputeWorkGroupCount[0]} * GroupSize, std::numeric_limits<std::uint32_t>::max() - GroupSize));
     for (std::uint32_t done = 0; done < dwords;) {
@@ -3615,7 +3616,7 @@ bool Recorder::RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress resul
             VkDeviceAddress counter;
             std::uint32_t count;
             std::uint32_t always;
-        } parameters{result + VkDeviceAddress{done} * 4u, snapshot + VkDeviceAddress{done} * 4u, target + VkDeviceAddress{done} * 4u, counter, count, alwaysCopy ? 1u : 0u};
+        } parameters{result + VkDeviceAddress{done} * 4u, snapshot + VkDeviceAddress{done} * 4u, target + VkDeviceAddress{done} * 4u, counter, count, mode};
         static_assert(sizeof(parameters) == PushBytes);
         pushOnlyParameters(commands, changedCopyHeapPipeline, changedCopyLayout, PushBytes, &parameters);
         function(cmdDispatch, "vkCmdDispatch")(commands, (count + GroupSize - 1) / GroupSize, 1, 1);
