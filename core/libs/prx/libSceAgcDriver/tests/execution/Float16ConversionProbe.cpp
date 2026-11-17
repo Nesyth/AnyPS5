@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
+#include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -43,6 +44,11 @@ alignas(256) constexpr std::array<std::uint32_t, 11> RoundTripCode{
 
 alignas(256) constexpr std::array<std::uint32_t, 10> NarrowTowardZeroCode{
     0x34020082u, 0x8f098708u, 0x4a020209u, 0xe0301000u, 0x80000401u, 0xbf8c3f70u, 0x5e0a0904u, 0xe0701000u,
+    0x80010501u, 0xbf810000u,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 10> NarrowTowardZeroConstantCode{
+    0x34020082u, 0x8f098708u, 0x4a020209u, 0xe0301000u, 0x80000401u, 0xbf8c3f70u, 0x5e0a08f0u, 0xe0701000u,
     0x80010501u, 0xbf810000u,
 };
 
@@ -119,6 +125,7 @@ struct Spirv {
     std::uint32_t selects = 0;
     std::uint32_t floatConverts = 0;
     std::uint32_t widenings = 0;
+    std::uint32_t halfPacks = 0;
 };
 
 Spirv Scan(std::span<const std::uint32_t> words) {
@@ -131,6 +138,7 @@ Spirv Scan(std::span<const std::uint32_t> words) {
         Require(count != 0 && cursor + count <= words.size(), "f16 conversion probe: malformed SPIR-V");
         if (opcode == spv::OpSelect) ++scan.selects;
         if (opcode == spv::OpFConvert) ++scan.floatConverts;
+        if (opcode == spv::OpExtInst && count >= 5u && words[cursor + 4u] == GLSLstd450PackHalf2x16) ++scan.halfPacks;
         if (opcode == spv::OpTypeFloat && count >= 3u && words[cursor + 2u] == 32u) f32Types.push_back(words[cursor + 1u]);
         if (opcode == spv::OpFConvert && count >= 4u && std::ranges::find(f32Types, words[cursor + 1u]) != f32Types.end()) widenings.push_back(words[cursor + 2u]);
         cursor += count;
@@ -183,6 +191,16 @@ void VerifySpirv() {
     Require(narrowNative.selects + 1u == narrowEmulated.selects, "f16 conversion probe: v_cvt_f16_f32 with float16NarrowNans has " + std::to_string(narrowNative.selects) + " selects, without " + std::to_string(narrowEmulated.selects) + ", expected one fewer");
     const auto towardZero = scan(NarrowTowardZeroCode, true);
     Require(towardZero.widenings == 0u, "f16 conversion probe: v_cvt_pkrtz_f16_f32 with float16NarrowNans widens " + std::to_string(towardZero.widenings) + " f16 values to f32 with OpFConvert, which drivers fold with the narrowing");
+    Require(towardZero.halfPacks == 0u, "f16 conversion probe: v_cvt_pkrtz_f16_f32 without float16PackTowardZero uses PackHalf2x16");
+    target.float16PackTowardZero = ShaderRecompiler::PackTowardZeroHalf2x16;
+    const auto packed = scan(NarrowTowardZeroCode, true);
+    Require(packed.halfPacks == 1u && packed.floatConverts == 0u, "f16 conversion probe: v_cvt_pkrtz_f16_f32 with float16PackTowardZero has " + std::to_string(packed.halfPacks) + " PackHalf2x16 and " + std::to_string(packed.floatConverts) + " OpFConvert, expected one and none");
+    const auto constantOperand = scan(NarrowTowardZeroConstantCode, true);
+    Require(constantOperand.halfPacks == 0u, "f16 conversion probe: v_cvt_pkrtz_f16_f32 of the constant 0.5 and a loaded value uses PackHalf2x16 with float16PackTowardZero, expected the emulated narrowing");
+    target.float16PackTowardZero = ShaderRecompiler::PackTowardZeroHalf2x16 | ShaderRecompiler::PackTowardZeroDifference;
+    const auto difference = scan(NarrowTowardZeroCode, true);
+    Require(difference.halfPacks == 1u && difference.floatConverts == towardZero.floatConverts, "f16 conversion probe: the difference form of v_cvt_pkrtz_f16_f32 does not hold both the emulated and the native narrowing");
+    target.float16PackTowardZero = 0u;
 }
 
 struct Tally {
@@ -261,10 +279,20 @@ int main(int argc, char** argv) {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const auto target = device->Target();
-        const bool widen = target.float16DenormPreserve;
+        const bool widen = target.float16DenormPreserve || target.float16NativeWiden;
         const bool narrow = TargetHasCapability(target, spv::CapabilityFloat16) && TargetHasCapability(target, spv::CapabilityRoundingModeRTE) && TargetHasCapability(target, spv::CapabilityDenormPreserve);
         if (widen) Widen(*device, target);
         if (narrow) Narrow(*device, target);
+        if (target.float16NativeWiden && !target.float16DenormPreserve) {
+            const auto probe = AgcDriver::ProbeFloat16NativeWiden(*device, target);
+            std::printf("UnpackHalf2x16 under DenormPreserve 16 and 64 vs the integer decode: %u of %u probe results differ\n", probe.mismatches, probe.compared);
+            Require(probe.compared != 0u && probe.mismatches == 0u, "f16 conversion probe: the device uses native f16 to f32 widening whose results differ from the integer decode");
+        }
+        if (target.float16PackTowardZero != 0u) {
+            const auto probe = AgcDriver::ProbeFloat16PackTowardZero(*device, target);
+            std::printf("v_cvt_pkrtz_f16_f32 form %u vs the emulated narrowing: %llu of %llu probe results differ in %u float modes\n", target.float16PackTowardZero, static_cast<unsigned long long>(probe.mismatches), static_cast<unsigned long long>(probe.compared), probe.modes);
+            Require(probe.mismatches == 0u && probe.form == target.float16PackTowardZero, "f16 conversion probe: the device uses a native toward-zero narrowing whose results differ from the emulated one");
+        }
         std::printf("f16 conversion probe tests passed (%s, %s)\n", widen ? "f16 to f32 compared" : "no native f16 to f32", narrow ? "f32 to f16 compared" : "no native f32 to f16");
         return 0;
     } catch (const std::exception& error) {

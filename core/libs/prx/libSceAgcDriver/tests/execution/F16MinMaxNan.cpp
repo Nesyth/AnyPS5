@@ -745,6 +745,7 @@ std::uint32_t Chunk = 0;
 bool Ieee = false;
 std::uint32_t Denorm16 = 4u;
 std::uint32_t SourceForm = 0u;
+bool WordForms = false;
 constexpr const char* Names[7] = {
     "v_min_f16 v10, v4, v5",
     "v_max_f16 v11, v4, v5",
@@ -793,7 +794,7 @@ void Run(AgcDriver::VulkanDevice& device) {
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
-        device.Target(),
+        WordForms ? WithFloat16Forms(device) : WithoutFloat16Forms(device.Target()),
         {0, 0, 0, 128}
     };
     request.useCache = false;
@@ -828,21 +829,26 @@ void Check() {
 
 int main() {
     try {
+        RequestFloat16FormProbes();
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        for (const bool ieee : {false, true}) {
-            Ieee = ieee;
-            for (Chunk = 0; Chunk < Chunks; ++Chunk) {
-                Run(*device);
-                Check();
-            }
-            for (SourceForm = 0u; SourceForm < 3u; ++SourceForm) {
-                for (Denorm16 = 0u; Denorm16 < 4u; ++Denorm16) {
+        for (const bool wordForms : {false, true}) {
+            WordForms = wordForms;
+            for (const bool ieee : {false, true}) {
+                Ieee = ieee;
+                Denorm16 = 4u;
+                for (Chunk = 0; Chunk < Chunks; ++Chunk) {
                     Run(*device);
                     Check();
                 }
+                for (SourceForm = 0u; SourceForm < 3u; ++SourceForm) {
+                    for (Denorm16 = 0u; Denorm16 < 4u; ++Denorm16) {
+                        Run(*device);
+                        Check();
+                    }
+                }
+                SourceForm = 0u;
             }
-            SourceForm = 0u;
         }
         std::puts("f16 min max nan tests passed");
         return 0;

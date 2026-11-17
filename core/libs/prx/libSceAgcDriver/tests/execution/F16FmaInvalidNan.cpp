@@ -75,7 +75,7 @@ std::string Hex(std::uint32_t value) {
     return text;
 }
 
-void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, const Rows& rows, const Mode& mode) {
+void Run(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target, std::span<const std::uint32_t> code, const Rows& rows, const Mode& mode) {
     for (std::uint32_t tid = 0; tid < Threads; ++tid) {
         std::copy(rows[tid].begin(), rows[tid].end(), &Input[tid * Inputs]);
         Input[tid * Inputs + 3u] = 0u;
@@ -91,7 +91,7 @@ void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, c
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
-        device.Target(),
+        target,
         {0, 0, 0, 128}
     };
     request.useCache = false;
@@ -114,8 +114,10 @@ void Check(const Mode& mode, const Rows& rows, const char* const (&names)[Result
 
 int main() {
     try {
+        RequestFloat16FormProbes();
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        const std::array<ShaderRecompiler::SpirvTarget, 2> targets{WithoutFloat16Forms(device->Target()), WithFloat16Forms(*device)};
         const Mode modes[] = {
             {"without a known float mode", std::nullopt},
             {"with denormals flushed, IEEE mode off", ShaderRecompiler::ShaderFloatMode{0x00u, true, false, false}},
@@ -125,12 +127,14 @@ int main() {
         };
         constexpr const char* FmaNames[Results] = {"v_fma_f16", "v_fmac_f16"};
         constexpr const char* MixNames[Results] = {"v_fma_mix_f32 of three f16 sources", "v_fma_mix_f32 of an f16, an f32 and an f16 source"};
-        for (const Mode& mode : modes) {
-            Run(*device, FmaCode, FmaRows, mode);
-            Check(mode, FmaRows, FmaNames, 0xfe00u);
-            if (!mode.value) continue;
-            Run(*device, MixCode, MixRows, mode);
-            Check(mode, MixRows, MixNames, 0xffc00000u);
+        for (const auto& target : targets) {
+            for (const Mode& mode : modes) {
+                Run(*device, target, FmaCode, FmaRows, mode);
+                Check(mode, FmaRows, FmaNames, 0xfe00u);
+                if (!mode.value) continue;
+                Run(*device, target, MixCode, MixRows, mode);
+                Check(mode, MixRows, MixNames, 0xffc00000u);
+            }
         }
         std::puts("f16 fma invalid operation NaN tests passed");
         return 0;

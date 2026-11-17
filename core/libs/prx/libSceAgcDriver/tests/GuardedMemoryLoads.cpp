@@ -1,6 +1,7 @@
 #define SPV_ENABLE_UTILITY_CODE
 #include <spirv/unified1/spirv.hpp>
 #undef SPV_ENABLE_UTILITY_CODE
+#include <spirv/unified1/GLSL.std.450.h>
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "SpirvBackend/SpirvEmitter.hpp"
@@ -40,7 +41,7 @@ struct LoadCase {
     bool written = false;
 };
 
-std::vector<std::uint32_t> emitLoad(const LoadCase& test, bool active, std::uint32_t offset, std::uint32_t records, bool robust, bool exact = false, bool valid = true) {
+std::vector<std::uint32_t> emitLoad(const LoadCase& test, bool active, std::uint32_t offset, std::uint32_t records, bool robust, bool exact = false, bool valid = true, bool align4 = false) {
     IrProgram program;
     program.SetWaveSize(32);
     program.Resources().stage = test.stage;
@@ -77,7 +78,7 @@ std::vector<std::uint32_t> emitLoad(const LoadCase& test, bool active, std::uint
         program.Info().scratchDwords = 16;
         auto& handle = emit(IrOpcode::GetScratchResource, IrType::AddressResource, {});
         emit(test.opcode, test.type, {&handle, &address, &zero, &enabled});
-    } else if (test.kind == ResourceKind::Buffer) {
+    } else if (test.kind == ResourceKind::Buffer || test.kind == ResourceKind::ScalarBuffer) {
         program.Resources().memoryInfo.front().coherent = test.coherent;
         program.Info().buffers.emplace_back().read = true;
         program.Info().buffers.front().written = test.written;
@@ -87,7 +88,8 @@ std::vector<std::uint32_t> emitLoad(const LoadCase& test, bool active, std::uint
         auto& size = constant(records);
         auto& base = constant(valid ? 0x100u : 0u);
         auto& handle = emit(IrOpcode::GetBufferResource, IrType::BufferResource, {&base, &zero, &size, &zero});
-        emit(test.opcode, test.type, {&handle, &zero, &address, &zero, &enabled});
+        if (test.kind == ResourceKind::ScalarBuffer) emit(test.opcode, test.type, {&handle, &address});
+        else emit(test.opcode, test.type, {&handle, &zero, &address, &zero, &enabled});
     } else {
         if (test.kind == ResourceKind::Gds) program.Metadata().bindings.descriptors.push_back({DescriptorBindingKind::Gds, {0}});
         emit(test.opcode, test.type, {&address, &enabled});
@@ -112,6 +114,9 @@ std::vector<std::uint32_t> emitLoad(const LoadCase& test, bool active, std::uint
     target.subgroupSize = 32;
     target.robustBufferAccess2 = robust;
     target.exactRobustLoads = exact;
+    target.exactRobustLoadsAlign4 = align4;
+    static constexpr std::array<std::uint32_t, 1> Int64Capability{spv::CapabilityInt64};
+    if (test.kind == ResourceKind::ScalarBuffer) target.supportedCapabilities = Int64Capability;
     return SpirvEmitter().Emit(program, inputs, bindings, target);
 }
 
@@ -264,6 +269,9 @@ private:
             require(isGuestPointer(instruction[3]), "unknown array length in access fixture");
             return rootName(instruction[3]) == "scratch_pool" ? PoolDwords : 16;
         case spv::OpUDiv: return argument(3) / argument(4);
+        case spv::OpExtInst:
+            require(instruction.size() == 7 && instruction[4] == GLSLstd450UMin, "unsupported extended instruction in access condition");
+            return std::min(argument(5), argument(6));
         case spv::OpAtomicIDecrement: return 0;
         case spv::OpLoad:
             require(!isGuestPointer(instruction[3]), "guest data unexpectedly controls a fixture access");
@@ -389,26 +397,51 @@ int main() {
                 for (const std::uint32_t records : {32u, 64u, 128u}) {
                     for (const std::uint32_t misalignment : {0u, 1u, 2u, 3u}) {
                         for (const bool valid : {false, true}) {
-                            const auto checked = emitLoad(test, active, offset, records, true, false, valid);
-                            const auto exact = emitLoad(test, active, offset, records, true, true, valid);
-                            const auto expected = effective(AccessTrace(checked, misalignment).Run());
-                            const auto actual = effective(AccessTrace(exact, misalignment).Run());
-                            if (actual != expected) {
-                                std::string detail = "exact reads differ at offset " + std::to_string(offset) + " records " + std::to_string(records) + " misalignment " + std::to_string(misalignment) + " active " + std::to_string(active) + " valid " + std::to_string(valid) + ":";
-                                for (const auto index : actual) detail += " " + std::to_string(index);
-                                detail += "; checked:";
-                                for (const auto index : expected) detail += " " + std::to_string(index);
-                                throw std::runtime_error(detail);
+                            for (const bool align4 : {false, true}) {
+                                const auto checked = emitLoad(test, active, offset, records, true, false, valid);
+                                const auto exact = emitLoad(test, active, offset, records, true, true, valid, align4);
+                                const auto expected = effective(AccessTrace(checked, misalignment).Run());
+                                const auto actual = effective(AccessTrace(exact, misalignment).Run());
+                                if (actual != expected) {
+                                    std::string detail = "exact reads differ at offset " + std::to_string(offset) + " records " + std::to_string(records) + " misalignment " + std::to_string(misalignment) + " active " + std::to_string(active) + " valid " + std::to_string(valid) + " align4 " + std::to_string(align4) + ":";
+                                    for (const auto index : actual) detail += " " + std::to_string(index);
+                                    detail += "; checked:";
+                                    for (const auto index : expected) detail += " " + std::to_string(index);
+                                    throw std::runtime_error(detail);
+                                }
+                                ++compared;
                             }
-                            ++compared;
                         }
                     }
                 }
             }
         }
-        require(compared == 2u * 9u * 3u * 4u * 2u, "exact robust loads: the comparison grid shrank");
+        require(compared == 2u * 9u * 3u * 4u * 2u * 2u, "exact robust loads: the comparison grid shrank");
         const auto plain = emitLoad(test, true, 8, 64, false, true);
         require(AccessTrace(plain, 0).Run() == std::vector<std::uint32_t>({2}), "exact request without robustBufferAccess2 changed the plain variant");
+    });
+    run("exact robust scalar loads of a whole V# at alignment 4 read what the checked variant reads", [] {
+        const LoadCase test{ResourceKind::ScalarBuffer, IrOpcode::ReadConstBuffer, IrType::U32};
+        const auto effective = [](std::vector<std::uint32_t> reads) {
+            for (auto& index : reads) if (index >= 16u) index = Unreachable;
+            return reads;
+        };
+        unsigned compared = 0;
+        for (const std::uint32_t offset : {0u, 4u, 8u, 56u, 60u, 64u, 68u, 4092u, 0xfffffffcu}) {
+            for (const std::uint32_t records : {32u, 64u, 128u}) {
+                const auto expected = effective(AccessTrace(emitLoad(test, true, offset, records, true, false), 0).Run());
+                const auto actual = effective(AccessTrace(emitLoad(test, true, offset, records, true, true, true, true), 0).Run());
+                if (actual != expected || actual.empty()) {
+                    std::string detail = "exact scalar reads differ at offset " + std::to_string(offset) + " records " + std::to_string(records) + ":";
+                    for (const auto index : actual) detail += " " + std::to_string(index);
+                    detail += "; checked:";
+                    for (const auto index : expected) detail += " " + std::to_string(index);
+                    throw std::runtime_error(detail);
+                }
+                ++compared;
+            }
+        }
+        require(compared == 9u * 3u, "exact robust scalar loads: the comparison grid shrank");
     });
     run("read-only pixel robust buffer result", [] {
         const auto selections = [](const std::vector<std::uint32_t>& module) {

@@ -52,6 +52,9 @@ struct SpirvTargetOptions {
     bool meshWindowBuffer = false;
     bool float16WidenNans = false;
     bool float16NarrowNans = false;
+    bool float16NativeWiden = false;
+    std::uint32_t float16PackTowardZero = 0;
+    bool exactRobustLoadsAlign4 = false;
 };
 
 struct SpirvEmitInfo {

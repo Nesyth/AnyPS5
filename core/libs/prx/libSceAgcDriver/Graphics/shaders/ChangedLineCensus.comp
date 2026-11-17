@@ -1,0 +1,40 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 128) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint words[]; };
+layout(push_constant) uniform Parameters {
+    Words result;
+    Words snapshot;
+    Words counter;
+    uint count;
+    uint lead;
+    uint base;
+    uint unused;
+} parameters;
+
+shared uint changedLines[4];
+shared uint changedWords;
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    if (lane < 4u) changedLines[lane] = 0u;
+    if (lane == 0u) changedWords = 0u;
+    memoryBarrierShared();
+    barrier();
+    uint position = parameters.base + gl_GlobalInvocationID.x;
+    if (position >= parameters.lead && position - parameters.lead < parameters.count) {
+        uint index = position - parameters.lead;
+        if (parameters.result.words[index] != parameters.snapshot.words[index]) {
+            atomicOr(changedLines[lane / 32u], 1u);
+            atomicAdd(changedWords, 1u);
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+    if (lane == 0u) {
+        uint lines = changedLines[0] + changedLines[1] + changedLines[2] + changedLines[3];
+        if (lines != 0u) atomicAdd(parameters.counter.words[0], lines);
+        if (changedWords != 0u) atomicAdd(parameters.counter.words[1], changedWords);
+    }
+}

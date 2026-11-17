@@ -257,6 +257,7 @@ enum class RuntimeSwitch : std::size_t {
     SpreadDestruction,
     StorageCopyRelease,
     SkipPendingPipelines,
+    ImportAhead,
     Count,
 };
 

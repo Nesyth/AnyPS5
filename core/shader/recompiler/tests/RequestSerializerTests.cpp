@@ -286,7 +286,7 @@ void VerifyDeviceImageTablesField(const ShaderRecompiler::RequestSerializer& ser
     const auto replay = serializer.Deserialize(encoded);
     Require(replay.request.target.deviceImageTables && serializer.Serialize(replay.request) == encoded);
     Require(!serializer.Deserialize(EncodeBase64(defaultBytes)).request.target.deviceImageTables);
-    for (const std::uint8_t version : {57u, 58u, 59u, 62u}) {
+    for (const std::uint8_t version : {57u, 58u, 59u, 63u}) {
         auto foreign = bytes;
         foreign[4] = version;
         bool refused = false;
@@ -297,6 +297,92 @@ void VerifyDeviceImageTablesField(const ShaderRecompiler::RequestSerializer& ser
         }
         Require(refused);
     }
+}
+
+void VerifyFloat16FormFields(const ShaderRecompiler::RequestSerializer& serializer) {
+    const ShaderRecompiler::RecompileRequest defaults{};
+    const auto defaultEncoded = serializer.Serialize(defaults);
+    const auto defaultBytes = DecodeBase64(defaultEncoded);
+    Require(defaultBytes[4] == 56u);
+    struct Forms {
+        bool wholeRegister;
+        bool scalarOnVector;
+        bool nativeMinMax;
+        bool deviceImageTables;
+    };
+    constexpr std::array<Forms, 6> cases{{{true, false, false, false}, {false, true, false, false}, {false, false, true, false}, {true, true, true, false}, {true, false, true, true}, {false, true, false, true}}};
+    for (const auto& forms : cases) {
+        ShaderRecompiler::RecompileRequest request{};
+        request.target.float16WholeRegister = forms.wholeRegister;
+        request.target.float16ScalarOnVector = forms.scalarOnVector;
+        request.target.float16NativeMinMax = forms.nativeMinMax;
+        request.target.deviceImageTables = forms.deviceImageTables;
+        const auto encoded = serializer.Serialize(request);
+        const auto bytes = DecodeBase64(encoded);
+        Require(bytes[4] == 62u && bytes.size() == defaultBytes.size() + 31u);
+        Require(bytes[bytes.size() - 17u] == (forms.wholeRegister ? 1u : 0u) && bytes[bytes.size() - 16u] == (forms.scalarOnVector ? 1u : 0u) && bytes[bytes.size() - 15u] == (forms.nativeMinMax ? 1u : 0u) && bytes[bytes.size() - 18u] == (forms.deviceImageTables ? 1u : 0u));
+        const auto replay = serializer.Deserialize(encoded).request.target;
+        Require(replay.float16WholeRegister == forms.wholeRegister && replay.float16ScalarOnVector == forms.scalarOnVector && replay.float16NativeMinMax == forms.nativeMinMax && replay.deviceImageTables == forms.deviceImageTables);
+        Require(!replay.gpuResolvedImages && !replay.descriptorMemory && replay.heapDataUniformDwords == 0u && !replay.exactRobustLoads);
+        Require(serializer.Serialize(serializer.Deserialize(encoded).request) == encoded);
+        auto older = bytes;
+        older.resize(older.size() - 17u);
+        older[4] = 61u;
+        const auto version61 = serializer.Deserialize(EncodeBase64(older)).request.target;
+        Require(!version61.float16WholeRegister && !version61.float16ScalarOnVector && !version61.float16NativeMinMax && version61.deviceImageTables == forms.deviceImageTables);
+        auto truncated = bytes;
+        truncated.pop_back();
+        bool refused = false;
+        try {
+            static_cast<void>(serializer.Deserialize(EncodeBase64(truncated)));
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        Require(refused);
+    }
+    ShaderRecompiler::RecompileRequest tables{};
+    tables.target.deviceImageTables = true;
+    const auto tablesBytes = DecodeBase64(serializer.Serialize(tables));
+    Require(tablesBytes[4] == 61u && tablesBytes.size() == defaultBytes.size() + 14u);
+}
+
+void VerifyFloat32ExactnessFields(const ShaderRecompiler::RequestSerializer& serializer) {
+    const ShaderRecompiler::RecompileRequest defaults{};
+    const auto defaultBytes = DecodeBase64(serializer.Serialize(defaults));
+    Require(defaultBytes[4] == 56u);
+    using Field = std::uint32_t ShaderRecompiler::SpirvTarget::*;
+    constexpr std::array<Field, 2> fields{&ShaderRecompiler::SpirvTarget::float32HardwareFlushOps, &ShaderRecompiler::SpirvTarget::float32NativeUnaryOps};
+    constexpr std::array<std::uint32_t, 2> values{0x1u, 0x821u};
+    for (std::size_t chosen = 0; chosen <= fields.size(); ++chosen) {
+        for (const bool imageTables : {false, true}) {
+            ShaderRecompiler::RecompileRequest request{};
+            request.target.deviceImageTables = imageTables;
+            for (std::size_t index = 0; index < fields.size(); ++index) {
+                if (chosen == fields.size() || index == chosen) request.target.*fields[index] = values[index];
+            }
+            const auto encoded = serializer.Serialize(request);
+            const auto bytes = DecodeBase64(encoded);
+            Require(bytes[4] == 62u && bytes.size() == defaultBytes.size() + 31u && bytes[bytes.size() - 18u] == (imageTables ? 1u : 0u));
+            const auto replay = serializer.Deserialize(encoded);
+            for (std::size_t index = 0; index < fields.size(); ++index) Require(replay.request.target.*fields[index] == (chosen == fields.size() || index == chosen ? values[index] : 0u));
+            Require(replay.request.target.deviceImageTables == imageTables && serializer.Serialize(replay.request) == encoded);
+            auto older = bytes;
+            older.resize(older.size() - 17u);
+            older[4] = 61u;
+            const auto replay61 = serializer.Deserialize(EncodeBase64(older));
+            Require(replay61.request.target.deviceImageTables == imageTables && replay61.request.target.float32HardwareFlushOps == 0u && replay61.request.target.float32NativeUnaryOps == 0u);
+            auto truncated = bytes;
+            truncated.pop_back();
+            bool truncatedRejected = false;
+            try {
+                static_cast<void>(serializer.Deserialize(EncodeBase64(truncated)));
+            } catch (const std::runtime_error& error) {
+                truncatedRejected = std::string_view(error.what()) == "RequestSerializer: truncated data";
+            }
+            Require(truncatedRejected);
+        }
+    }
+    Require(DecodeBase64(serializer.Serialize(defaults)) == defaultBytes);
 }
 
 void VerifyKeyedTargetFields(const ShaderRecompiler::RequestSerializer& serializer) {
@@ -326,6 +412,55 @@ void VerifyKeyedTargetFields(const ShaderRecompiler::RequestSerializer& serializ
             auto other = request;
             other.target.*fields[index] = !(other.target.*fields[index]);
             Require(serializer.Serialize(other) != encoded);
+        }
+    }
+}
+
+void VerifyConversionFormFields(const ShaderRecompiler::RequestSerializer& serializer) {
+    const ShaderRecompiler::RecompileRequest defaults{};
+    const auto defaultBytes = DecodeBase64(serializer.Serialize(defaults));
+    Require(defaultBytes[4] == 56u);
+    const auto defaultTarget = serializer.Deserialize(EncodeBase64(defaultBytes)).request.target;
+    Require(!defaultTarget.float16NativeWiden && defaultTarget.float16PackTowardZero == 0u && !defaultTarget.exactRobustLoadsAlign4);
+    for (const bool images : {false, true}) {
+        for (const bool widen : {false, true}) {
+            for (const std::uint32_t pack : {0u, ShaderRecompiler::PackTowardZeroHalf2x16, ShaderRecompiler::PackTowardZeroHalf2x16 | ShaderRecompiler::PackTowardZeroDifference}) {
+                for (const bool align4 : {false, true}) {
+                    if (!widen && pack == 0u && !align4) continue;
+                    ShaderRecompiler::RecompileRequest request{};
+                    request.target.deviceImageTables = images;
+                    request.target.float16NativeWiden = widen;
+                    request.target.float16PackTowardZero = pack;
+                    request.target.exactRobustLoadsAlign4 = align4;
+                    const auto encoded = serializer.Serialize(request);
+                    auto bytes = DecodeBase64(encoded);
+                    Require(bytes[4] == 62u && bytes.size() == defaultBytes.size() + 31u);
+                    Require(bytes[bytes.size() - 18u] == (images ? 1u : 0u) && bytes[bytes.size() - 6u] == (widen ? 1u : 0u) && bytes.back() == (align4 ? 1u : 0u));
+                    const auto replay = serializer.Deserialize(encoded);
+                    Require(replay.request.target.float16NativeWiden == widen && replay.request.target.float16PackTowardZero == pack && replay.request.target.exactRobustLoadsAlign4 == align4 && replay.request.target.deviceImageTables == images);
+                    Require(serializer.Serialize(replay.request) == encoded);
+                    auto other = request;
+                    other.target.float16PackTowardZero = pack ^ 2u;
+                    Require(serializer.Serialize(other) != encoded);
+                    bytes.resize(bytes.size() - 17u);
+                    bytes[4] = 61u;
+                    const auto older = serializer.Deserialize(EncodeBase64(bytes)).request.target;
+                    Require(!older.float16NativeWiden && older.float16PackTowardZero == 0u && !older.exactRobustLoadsAlign4 && older.deviceImageTables == images);
+                    bytes.pop_back();
+                    bytes[4] = 60u;
+                    const auto oldest = serializer.Deserialize(EncodeBase64(bytes)).request.target;
+                    Require(!oldest.float16NativeWiden && oldest.float16PackTowardZero == 0u && !oldest.exactRobustLoadsAlign4 && !oldest.deviceImageTables);
+                    auto truncated = DecodeBase64(encoded);
+                    truncated.pop_back();
+                    bool refused = false;
+                    try {
+                        static_cast<void>(serializer.Deserialize(EncodeBase64(truncated)));
+                    } catch (const std::runtime_error& error) {
+                        refused = std::string_view(error.what()) == "RequestSerializer: truncated data";
+                    }
+                    Require(refused);
+                }
+            }
         }
     }
 }
@@ -1208,6 +1343,9 @@ int main() {
 
     VerifyHeapProfile(serializer);
     VerifyDeviceImageTablesField(serializer);
+    VerifyFloat16FormFields(serializer);
     VerifyKeyedTargetFields(serializer);
+    VerifyFloat32ExactnessFields(serializer);
+    VerifyConversionFormFields(serializer);
     return 0;
 }

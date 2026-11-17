@@ -916,8 +916,11 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    const bool targetTail = request.target.gpuResolvedImages || request.target.descriptorMemory || request.target.heapDataUniformDwords != 0u || request.target.ldsLockFences || request.target.meshWindowBuffer || request.target.waveLdsMemoryBarriers || request.target.deviceScopeLdsMemoryBarriers || request.target.exactRobustLoads || request.target.robustBufferAccess2 || request.target.heapBufferDescriptors || request.target.deviceImageTables;
-    writer.WriteU32(request.target.deviceImageTables ? 61u : targetTail ? 60u : 56u);
+    const bool float16Forms = request.target.float16WholeRegister || request.target.float16ScalarOnVector || request.target.float16NativeMinMax;
+    const bool float32Tail = request.target.float32HardwareFlushOps != 0u || request.target.float32NativeUnaryOps != 0u;
+    const bool formTail = request.target.float16NativeWiden || request.target.float16PackTowardZero != 0u || request.target.exactRobustLoadsAlign4;
+    const bool targetTail = request.target.gpuResolvedImages || request.target.descriptorMemory || request.target.heapDataUniformDwords != 0u || request.target.ldsLockFences || request.target.meshWindowBuffer || request.target.waveLdsMemoryBarriers || request.target.deviceScopeLdsMemoryBarriers || request.target.exactRobustLoads || request.target.robustBufferAccess2 || request.target.heapBufferDescriptors || request.target.deviceImageTables || float16Forms || float32Tail || formTail;
+    writer.WriteU32(float16Forms || float32Tail || formTail ? 62u : request.target.deviceImageTables ? 61u : targetTail ? 60u : 56u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -975,7 +978,17 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
         writer.WriteBool(request.target.exactRobustLoads);
         writer.WriteBool(request.target.robustBufferAccess2);
         writer.WriteBool(request.target.heapBufferDescriptors);
-        if (request.target.deviceImageTables) writer.WriteBool(true);
+        if (request.target.deviceImageTables || float16Forms || float32Tail || formTail) writer.WriteBool(request.target.deviceImageTables);
+    }
+    if (float16Forms || float32Tail || formTail) {
+        writer.WriteBool(request.target.float16WholeRegister);
+        writer.WriteBool(request.target.float16ScalarOnVector);
+        writer.WriteBool(request.target.float16NativeMinMax);
+        writer.WriteU32(request.target.float32HardwareFlushOps);
+        writer.WriteU32(request.target.float32NativeUnaryOps);
+        writer.WriteBool(request.target.float16NativeWiden);
+        writer.WriteU32(request.target.float16PackTowardZero);
+        writer.WriteBool(request.target.exactRobustLoadsAlign4);
     }
     if (request.context.compute.has_value()) {
         writer.WriteU32(request.context.compute->granulatedVgprCount);
@@ -989,7 +1002,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     Reader reader(decoded);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    if (version < 1u || version > 61u || version == 50u || version == 57u || version == 58u || version == 59u) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version < 1u || version > 62u || version == 50u || version == 57u || version == 58u || version == 59u) throw std::runtime_error("unsupported recompile request serialization version");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
     result.request.context = readGuestContext(reader, result, version);
@@ -1069,6 +1082,16 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.request.target.heapBufferDescriptors = reader.ReadBool();
     }
     if (version >= 61u) result.request.target.deviceImageTables = reader.ReadBool();
+    if (version >= 62u) {
+        result.request.target.float16WholeRegister = reader.ReadBool();
+        result.request.target.float16ScalarOnVector = reader.ReadBool();
+        result.request.target.float16NativeMinMax = reader.ReadBool();
+        result.request.target.float32HardwareFlushOps = reader.ReadU32();
+        result.request.target.float32NativeUnaryOps = reader.ReadU32();
+        result.request.target.float16NativeWiden = reader.ReadBool();
+        result.request.target.float16PackTowardZero = reader.ReadU32();
+        result.request.target.exactRobustLoadsAlign4 = reader.ReadBool();
+    }
     if (version >= 56u && result.request.context.compute.has_value()) {
         result.request.context.compute->granulatedVgprCount = reader.ReadU32();
         result.request.context.compute->sharedVgprBlocks = reader.ReadU32();

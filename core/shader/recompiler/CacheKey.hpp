@@ -400,6 +400,17 @@ private:
         append(key, value.float16NarrowNans);
         if (value.float32HostFmaNans) append(key, 0x46333246414e414eull);
         if (value.float32NativeMinMax) append(key, 0x46333246584d4e4dull);
+        if (value.float16WholeRegister) append(key, 0x4631365748524547ull);
+        if (value.float16ScalarOnVector) append(key, 0x4631365343564543ull);
+        if (value.float16NativeMinMax) append(key, 0x4631364e4d4e4d58ull);
+        if (value.float32HardwareFlushOps != 0u) append(key, std::array<std::uint64_t, 2>{0x4633324857464c55ull, value.float32HardwareFlushOps});
+        if (value.float32NativeUnaryOps != 0u) append(key, std::array<std::uint64_t, 2>{0x4633324e554e4152ull, value.float32NativeUnaryOps});
+        if (value.float16NativeWiden) append(key, 0x4631364e57494445ull);
+        if (value.float16PackTowardZero != 0u) {
+            append(key, 0x463136504b52545aull);
+            append(key, value.float16PackTowardZero);
+        }
+        if (value.exactRobustLoadsAlign4) append(key, 0x524f42414c494734ull);
     }
 };
 

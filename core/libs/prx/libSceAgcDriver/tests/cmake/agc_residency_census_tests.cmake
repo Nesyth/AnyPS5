@@ -1,0 +1,11 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_residency_census_tests tests/ResidencyCensus.cpp)
+    target_include_directories(agc_residency_census_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_residency_census_tests PRIVATE libc)
+    add_test(NAME agc_residency_census COMMAND agc_residency_census_tests)
+    set_tests_properties(agc_residency_census PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_residency_census PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

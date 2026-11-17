@@ -4,6 +4,7 @@
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
@@ -92,23 +93,32 @@ int main() {
         const std::span<const std::uint32_t> words(code);
         const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(words)}}};
         const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {true, false, false}, false, 1};
-        ShaderRecompiler::RecompileRequest request{
-            {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), words, 0, {}},
-            {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
-            device->Target(),
-            {0, 0, 0, 128}
+        const auto run = [&](const ShaderRecompiler::SpirvTarget& target) {
+            Output.fill(0xdeadbeefu);
+            ShaderRecompiler::RecompileRequest request{
+                {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), words, 0, {}},
+                {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
+                target,
+                {0, 0, 0, 128}
+            };
+            request.useCache = false;
+            request.context.floatMode = ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false};
+            const auto result = ShaderRecompiler::Recompile(request);
+            device->Dispatch(result, static_cast<std::uint32_t>(inputs.size() / Threads), 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+            device->WaitIdle();
+            return std::vector<std::uint32_t>(Output.begin(), Output.begin() + static_cast<std::ptrdiff_t>(inputs.size()));
         };
-        request.useCache = false;
-        request.context.floatMode = ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false};
-        const auto result = ShaderRecompiler::Recompile(request);
-        device->Dispatch(result, static_cast<std::uint32_t>(inputs.size() / Threads), 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
-        device->WaitIdle();
+        auto emulatedTarget = device->Target();
+        emulatedTarget.float16PackTowardZero = 0u;
+        const auto emulated = run(emulatedTarget);
+        const auto native = device->Target().float16PackTowardZero != 0u ? run(device->Target()) : emulated;
         for (std::size_t index = 0; index < inputs.size(); ++index) {
             const std::uint32_t source = inputs[index];
             const std::uint32_t expected = TowardZero(source) | (TowardZero(source ^ 0x80000000u) << 16u);
-            Require(Output[index] == expected, "f16 pack toward zero: v_cvt_pkrtz_f16_f32 of " + Hex(source) + ", -" + Hex(source) + " is " + Hex(Output[index]) + ", expected " + Hex(expected));
+            Require(emulated[index] == expected, "f16 pack toward zero: v_cvt_pkrtz_f16_f32 of " + Hex(source) + ", -" + Hex(source) + " is " + Hex(emulated[index]) + ", expected " + Hex(expected));
+            Require(native[index] == emulated[index], "f16 pack toward zero: v_cvt_pkrtz_f16_f32 form " + std::to_string(device->Target().float16PackTowardZero) + " of " + Hex(source) + ", -" + Hex(source) + " is " + Hex(native[index]) + ", the emulated form " + Hex(emulated[index]));
         }
-        std::printf("f16 pack toward zero tests passed (%zu inputs)\n", inputs.size());
+        std::printf("f16 pack toward zero tests passed (%zu inputs, %s)\n", inputs.size(), device->Target().float16PackTowardZero != 0u ? "emulated and native forms" : "emulated form only");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
+#include "Float32Exactness.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -439,6 +440,7 @@ void Run(AgcDriver::VulkanDevice& device, const std::optional<ShaderRecompiler::
     const auto result = ShaderRecompiler::Recompile(request);
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
+    Float32Exactness::Recheck(device, request, Output, {1u, 1u, 1u}, "F32DenormalFlush");
 }
 
 void Check(const char* mode) {

@@ -8,6 +8,7 @@
 #include "PipelineSpecialization.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
+#include <spirv/unified1/GLSL.std.450.h>
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -304,7 +305,7 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
     const auto next = EmitAddU32(state, index, ConstantU32(state, 1u));
     const auto last = Select(state, TypeU32(state), unaligned, next, index);
     const bool exact = state.exactRobustLoads && !access.physical && LoadsSelectable(state, access);
-    if (!exact && boundedEnable != 0u) enable = boundedEnable;
+    if ((!exact || state.exactRobustLoadsAlign4) && boundedEnable != 0u) enable = boundedEnable;
     const auto bounds = exact ? 0u : EmitMemoryElementInBounds(state, access, last);
     const auto inBounds = exact ? 0u : (enable != 0u ? both(state, enable, bounds) : bounds);
     const auto load = [&](std::uint32_t word) {
@@ -332,8 +333,24 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
             const auto nextFits = Binary(state, spv::OpLogicalOr, TypeBool(state), Unary(state, spv::OpLogicalNot, TypeBool(state), unaligned), EmitMemoryElementInBounds(state, access, next));
             guard = guard != 0u ? both(state, guard, nextFits) : nextFits;
         }
-        const auto lowIndex = guard != 0u ? GuardedElementIndex(state, access, guard, index) : index;
-        const auto highIndex = Select(state, TypeU32(state), guard != 0u ? both(state, guard, unaligned) : unaligned, next, lowIndex);
+        if (!state.exactRobustLoadsAlign4) {
+            const auto lowIndex = guard != 0u ? GuardedElementIndex(state, access, guard, index) : index;
+            const auto highIndex = Select(state, TypeU32(state), guard != 0u ? both(state, guard, unaligned) : unaligned, next, lowIndex);
+            const auto low = Binary(state, spv::OpShiftRightLogical, TypeU32(state), load(lowIndex), shift);
+            const auto high = EmitValueOrZero(state, unaligned, Binary(state, spv::OpShiftLeftLogical, TypeU32(state), load(highIndex), highShift));
+            return combine(low, high);
+        }
+        const auto glsl = GlslStd450(state);
+        const auto lastWord = ConstantU32(state, 0x3fffffffu);
+        const auto bounded = [&](std::uint32_t word) {
+            const auto result = state.module.AllocateId();
+            state.module.AddFunction(spv::OpExtInst, TypeU32(state), result, glsl, GLSLstd450UMin, word, lastWord);
+            return result;
+        };
+        const auto lowIndex = bounded(guard != 0u ? GuardedElementIndex(state, access, guard, index) : index);
+        const auto highCondition = guard != 0u ? both(state, guard, unaligned) : unaligned;
+        const auto highWord = bounded(next);
+        const auto highIndex = Select(state, TypeU32(state), highCondition, highWord, lowIndex);
         const auto low = Binary(state, spv::OpShiftRightLogical, TypeU32(state), load(lowIndex), shift);
         const auto high = EmitValueOrZero(state, unaligned, Binary(state, spv::OpShiftLeftLogical, TypeU32(state), load(highIndex), highShift));
         return combine(low, high);

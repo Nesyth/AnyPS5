@@ -487,6 +487,11 @@ enum class IrOpcode : std::uint16_t {
     InstPrefetch,
     SelectU32,
     ImageBvhIntersectRay,
+    Shuffle16x2,
+    FPNanSelect16x2,
+    FPOverflowClamp16x2,
+    FPSaturate16x2,
+    FPMinMax16x2,
     Count
 };
 

@@ -931,6 +931,9 @@ void verifyKeySensitivity() {
     changes("the push constant offset", [](SampleRequest& sample) { sample.request.layout.pushConstantOffsetBytes = 16; });
     changes("the push constant size", [](SampleRequest& sample) { sample.request.layout.pushConstantSizeBytes = 64; });
     changes("a float mode", [](SampleRequest& sample) { sample.request.context.floatMode = ShaderFloatMode{}; });
+    changes("native f16 widening", [](SampleRequest& sample) { sample.request.target.float16NativeWiden = true; });
+    changes("the toward-zero f16 narrowing form", [](SampleRequest& sample) { sample.request.target.float16PackTowardZero = PackTowardZeroHalf2x16; });
+    changes("exact robust loads at alignment 4", [](SampleRequest& sample) { sample.request.target.exactRobustLoadsAlign4 = true; });
     const ShaderFloatMode astroMode{0xc0u, true, false, false};
     const auto withMode = [&](const ShaderFloatMode& mode) {
         SampleRequest sample;

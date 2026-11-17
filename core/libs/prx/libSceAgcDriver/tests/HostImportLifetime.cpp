@@ -3,8 +3,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -776,6 +778,70 @@ void reimportRefusedWhileWaiting(Fixture& fixture) {
     mutationRace = nullptr;
 }
 
+class ImportAheadSwitch {
+public:
+    ImportAheadSwitch() : was(RuntimeSwitches::Set(RuntimeSwitch::ImportAhead)) {
+        RuntimeSwitches::Assign(RuntimeSwitch::ImportAhead, true);
+    }
+    ~ImportAheadSwitch() {
+        RuntimeSwitches::Assign(RuntimeSwitch::ImportAhead, was);
+    }
+    ImportAheadSwitch(const ImportAheadSwitch&) = delete;
+    ImportAheadSwitch& operator=(const ImportAheadSwitch&) = delete;
+
+private:
+    bool was;
+};
+
+std::vector<std::shared_ptr<ImportState>> liveImportsAt(Fixture& fixture, std::uint64_t address) {
+    std::vector<std::shared_ptr<ImportState>> live;
+    std::lock_guard lock(fixture.calls.mutex);
+    for (const auto& [memory, state] : fixture.calls.imports) {
+        if (state->address == address && !state->freed.load()) live.push_back(state);
+    }
+    return live;
+}
+
+bool importAhead(Fixture& fixture) {
+    const ImportAheadSwitch enabled;
+    const auto before = ImportAheadCounters();
+    Allocation allocation(fixture, 16);
+    {
+        std::lock_guard gpu(GpuMutex());
+        static_cast<void>(PrepareImportWatch(fixture.context));
+        Require(HostImportFor(fixture.context, 0x1000, 16) == nullptr, "an unregistered address had a host import");
+    }
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> ranges{{{allocation.Address(), allocation.Address() + allocation.bytes}}};
+    std::array<ExistingHostImport, 1> found{};
+    Require(!ExistingHostImportsFor(fixture.context, ranges, found), "a range nothing imported yet already had a host import");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!HostImportCovers(fixture.context, allocation.Address(), allocation.bytes) && ImportAheadCounters().leavesWatch == before.leavesWatch && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (!HostImportCovers(fixture.context, allocation.Address(), allocation.bytes) && ImportAheadCounters().leavesWatch != before.leavesWatch) {
+        std::puts("skipped, host imports of this device leave the write watch, which imports made ahead do not cover");
+        return false;
+    }
+    const auto after = ImportAheadCounters();
+    Require(HostImportCovers(fixture.context, allocation.Address(), allocation.bytes), "a host import requested ahead was not made: " + FormatImportAheadCounts());
+    Require(after.made > before.made && after.inserted > before.inserted, "a host import made ahead was not counted: " + FormatImportAheadCounts());
+    const auto made = liveImportsAt(fixture, allocation.Address());
+    Require(made.size() == 1 && made.front()->bytes >= allocation.bytes, "the host import made ahead did not import the requested range once");
+    const auto imported = fixture.Import(allocation.Address(), allocation.bytes);
+    Require(liveImportsAt(fixture, allocation.Address()).size() == 1 && imported->memory == made.front()->memory, "the requester made a second host import of a range imported ahead");
+    Require(ImportAheadCounters().own == after.own, "the requester counted an import of its own for a range imported ahead");
+    return true;
+}
+
+}
+
+int RunHostImportAheadTests(const Context& context) {
+    if (context.hostImportAlignment == 0) {
+        std::puts("skipped, the device has no VK_EXT_external_memory_host");
+        return 77;
+    }
+    Fixture fixture(context);
+    if (!importAhead(fixture)) return 77;
+    std::puts("host import ahead tests passed");
+    return 0;
 }
 
 int RunHostImportLifetimeTests(const Context& context) {

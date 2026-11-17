@@ -3,6 +3,7 @@
 
 #include <bitset>
 #include <cstdint>
+#include <mutex>
 
 namespace AgcDriver::Graphics::MapImportGate {
 
@@ -54,14 +55,17 @@ private:
 class ImportHold {
 public:
     explicit ImportHold(const Stripes& stripes);
+    ImportHold(const Stripes& stripes, std::try_to_lock_t);
     ~ImportHold();
     ImportHold(const ImportHold&) = delete;
     ImportHold& operator=(const ImportHold&) = delete;
     bool Covers(std::uint64_t begin, std::uint64_t end) const;
     const Stripes& Held() const { return held; }
+    bool Owned() const { return owned; }
 
 private:
     Stripes held;
+    bool owned = true;
 };
 
 struct Counters {

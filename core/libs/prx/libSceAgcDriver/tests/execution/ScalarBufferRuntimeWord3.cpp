@@ -81,7 +81,7 @@ std::string Hex(std::uint32_t value) {
     return text;
 }
 
-void Run(AgcDriver::VulkanDevice& device, GuestBlock& guest, std::uint32_t word3) {
+void Run(AgcDriver::VulkanDevice& device, GuestBlock& guest, std::uint32_t word3, bool exactRobustLoads) {
     Input.fill(word3);
     Output.fill(0xdeadbeefu);
     std::vector<std::uint32_t> userData(12, 0u);
@@ -95,10 +95,13 @@ void Run(AgcDriver::VulkanDevice& device, GuestBlock& guest, std::uint32_t word3
     const std::span<const std::uint8_t> guestBytes(guest.Data(), 256);
     const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}, {reinterpret_cast<std::uintptr_t>(guest.Data()), std::as_bytes(guestBytes)}}};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
+    auto target = device.Target();
+    target.exactRobustLoadsAlign4 = exactRobustLoads && target.exactRobustLoadsAlign4;
+    target.exactRobustLoads = exactRobustLoads;
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
-        device.Target(),
+        target,
         {0, 0, 0, 128}
     };
     request.useCache = false;
@@ -130,11 +133,15 @@ int main() {
             const std::uint32_t value = 0xa0000000u | i;
             std::memcpy(guest.Data() + i * 4u, &value, sizeof(value));
         }
+        const bool exact = device->Target().exactRobustLoads;
         for (const auto word3 : Word3s) {
-            Run(*device, guest, word3);
+            Run(*device, guest, word3, false);
+            Check(word3);
+            if (!exact) continue;
+            Run(*device, guest, word3, true);
             Check(word3);
         }
-        std::puts("scalar buffer runtime word 3 tests passed");
+        std::printf("scalar buffer runtime word 3 tests passed (%s)\n", exact ? "with and without exact robust loads" : "without exact robust loads");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

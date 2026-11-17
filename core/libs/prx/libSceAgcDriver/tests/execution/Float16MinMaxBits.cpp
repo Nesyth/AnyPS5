@@ -235,20 +235,22 @@ std::string Hex(std::uint32_t value) {
 
 int main() {
     try {
+        RequestFloat16FormProbes();
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        const std::array<ShaderRecompiler::SpirvTarget, 2> targets{WithoutFloat16Forms(device->Target()), WithFloat16Forms(*device)};
         std::vector<std::uint32_t> userData(8, 0u);
         const auto input = BufferDescriptor(Input.data(), static_cast<std::uint32_t>(Input.size() * 4u));
         const auto output = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(Output.size() * 4u));
         std::copy(input.begin(), input.end(), userData.begin());
         std::copy(output.begin(), output.end(), userData.begin() + 4);
         const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
-        const auto compile = [&](std::span<const std::uint32_t> code, const Mode& mode) {
+        const auto compile = [&](std::span<const std::uint32_t> code, const Mode& mode, const ShaderRecompiler::SpirvTarget& target) {
             const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
             ShaderRecompiler::RecompileRequest request{
                 {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
                 {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
-                device->Target(),
+                target,
                 {0, 0, 0, 128}
             };
             request.useCache = false;
@@ -269,11 +271,13 @@ int main() {
         constexpr std::array<std::uint32_t, 16> special{0x0000u, 0x8000u, 0x7c00u, 0xfc00u, 0x7e01u, 0xfe42u, 0x7c01u, 0xfc42u,
                                                        0x0001u, 0x8001u, 0x03ffu, 0x83ffu, 0x0400u, 0x8400u, 0x3c00u, 0xbc00u};
         std::uint64_t compared = 0u;
-        for (const auto& mode : modes) {
+        for (std::size_t pass = 0; pass < modes.size() * targets.size(); ++pass) {
+            const auto& mode = modes[pass % modes.size()];
+            const auto& target = targets[pass / modes.size()];
             const bool flushInputs = mode.floatMode.has_value() && (mode.floatMode->floatMode & 0x40u) == 0u;
             const Model model{mode.floatMode.has_value() && mode.floatMode->ieeeMode, !mode.floatMode.has_value() || mode.floatMode->dx10Clamp, flushInputs};
-            const auto scalar = mode.scalar ? std::optional{compile(ScalarCode, mode)} : std::nullopt;
-            const auto packed = compile(PackedCode, mode);
+            const auto scalar = mode.scalar ? std::optional{compile(ScalarCode, mode, target)} : std::nullopt;
+            const auto packed = compile(PackedCode, mode, target);
             for (std::uint32_t batch = 0; batch < Batches; ++batch) {
                 for (std::uint32_t tid = 0; tid < Threads; ++tid) {
                     std::uint32_t* row = &Input[tid * Inputs];

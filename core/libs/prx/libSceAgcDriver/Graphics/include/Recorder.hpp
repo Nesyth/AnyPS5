@@ -199,10 +199,13 @@ public:
         WriterScope(const WriterScope&) = delete;
         WriterScope& operator=(const WriterScope&) = delete;
         std::uint64_t previous;
+        std::uint64_t stampPrevious = 0;
+        bool stamped = false;
     };
     static constexpr std::uint64_t WriterTag(std::uint64_t site, std::uint64_t program = 0) { return (site << 56u) | (program & ((std::uint64_t{1} << 56u) - 1u)); }
     static bool KeyWriterCensus();
     static std::uint64_t WriterOfNote(std::uint64_t note);
+    static std::uint64_t CurrentWriterTag();
     void PendingWriteRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const;
     // Batch read tracking: the guest ranges the recorded work reads IN PLACE through a host import
     // and the GPU has not executed yet (a V# element bound in place, a region the GPU copies out of
@@ -284,6 +287,8 @@ public:
     bool CountingSamples() const { return countingSamples; }
     bool RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules);
     bool RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress snapshot, VkDeviceAddress target, std::uint32_t dwords, VkDeviceAddress counter = 0);
+    bool ChangedLineCensusReady();
+    bool RecordChangedLineCensus(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress snapshot, VkDeviceAddress counter, std::uint32_t dwords, std::uint32_t leadDwords);
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target, std::uint64_t address = 0);
     void NoteSampledDraw(VkCommandBuffer commands);
@@ -880,6 +885,10 @@ private:
     VkPipelineLayout changedCopyLayout = VK_NULL_HANDLE;
     VkPipeline changedCopyPipeline = VK_NULL_HANDLE;
     VkPipeline changedCopyHeapPipeline = VK_NULL_HANDLE;
+    int lineCensusState = 0;
+    VkPipelineLayout lineCensusLayout = VK_NULL_HANDLE;
+    VkPipeline lineCensusPipeline = VK_NULL_HANDLE;
+    VkPipeline lineCensusHeapPipeline = VK_NULL_HANDLE;
     VkPipeline createPushOnlyHeapPipeline(const VkComputePipelineCreateInfo& info) const;
     void bindPushOnlyPipeline(VkCommandBuffer commands, VkPipeline pipeline, VkPipeline heapPipeline) const;
     void pushOnlyParameters(VkCommandBuffer commands, VkPipeline heapPipeline, VkPipelineLayout layout, std::uint32_t bytes, const void* values) const;

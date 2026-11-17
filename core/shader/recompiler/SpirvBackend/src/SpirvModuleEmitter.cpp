@@ -1829,11 +1829,12 @@ void EmitF16DenormPreserve(SpirvEmitterState& state) {
     if (state.f16DenormPreserveEmitted) return;
     state.module.EmitCapability(spv::CapabilityDenormPreserve);
     state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDenormPreserve, 16u);
+    if (state.float16NativeWiden && !state.float64DenormPreserve) state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDenormPreserve, 64u);
     state.f16DenormPreserveEmitted = true;
 }
 
 static std::uint32_t UnpackF16BitsToF32(SpirvEmitterState& state, std::uint32_t bits, bool nanBits) {
-    if (!state.float16DenormPreserve) return EmitF16BitsToF32Decoded(state, bits);
+    if (!state.float16DenormPreserve && !state.float16NativeWiden) return EmitF16BitsToF32Decoded(state, bits);
     EmitF16DenormPreserve(state);
     const auto u32 = TypeU32(state);
     const auto f32 = TypeF32(state);
@@ -1841,7 +1842,7 @@ static std::uint32_t UnpackF16BitsToF32(SpirvEmitterState& state, std::uint32_t 
     const auto value = state.module.AllocateId();
     state.module.AddFunction(spv::OpExtInst, TypeF32Vector(state, 2), unpacked, GlslStd450(state), GLSLstd450UnpackHalf2x16, bits);
     state.module.AddFunction(spv::OpCompositeExtract, f32, value, unpacked, 0u);
-    if (!nanBits || state.float16WidenNans) return value;
+    if (!nanBits || (state.float16WidenNans && !state.float16NativeWiden)) return value;
     const auto signAndPayload = Binary(state, spv::OpShiftRightArithmetic, u32, Binary(state, spv::OpShiftLeftLogical, u32, bits, ConstantU32(state, 16u)), ConstantU32(state, 3u));
     const auto nan = Unary(state, spv::OpBitcast, f32, Binary(state, spv::OpBitwiseOr, u32, signAndPayload, ConstantU32(state, 0x7f800000u)));
     return Select(state, f32, Unary(state, spv::OpIsNan, TypeBool(state), value), nan, value);

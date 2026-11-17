@@ -23,6 +23,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MapImportGate.hpp"
 // For the declaration of PendingStorageOverlaps, defined below.
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidencyCensus.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
@@ -256,6 +257,10 @@ void countStorageEviction(const char* reason) {
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
     ++traffic.evictions[reason];
+}
+
+void noteCopyOrigin(std::uint8_t& origin, const std::vector<std::byte>& copy, ResidencyCensus::CopyOrigin site) {
+    if (ResidencyCensus::On() && copy.capacity() == 0) origin = static_cast<std::uint8_t>(site);
 }
 
 std::uint64_t VerifyEvery(const char* text) {
@@ -3613,6 +3618,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
             pendingResults = true;
             if (blockUnits && droppable(layer)) {
                 CaptureTrace::Log("drop-unit image=%llx unit=%u generation=%llu stamped=%d keys=%d", static_cast<unsigned long long>(descriptor.baseAddress), layer, static_cast<unsigned long long>(layerGeneration[layer]), layer < stampedBlocks.size() && stampedBlocks[layer] != 0, static_cast<int>(keys));
+                if (ResidencyCensus::On()) ResidencyCensus::NoteDrop(layerBegin(layer), layerBytes(layer), layerGeneration[layer], layer < layerPendingSince.size() ? layerPendingSince[layer] : std::uint64_t{0}, keysChanged && IsDccClear(keys) ? ResidencyCensus::DropCause::ClearKeys : compared ? ResidencyCensus::DropCause::Compared : ResidencyCensus::DropCause::Stamped);
                 layerPending[layer] = false;
                 dropped = true;
                 continue;
@@ -3773,6 +3779,7 @@ void StorageTexture::captureGuestBytes(const std::vector<bool>* layers, bool kee
     if (layers != nullptr) selected = *layers;
     restoreCopy(CopySite::Capture, &selected);
     guestSnapshots.fetch_add(1, std::memory_order_relaxed);
+    noteCopyOrigin(originalOrigin, original, ResidencyCensus::CopyOrigin::Capture);
     original.resize(static_cast<std::size_t>(guestBytes));
     comparedRanges = {};
     const auto runs = unitRuns(selected);
@@ -4025,6 +4032,11 @@ std::vector<bool> StorageTexture::cpuUploadLayers(const std::vector<bool>& units
 
 void StorageTexture::upload(const std::vector<bool>* layers) {
     restoreCopy(CopySite::Upload);
+    if (ResidencyCensus::On()) {
+        const bool whole = layers == nullptr || (!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; });
+        const auto runs = whole ? std::vector<std::pair<std::uint64_t, std::uint64_t>>{{0, guestBytes}} : unitRuns(*layers);
+        ResidencyCensus::NoteUpload(descriptor.baseAddress, runs, uploadReason);
+    }
     const GuestMemory::UnflushedReadScope unflushed(RuntimeSwitches::Set(RuntimeSwitch::XpUploadNoSync));
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -4267,6 +4279,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         cancelStoredSaves();
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
+        noteCopyOrigin(originalOrigin, original, ResidencyCensus::CopyOrigin::CpuUpload);
         original.resize(static_cast<std::size_t>(guestBytes));
         GuestMemory::ReadCommitted(descriptor.baseAddress, original);
     }
@@ -6029,6 +6042,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         }
     }
     std::exception_ptr failure;
+    const auto censusSlab = ResidencyCensus::On() ? ResidencyCensus::ThreadSlabBytes() : std::uint64_t{0};
     const auto previousReason = std::exchange(flushReason, reason);
     for (const auto& texture : flush) {
         try {
@@ -6043,11 +6057,14 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     if (failure) std::rethrow_exception(failure);
     // The stores above went into the unit shadows where slabs took them: the consumer reads the
     // import, so they are published under the same hold, after every store.
+    std::size_t publishedUnits = 0;
     if (scope != PublishScope::None) {
         const auto units = PublishShadow(address, bytes, scope, PublishReasonFor(reason), waited);
+        publishedUnits = units;
         if (units != 0) waitForIdlePublish(reason);
         if (published != nullptr) *published = units != 0;
     }
+    if (ResidencyCensus::On()) ResidencyCensus::NoteFlush(reason, flush.size(), ResidencyCensus::ThreadSlabBytes() - censusSlab, publishedUnits);
     return true;
 }
 
@@ -6153,6 +6170,7 @@ void StorageTexture::saveBeforeUnwatch() {
     for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) units[unit] = layerPending[unit] && !layerOriginal[unit];
     const auto runs = unitRuns(units);
     if (runs.empty()) return;
+    noteCopyOrigin(originalOrigin, original, ResidencyCensus::CopyOrigin::Unwatch);
     original.resize(static_cast<std::size_t>(guestBytes));
     comparedRanges = {};
     for (const auto& [begin, end] : runs) GuestMemory::ReadCommittedUnsynced(descriptor.baseAddress + begin, std::span(original).subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)));
@@ -6200,6 +6218,7 @@ void StorageTexture::applyStoredSave(std::uint64_t ticket, const std::vector<std
     const auto stored = savedBytes->Bytes();
     for (const auto unit : units) {
         if (savedTicket[unit] != ticket) continue;
+        noteCopyOrigin(originalOrigin, original, ResidencyCensus::CopyOrigin::StoredSave);
         if (original.size() != guestBytes) original.resize(static_cast<std::size_t>(guestBytes));
         comparedRanges = {};
         const auto offset = static_cast<std::size_t>(layerBegin(unit) - descriptor.baseAddress);
@@ -8270,6 +8289,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // store, the keys stay as they are, and the image is stale there (re-uploaded at its next
         // use, never from a matching `original`).
         emptyWriteBacks.fetch_add(1, std::memory_order_relaxed);
+        if (ResidencyCensus::On()) ResidencyCensus::NoteWriteBack(firstStored, lastStored, flushReason, blockUnits, 0, 0, 0, skipped);
         forgetStored();
         settle(true);
         return;
@@ -8286,11 +8306,19 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             // The kept blocks alone pass through the retiler (windows of their slices).
             const auto storedBytes = writeBackWindows(segments, keep, firstStored, lastStored, shadowed, imported, saveUnits.empty() ? nullptr : savedBytes.get());
             countStorageWriteBack(storedBytes, true);
+            if (ResidencyCensus::On()) {
+                std::uint64_t slabBytes = 0;
+                std::uint64_t importBytes = 0;
+                for (const auto& piece : shadowed) slabBytes += piece.end - piece.begin;
+                for (const auto& piece : imported) importBytes += piece.second - piece.first;
+                ResidencyCensus::NoteWriteBack(firstStored, lastStored, flushReason, true, slabBytes, importBytes, 0, skipped);
+            }
             if (profile) Profile().storageGpu += timer.lap();
             forgetStored();
             traceKeyStore("block write-back", descriptor, guestBytes);
             if (!IsDccClear(filledKeys) && uploadedKeys != DccKeys::Uncompressed && !keysReplacedByClear()) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
             SetUploadedKeys(DccKeys::Uncompressed);
+            const ResidencyCensus::StampScope stamp(ResidencyCensus::Stamper::ImageWriteBack, descriptor.baseAddress >> 16u);
             for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
             settle(true);
             commitStoredSave(saveUnits);
@@ -8301,6 +8329,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             PublishShadow(stampBegin, static_cast<std::size_t>(stampEnd - stampBegin), PublishScope::PartialUnits, PublishReason::Upload);
             const auto storedBytes = storeDrawnRect(drawn, segments, stores, saveUnits);
             countStorageWriteBack(storedBytes, true, true);
+            if (ResidencyCensus::On()) ResidencyCensus::NoteWriteBack(stampBegin, stampEnd, flushReason, blockUnits, 0, storedBytes, 0, skipped);
             if (profile) Profile().storageGpu += timer.lap();
             forgetStored();
             SetUploadedKeys(DccKeys::Uncompressed);
@@ -8309,6 +8338,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                 if (!stamps.empty() && from / block <= (stamps.back().second - 1) / block + 1) stamps.back().second = to;
                 else stamps.emplace_back(from, to);
             }
+            const ResidencyCensus::StampScope stamp(ResidencyCensus::Stamper::ImageWriteBack, descriptor.baseAddress >> 16u);
             for (const auto& [from, to] : stamps) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
             settle(true);
             commitStoredSave(saveUnits);
@@ -8450,6 +8480,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             else if (OwnStoreNotesEnabled()) noteOwnStore(recorder, recorder->LastWriteNote(firstStored, static_cast<std::size_t>(lastStored - firstStored)));
         }
         countStorageWriteBack(storedBytes, true, drawn.drawn);
+        if (ResidencyCensus::On()) ResidencyCensus::NoteWriteBack(firstStored, lastStored, flushReason, blockUnits, 0, storedBytes, 0, skipped);
         if (profile) Profile().storageGpu += timer.lap();
         // The guest bytes now differ from `original`; other caches of the range see the write.
         forgetStored();
@@ -8459,6 +8490,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         traceKeyStore("layer write-back", descriptor, guestBytes);
         if (!IsDccClear(filledKeys) && uploadedKeys != DccKeys::Uncompressed && !keysReplacedByClear()) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
         SetUploadedKeys(DccKeys::Uncompressed);
+        const ResidencyCensus::StampScope stamp(ResidencyCensus::Stamper::ImageWriteBack, descriptor.baseAddress >> 16u);
         for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
         // The walk covers this surface's pages only: an adjacent image's later CPU write is stamped
         // newer than this value when its own range is collected. No CPU wrote the pages here
@@ -8502,6 +8534,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         }
         return;
     }
+    noteCopyOrigin(originalOrigin, original, ResidencyCensus::CopyOrigin::CpuWriteBack);
     original.resize(static_cast<std::size_t>(guestBytes));
     // The store below compares against the guest bytes, read now when `original` does not hold
     // them (a GPU clear, a dropped or kept unit). Reading them says nothing about the image: a
@@ -8579,6 +8612,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     std::uint64_t storedBytes = 0;
     for (const auto& [from, to] : stores) storedBytes += to - from;
     countStorageWriteBack(drawn.rect ? storedBytes : guestBytes, false, drawn.drawn);
+    if (ResidencyCensus::On()) ResidencyCensus::NoteWriteBack(firstStored, lastStored, flushReason, blockUnits, 0, 0, drawn.rect ? storedBytes : guestBytes, skipped);
+    const ResidencyCensus::StampScope stamp(ResidencyCensus::Stamper::ImageWriteBack, descriptor.baseAddress >> 16u);
     if (profile) Profile().storageGpu += timer.lap();
     if (dump) {
         char name[64];
@@ -8823,6 +8858,7 @@ void StorageTexture::restoreCopy(CopySite site, const std::vector<bool>* overwri
         }
     } unheld{*this};
     if (any) {
+        noteCopyOrigin(originalOrigin, original, ResidencyCensus::CopyOrigin::Restore);
         original.resize(static_cast<std::size_t>(guestBytes));
         for (const auto& [begin, end] : unitRuns(held)) GuestMemory::ReadCommittedUnguarded(descriptor.baseAddress + begin, std::span(original).subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)));
     }
@@ -8878,7 +8914,8 @@ void StorageTexture::ReleaseIdleCopies() {
     const bool on = RuntimeSwitches::Set(RuntimeSwitch::StorageCopyRelease);
     const bool stats = PipelineStatsOn();
     const bool verify = copyVerifyOn();
-    if ((!on && !stats && !verify) || !GuestMemory::GpuMutex().HeldByThisThread()) return;
+    const bool residency = ResidencyCensus::On();
+    if ((!on && !stats && !verify && !residency) || !GuestMemory::GpuMutex().HeldByThisThread()) return;
     auto& census = copyCensus();
     const auto now = Recorder::Presents();
     const auto idle = copyIdlePresents();
@@ -8936,6 +8973,46 @@ void StorageTexture::ReleaseIdleCopies() {
         census.reported = totals;
     }
     if (verifyReport) AgcDriver::ProfilePrint_nid_no_patch("[storage-copies-verify] %llu checked, %llu differing; %llu units changed since their release before a refresh read them again\n", static_cast<unsigned long long>(census.checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(census.differing.load(std::memory_order_relaxed)), static_cast<unsigned long long>(census.changedBeforeRefresh.load(std::memory_order_relaxed)));
+    if (!residency || !ResidencyCensus::CopiesDue()) return;
+    std::vector<std::shared_ptr<StorageTexture>> images;
+    {
+        auto& live = Live();
+        std::lock_guard lock(live.mutex);
+        for (auto* texture : live.textures) {
+            if (texture->released || !texture->Cached()) continue;
+            if (auto alive = texture->weak_from_this().lock()) images.push_back(std::move(alive));
+        }
+    }
+    ResidencyCensus::Copies copies;
+    copies.release = on;
+    for (const auto& texture : images) {
+        ++copies.cachedImages;
+        const auto copyBytes = static_cast<std::uint64_t>(texture->original.capacity());
+        const auto baselineBytes = static_cast<std::uint64_t>(texture->generationBaseline.capacity());
+        if (baselineBytes != 0) copies.baselines.Add(baselineBytes);
+        if (texture->savedBytes != nullptr) copies.saved.Add(texture->guestBytes);
+        if (texture->releasedCopy.active) {
+            ++copies.released;
+            if (const auto aside = static_cast<std::uint64_t>(texture->releasedCopy.kept.capacity()); aside != 0) copies.keptToVerify.Add(aside);
+        }
+        if (copyBytes == 0) continue;
+        copies.holding.Add(copyBytes);
+        const auto held = static_cast<std::size_t>(std::count(texture->layerOriginal.begin(), texture->layerOriginal.end(), true));
+        if (held == 0) copies.holdsNone.Add(copyBytes);
+        else if (held == texture->layerOriginal.size()) copies.holdsAll.Add(copyBytes);
+        else copies.holdsSome.Add(copyBytes);
+        const auto base = texture->descriptor.baseAddress;
+        const auto bytes = static_cast<std::size_t>(texture->guestBytes);
+        if (GuestMemory::Watched(base, bytes)) copies.watched.Add(copyBytes);
+        else copies.unwatched.Add(copyBytes);
+        if (HostImportCovers(texture->context, base, bytes)) copies.imported.Add(copyBytes);
+        else copies.notImported.Add(copyBytes);
+        if (texture->layerPending.Any()) copies.pending.Add(copyBytes);
+        const auto used = texture->usedPresent.load(std::memory_order_relaxed);
+        if (used <= now && now - used >= idle) copies.idle.Add(copyBytes);
+        copies.origins[std::min<std::size_t>(texture->originalOrigin, copies.origins.size() - 1u)].Add(copyBytes);
+    }
+    ResidencyCensus::ReportCopies(copies);
 }
 
 std::uint64_t StorageTexture::GuestBytes() const {

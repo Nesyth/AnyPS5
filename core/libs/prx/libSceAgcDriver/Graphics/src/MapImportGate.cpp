@@ -200,7 +200,28 @@ ImportHold::ImportHold(const Stripes& stripes) : held(stripes) {
     importHolds.fetch_add(1, std::memory_order_relaxed);
 }
 
+ImportHold::ImportHold(const Stripes& stripes, std::try_to_lock_t) : held(stripes), owned(false) {
+    Require(publisher.depth == 0, "a map-time import without the GPU lock runs inside a storage image publication of its own thread");
+    activeImports.fetch_add(1, std::memory_order_seq_cst);
+    if (fastPublishers.load(std::memory_order_seq_cst) != 0) {
+        activeImports.fetch_sub(1, std::memory_order_release);
+        return;
+    }
+    auto& locks = StripeLocks();
+    for (std::uint32_t index = 0; index < StripeCount; ++index) {
+        if (!held[index] || locks[index].mutex.try_lock()) continue;
+        for (std::uint32_t taken = index; taken-- > 0;) {
+            if (held[taken]) locks[taken].mutex.unlock();
+        }
+        activeImports.fetch_sub(1, std::memory_order_release);
+        return;
+    }
+    owned = true;
+    importHolds.fetch_add(1, std::memory_order_relaxed);
+}
+
 ImportHold::~ImportHold() {
+    if (!owned) return;
     auto& locks = StripeLocks();
     for (std::uint32_t index = StripeCount; index-- > 0;) {
         if (held[index]) locks[index].mutex.unlock();

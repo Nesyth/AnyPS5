@@ -259,4 +259,51 @@ FloatFlushProbeResult ProbeFloat32DenormPreserve(VulkanDevice& device, const Sha
     return result;
 }
 
+namespace {
+
+constexpr std::uint32_t FlushScratch = 20u;
+
+Float32Probe::Program FractProgram(const Float32Probe::Sweep& sweep) {
+    using namespace Float32Probe;
+    Program program;
+    program.begin();
+    program.laneIndex(1u, sweep.groupsXLog2);
+    program.vop2(Vop2::Lshlrev, 2u, Int(IterationShift), 1u);
+    const auto start = program.loopBegin();
+    program.loopInput(3u, 2u);
+    program.sentinel(3u, 0u, FirstSentinel);
+    program.sentinel(3u, 0xffffffffu, LastSentinel);
+    program.vop1(Vop1::Fract, 4u, V(3u));
+    program.flush(5u, 3u, FlushScratch);
+    program.vop1(Vop1::Fract, 6u, V(5u));
+    program.flush(7u, 6u, FlushScratch);
+    program.check(4u, 7u, 0u);
+    program.checksum(4u, 0u);
+    program.loopEnd(start, Iterations);
+    program.report(1u);
+    return program;
+}
+
+}
+
+Float32Probe::Verdict ProbeFloat32HardwareFlushOps(VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target, const Float32Probe::Sweep& sweep) {
+    Float32Probe::Verdict verdict;
+    const std::array<std::optional<ShaderRecompiler::ShaderFloatMode>, 3> modes{std::nullopt, ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false}, ShaderRecompiler::ShaderFloatMode{0xc0u, true, true, false}};
+    const auto program = FractProgram(sweep);
+    auto reference = target;
+    reference.float32FlushToZero = true;
+    reference.float32HardwareFlushOps = 0u;
+    reference.float32NativeUnaryOps = 0u;
+    auto candidate = reference;
+    candidate.float32HardwareFlushOps = ShaderRecompiler::Float32HardwareFlushFract;
+    std::uint32_t failing = 0u;
+    for (const auto& mode : modes) {
+        const auto expected = Float32Probe::Run(device, reference, mode, program, sweep);
+        const auto actual = expected.compiled && expected.ran ? Float32Probe::Run(device, candidate, mode, program, sweep) : Float32Probe::Outcome{};
+        failing |= Float32Probe::Compare(verdict, expected, actual, 1u, sweep.Inputs());
+    }
+    verdict.proven = verdict.Passed() && failing == 0u ? ShaderRecompiler::Float32HardwareFlushFract : 0u;
+    return verdict;
+}
+
 }

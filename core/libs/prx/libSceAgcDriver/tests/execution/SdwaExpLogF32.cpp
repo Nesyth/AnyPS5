@@ -3,6 +3,7 @@
 #include "Recompiler.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "VulkanTestDevice.hpp"
+#include "Float32Exactness.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -207,6 +208,7 @@ void RunExecutionTests(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) 
     const auto result = ShaderRecompiler::Recompile(request);
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
+    Float32Exactness::Recheck(device, request, Output, {1u, 1u, 1u}, "SdwaExpLogF32");
 
     std::uint32_t checkIndex = 0u;
     for (std::uint32_t c = 0u; c < Inputs; ++c) {

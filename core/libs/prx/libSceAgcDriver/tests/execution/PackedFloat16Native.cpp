@@ -143,9 +143,11 @@ F16x2Math FindF16x2Math(std::span<const std::uint32_t> spirv) {
 
 int main() {
     try {
+        RequestFloat16FormProbes();
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        const auto target = device->Target();
+        const auto target = WithoutFloat16Forms(device->Target());
+        const auto formsTarget = WithFloat16Forms(*device);
         const auto supports = [&](spv::Capability capability) {
             return std::ranges::find(target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != target.supportedCapabilities.end();
         };
@@ -194,6 +196,7 @@ int main() {
             const auto native = compile(target, mode);
             const auto unfused = compile(unfusedTarget, mode);
             const auto emulated = compile(emulatedTarget, mode);
+            const auto forms = compile(formsTarget, mode);
             const F16x2Math nativeMath = FindF16x2Math(native.spirv.Words());
             const F16x2Math unfusedMath = FindF16x2Math(unfused.spirv.Words());
             const F16x2Math emulatedMath = FindF16x2Math(emulated.spirv.Words());
@@ -219,6 +222,15 @@ int main() {
                 };
                 check(native, fused ? "OpFmaKHR" : "native");
                 if (fused) check(unfused, "native without FMAKHR");
+                const auto nativeOutput = run(native);
+                const auto formsOutput = run(forms);
+                for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+                    for (std::uint32_t index = 0; index < Results; ++index) {
+                        const std::uint32_t* row = &Input[tid * Inputs];
+                        Require(formsOutput[tid * Results + index] == nativeOutput[tid * Results + index], std::string("packed f16 native: ") + mode.name + ", " + Names[index] + " with v4=" + Hex(row[0]) + " v5=" + Hex(row[1]) + " v6=" + Hex(row[2]) + " v7=" + Hex(row[3]) + " is " + Hex(formsOutput[tid * Results + index]) + " with the f16 word forms, " + Hex(nativeOutput[tid * Results + index]) + " without");
+                    }
+                }
+                compared += Threads * Results;
             }
         }
         std::printf("packed f16 native tests passed (%llu halves, %s)\n", static_cast<unsigned long long>(compared), fused ? "fused f16 fma" : "no FMAKHR");

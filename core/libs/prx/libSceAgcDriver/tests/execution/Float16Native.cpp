@@ -162,9 +162,11 @@ F16x2Math FindF16x2Math(std::span<const std::uint32_t> spirv) {
 
 int main() {
     try {
+        RequestFloat16FormProbes();
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        const auto target = device->Target();
+        const auto target = WithoutFloat16Forms(device->Target());
+        const auto formsTarget = WithFloat16Forms(*device);
         const auto supports = [&](spv::Capability capability) {
             return std::ranges::find(target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != target.supportedCapabilities.end();
         };
@@ -210,6 +212,7 @@ int main() {
         for (const auto& mode : Modes) {
             const auto native = compile(target, mode);
             const auto emulated = compile(emulatedTarget, mode);
+            const auto forms = compile(formsTarget, mode);
             const F16x2Math nativeMath = FindF16x2Math(native.spirv.Words());
             const F16x2Math emulatedMath = FindF16x2Math(emulated.spirv.Words());
             Require(nativeMath.add == mode.native && nativeMath.mul == mode.native, std::string("f16 native: ") + mode.name + (mode.native ? " does not use" : " uses") + " f16vec2 add and mul");
@@ -220,6 +223,7 @@ int main() {
                 for (auto& word : Input) word = Half() | (Half() << 16u);
                 const auto nativeOutput = run(native);
                 const auto emulatedOutput = run(emulated);
+                const auto formsOutput = run(forms);
                 for (std::uint32_t tid = 0; tid < Threads; ++tid) {
                     for (std::uint32_t index = 0; index < Results; ++index) {
                         const std::uint32_t actual = nativeOutput[tid * Stride + index];
@@ -228,6 +232,7 @@ int main() {
                         const bool bothNan = (actual >> 16u) == (expected >> 16u) && isNan16(actual) && isNan16(expected);
                         if (actual != expected && bothNan) ++nanPayloads;
                         Require(actual == expected || bothNan, std::string("f16 native: ") + mode.name + ", " + Names[index] + " with v4=" + Hex(row[0]) + " v5=" + Hex(row[1]) + " v6=" + Hex(row[2]) + " v7=" + Hex(row[3]) + " is " + Hex(actual) + ", f32 path gives " + Hex(expected));
+                        Require(formsOutput[tid * Stride + index] == actual, std::string("f16 native: ") + mode.name + ", " + Names[index] + " with v4=" + Hex(row[0]) + " v5=" + Hex(row[1]) + " v6=" + Hex(row[2]) + " v7=" + Hex(row[3]) + " is " + Hex(formsOutput[tid * Stride + index]) + " with the f16 word forms, " + Hex(actual) + " without");
                     }
                 }
                 compared += Threads * Results;

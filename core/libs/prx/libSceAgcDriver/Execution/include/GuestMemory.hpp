@@ -69,7 +69,16 @@ bool WriteWatched();
 void Unwatch(std::uint64_t address, std::size_t bytes);
 void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched = true, bool importMayWriteGuest = true);
+bool ImportWatchedOutside(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import);
+void NoteImportAdopted(std::uint64_t address, std::size_t bytes);
+struct ImportWindowWaits {
+    std::uint64_t waits = 0;
+    std::uint64_t nanoseconds = 0;
+    std::uint64_t longestNanoseconds = 0;
+};
+ImportWindowWaits ImportWindowWaitCounts();
 void SetUnwatchHook(void (*hook)(std::uint64_t address, std::size_t bytes));
+void SetRegistryChangeHook(void (*hook)());
 bool UnwatchWritesProven();
 void SetImportWalkFailureForTest(int walk, std::uint64_t span = 0);
 #ifdef _WIN32
@@ -113,6 +122,24 @@ struct WriteIndexStats {
 };
 WriteIndexStats WriteIndexCounted();
 void ResetWriteIndexCounts();
+struct WriteStamper {
+    std::uint64_t generation = 0;
+    std::uint64_t tag = 0;
+    WriteBumpSource source = WriteBumpSource::Count;
+};
+struct WriteCensusCounts {
+    std::uint64_t generation = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(WriteBumpSource::Count)> events{};
+    std::array<std::uint64_t, static_cast<std::size_t>(WriteBumpSource::Count)> blocks{};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> tags;
+    std::uint64_t otherTags = 0;
+    WriteBumpSource firstSource = WriteBumpSource::Count;
+    std::uint64_t firstTag = 0;
+};
+std::shared_ptr<WriteSubscription> SubscribeWriteCensus(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+WriteCensusCounts ReadWriteCensus(WriteSubscription& subscription, bool restartFirst);
+WriteStamper NewestCensusStamper(const WriteSubscription& subscription, std::uint64_t address, std::size_t bytes);
+std::uint64_t SetStampTag(std::uint64_t tag);
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // UnchangedSince for several ranges under one tracker lock: true only when every one holds.
 struct UnchangedQuery {

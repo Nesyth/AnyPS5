@@ -150,6 +150,10 @@ struct SpirvEmitterState {
     bool devicePageTable = false;
     bool float16WidenNans = false;
     bool float16NarrowNans = false;
+    bool float16NativeWiden = false;
+    std::uint32_t float16PackTowardZero = 0;
+    bool exactRobustLoadsAlign4 = false;
+    std::unordered_map<const IrValue*, bool> packFoldableOperands;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     std::uint32_t spirvVersion = 0x00010300u;

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
@@ -88,6 +89,7 @@ struct F16Decode {
     std::uint32_t unpacks = 0;
     std::uint32_t nanRebuilds = 0;
     bool denormPreserve16 = false;
+    bool denormPreserve64 = false;
 };
 
 F16Decode ScanF16Decode(std::span<const std::uint32_t> words) {
@@ -97,6 +99,7 @@ F16Decode ScanF16Decode(std::span<const std::uint32_t> words) {
         const auto opcode = words[cursor] & 0xffffu;
         Require(count != 0 && cursor + count <= words.size(), "f16 to f32 unpack: malformed SPIR-V");
         if (opcode == spv::OpExecutionMode && count == 4 && words[cursor + 2] == spv::ExecutionModeDenormPreserve && words[cursor + 3] == 16u) decode.denormPreserve16 = true;
+        if (opcode == spv::OpExecutionMode && count == 4 && words[cursor + 2] == spv::ExecutionModeDenormPreserve && words[cursor + 3] == 64u) decode.denormPreserve64 = true;
         if (opcode == spv::OpExtInst && count >= 5 && words[cursor + 4] == GLSLstd450UnpackHalf2x16) ++decode.unpacks;
         if (opcode == spv::OpShiftRightArithmetic) ++decode.nanRebuilds;
         cursor += count;
@@ -137,17 +140,22 @@ void VerifySpirv() {
     }};
     for (const auto& program : programs) {
         const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(program.code.data()), std::as_bytes(program.code)}}};
-        for (const bool preserve : {false, true}) {
-            target.float16DenormPreserve = preserve;
-            const std::string flag = std::string(" with float16DenormPreserve=") + (preserve ? "true" : "false");
+        for (const std::uint32_t variant : {0u, 1u, 2u}) {
+            const bool preserve = variant != 0u;
+            target.float16DenormPreserve = variant == 1u;
+            target.float16NativeWiden = variant == 2u;
+            const std::string flag = std::string(" with float16DenormPreserve=") + (variant == 1u ? "true" : "false") + " and float16NativeWiden=" + (variant == 2u ? "true" : "false");
             const auto decode = ScanF16Decode(ShaderRecompiler::Recompile(Request(program.code, target, userData, memory)).spirv.Words());
             const std::string name = std::string("f16 to f32 unpack: ") + program.name;
             Require(decode.denormPreserve16 == preserve, name + (preserve ? " lacks" : " has") + " DenormPreserve 16" + flag);
+            Require(decode.denormPreserve64 == (variant == 2u), name + (variant == 2u ? " lacks" : " has") + " DenormPreserve 64" + flag);
             Require(preserve ? decode.unpacks != 0u : decode.unpacks == 0u, name + " has " + std::to_string(decode.unpacks) + " UnpackHalf2x16" + flag);
             if (program.nanBits.has_value()) {
                 Require(decode.nanRebuilds == (preserve && *program.nanBits ? decode.unpacks : 0u), name + " rebuilds " + std::to_string(decode.nanRebuilds) + " of " + std::to_string(decode.unpacks) + " NaN results" + flag);
             }
         }
+        target.float16DenormPreserve = false;
+        target.float16NativeWiden = false;
     }
 }
 
@@ -160,16 +168,19 @@ void Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> co
     device.WaitIdle();
 }
 
-void Run(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target, const char* name) {
+std::vector<std::uint32_t> Run(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target, const char* name) {
+    std::vector<std::uint32_t> results;
     Dispatch(device, ConvertCode, target);
     for (std::uint32_t lane = 0; lane < Halves; ++lane) {
         Require(Output[lane] == HalfToFloatBits(lane), std::string("f16 to f32 unpack (") + name + "): v_cvt_f32_f16 of " + Hex(Input[lane]) + " is " + Hex(Output[lane]) + ", expected " + Hex(HalfToFloatBits(lane)));
     }
+    results.insert(results.end(), Output.begin(), Output.begin() + static_cast<std::ptrdiff_t>(Halves));
     Dispatch(device, ByteCode, target);
     for (std::uint32_t lane = 0; lane < Halves; ++lane) {
         const std::uint32_t selected = (Input[lane] >> 8u) & 0xffu;
         Require((Output[lane] & 0xffffu) == selected, std::string("f16 to f32 unpack (") + name + "): v_add_f16 src0_sel:BYTE_1 of " + Hex(Input[lane]) + " and -0 is " + Hex(Output[lane]) + ", expected " + Hex(selected));
     }
+    results.insert(results.end(), Output.begin(), Output.begin() + static_cast<std::ptrdiff_t>(Halves));
     Dispatch(device, CompareCode, target);
     for (std::uint32_t lane = 0; lane < Halves; ++lane) {
         const float value = std::bit_cast<float>(HalfToFloatBits(lane));
@@ -178,6 +189,8 @@ void Run(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& t
         Require(Output[lane * 2u] == unordered, std::string("f16 to f32 unpack (") + name + "): v_cmp_u_f16 of " + Hex(lane) + " with itself is " + Hex(Output[lane * 2u]) + ", expected " + Hex(unordered));
         Require(Output[lane * 2u + 1u] == less, std::string("f16 to f32 unpack (") + name + "): v_cmp_lt_f16 of " + Hex(lane) + " and 1.0 is " + Hex(Output[lane * 2u + 1u]) + ", expected " + Hex(less));
     }
+    results.insert(results.end(), Output.begin(), Output.end());
+    return results;
 }
 
 }
@@ -194,13 +207,24 @@ int main(int argc, char** argv) {
         for (std::uint32_t lane = 0; lane < Halves; ++lane) Input[lane] = lane | ((lane ^ 0xa5a5u) << 16u);
         auto target = device->Target();
         const bool preserve = target.float16DenormPreserve;
+        const bool nativeWiden = target.float16NativeWiden;
         target.float16DenormPreserve = false;
-        Run(*device, target, "integer decode");
+        target.float16NativeWiden = false;
+        const auto decoded = Run(*device, target, "integer decode");
         if (preserve) {
             target.float16DenormPreserve = true;
             Run(*device, target, "UnpackHalf2x16");
+            target.float16DenormPreserve = false;
         }
-        std::printf("f16 to f32 unpack tests passed (%u halves, %s)\n", Halves, preserve ? "both decodes" : "integer decode only");
+        if (nativeWiden) {
+            target.float16NativeWiden = true;
+            const auto widened = Run(*device, target, "UnpackHalf2x16 with DenormPreserve 16 and 64");
+            Require(widened.size() == decoded.size(), "f16 to f32 unpack: the native widening runs differ in size");
+            for (std::size_t index = 0; index < decoded.size(); ++index) {
+                Require(widened[index] == decoded[index], "f16 to f32 unpack: result " + std::to_string(index) + " with float16NativeWiden is " + Hex(widened[index]) + ", the integer decode " + Hex(decoded[index]));
+            }
+        }
+        std::printf("f16 to f32 unpack tests passed (%u halves, %s%s)\n", Halves, preserve ? "both decodes" : "integer decode", nativeWiden ? " and the native widening under DenormPreserve 16 and 64" : "");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -285,6 +285,7 @@ function(add_shader_recompiler target runtimeTarget)
             RecompileCacheKey::ContextHash
             RecompileCacheKey::SealFeatureDigest
             RecompileResult
+            ShaderFloatMode
             PrepareShader
             GetPreparedCode
             PreparedShaderInvocation::TryCreate
@@ -307,6 +308,7 @@ function(add_shader_recompiler target runtimeTarget)
             SetGcnGuestShaders
             HostF32FmaNansRequested
             NativeF32MinMaxRequested
+            Float32NativeUnaryBit
             GcnImageTilingIndex
             GcnImagePitch
             GcnImagePow2Pad

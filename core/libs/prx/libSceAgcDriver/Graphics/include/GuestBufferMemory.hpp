@@ -159,6 +159,21 @@ struct HostImportSettleCounts {
 HostImportSettleCounts HostImportSettles();
 // Tests: how many imports settleImport has used on the settle queue.
 std::uint64_t HostImportsSettled();
+struct ImportAheadCounts {
+    std::uint64_t made = 0;
+    std::uint64_t madeBytes = 0;
+    std::uint64_t inserted = 0;
+    std::uint64_t adopted = 0;
+    std::uint64_t discarded = 0;
+    std::uint64_t failed = 0;
+    std::uint64_t own = 0;
+    std::uint64_t waits = 0;
+    std::uint64_t pinnedBytes = 0;
+    std::size_t live = 0;
+    std::uint64_t leavesWatch = 0;
+};
+ImportAheadCounts ImportAheadCounters();
+std::string FormatImportAheadCounts();
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices
@@ -439,6 +454,7 @@ public:
         return false;
     }
     void MarkStagedWrites() const;
+    void CensusArm(bool copyBacksDeferred) const;
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
@@ -538,6 +554,7 @@ private:
         bool unstaged = false;
         bool overlay = false;
         bool adaptiveInPlace = false;
+        std::uint32_t censusId = 0;
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -592,6 +609,7 @@ private:
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
+    void noteCensusUses(std::span<Region* const> copies, bool reused, std::span<const std::uint8_t> copiedBefore);
     void takeHeapReferences();
     void releaseHeapReferences() noexcept;
     Context context;
@@ -629,6 +647,7 @@ private:
     bool uploaded = false;
     bool committed = false;
     mutable std::uint64_t directWritesGeneration = 0;
+    std::uint64_t censusBuild = 0;
 };
 
 }

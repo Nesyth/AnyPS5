@@ -7,4 +7,6 @@ int RunHostImportLifetimeTests(const AgcDriver::Graphics::Context& context);
 
 int RunHostImportMutationRaceTests(const AgcDriver::Graphics::Context& context);
 
+int RunHostImportAheadTests(const AgcDriver::Graphics::Context& context);
+
 #endif

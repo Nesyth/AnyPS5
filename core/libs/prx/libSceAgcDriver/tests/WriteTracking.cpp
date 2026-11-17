@@ -1991,6 +1991,55 @@ void CheckImportWindow() {
     Require(!UnchangedSince(base, Block, after), "a store after the import window was missed");
 }
 
+void CheckImportWindowOutsideLock() {
+    void* memory = AllocateWatched(4 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 4 * Block);
+    const auto synced = CollectWritesUncached(base, 3 * Block);
+    const auto syncedBeside = CollectWritesUncached(base + 3 * Block, Block);
+    Require(synced != 0 && syncedBeside != 0, "the blocks of an import window outside the tracker mutex are not collected");
+    const auto waitsBefore = ImportWindowWaitCounts().waits;
+    std::atomic<bool> overlapDone{false};
+    std::atomic<bool> besideDone{false};
+    std::thread overlap;
+    bool overlapWaited = false;
+    const bool imported = ImportWatchedOutside(base, 3 * Block, [&] {
+        bytes[0x100] = 0x11;
+        bytes[Block + 0x2000] = 0x22;
+        std::thread beside([&] {
+            static_cast<void>(CollectWritesUncached(base + 3 * Block, Block));
+            besideDone.store(true);
+        });
+        beside.join();
+        overlap = std::thread([&] {
+            static_cast<void>(CollectWritesUncached(base + Block, Block));
+            overlapDone.store(true);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        overlapWaited = !overlapDone.load();
+        return true;
+    });
+    if (overlap.joinable()) overlap.join();
+    Require(imported, "the import window outside the tracker mutex failed");
+    Require(besideDone.load(), "a tracker call beside an open import window did not run while it was open");
+    Require(overlapWaited && overlapDone.load(), "a tracker call over an open import window did not wait for it");
+    Require(ImportWindowWaitCounts().waits > waitsBefore, "a tracker call that waited for an import window was not counted");
+    Require(Watched(base, 3 * Block), "an import window outside the tracker mutex left its range unwatched");
+    const std::array<std::uint64_t, 3> generations{synced, synced, synced};
+    std::array<std::uint8_t, 3> changed{};
+    std::array<std::uint8_t, 3> cpu{};
+    Require(ChangedBlocks(base, 3 * Block, generations, changed, cpu), "the blocks of an import window outside the tracker mutex are not tracked");
+    Require(changed[0] == BlockUnchanged && UnchangedSince(base, Block, synced), "a page an import window outside the tracker mutex resolved without changing its bytes reads as written");
+    Require(changed[1] == BlockWritten && WrittenSince(base + Block, Block, synced), "a store of new bytes within an import window outside the tracker mutex was missed");
+    Require(changed[2] == BlockUnchanged, "a block an import window outside the tracker mutex did not touch reads as written");
+    Require(UnchangedSince(base + 3 * Block, Block, syncedBeside), "a block beside an import window outside the tracker mutex reads as written");
+    const auto after = CollectWritesUncached(base, 3 * Block);
+    bytes[0x100] = 0x33;
+    static_cast<void>(CollectWritesUncached(base, 3 * Block));
+    Require(after != 0 && !UnchangedSince(base, Block, after), "a store after an import window outside the tracker mutex was missed");
+}
+
 void CheckImportWindowOtherThread() {
     void* memory = AllocateWatched(2 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -2784,6 +2833,7 @@ int main(int argc, char** argv) {
         CheckWidenedCollectBesideUncommittedPages();
 #endif
         CheckImportWindow();
+        CheckImportWindowOutsideLock();
         CheckImportWindowZeroPages();
         CheckImportWindowOtherThread();
         CheckImportWindowOverUnwatchedBlock();

@@ -421,6 +421,11 @@ IrValue* TranslationContext::propagatedNanResultF32(std::initializer_list<IrValu
     return &ir.BitCastF32(ir.Select(isNan(bits), *nan, bits));
 }
 
+bool TranslationContext::probedFloat32Mode() const {
+    const std::uint32_t declared = floatMode.has_value() ? floatMode->floatMode : ModeUndeclaredSeed;
+    return (declared & ModeTrackedBits) == ModeDenorm1664Bits && (rounding.unknown & ModeTrackedBits) == 0u && (rounding.value & ModeTrackedBits) == ModeDenorm1664Bits;
+}
+
 IrValue& TranslationContext::invalidProductF32(IrValue* lhs, IrValue* rhs) {
     IrValue& lhsMagnitude = ir.BitwiseAnd(ir.BitCastU32(*lhs), ir.Constant(0x7fffffffu));
     IrValue& rhsMagnitude = ir.BitwiseAnd(ir.BitCastU32(*rhs), ir.Constant(0x7fffffffu));

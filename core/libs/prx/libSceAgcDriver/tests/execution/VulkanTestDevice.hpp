@@ -52,4 +52,23 @@ inline ShaderRecompiler::BindingLayout PixelPushLayout(std::uint32_t vertexPush,
     return {0, 0, offset, AgcDriver::Graphics::PipelinePushSlotBytes - offset % AgcDriver::Graphics::PipelinePushSlotBytes};
 }
 
+inline void RequestFloat16FormProbes() {
+    SetTestEnvironment("APS5_F16_NATIVE_MINMAX", "1");
+}
+
+inline ShaderRecompiler::SpirvTarget WithoutFloat16Forms(ShaderRecompiler::SpirvTarget target) {
+    target.float16WholeRegister = false;
+    target.float16ScalarOnVector = false;
+    target.float16NativeMinMax = false;
+    return target;
+}
+
+inline ShaderRecompiler::SpirvTarget WithFloat16Forms(const AgcDriver::VulkanDevice& device) {
+    auto target = device.Target();
+    target.float16WholeRegister = true;
+    target.float16ScalarOnVector = false;
+    target.float16NativeMinMax = device.ComputeTarget(32u).float16NativeMinMax;
+    return target;
+}
+
 #endif

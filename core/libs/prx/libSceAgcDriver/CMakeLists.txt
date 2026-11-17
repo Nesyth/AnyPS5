@@ -182,6 +182,19 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcChangedLineCensusShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/ChangedLineCensus.comp)
+set(agcChangedLineCensusShaderSpv ${agcTextureDetileGeneratedDir}/ChangedLineCensus.spv)
+set(agcChangedLineCensusShaderHeader ${agcTextureDetileGeneratedDir}/ChangedLineCensus_spv.h)
+add_custom_command(
+        OUTPUT "${agcChangedLineCensusShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcChangedLineCensusShaderSpv}" "${agcChangedLineCensusShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcChangedLineCensusShaderSpv} -DOUTPUT=${agcChangedLineCensusShaderHeader}
+        -DSYMBOL=CHANGED_LINE_CENSUS_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcChangedLineCensusShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcCmaskClearShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/CmaskClear.comp)
 set(agcCmaskClearShaderSpv ${agcTextureDetileGeneratedDir}/CmaskClear.spv)
 set(agcCmaskClearShaderHeader ${agcTextureDetileGeneratedDir}/CmaskClear_spv.h)
@@ -471,6 +484,10 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FloatFlushProbe.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FloatProbeTolerance.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Float16ConversionProbe.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Float16FormProbe.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Float32ProbeProgram.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Float32UnaryProbe.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/RobustLoadProbe.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AspectFit.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PresentationScaler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PresentationPass.cpp
@@ -529,6 +546,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/StagedMerge.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BarrierBatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidencyCensus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcSampleOrderShaderHeaders}
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BindlessHeap.cpp
@@ -542,6 +560,7 @@ set(agcDriverSources
         ${agcPackedMergeShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcStagingCopyBackShaderHeader}
+        ${agcChangedLineCensusShaderHeader}
         ${agcTextureDetileImageShaderHeader}
         ${agcTextureRepackShaderHeader}
         ${agcTextureDetileAddressedShaderHeader}

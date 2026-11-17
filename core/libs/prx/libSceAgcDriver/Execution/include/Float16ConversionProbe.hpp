@@ -33,6 +33,17 @@ std::vector<std::uint32_t> Float16NarrowProbeInputs();
 
 Float16ConversionProbeResult ProbeFloat16Conversions(VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target);
 
+struct Float16PackProbeResult {
+    std::uint32_t form = 0;
+    std::uint32_t modes = 0;
+    std::uint64_t compared = 0;
+    std::uint64_t mismatches = 0;
+    std::optional<std::uint32_t> first;
+};
+
+Float16ConversionProbeDirection ProbeFloat16NativeWiden(VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target);
+Float16PackProbeResult ProbeFloat16PackTowardZero(VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target);
+
 }
 
 #endif

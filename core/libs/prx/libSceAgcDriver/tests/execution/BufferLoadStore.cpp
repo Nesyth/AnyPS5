@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/RobustLoadProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
@@ -288,7 +289,7 @@ void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, s
     device.WaitIdle();
 }
 
-void CheckRuntimeDescriptors(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
+void CheckRuntimeDescriptors(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, bool exactRobustLoads, bool exactRobustLoadsAlign4) {
     constexpr std::array<std::uint32_t, 6> code{0x34040082u, 0xe0000000u, 0x80000100u, 0xe0701000u, 0x80010102u, 0xbf810000u};
     struct Case {
         std::uint32_t stride;
@@ -304,7 +305,10 @@ void CheckRuntimeDescriptors(AgcDriver::VulkanDevice& device, std::uint32_t wave
     const auto output = BufferDescriptor(Output.data(), threads * 4u);
     std::copy(output.begin(), output.end(), userData.begin() + 4);
     const ShaderRecompiler::ShaderComputeStageInfo compute{{threads, 1u, 1u}, 0u, {false, false, false}, false, 1u};
-    ShaderRecompiler::RecompileRequest request{{ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}}, {waveSize, 0u, userData, compute, std::nullopt, std::nullopt, {}}, device.ComputeTarget(waveSize), {0u, 0u, 0u, 128u}};
+    auto target = device.ComputeTarget(waveSize);
+    target.exactRobustLoads = exactRobustLoads;
+    target.exactRobustLoadsAlign4 = exactRobustLoadsAlign4;
+    ShaderRecompiler::RecompileRequest request{{ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}}, {waveSize, 0u, userData, compute, std::nullopt, std::nullopt, {}}, target, {0u, 0u, 0u, 128u}};
     ShaderRecompiler::RecompileResult first;
     for (const auto& value : cases) {
         auto input = BufferDescriptor(Input.data(), value.records);
@@ -345,15 +349,31 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        Run(*device, Wave32Code, 32, device->ComputeTarget(32));
-        Check(Expected32, Names, "wave32");
-        Run(*device, Wave64Code, 64, device->ComputeTarget(64));
-        Check(Expected64, Names, "wave64");
-        Run(*device, Wave64Code, 64, device->ComputeTarget(32));
-        Check(Expected64, Names, "wave64 split");
-        CheckRuntimeDescriptors(*device, 32u);
-        CheckRuntimeDescriptors(*device, 64u);
-        std::puts("buffer load store tests passed");
+        const bool exact = device->Target().exactRobustLoads;
+        const bool align4 = device->Target().exactRobustLoadsAlign4;
+        for (const bool exactLoads : {false, true}) {
+            if (exactLoads && !exact) continue;
+            const auto target = [&](std::uint32_t wave) {
+                auto chosen = device->ComputeTarget(wave);
+                chosen.exactRobustLoads = exactLoads;
+                chosen.exactRobustLoadsAlign4 = exactLoads && align4;
+                return chosen;
+            };
+            Run(*device, Wave32Code, 32, target(32));
+            Check(Expected32, Names, exactLoads ? "wave32 with exact robust loads" : "wave32");
+            Run(*device, Wave64Code, 64, target(64));
+            Check(Expected64, Names, exactLoads ? "wave64 with exact robust loads" : "wave64");
+            Run(*device, Wave64Code, 64, target(32));
+            Check(Expected64, Names, exactLoads ? "wave64 split with exact robust loads" : "wave64 split");
+            CheckRuntimeDescriptors(*device, 32u, exactLoads, exactLoads && align4);
+            CheckRuntimeDescriptors(*device, 64u, exactLoads, exactLoads && align4);
+        }
+        if (align4) {
+            const auto probe = AgcDriver::ProbeRobustLoads(*device, device->Target());
+            std::printf("exact robust load probe: %u of %u loads differ from today's checked loads\n", probe.mismatches, probe.compared);
+            Require(probe.compared != 0u && probe.mismatches == 0u, "buffer load store: the exact robust load probe found " + std::to_string(probe.mismatches) + " loads that differ" + (probe.first ? " (range " + std::to_string(probe.first->range) + ", offset " + std::to_string(probe.first->offset) + (probe.first->scalar ? ", scalar)" : ", vector)") : std::string()));
+        }
+        std::printf("buffer load store tests passed (%s)\n", align4 ? "with and without exact robust loads at alignment 4" : exact ? "with and without exact robust loads" : "without exact robust loads");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

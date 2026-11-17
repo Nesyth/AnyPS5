@@ -18,6 +18,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Float32NanProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Float16ConversionProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FloatFlushProbe.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Float16FormProbe.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Float32UnaryProbe.hpp"
+#include "prx/libSceAgcDriver/Execution/include/RobustLoadProbe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeviceImageTable.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
@@ -250,6 +253,10 @@ std::optional<std::uint32_t> ActiveValidationLayerVersion(PFN_vkGetInstanceProcA
 }
 
 constexpr std::uint32_t HeapDataUniformDwordCap = 16384u;
+
+bool ProbeSwitchSet(const char* text) {
+    return text != nullptr && text[0] != '\0' && text[0] != '0';
+}
 
 bool DescriptorHeapAvailable(const std::vector<VkExtensionProperties>& availableExtensions, PFN_vkGetInstanceProcAddr instanceProc) {
     if (!Graphics::GpuHeapEnabled()) return false;
@@ -672,6 +679,20 @@ struct VulkanDevice::State {
     bool float32HostNans = false;
     bool float32HostFmaNans = false;
     bool float32NativeMinMax = false;
+    bool float16WholeRegister = false;
+    bool float16ScalarOnVector = false;
+    bool float16NativeMinMax = false;
+    std::uint32_t float32HardwareFlushOps = 0;
+    std::uint32_t float32NativeUnaryOps = 0;
+    std::uint32_t float32HardwareFlushRequest = 0;
+    std::uint32_t float32NativeUnaryRequest = 0;
+    bool float16NativeWidenCandidate = false;
+    bool float16NativeWiden = false;
+    bool float16PackTowardZeroCandidate = false;
+    std::uint32_t float16PackTowardZero = 0;
+    bool exactRobustLoadsCandidate = false;
+    bool exactRobustLoadsAlign4 = false;
+    std::uint32_t robustStorageAlignment = 0;
     bool probingFloatControls = false;
     bool demoteToHelperInvocation = false;
     bool earlyFragmentSampleMaskTestBeforeSampleCounting = false;
@@ -1924,6 +1945,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (state->float32FlushToZeroCandidate && float32Flush.declared) state->capabilities.push_back(spv::CapabilityDenormFlushToZero);
     state->float32DenormPreserve = floatControls.shaderDenormPreserveFloat32 == VK_TRUE && floatControls.denormBehaviorIndependence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE && std::getenv("APS5_NO_HW_F32_PRESERVE") == nullptr;
     if ((state->float16DenormPreserve || state->float32DenormPreserve) && std::find(state->capabilities.begin(), state->capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDenormPreserve)) == state->capabilities.end()) state->capabilities.push_back(spv::CapabilityDenormPreserve);
+    const auto exactnessRequest = [](const char* text, std::uint32_t all) -> std::uint32_t {
+        if (text == nullptr || *text == '\0') return 0u;
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(text, &end, 0);
+        if (end != text && *end == '\0' && value == 0u) return 0u;
+        if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) return static_cast<std::uint32_t>(value) & all;
+        return all;
+    };
+    state->float32HardwareFlushRequest = exactnessRequest(std::getenv("APS5_F32_WIDE_HARDWARE_FLUSH"), ShaderRecompiler::Float32HardwareFlushAll);
+    state->float32NativeUnaryRequest = exactnessRequest(std::getenv("APS5_F32_NATIVE_UNARY"), ShaderRecompiler::Float32NativeUnaryAll);
+    state->float16NativeWidenCandidate = ProbeSwitchSet(std::getenv("APS5_F16_NATIVE_WIDEN")) &&!state->float16DenormPreserve && floatControls.shaderDenormPreserveFloat16 == VK_TRUE && floatControls.shaderDenormPreserveFloat64 == VK_TRUE &&
+        floatControls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY && std::find(state->capabilities.begin(), state->capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDenormPreserve)) != state->capabilities.end();
+    state->float16PackTowardZeroCandidate = ProbeSwitchSet(std::getenv("APS5_F16_PACK_TOWARD_ZERO")) && float16Rte;
     VkPhysicalDeviceShaderFmaFeaturesKHR fmaFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};
     if (float16Rte && hasExtension(VK_KHR_SHADER_FMA_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fmaFeatures};
@@ -2614,12 +2648,20 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &queried);
     }
     state->robustBufferAccess2 = robustness2.robustBufferAccess2 == VK_TRUE && enabled.robustBufferAccess == VK_TRUE;
-    if (state->robustBufferAccess2 && std::getenv("APS5_NO_EXACT_ROBUST_LOADS") == nullptr) {
+    if (state->robustBufferAccess2) {
         VkPhysicalDeviceRobustness2PropertiesEXT robustnessLimits{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 queriedLimits{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &robustnessLimits};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &queriedLimits);
-        state->exactRobustLoads = robustnessLimits.robustStorageBufferAccessSizeAlignment == 1u;
+        state->robustStorageAlignment = robustnessLimits.robustStorageBufferAccessSizeAlignment;
     }
+    if (state->robustBufferAccess2 && std::getenv("APS5_NO_EXACT_ROBUST_LOADS") == nullptr) {
+        state->exactRobustLoads = state->robustStorageAlignment == 1u;
+        state->exactRobustLoadsCandidate = state->robustStorageAlignment > 1u && state->robustStorageAlignment <= 4u && ProbeSwitchSet(std::getenv("APS5_EXACT_ROBUST_LOADS_ALIGN4"));
+    }
+    const auto independence = [](VkShaderFloatControlsIndependence value) {
+        return value == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL ? "ALL" : value == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY ? "32_BIT_ONLY" : value == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE ? "NONE" : "unknown";
+    };
+    std::fprintf(stderr, "[float-controls] device limits: robustStorageBufferAccessSizeAlignment %u%s, denormBehaviorIndependence %s, roundingModeIndependence %s, shaderDenormPreserveFloat16 %u, shaderDenormPreserveFloat64 %u\n", state->robustStorageAlignment, state->robustBufferAccess2 ? "" : " (robustBufferAccess2 off)", independence(floatControls.denormBehaviorIndependence), independence(floatControls.roundingModeIndependence), floatControls.shaderDenormPreserveFloat16 == VK_TRUE ? 1u : 0u, floatControls.shaderDenormPreserveFloat64 == VK_TRUE ? 1u : 0u);
     if (robustness2.nullDescriptor == VK_TRUE || state->robustBufferAccess2) {
         const bool nullDescriptor = robustness2.nullDescriptor == VK_TRUE;
         robustness2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
@@ -2919,6 +2961,28 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->float32DenormPreserve = probe.mismatches == 0u;
         std::fprintf(stderr, "[float-controls] f32 denormal preserve: %s (%u of %u probe results on normal values differ from the default mode by more than the Vulkan precision bounds, %.0f ms)\n", state->float32DenormPreserve ? "requested" : "not requested", probe.mismatches, probe.compared, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - probeStart).count());
     }
+    if (state->float16NativeWidenCandidate) {
+        const auto probeStart = std::chrono::steady_clock::now();
+        state->probingFloatControls = true;
+        Float16ConversionProbeDirection probe;
+        std::string failure;
+        try {
+            probe = ProbeFloat16NativeWiden(*this, Target());
+            if (state->float32FlushToZero && state->float32FlushComputeOnly) {
+                const auto compute = ProbeFloat16NativeWiden(*this, ComputeTarget(32u));
+                probe.compared += compute.compared;
+                probe.mismatches += compute.mismatches;
+                if (!probe.first) probe.first = compute.first;
+            }
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+        state->probingFloatControls = false;
+        state->float16NativeWiden = failure.empty() && probe.compared != 0u && probe.mismatches == 0u;
+        char first[96] = "";
+        if (probe.first) std::snprintf(first, sizeof(first), ", first 0x%08x: 0x%08x decoded, 0x%08x native", probe.first->input, probe.first->emulated, probe.first->native);
+        std::fprintf(stderr, "[float-controls] f16 to f32 widening with DenormPreserve 16 and 64 under denormBehaviorIndependence 32_BIT_ONLY: %s (%u of %u probe results differ from the integer decode%s%s%s, %.0f ms)\n", state->float16NativeWiden ? "native" : "emulated", probe.mismatches, probe.compared, first, failure.empty() ? "" : ", probe failed: ", failure.c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - probeStart).count());
+    }
     if (state->float16HostNanCandidate) {
         const auto probeStart = std::chrono::steady_clock::now();
         state->probingFloatControls = true;
@@ -2975,6 +3039,106 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             return text + ")";
         };
         std::fprintf(stderr, "[float-controls] f16 to f32 NaN results: %s; f32 to f16 NaN results: %s (%.0f ms)\n", describe(probe.widen, state->float16WidenNans).c_str(), describe(probe.narrow, state->float16NarrowNans).c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - probeStart).count());
+    }
+    {
+        const auto halfTarget = Target();
+        const auto halfCapability = [&](spv::Capability capability) { return std::find(halfTarget.supportedCapabilities.begin(), halfTarget.supportedCapabilities.end(), static_cast<std::uint32_t>(capability)) != halfTarget.supportedCapabilities.end(); };
+        const bool nativeHalves = halfCapability(spv::CapabilityFloat16) && halfCapability(spv::CapabilityRoundingModeRTE) && halfCapability(spv::CapabilityDenormPreserve);
+        const auto switchedOn = [](const char* text) { return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0; };
+        const bool wholeRegisterRequested = switchedOn(std::getenv("APS5_F16_WHOLE_REGISTER"));
+        state->float16WholeRegister = wholeRegisterRequested && nativeHalves;
+        std::fprintf(stderr, "[float-controls] f16 packed operations on whole registers: %s (bit identity, no probe: 0 of 0 probe cases differ, 0 ms)\n", state->float16WholeRegister ? "on" : wholeRegisterRequested ? "off, no native f16" : "off, APS5_F16_WHOLE_REGISTER unset or 0");
+        const bool scalarOnVectorRequested = switchedOn(std::getenv("APS5_F16_SCALAR_ON_VECTOR"));
+        state->float16ScalarOnVector = scalarOnVectorRequested && nativeHalves;
+        std::fprintf(stderr, "[float-controls] f16 scalar operations on whole registers: %s (bit identity, no probe: 0 of 0 probe cases differ, 0 ms)\n", state->float16ScalarOnVector ? "on" : scalarOnVectorRequested ? "off, no native f16" : "off, APS5_F16_SCALAR_ON_VECTOR unset or 0");
+        const bool minMaxRequested = switchedOn(std::getenv("APS5_F16_NATIVE_MINMAX"));
+        if (minMaxRequested && nativeHalves) {
+            const auto probeStart = std::chrono::steady_clock::now();
+            state->probingFloatControls = true;
+            Float16FormProbeResult probe;
+            std::string failure;
+            try {
+                probe = ProbeFloat16NativeMinMax(*this, ComputeTarget(32u), true);
+            } catch (const std::exception& error) {
+                failure = error.what();
+            }
+            state->probingFloatControls = false;
+            state->float16NativeMinMax = failure.empty() && probe.compared != 0u && probe.mismatches == 0u;
+            std::fprintf(stderr, "[float-controls] f16 min, max, min3 and max3 of compute programs: %s (%llu of %llu probe cases differ: min %llu, max %llu; %u float modes, %llu of %llu dispatched groups counted%s%s, %.0f ms)\n", state->float16NativeMinMax ? "NMin and NMax" : "integer order",
+                static_cast<unsigned long long>(probe.mismatches), static_cast<unsigned long long>(probe.compared), static_cast<unsigned long long>(probe.byOperation[0]), static_cast<unsigned long long>(probe.byOperation[1]),
+                probe.modes, static_cast<unsigned long long>(probe.groupsCounted), static_cast<unsigned long long>(probe.groupsExpected), failure.empty() ? "" : "; probe failed: ", failure.c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - probeStart).count());
+        } else {
+            std::fprintf(stderr, "[float-controls] f16 min, max, min3 and max3 of compute programs: integer order (%s: 0 of 0 probe cases differ, 0 ms)\n", minMaxRequested ? "no native f16" : "APS5_F16_NATIVE_MINMAX unset or 0");
+        }
+    }
+    const auto describeExactnessProbe = [](const Float32Probe::Verdict& probe) {
+        char text[384];
+        std::snprintf(text, sizeof(text), "%llu of %llu probe results differ, %llu differ in today's form, checksums differ in checks 0x%x, %u programs not compiled, %u runs failed their control counts, sentinels %s, %u dispatches", static_cast<unsigned long long>(probe.mismatches), static_cast<unsigned long long>(probe.compared), static_cast<unsigned long long>(probe.referenceMismatches), probe.checksumDifferences, probe.notCompiled, probe.failedRuns, probe.sentinels ? "found" : "missing", probe.dispatches);
+        return std::string(text);
+    };
+    if (state->float32HardwareFlushRequest != 0u) {
+        const auto probeStart = std::chrono::steady_clock::now();
+        const auto probeTarget = Target();
+        const bool declared = std::find(probeTarget.supportedCapabilities.begin(), probeTarget.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDenormFlushToZero)) != probeTarget.supportedCapabilities.end();
+        if (state->float32FlushToZero && declared) {
+            state->probingFloatControls = true;
+            const auto probe = ProbeFloat32HardwareFlushOps(*this, probeTarget, Float32Probe::FullSweep());
+            state->probingFloatControls = false;
+            state->float32HardwareFlushOps = probe.proven & state->float32HardwareFlushRequest;
+            std::fprintf(stderr, "[float-controls] f32 fract with the hardware denormal flush: mask 0x%x of requested 0x%x (%s, %.0f ms)\n", state->float32HardwareFlushOps, state->float32HardwareFlushRequest, describeExactnessProbe(probe).c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - probeStart).count());
+        } else {
+            std::fprintf(stderr, "[float-controls] f32 fract with the hardware denormal flush: not probed (no declared hardware f32 flush)\n");
+        }
+    }
+    if (state->float32NativeUnaryRequest != 0u) {
+        const auto probeStart = std::chrono::steady_clock::now();
+        const auto probeTarget = Target();
+        const std::array<bool, 2> flushSettings{probeTarget.float32FlushToZero, state->float32FlushToZero};
+        state->probingFloatControls = true;
+        const auto probe = ProbeFloat32NativeUnary(*this, probeTarget, std::span<const bool>(flushSettings.data(), flushSettings[0] == flushSettings[1] ? 1u : 2u), Float32Probe::FullSweep());
+        state->probingFloatControls = false;
+        state->float32NativeUnaryOps = probe.proven & state->float32NativeUnaryRequest;
+        std::fprintf(stderr, "[float-controls] f32 unary operations without special-case selects: mask 0x%03x of requested 0x%03x (%s, %.0f ms)\n", state->float32NativeUnaryOps, state->float32NativeUnaryRequest, describeExactnessProbe(probe).c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - probeStart).count());
+    }
+    if (state->float16PackTowardZeroCandidate) {
+        const auto probeStart = std::chrono::steady_clock::now();
+        state->probingFloatControls = true;
+        Float16PackProbeResult probe;
+        std::string failure;
+        try {
+            probe = ProbeFloat16PackTowardZero(*this, Target());
+            if (state->float32FlushToZero && state->float32FlushComputeOnly) {
+                const auto compute = ProbeFloat16PackTowardZero(*this, ComputeTarget(32u));
+                probe.compared += compute.compared;
+                probe.mismatches += compute.mismatches;
+                probe.modes += compute.modes;
+                if (compute.first && (!probe.first || *compute.first < *probe.first)) probe.first = compute.first;
+                if (compute.form != probe.form || probe.mismatches != 0u) probe.form = 0u;
+            }
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+        state->probingFloatControls = false;
+        state->float16PackTowardZero = failure.empty() && probe.compared != 0u ? probe.form : 0u;
+        char first[48] = "";
+        if (probe.first) std::snprintf(first, sizeof(first), ", first input 0x%08x", *probe.first);
+        std::fprintf(stderr, "[float-controls] f32 to f16 toward-zero narrowing (v_cvt_pkrtz_f16_f32): %s (%llu of %llu probe results differ from the emulated narrowing in %u float modes%s%s%s, %.0f ms)\n", state->float16PackTowardZero == ShaderRecompiler::PackTowardZeroHalf2x16 ? "PackHalf2x16" : "emulated", static_cast<unsigned long long>(probe.mismatches), static_cast<unsigned long long>(probe.compared), probe.modes, first, failure.empty() ? "" : ", probe failed: ", failure.c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - probeStart).count());
+    }
+    if (state->exactRobustLoadsCandidate) {
+        const auto probeStart = std::chrono::steady_clock::now();
+        state->probingFloatControls = true;
+        RobustLoadProbeResult probe;
+        std::string failure;
+        try {
+            probe = ProbeRobustLoads(*this, Target());
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+        state->probingFloatControls = false;
+        state->exactRobustLoadsAlign4 = failure.empty() && probe.compared != 0u && probe.mismatches == 0u;
+        char first[192] = "";
+        if (probe.first) std::snprintf(first, sizeof(first), ", first range %u bytes%s, out-of-range mode %u, %s load at byte %u: 0x%08x today, 0x%08x exact", probe.first->range, probe.first->rangeEndsBuffer ? " at the end of its array" : "", probe.first->outOfRangeMode, probe.first->scalar ? "scalar" : "vector", probe.first->offset, probe.first->today, probe.first->exact);
+        std::fprintf(stderr, "[float-controls] exact robust loads at robustStorageBufferAccessSizeAlignment %u: %s (%u of %u probe loads differ from today's checked loads%s%s%s, %.0f ms)\n", state->robustStorageAlignment, state->exactRobustLoadsAlign4 ? "on" : "off", probe.mismatches, probe.compared, first, failure.empty() ? "" : ", probe failed: ", failure.c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - probeStart).count());
     }
     // A device without a window is usually replaced by the window's device before the title draws
     // (Driver::AttachWindow): its replay starts at its first draw or dispatch instead, so the
@@ -4847,6 +5011,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::ComputeTarget(std::uint32_t waveSize
     if (waveSize == 32u && state->computeWave32) target.subgroupSize = 32u;
     target.gpuResolvedImages = Graphics::DescriptorHeapEnabled();
     if (state->devicePageTable) target.bdaAbiVersion = ShaderRecompiler::BdaAbi::PageTableVersion;
+    target.float16NativeMinMax = state->float16NativeMinMax;
     return target;
 }
 
@@ -4912,6 +5077,8 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     target.float32HostNans = state->float32HostNans;
     target.float32HostFmaNans = state->float32HostFmaNans;
     target.float32NativeMinMax = state->float32NativeMinMax;
+    target.float32HardwareFlushOps = state->float32HardwareFlushOps;
+    target.float32NativeUnaryOps = state->float32NativeUnaryOps;
     target.fusedExactArithmetic = state->fusedExactArithmetic;
     target.hostInterpolationFirst = state->hostInterpolationFirst;
     target.float32DenormPreserve = state->float32DenormPreserve;
@@ -4921,6 +5088,14 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     target.heapBufferDescriptors = target.descriptorMemory && state->heapBufferDescriptors;
     target.float16WidenNans = state->float16WidenNans;
     target.float16NarrowNans = state->float16NarrowNans;
+    target.float16WholeRegister = state->float16WholeRegister;
+    target.float16ScalarOnVector = state->float16ScalarOnVector;
+    target.float16NativeWiden = state->float16NativeWiden;
+    target.float16PackTowardZero = state->float16PackTowardZero;
+    if (state->exactRobustLoadsAlign4) {
+        target.exactRobustLoads = true;
+        target.exactRobustLoadsAlign4 = true;
+    }
     return target;
 }
 

@@ -498,6 +498,41 @@ void OverflowedHistory(AgcDriver::VulkanDevice& device) {
     Require(GuestMemory::SubscriptionBumpsSince(*subscription, settled, plain, lookup) && plain == std::vector<std::uint64_t>{GuestMemory::WriteBlockOf(base + 2u * BlockBytes)} && lookup.empty(), "overflow: after the overflow cleared, a new bump of block 2 was not listed by itself");
 }
 
+void CensusSources(AgcDriver::VulkanDevice& device) {
+    static_cast<void>(device);
+    if (OutcomeOnly) return;
+    GuestBlocks blocks(3u * BlockBytes);
+    const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(blocks.base));
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> ranges{{{base, base + 3u * BlockBytes}}};
+    const auto subscription = GuestMemory::SubscribeWriteCensus(ranges);
+    const auto start = GuestMemory::ReadWriteCensus(*subscription, true);
+    const auto driver = static_cast<std::size_t>(GuestMemory::WriteBumpSource::Driver);
+    const auto pending = static_cast<std::size_t>(GuestMemory::WriteBumpSource::Pending);
+    const auto release = static_cast<std::size_t>(GuestMemory::WriteBumpSource::Release);
+    constexpr std::uint64_t tag = (std::uint64_t{16} << 56u) | 7u;
+    const auto previousTag = GuestMemory::SetStampTag(tag);
+    GuestMemory::NoteGpuPending(base, 3u * BlockBytes);
+    GuestMemory::MarkWritten(base + BlockBytes, 4u);
+    GuestMemory::SetStampTag(previousTag);
+    GuestMemory::NoteTextureReleased(base + 2u * BlockBytes);
+    const auto counted = GuestMemory::ReadWriteCensus(*subscription, false);
+    Require(counted.events[pending] - start.events[pending] == 1u && counted.blocks[pending] - start.blocks[pending] == 3u, "census: one pending note over three blocks was not counted as one event of three block bumps");
+    Require(counted.events[driver] - start.events[driver] == 1u && counted.blocks[driver] - start.blocks[driver] == 1u, "census: a driver store into one block was not counted as one event of one block bump");
+    Require(counted.events[release] - start.events[release] == 1u, "census: a texture release over the range was not counted as a release");
+    Require(counted.generation - start.generation >= 5u, "census: the subscription's generation moved by " + std::to_string(counted.generation - start.generation) + " for five block bumps");
+    Require(counted.firstSource == GuestMemory::WriteBumpSource::Pending && counted.firstTag == tag, "census: the first bump after the restart is not the tagged pending note");
+    const auto tagged = std::find_if(counted.tags.begin(), counted.tags.end(), [&](const std::pair<std::uint64_t, std::uint64_t>& entry) { return entry.first == tag; });
+    Require(tagged != counted.tags.end() && tagged->second == 1u, "census: the driver store was not counted under its stamp tag");
+    const auto third = GuestMemory::NewestCensusStamper(*subscription, base + 2u * BlockBytes, 4u);
+    Require(third.source == GuestMemory::WriteBumpSource::Release && third.tag == 0, "census: the newest stamper of the third block is not the untagged release");
+    const auto second = GuestMemory::NewestCensusStamper(*subscription, base + BlockBytes, 4u);
+    Require(second.source == GuestMemory::WriteBumpSource::Driver && second.tag == tag, "census: the newest stamper of the second block is not the tagged driver store");
+    const auto whole = GuestMemory::NewestCensusStamper(*subscription, base, 3u * BlockBytes);
+    Require(whole.generation == third.generation, "census: the newest stamper of the range is not the last bump");
+    static_cast<void>(GuestMemory::ReadWriteCensus(*subscription, true));
+    Require(GuestMemory::ReadWriteCensus(*subscription, false).firstSource == GuestMemory::WriteBumpSource::Count, "census: a restart did not clear the first bump");
+}
+
 void WriteValidationClocks(AgcDriver::VulkanDevice&) {
     namespace Validation = AgcDriver::Graphics::WriteValidation;
     namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
@@ -584,7 +619,7 @@ int main(int argc, char** argv) {
         TargetBytes = AgcDriver::Graphics::ColorTargetLayout(TargetWidth, TargetHeight, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4).Bytes();
         GuestBlocks target((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
         Target = &target;
-        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 12> cases{{{"cpu", &CpuWrite}, {"table", &TableWord}, {"pending", &PendingWrite}, {"remap", &Remap}, {"compared", &Compared}, {"driver", &DriverStore}, {"unwatch", &UnwatchRange}, {"release", &Released}, {"import", &Imported}, {"array", &ArraySlices}, {"overflow", &OverflowedHistory}, {"write-validation", &WriteValidationClocks}}};
+        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 13> cases{{{"cpu", &CpuWrite}, {"table", &TableWord}, {"pending", &PendingWrite}, {"remap", &Remap}, {"compared", &Compared}, {"driver", &DriverStore}, {"unwatch", &UnwatchRange}, {"release", &Released}, {"import", &Imported}, {"array", &ArraySlices}, {"overflow", &OverflowedHistory}, {"write-validation", &WriteValidationClocks}, {"census", &CensusSources}}};
         for (const auto& [name, run] : cases) {
             if (!args.empty() && std::find(args.begin(), args.end(), name) == args.end()) continue;
             run(*device);

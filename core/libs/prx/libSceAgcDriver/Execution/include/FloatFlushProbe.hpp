@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_FLOATFLUSHPROBE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_FLOATFLUSHPROBE_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Float32ProbeProgram.hpp"
 #include "Recompiler.hpp"
 
 #include <cstdint>
@@ -16,6 +17,7 @@ struct FloatFlushProbeResult {
 
 FloatFlushProbeResult ProbeFloat32FlushToZero(VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target);
 FloatFlushProbeResult ProbeFloat32DenormPreserve(VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target);
+Float32Probe::Verdict ProbeFloat32HardwareFlushOps(VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target, const Float32Probe::Sweep& sweep);
 
 }
 

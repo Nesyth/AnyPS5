@@ -26,9 +26,11 @@ public:
     }
     void SetEntryRounding(const RoundingState& state) { setRounding(state); }
     void SetNativeFloat16(bool enabled, bool fma, bool hostNans) { nativeFloat16 = enabled; nativeFloat16Fma = enabled && fma; float16HostNans = enabled && hostNans; }
+    void SetFloat16Forms(bool wholeRegister, bool scalarOnVector, bool nativeMinMax) { float16WholeRegister = wholeRegister; float16ScalarOnVector = scalarOnVector; float16NativeMinMax = nativeMinMax; }
     void SetFloat32DenormPreserve(bool enabled) { float32DenormPreserve = enabled; }
     void SetFloat32HostNans(bool enabled) { float32HostNans = enabled; }
     void SetFloat32HostFmaNans(bool enabled) { float32HostFmaNans = enabled; }
+    void SetFloat32Exactness(std::uint32_t hardwareFlushOps, std::uint32_t nativeUnaryOps) { float32HardwareFlushOps = hardwareFlushOps; float32NativeUnaryOps = nativeUnaryOps; }
     void SetFloat32FlushToZero(bool enabled) { float32FlushToZero = enabled; }
     void SetFloat32FlushDeclared(bool enabled) { float32FlushDeclared = enabled; }
     void SetFloat64(bool enabled) { float64 = enabled; }
@@ -83,6 +85,7 @@ private:
     bool dx10Clamp() const { return !floatMode.has_value() || floatMode->dx10Clamp; }
     bool fp16Overflow() const { return floatMode.has_value() && floatMode->fp16Overflow; }
     bool nativeFloat16Mode() const { return nativeFloat16 && (!floatMode.has_value() || (floatMode->floatMode & 0xccu) == 0xc0u); }
+    bool float16InputsKept() const { return !floatMode.has_value() || (floatMode->floatMode & 0x40u) != 0u; }
     bool hostFloat16Nans(const RdnaInstruction& inst, std::uint32_t count, bool accumulator);
     IrF32 clampF16Overflow(IrF32 value, std::initializer_list<IrValue*> sources);
     IrU32 clampF16Bits(const RdnaOperand& operand, IrU32 bits);
@@ -108,6 +111,8 @@ private:
     IrValue* propagatedNanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, const IrValue* negatedFrom = nullptr);
     bool hostNanResultF32(std::initializer_list<IrValue*> sources) const;
     IrValue* hostNanSelectF32(std::initializer_list<IrValue*> sources, IrValue* result, const IrValue* negatedFrom = nullptr);
+    bool probedFloat32Mode() const;
+    bool nativeUnaryF32(IrOpcode opcode) const;
     IrValue& invalidProductF32(IrValue* lhs, IrValue* rhs);
     IrValue* fusedNanResultF32(IrValue* lhs, IrValue* rhs, IrValue* addend, IrValue* result);
     IrValue& invalidOperationF32(std::initializer_list<IrValue*> sources, IrValue& invalidProduct);
@@ -239,6 +244,17 @@ private:
     bool float16Ternary(const RdnaInstruction& inst, IrOpcode opcode, bool accumulator, bool mix);
     bool float16Native(const RdnaInstruction& inst, IrOpcode opcode, const RdnaOperand& lhsOperand, const RdnaOperand& rhsOperand);
     bool float16NativeFma(const RdnaInstruction& inst, bool accumulator);
+    IrU32 shuffle16(IrU32 first, IrU32 second, std::uint32_t low, std::uint32_t high);
+    IrU32 float16Word(const RdnaOperand& operand, std::uint32_t low, std::uint32_t high, std::uint32_t negate);
+    IrU32 float16LaneWord(const RdnaOperand& operand, std::uint32_t lane);
+    IrU32 saturate16(IrU32 value, bool dx10);
+    bool float16LaneWrite(const RdnaOperand& operand) const;
+    void writeF16Lane(const RdnaOperand& operand, IrU32 value, std::uint32_t lane);
+    bool packedFloat16Words(const RdnaInstruction& inst, IrOpcode opcode, bool accumulator);
+    bool packedMinMaxF16Words(const RdnaInstruction& inst, IrOpcode opcode);
+    bool float16NativeWords(const RdnaInstruction& inst, IrOpcode opcode, const RdnaOperand& lhsOperand, const RdnaOperand& rhsOperand);
+    bool float16NativeFmaWords(const RdnaInstruction& inst, bool accumulator);
+    bool minMaxF16Native(const RdnaInstruction& inst, IrOpcode opcode);
     IrF32 fmaF16RoundedToOdd(IrF32 lhs, IrF32 rhs, IrF32 addend);
     bool floatUnary(const RdnaInstruction& inst, IrOpcode opcode);
     bool floatBinary(const RdnaInstruction& inst, IrOpcode opcode, bool reverse);
@@ -407,8 +423,13 @@ private:
     bool nativeFloat16 = false;
     bool nativeFloat16Fma = false;
     bool float16HostNans = false;
+    bool float16WholeRegister = false;
+    bool float16ScalarOnVector = false;
+    bool float16NativeMinMax = false;
     bool float32HostNans = false;
     bool float32HostFmaNans = false;
+    std::uint32_t float32HardwareFlushOps = 0u;
+    std::uint32_t float32NativeUnaryOps = 0u;
     IrBuilder ir;
     IrBlock& block;
     IrU1 instructionBranchCondition;

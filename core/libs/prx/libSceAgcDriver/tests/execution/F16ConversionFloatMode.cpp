@@ -133,7 +133,7 @@ std::string Hex(std::uint32_t value) {
     return text;
 }
 
-void Run(AgcDriver::VulkanDevice& device, const Case& item, std::uint32_t round16, std::uint32_t denorm16) {
+void Run(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target, const Case& item, std::uint32_t round16, std::uint32_t denorm16) {
     Input.fill(0u);
     for (std::uint32_t row = 0; row < item.rows.size(); ++row) {
         Input[row * Inputs] = item.rows[row].a;
@@ -151,7 +151,7 @@ void Run(AgcDriver::VulkanDevice& device, const Case& item, std::uint32_t round1
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
-        device.Target(),
+        target,
         {0, 0, 0, 128}
     };
     request.useCache = false;
@@ -176,15 +176,22 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        auto today = device->Target();
+        today.float16NativeWiden = false;
+        today.float16PackTowardZero = 0u;
+        const bool converted = device->Target().float16NativeWiden || device->Target().float16PackTowardZero != 0u;
         for (const auto& item : Cases) {
             for (std::uint32_t round16 = 0u; round16 < 4u; ++round16) {
                 for (std::uint32_t denorm16 = 0u; denorm16 < 4u; ++denorm16) {
-                    Run(*device, item, round16, denorm16);
+                    Run(*device, today, item, round16, denorm16);
+                    Check(item, round16, denorm16);
+                    if (!converted) continue;
+                    Run(*device, device->Target(), item, round16, denorm16);
                     Check(item, round16, denorm16);
                 }
             }
         }
-        std::puts("f16 conversion float mode tests passed");
+        std::printf("f16 conversion float mode tests passed (%s)\n", converted ? "with the native conversion forms unset and set" : "native conversion forms unset");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

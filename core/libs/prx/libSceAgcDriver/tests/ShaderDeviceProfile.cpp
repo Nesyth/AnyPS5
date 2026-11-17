@@ -189,6 +189,30 @@ void CheckFeatureDigest() {
     Require(indexingKey != key && indexingKey != geometryKey && indexingKey == PerKeyDigestKeyFor(indexingProfile.Target()), "a profile extension did not change the feature digest");
 }
 
+void CheckFloat16FormKeys() {
+    ProfileInput input;
+    const AgcDriver::ShaderDeviceProfile profile(input.Target(), input.device, input.limits);
+    const auto base = profile.Target();
+    const auto key = CacheKeyFor(base);
+    using Field = bool ShaderRecompiler::SpirvTarget::*;
+    constexpr std::array<Field, 3> fields{&ShaderRecompiler::SpirvTarget::float16WholeRegister, &ShaderRecompiler::SpirvTarget::float16ScalarOnVector, &ShaderRecompiler::SpirvTarget::float16NativeMinMax};
+    std::vector<std::vector<std::uint64_t>> keys{key};
+    for (const auto field : fields) {
+        Require(!(base.*field), "a shader device profile sets an f16 form field on its own");
+        auto target = base;
+        target.*field = true;
+        keys.push_back(CacheKeyFor(target));
+        target.*field = false;
+        Require(CacheKeyFor(target) == key, "clearing an f16 form field did not give back the default cache key");
+    }
+    auto all = base;
+    for (const auto field : fields) all.*field = true;
+    keys.push_back(CacheKeyFor(all));
+    for (std::size_t first = 0; first < keys.size(); ++first) {
+        for (std::size_t second = first + 1u; second < keys.size(); ++second) Require(keys[first] != keys[second], "float16WholeRegister, float16ScalarOnVector or float16NativeMinMax does not move the recompile cache key");
+    }
+}
+
 void CheckAbi() {
     using ShaderRecompiler::RuntimeAbi::Binding;
     using ShaderRecompiler::RuntimeAbi::BindingNumber;
@@ -282,6 +306,7 @@ int main() {
         CheckHeaps();
         CheckProfile();
         CheckFeatureDigest();
+        CheckFloat16FormKeys();
         std::cout << "shader runtime ABI and device profile tests passed\n";
         return 0;
     } catch (const std::exception& error) {

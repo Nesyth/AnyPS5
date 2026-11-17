@@ -69,7 +69,7 @@ void Fill() {
     }
 }
 
-void Run(AgcDriver::VulkanDevice& device, const Mode& mode) {
+void Run(AgcDriver::VulkanDevice& device, const Mode& mode, const ShaderRecompiler::SpirvTarget& target) {
     Output.fill(0xdeadbeefu);
     std::vector<std::uint32_t> userData(8, 0u);
     const auto input = BufferDescriptor(Input.data(), static_cast<std::uint32_t>(Input.size() * 4u));
@@ -82,7 +82,7 @@ void Run(AgcDriver::VulkanDevice& device, const Mode& mode) {
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
-        device.Target(),
+        target,
         {0, 0, 0, 128}
     };
     request.useCache = false;
@@ -132,11 +132,21 @@ int main() {
             {"f16 denormal mode 3, IEEE mode on", ShaderRecompiler::ShaderFloatMode{0xf0u, true, true, false}},
             {"f16 denormal mode 3, IEEE mode off", ShaderRecompiler::ShaderFloatMode{0xf0u, true, false, false}},
         };
+        auto emulatedTarget = device->Target();
+        emulatedTarget.float16PackTowardZero = 0u;
+        const bool native = device->Target().float16PackTowardZero != 0u;
         for (const Mode& mode : modes) {
-            Run(*device, mode);
+            Run(*device, mode, emulatedTarget);
             Check(mode);
+            if (!native) continue;
+            const std::vector<std::uint32_t> emulated(Output.begin(), Output.end());
+            Run(*device, mode, device->Target());
+            Check(mode);
+            for (std::uint32_t index = 0; index < Output.size(); ++index) {
+                Require(Output[index] == emulated[index], std::string("v_cvt_pkrtz_f16_f32 form ") + std::to_string(device->Target().float16PackTowardZero) + " " + mode.name + " result " + std::to_string(index) + " is " + Hex(Output[index]) + ", the emulated form " + Hex(emulated[index]));
+            }
         }
-        std::puts("f16 pack denormal mode tests passed");
+        std::printf("f16 pack denormal mode tests passed (%s)\n", native ? "emulated and native toward-zero forms" : "emulated toward-zero form only");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

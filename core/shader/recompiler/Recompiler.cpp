@@ -284,6 +284,11 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.float16HostNans = translateOptions.nativeFloat16 && request.target.float16HostNans;
     translateOptions.float32HostNans = request.target.float32HostNans;
     translateOptions.float32HostFmaNans = request.target.float32HostFmaNans;
+    translateOptions.float16WholeRegister = translateOptions.nativeFloat16 && request.target.float16WholeRegister;
+    translateOptions.float16ScalarOnVector = translateOptions.nativeFloat16 && request.target.float16ScalarOnVector;
+    translateOptions.float16NativeMinMax = translateOptions.nativeFloat16 && request.target.float16NativeMinMax && stageKind == ShaderStageKind::Compute;
+    translateOptions.float32HardwareFlushOps = request.target.float32HardwareFlushOps;
+    translateOptions.float32NativeUnaryOps = request.target.float32NativeUnaryOps;
     translateOptions.floatMode = request.context.floatMode;
     translateOptions.float32FlushToZero = HardwareFloat32Flush(request);
     translateOptions.float32FlushDeclared = supports(spv::CapabilityDenormFlushToZero);
@@ -821,6 +826,9 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.meshWindowBuffer = request.target.meshWindowBuffer;
     targetOptions.float16WidenNans = request.target.float16WidenNans;
     targetOptions.float16NarrowNans = request.target.float16NarrowNans;
+    targetOptions.float16NativeWiden = request.target.float16NativeWiden;
+    targetOptions.float16PackTowardZero = request.context.floatMode.has_value() && (request.context.floatMode->floatMode & 0x80u) == 0u ? 0u : request.target.float16PackTowardZero;
+    targetOptions.exactRobustLoadsAlign4 = request.target.exactRobustLoadsAlign4;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;

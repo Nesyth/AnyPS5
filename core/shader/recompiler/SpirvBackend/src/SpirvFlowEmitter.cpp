@@ -718,6 +718,11 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::TtraceData: return Invoke(EmitTtraceData, ctx, inst);
         case IrOpcode::InstPrefetch: return Invoke(EmitInstPrefetch, ctx, inst);
         case IrOpcode::SelectU32: return Invoke(EmitSelectU32, ctx, inst);
+        case IrOpcode::Shuffle16x2: return Invoke(EmitShuffle16x2, ctx, inst);
+        case IrOpcode::FPNanSelect16x2: return Invoke(EmitFPNanSelect16x2, ctx, inst);
+        case IrOpcode::FPOverflowClamp16x2: return Invoke(EmitFPOverflowClamp16x2, ctx, inst);
+        case IrOpcode::FPSaturate16x2: return Invoke(EmitFPSaturate16x2, ctx, inst);
+        case IrOpcode::FPMinMax16x2: return Invoke(EmitFPMinMax16x2, ctx, inst);
         default: ctx.Fail(inst, "has no direct SPIR-V emitter");
     }
 }

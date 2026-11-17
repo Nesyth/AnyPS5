@@ -12,7 +12,7 @@ std::uint32_t EmitConvertS32F32(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitConvertU32F32(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitConvertF32S32(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitCompositeExtractU64(SpirvEmitterState& state, std::uint32_t arg0, const IrValue* arg1);
-std::uint32_t EmitPackFloat2x16Rtz(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
+std::uint32_t EmitPackFloat2x16Rtz(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1);
 std::uint32_t EmitFPAdd16x2(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
 std::uint32_t EmitFPMul16x2(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
 std::uint32_t EmitFPFma16x2(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2);
@@ -420,6 +420,11 @@ void EmitGetVccHi(SpirvValueEmitContext& ctx, const IrValue& inst);
 void EmitSetVccHi(SpirvValueEmitContext& ctx, const IrValue& inst);
 void EmitGetM0(SpirvValueEmitContext& ctx, const IrValue& inst);
 void EmitSetM0(SpirvValueEmitContext& ctx, const IrValue& inst);
+std::uint32_t EmitShuffle16x2(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, const IrValue* arg2);
+std::uint32_t EmitFPNanSelect16x2(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2);
+std::uint32_t EmitFPOverflowClamp16x2(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2, std::uint32_t arg3);
+std::uint32_t EmitFPSaturate16x2(SpirvEmitterState& state, std::uint32_t arg0, const IrValue* arg1);
+std::uint32_t EmitFPMinMax16x2(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1, const IrValue* arg2);
 
 }
 

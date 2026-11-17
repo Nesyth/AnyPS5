@@ -174,7 +174,7 @@ void ExpectHalf(std::uint32_t tid, std::uint32_t actual, std::uint32_t expected,
     Expect(tid, actual, expected, name);
 }
 
-void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, const std::optional<ShaderRecompiler::ShaderFloatMode>& floatMode) {
+void Run(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target, std::span<const std::uint32_t> code, const std::optional<ShaderRecompiler::ShaderFloatMode>& floatMode) {
     for (std::uint32_t tid = 0; tid < Threads; ++tid) Fill(tid, &Input[tid * Inputs]);
     Output.fill(0xdeadbeefu);
     std::vector<std::uint32_t> userData(8, 0u);
@@ -187,7 +187,7 @@ void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, c
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
-        device.Target(),
+        target,
         {0, 0, 0, 128}
     };
     request.useCache = false;
@@ -209,32 +209,36 @@ void Check() {
 
 int main() {
     try {
+        RequestFloat16FormProbes();
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        Run(*device, Code, std::nullopt);
-        Check();
-        Run(*device, Code, ShaderRecompiler::ShaderFloatMode{0xf0u, true, true, false});
-        Check();
-        Run(*device, Code, ShaderRecompiler::ShaderFloatMode{0x00u, true, false, false});
-        Require((Output[1] & 0xffffu) == 0xf099u, "float16 modifiers: lane 0 v_add_f16 mul:2 was not scaled");
-        Require((Output[12] & 0xffffu) == 0x77abu, "float16 modifiers: lane 0 v_max3_f16 mul:2 was not scaled");
-        Require((Output[14] & 0xffffu) == 0xe899u, "float16 modifiers: lane 0 v_min3_f16 div:2 was not scaled");
-        Require((Output[15] & 0xffffu) == 0x77abu, "float16 modifiers: lane 0 v_fma_f16 mul:2 was not scaled");
-        const struct {
-            std::span<const std::uint32_t> code;
-            const char* name;
-            std::uint32_t expected;
-        } ternaries[] = {
-            {Min3Div2, "v_min3_f16 div:2", 0xe899u},
-            {Max3Mul2, "v_max3_f16 mul:2", 0x77abu},
-            {Med3Mul4, "v_med3_f16 mul:4", 0x9e5eu},
-            {DivFixupMul2, "v_div_fixup_f16 mul:2", 0xf099u},
-        };
-        for (const auto& [code, name, expected] : ternaries) {
-            Run(*device, code, std::nullopt);
-            Run(*device, code, ShaderRecompiler::ShaderFloatMode{0xf0u, true, true, false});
-            Run(*device, code, ShaderRecompiler::ShaderFloatMode{0x00u, true, false, false});
-            Require((Output[0] & 0xffffu) == expected, std::string("float16 modifiers: lane 0 ") + name + " was not scaled");
+        const std::array<ShaderRecompiler::SpirvTarget, 2> targets{WithoutFloat16Forms(device->Target()), WithFloat16Forms(*device)};
+        for (const auto& target : targets) {
+            Run(*device, target, Code, std::nullopt);
+            Check();
+            Run(*device, target, Code, ShaderRecompiler::ShaderFloatMode{0xf0u, true, true, false});
+            Check();
+            Run(*device, target, Code, ShaderRecompiler::ShaderFloatMode{0x00u, true, false, false});
+            Require((Output[1] & 0xffffu) == 0xf099u, "float16 modifiers: lane 0 v_add_f16 mul:2 was not scaled");
+            Require((Output[12] & 0xffffu) == 0x77abu, "float16 modifiers: lane 0 v_max3_f16 mul:2 was not scaled");
+            Require((Output[14] & 0xffffu) == 0xe899u, "float16 modifiers: lane 0 v_min3_f16 div:2 was not scaled");
+            Require((Output[15] & 0xffffu) == 0x77abu, "float16 modifiers: lane 0 v_fma_f16 mul:2 was not scaled");
+            const struct {
+                std::span<const std::uint32_t> code;
+                const char* name;
+                std::uint32_t expected;
+            } ternaries[] = {
+                {Min3Div2, "v_min3_f16 div:2", 0xe899u},
+                {Max3Mul2, "v_max3_f16 mul:2", 0x77abu},
+                {Med3Mul4, "v_med3_f16 mul:4", 0x9e5eu},
+                {DivFixupMul2, "v_div_fixup_f16 mul:2", 0xf099u},
+            };
+            for (const auto& [code, name, expected] : ternaries) {
+                Run(*device, target, code, std::nullopt);
+                Run(*device, target, code, ShaderRecompiler::ShaderFloatMode{0xf0u, true, true, false});
+                Run(*device, target, code, ShaderRecompiler::ShaderFloatMode{0x00u, true, false, false});
+                Require((Output[0] & 0xffffu) == expected, std::string("float16 modifiers: lane 0 ") + name + " was not scaled");
+            }
         }
         std::puts("float16 modifiers tests passed");
         return 0;

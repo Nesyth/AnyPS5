@@ -93,6 +93,16 @@ HeapProfileSelection SelectHeapProfile(ShaderRecompiler::SpirvTarget& target) {
 bool g_code = false;
 bool g_float16WidenNans = false;
 bool g_float16NarrowNans = false;
+bool g_float16HostNans = false;
+bool g_float16WholeRegister = false;
+bool g_float16ScalarOnVector = false;
+bool g_float16NativeMinMax = false;
+std::uint32_t g_float32HardwareFlushOps = 0;
+std::uint32_t g_float32NativeUnaryOps = 0;
+bool g_float16NativeWiden = false;
+bool g_hasFloat16PackTowardZero = false;
+std::uint32_t g_float16PackTowardZero = 0;
+bool g_exactRobustLoadsAlign4 = false;
 
 bool OutputSpirv(const char* path, std::span<const std::uint32_t> spirv) {
     if (g_spirv) {
@@ -125,6 +135,14 @@ bool OutputSpirv(const char* path, std::span<const std::uint32_t> spirv) {
 bool ParseHeapDataUniformDwords(int index, int argc, char** argv, std::uint32_t& result) {
     char* end = nullptr;
     const auto value = index + 1 < argc ? std::strtoull(argv[index + 1], &end, 10) : 0ull;
+    if (index + 1 >= argc || end == argv[index + 1] || *end != '\0' || value > UINT32_MAX) return false;
+    result = static_cast<std::uint32_t>(value);
+    return true;
+}
+
+bool ParseMask(int index, int argc, char** argv, std::uint32_t& result) {
+    char* end = nullptr;
+    const auto value = index + 1 < argc ? std::strtoull(argv[index + 1], &end, 0) : 0ull;
     if (index + 1 >= argc || end == argv[index + 1] || *end != '\0' || value > UINT32_MAX) return false;
     result = static_cast<std::uint32_t>(value);
     return true;
@@ -166,6 +184,10 @@ bool Replay(const char* path) {
     force(g_waveLdsMemoryBarriers, target.waveLdsMemoryBarriers, "wave-lds-memory-barriers");
     force(g_deviceScopeLdsMemoryBarriers, target.deviceScopeLdsMemoryBarriers, "device-scope-lds-memory-barriers");
     force(g_ldsLockFences, target.ldsLockFences, "lds-lock-fences");
+    force(g_float16HostNans || g_float16WholeRegister || g_float16ScalarOnVector, target.float16HostNans, "f16-host-nans");
+    force(g_float16WholeRegister, target.float16WholeRegister, "f16-whole-register");
+    force(g_float16ScalarOnVector, target.float16ScalarOnVector, "f16-scalar-on-vector");
+    force(g_float16NativeMinMax, target.float16NativeMinMax, "f16-native-minmax");
     if (g_shaderFma) {
         request.supportedCapabilities.push_back(spv::CapabilityFMAKHR);
         request.supportedExtensions.push_back("SPV_KHR_fma");
@@ -175,6 +197,14 @@ bool Replay(const char* path) {
     const auto heapProfile = SelectHeapProfile(request.request.target);
     if (g_float16WidenNans) request.request.target.float16WidenNans = true;
     if (g_float16NarrowNans) request.request.target.float16NarrowNans = true;
+    if (g_float32HardwareFlushOps != 0u) request.request.target.float32HardwareFlushOps = g_float32HardwareFlushOps;
+    if (g_float32NativeUnaryOps != 0u) request.request.target.float32NativeUnaryOps = g_float32NativeUnaryOps;
+    if (g_float16NativeWiden) request.request.target.float16NativeWiden = true;
+    if (g_hasFloat16PackTowardZero) request.request.target.float16PackTowardZero = g_float16PackTowardZero;
+    if (g_exactRobustLoadsAlign4) {
+        request.request.target.exactRobustLoads = true;
+        request.request.target.exactRobustLoadsAlign4 = true;
+    }
     std::printf("%s: %zu code words, %zu user data, %zu memory regions, wave%u\n", path, request.request.shader.code.size(), request.request.context.userData.size(), request.request.context.memory.size(), request.request.context.waveSize);
     std::printf("  heap profile (%s): %s, gpuResolvedImages %d, descriptorMemory %d, data uniform dwords %u\n", heapProfile.source, heapProfile.heap ? "heap" : "no heap", request.request.target.gpuResolvedImages, request.request.target.descriptorMemory, request.request.target.heapDataUniformDwords);
     if (!forced.empty()) std::printf("  target flags forced on: %s\n", forced.c_str());
@@ -314,7 +344,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--lds-lock-fences] [--shader-fma] [--f16-widen-nans] [--f16-narrow-nans] [--gpu-heap] [--no-gpu-heap] [--heap-data-uniform-dwords N] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n  a request replays with the heap profile it was captured with; --gpu-heap forces the heap profile (gpuResolvedImages, descriptorMemory, and 16384 data uniform dwords unless --heap-data-uniform-dwords is given, replacing a captured limit), --no-gpu-heap forces it off, --heap-data-uniform-dwords N forces the limit (0 selects ring-address reads); --gpu-heap with --no-gpu-heap, and --no-gpu-heap with a nonzero limit, exit 2\n  --maintenance8, --robust2, --wave-lds-memory-barriers, --device-scope-lds-memory-barriers and --lds-lock-fences force their target flag on over the captured value and are listed on a 'target flags forced on' line\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--lds-lock-fences] [--shader-fma] [--f16-widen-nans] [--f16-narrow-nans] [--f16-host-nans] [--f16-whole-register] [--f16-scalar-on-vector] [--f16-native-minmax] [--f32-hardware-flush-ops MASK] [--f32-native-unary MASK] [--f16-native-widen] [--f16-pack-toward-zero N] [--exact-robust-loads-align4] [--gpu-heap] [--no-gpu-heap] [--heap-data-uniform-dwords N] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n  a request replays with the heap profile it was captured with; --gpu-heap forces the heap profile (gpuResolvedImages, descriptorMemory, and 16384 data uniform dwords unless --heap-data-uniform-dwords is given, replacing a captured limit), --no-gpu-heap forces it off, --heap-data-uniform-dwords N forces the limit (0 selects ring-address reads); --gpu-heap with --no-gpu-heap, and --no-gpu-heap with a nonzero limit, exit 2\n  --maintenance8, --robust2, --wave-lds-memory-barriers, --device-scope-lds-memory-barriers and --lds-lock-fences force their target flag on over the captured value and are listed on a 'target flags forced on' line\n  --f16-host-nans forces float16HostNans on (a device sets it when its startup f16 NaN probe passes; requests do not carry it); --f16-whole-register and --f16-scalar-on-vector force it on too, because their packed and fma forms exist only with it, so compare them against a replay with --f16-host-nans alone; --f16-native-minmax forces float16NativeMinMax on, which compute programs take\n  --f32-hardware-flush-ops and --f32-native-unary set float32HardwareFlushOps and float32NativeUnaryOps to MASK over the captured value\n");
         return 2;
     }
     if (HeapFlagsConflict(argc, argv)) return 2;
@@ -383,6 +413,49 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--f16-narrow-nans") {
             g_float16NarrowNans = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--f16-host-nans") {
+            g_float16HostNans = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--f16-whole-register") {
+            g_float16WholeRegister = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--f16-scalar-on-vector") {
+            g_float16ScalarOnVector = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--f16-native-minmax") {
+            g_float16NativeMinMax = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--f32-hardware-flush-ops" || std::string(argv[i]) == "--f32-native-unary") {
+            const std::string flag = argv[i];
+            std::uint32_t& mask = flag == "--f32-hardware-flush-ops" ? g_float32HardwareFlushOps : g_float32NativeUnaryOps;
+            if (!ParseMask(i, argc, argv, mask)) {
+                std::fprintf(stderr, "%s needs an unsigned 32-bit mask\n", flag.c_str());
+                return 2;
+            }
+            ++i;
+            continue;
+        }
+        if (std::string(argv[i]) == "--f16-native-widen") {
+            g_float16NativeWiden = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--f16-pack-toward-zero") {
+            if (!ParseHeapDataUniformDwords(i, argc, argv, g_float16PackTowardZero)) {
+                std::fprintf(stderr, "--f16-pack-toward-zero needs an unsigned 32-bit number\n");
+                return 2;
+            }
+            g_hasFloat16PackTowardZero = true;
+            ++i;
+            continue;
+        }
+        if (std::string(argv[i]) == "--exact-robust-loads-align4") {
+            g_exactRobustLoadsAlign4 = true;
             continue;
         }
         if (std::string(argv[i]) == "--mem") {

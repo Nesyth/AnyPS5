@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidencyCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
@@ -1205,6 +1206,45 @@ void changedCopyTests(const Device& device, Recorder& recorder) {
     for (std::uint32_t i = 0; i < words; ++i) {
         Require(stored[i] == expected[i], "changed copy word " + std::to_string(i) + " after a lead: " + std::to_string(stored[i]) + ", expected " + std::to_string(expected[i]));
     }
+}
+
+void changedLineCensusTests(const Device& device, Recorder& recorder) {
+    Require(recorder.Idle(), "the changed line census test needs an idle recorder");
+    constexpr std::uint32_t words = 70001;
+    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    auto result = std::make_shared<Buffer>(device.GetContext(), words * 4u, usage);
+    auto snapshot = std::make_shared<Buffer>(device.GetContext(), words * 4u, usage);
+    auto counter = std::make_shared<Buffer>(device.GetContext(), 16, usage);
+    if (result->DeviceAddress() == 0 || snapshot->DeviceAddress() == 0 || counter->DeviceAddress() == 0) {
+        std::cout << "changed line census tests skipped: no buffer device addresses\n";
+        return;
+    }
+    Require(recorder.ChangedLineCensusReady(), "the changed line census kernel did not build");
+    std::vector<std::uint32_t> before(words), after(words);
+    for (std::uint32_t i = 0; i < words; ++i) {
+        before[i] = i * 2654435761u;
+        const bool changed = i % 389u == 0 || (i >= 4000u && i < 4100u) || (i >= 9000u && i < 13000u && i % 3u == 0) || i == words - 1u;
+        after[i] = changed ? before[i] ^ 0x00010000u : before[i];
+    }
+    std::memcpy(snapshot->Bytes().data(), before.data(), words * 4u);
+    std::memcpy(result->Bytes().data(), after.data(), words * 4u);
+    for (const std::uint32_t lead : {0u, 9u, 31u}) {
+        const auto expected = AgcDriver::Graphics::ResidencyCensus::CountChangedLines(lead, after, before);
+        Require(expected.changedLines != 0 && expected.changedWords != 0, "the changed line census data changes nothing");
+        std::memset(counter->Bytes().data(), 0, 16);
+        Require(recorder.RecordChangedLineCensus(recorder.Commands(), result->DeviceAddress(), snapshot->DeviceAddress(), counter->DeviceAddress(), words, lead), "the changed line census kernel is unavailable");
+        recorder.Keep(result);
+        recorder.Keep(snapshot);
+        recorder.Keep(counter);
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        std::array<std::uint32_t, 2> counted{};
+        std::memcpy(counted.data(), counter->Bytes().data(), sizeof(counted));
+        Require(counted[0] == expected.changedLines, "the changed line census with a lead of " + std::to_string(lead) + " dwords counted " + std::to_string(counted[0]) + " changed 128-byte lines, expected " + std::to_string(expected.changedLines));
+        Require(counted[1] == expected.changedWords, "the changed line census with a lead of " + std::to_string(lead) + " dwords counted " + std::to_string(counted[1]) + " changed dwords, expected " + std::to_string(expected.changedWords));
+    }
+    std::cout << "The changed line census counts the changed 128-byte lines and dwords\n";
 }
 
 void readTrackingTests(const Device& device, Recorder& recorder) {
@@ -15862,6 +15902,7 @@ int main(int argc, char** argv) {
         Device& device = *created;
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-lifetime-only") return RunHostImportLifetimeTests(device.GetContext());
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-mutation-race-only") return RunHostImportMutationRaceTests(device.GetContext());
+        if (argc == 2 && std::string_view(argv[1]) == "--host-import-ahead-only") return RunHostImportAheadTests(device.GetContext());
         if (argc == 2 && (std::string_view(argv[1]) == "--gpu-timing-complete-only" || std::string_view(argv[1]) == "--gpu-timing-incomplete-only")) {
             return gpuTimingCompletionTests(device, std::string_view(argv[1]) == "--gpu-timing-incomplete-only");
         }
@@ -16169,6 +16210,10 @@ int main(int argc, char** argv) {
             changedCopyTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--changed-line-census-only") {
+            changedLineCensusTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--window-import-unmap-only") {
             gpu.unlock();
             windowImportUnmapTests(device);
@@ -16408,6 +16453,7 @@ int main(int argc, char** argv) {
         overlappedRangeTests(recorder);
         spaceWriteSyncTests(device, recorder);
         changedCopyTests(device, recorder);
+        changedLineCensusTests(device, recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);

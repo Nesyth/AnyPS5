@@ -392,7 +392,25 @@ struct SpirvTarget {
     bool float16NarrowNans = false;
     bool float32HostFmaNans = false;
     bool float32NativeMinMax = false;
+    bool float16WholeRegister = false;
+    bool float16ScalarOnVector = false;
+    bool float16NativeMinMax = false;
+    std::uint32_t float32HardwareFlushOps = 0;
+    std::uint32_t float32NativeUnaryOps = 0;
+    bool float16NativeWiden = false;
+    std::uint32_t float16PackTowardZero = 0;
+    bool exactRobustLoadsAlign4 = false;
 };
+
+inline constexpr std::uint32_t Float32HardwareFlushFract = 1u;
+inline constexpr std::uint32_t Float32HardwareFlushAll = Float32HardwareFlushFract;
+enum class Float32UnaryKind : std::uint32_t { Rcp, Rsq, Sqrt, Log, Exp, Fract, Sin, Cos, Floor, Ceil, Trunc, Rndne, Count };
+constexpr std::uint32_t Float32NativeUnaryBit(Float32UnaryKind kind) { return 1u << static_cast<std::uint32_t>(kind); }
+inline constexpr std::uint32_t Float32NativeUnaryAll = (1u << static_cast<std::uint32_t>(Float32UnaryKind::Count)) - 1u;
+
+inline constexpr std::uint32_t PackTowardZeroHalf2x16 = 1u;
+inline constexpr std::uint32_t PackTowardZeroForms = 0xffu;
+inline constexpr std::uint32_t PackTowardZeroDifference = 0x100u;
 
 struct BindingLayout {
     std::uint32_t descriptorSet;

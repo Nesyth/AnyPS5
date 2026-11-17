@@ -22,6 +22,8 @@
 #include "prx/libSceAgcDriver/Execution/include/SubmissionSnapshots.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/StagingCopyBack_spv.h"
+#include "prx/libSceAgcDriver/Graphics/shaders/ChangedLineCensus_spv.h"
+#include "prx/libSceAgcDriver/Graphics/include/ResidencyCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleDumps_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -1231,6 +1233,7 @@ private:
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
 void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     hookCalls.fetch_add(1, std::memory_order_relaxed);
+    if (ResidencyCensus::On()) ResidencyCensus::NoteHookRead(address, bytes, static_cast<std::uint8_t>(GuestMemory::CurrentReadSite()));
     // A label this worker queued but has not recorded writes the range: in queue order the label
     // precedes this access, so the group is recorded first (it then notes the range as a pending
     // write of the open batch, and the check below syncs on it like any recorded store). Not from
@@ -1634,6 +1637,9 @@ Recorder::~Recorder() {
     if (changedCopyPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, changedCopyPipeline, nullptr);
     if (changedCopyHeapPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, changedCopyHeapPipeline, nullptr);
     if (changedCopyLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, changedCopyLayout, nullptr);
+    if (lineCensusPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, lineCensusPipeline, nullptr);
+    if (lineCensusHeapPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, lineCensusHeapPipeline, nullptr);
+    if (lineCensusLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, lineCensusLayout, nullptr);
     if (sampleCounterState > 0) {
         samplesPassed.store(SamplesTotal(), std::memory_order_release);
         if (samplePools != nullptr) std::static_pointer_cast<SamplePoolCache>(samplePools)->close();
@@ -3618,6 +3624,67 @@ bool Recorder::RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress resul
     return true;
 }
 
+namespace {
+
+constexpr std::uint32_t LineCensusPushBytes = 40;
+
+}
+
+bool Recorder::ChangedLineCensusReady() {
+    if (lineCensusState == 0) {
+        lineCensusState = -1;
+        VkShaderModule module = VK_NULL_HANDLE;
+        try {
+            const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, LineCensusPushBytes};
+            VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layoutInfo.pushConstantRangeCount = 1;
+            layoutInfo.pPushConstantRanges = &push;
+            Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &lineCensusLayout), "vkCreatePipelineLayout changed line census");
+            VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            moduleInfo.codeSize = sizeof(CHANGED_LINE_CENSUS_SPV);
+            moduleInfo.pCode = CHANGED_LINE_CENSUS_SPV;
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule changed line census");
+            VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            pipelineInfo.stage.module = module;
+            pipelineInfo.stage.pName = "main";
+            pipelineInfo.layout = lineCensusLayout;
+            Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &lineCensusPipeline), "vkCreateComputePipelines changed line census");
+            lineCensusHeapPipeline = createPushOnlyHeapPipeline(pipelineInfo);
+            context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            lineCensusState = 1;
+        } catch (const std::exception& error) {
+            if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            std::fprintf(stderr, "[residency-census] the changed line census kernel is unavailable: %s\n", error.what());
+        }
+    }
+    return lineCensusState > 0;
+}
+
+bool Recorder::RecordChangedLineCensus(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress snapshot, VkDeviceAddress counter, std::uint32_t dwords, std::uint32_t leadDwords) {
+    constexpr std::uint32_t PushBytes = LineCensusPushBytes;
+    if (!ChangedLineCensusReady()) return false;
+    const auto plan = ResidencyCensus::LineDispatches(leadDwords, dwords, context.limits.maxComputeWorkGroupCount[0]);
+    if (plan.empty()) return true;
+    bindPushOnlyPipeline(commands, lineCensusPipeline, lineCensusHeapPipeline);
+    for (const auto& step : plan) {
+        struct {
+            VkDeviceAddress result;
+            VkDeviceAddress snapshot;
+            VkDeviceAddress counter;
+            std::uint32_t count;
+            std::uint32_t lead;
+            std::uint32_t base;
+            std::uint32_t unused;
+        } parameters{result, snapshot, counter, dwords, leadDwords, step.base, 0};
+        static_assert(sizeof(parameters) == PushBytes);
+        pushOnlyParameters(commands, lineCensusHeapPipeline, lineCensusLayout, PushBytes, &parameters);
+        function(cmdDispatch, "vkCmdDispatch")(commands, step.groups, 1, 1);
+    }
+    return true;
+}
+
 void Recorder::beginSamples(Batch& batch) {
     auto cache = std::static_pointer_cast<SamplePoolCache>(samplePools);
     if (sampleCounterState > 0 && cache == nullptr) {
@@ -4235,10 +4302,19 @@ void noteWriterOf(std::uint64_t note) {
 
 Recorder::WriterScope::WriterScope(std::uint64_t tag) noexcept : previous(currentWriterTag) {
     currentWriterTag = tag;
+    if (ResidencyCensus::On()) {
+        stampPrevious = GuestMemory::SetStampTag(tag);
+        stamped = true;
+    }
 }
 
 Recorder::WriterScope::~WriterScope() {
     currentWriterTag = previous;
+    if (stamped) GuestMemory::SetStampTag(stampPrevious);
+}
+
+std::uint64_t Recorder::CurrentWriterTag() {
+    return currentWriterTag;
 }
 
 bool Recorder::KeyWriterCensus() {

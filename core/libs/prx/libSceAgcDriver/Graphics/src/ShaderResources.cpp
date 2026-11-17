@@ -20,6 +20,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidencyCensus.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -14007,7 +14008,8 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // Written sub-ranges of buffers the GPU copied out of a host import go back into it by the GPU,
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),
     // and the note and mark below cover them like direct writes.
-    if (inRun != nullptr && recorder.RunOpen() && guestMemory.HasGpuCopies()) {
+    const bool deferCopyBacks = inRun != nullptr && recorder.RunOpen() && guestMemory.HasGpuCopies();
+    if (deferCopyBacks) {
         recorder.AfterRun([inRun](Recorder& after) { inRun->guestMemory.RecordCopyBacks(after); });
         guestMemory.MarkStagedWrites();
     } else {
@@ -14022,6 +14024,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         recorder.NotePendingReach(reachable);
     }
     guestMemory.MarkDirectWrites();
+    if (ResidencyCensus::On()) guestMemory.CensusArm(deferCopyBacks);
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in
@@ -14051,7 +14054,8 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder, std::span<const MovedBuf
         storageTextures[index]->MarkDirty();
         static_cast<void>(DepthSurfaceStoreBack(context, *storageTextures[index]));
     }
-    if (inRun != nullptr && recorder.RunOpen() && guestMemory.HasGpuCopies()) {
+    const bool deferCopyBacks = inRun != nullptr && recorder.RunOpen() && guestMemory.HasGpuCopies();
+    if (deferCopyBacks) {
         recorder.AfterRun([inRun](Recorder& after) { inRun->guestMemory.RecordCopyBacks(after); });
         guestMemory.MarkStagedWrites();
     } else {
@@ -14072,6 +14076,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder, std::span<const MovedBuf
         recorder.NotePendingReach(reachable);
     }
     guestMemory.MarkDirectWrites(dropped, added);
+    if (ResidencyCensus::On()) guestMemory.CensusArm(deferCopyBacks);
 }
 
 void ShaderResources::CheckFaults() const {

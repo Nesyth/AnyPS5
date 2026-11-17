@@ -877,6 +877,7 @@ private:
     std::uint64_t sliceLinearBytes = 0;
     SurfaceGeometry geometry;
     std::vector<std::byte> original;
+    std::uint8_t originalOrigin = 0;
     struct ComparedRange {
         std::uint64_t address = 0;
         std::size_t bytes = 0;
