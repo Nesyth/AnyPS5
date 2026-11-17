@@ -46,6 +46,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <charconv>
 #include <chrono>
 
 #include <condition_variable>
@@ -4325,6 +4326,31 @@ namespace {
 std::size_t SnapshotPool(Recorder::SnapshotUse use) {
     return use == Recorder::SnapshotUse::Storage ? 0 : 1;
 }
+
+std::size_t environmentCount(const char* name, std::size_t fallback, std::size_t minimum, std::size_t maximum) {
+    const char* text = std::getenv(name);
+    if (text == nullptr) return fallback;
+    const auto* end = text + std::strlen(text);
+    std::size_t value = 0;
+    const auto [last, error] = std::from_chars(text, end, value);
+    Require(error == std::errc{} && last == end, std::string(name) + "=" + text + " is not a whole number");
+    return std::clamp(value, minimum, maximum);
+}
+}
+
+std::size_t Recorder::DrawInputBudgetBytes() {
+    static const std::size_t bytes = environmentCount("APS5_DRAW_INPUT_BUDGET_MIB", 1024, 64, 65536) << 20u;
+    return bytes;
+}
+
+std::size_t Recorder::DrawInputEntryLimit() {
+    static const std::size_t entries = environmentCount("APS5_DRAW_INPUT_ENTRIES", 16384, 256, 4194304);
+    return entries;
+}
+
+std::size_t Recorder::DrawInputMirrorBudgetBytes() {
+    static const std::size_t bytes = environmentCount("APS5_DRAW_INPUT_MIRROR_MIB", 512, 0, DrawInputBudgetBytes() >> 21u) << 20u;
+    return bytes;
 }
 
 void Recorder::dropDrawInputMirror(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
@@ -4355,15 +4381,18 @@ std::pair<std::size_t, std::size_t> Recorder::DrawInputBytes() const {
 std::shared_ptr<Buffer> Recorder::mirrorDrawInput(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
     const auto bytes = std::get<2>(entry->first);
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
-    if (bytes > DrawInputMirrorBudget || 2 * bytes > DrawInputBudget || !context.HostMemoryType(~0u)) return {};
+    if (bytes > DrawInputMirrorBudgetBytes() || 2 * bytes > DrawInputBudgetBytes() || !context.HostMemoryType(~0u)) return {};
     const auto host = entry->second.buffer;
     const auto copied = host->Bytes().size();
     auto mirror = Buffer::WithinDeviceLocalHeadroom(context, copied, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     if (mirror == nullptr) return {};
-    for (auto oldest = pool.recency.begin(); drawInputMirrorBytes + bytes > DrawInputMirrorBudget && oldest != pool.recency.end(); ++oldest) {
+    for (auto oldest = pool.recency.begin(); drawInputMirrorBytes + bytes > DrawInputMirrorBudgetBytes() && oldest != pool.recency.end(); ++oldest) {
         if (*oldest != entry->first) dropDrawInputMirror(drawSnapshots.find(*oldest));
     }
-    while (pool.bytes + bytes > DrawInputBudget && pool.recency.front() != entry->first) eraseDrawSnapshot(drawSnapshots.find(pool.recency.front()));
+    while (pool.bytes + bytes > DrawInputBudgetBytes() && pool.recency.front() != entry->first) {
+        PerformanceTrace::CountOwnedDraw("OwnedDraw.evicted_for_mirror");
+        eraseDrawSnapshot(drawSnapshots.find(pool.recency.front()));
+    }
     const auto commands = Commands();
     const auto timing = BeginGpuTiming(CommandClass::InputMirror);
     CopyBuffer(context, commands, host->Handle(), 0, mirror->Handle(), 0, copied);
@@ -4530,8 +4559,8 @@ static void OwnedDrawTraceCount(const char* name, std::uint64_t amount = 1) {
 void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived, std::size_t from, std::uint32_t lowest, bool ownedInsertion) {
     Require(from == 0 || (use == SnapshotUse::Vertex && from < bytes), "only a vertex snapshot starts past its address");
     const bool storage = use == SnapshotUse::Storage;
-    const auto budget = storage ? DrawSnapshotBudget : DrawInputBudget;
-    const auto maxEntries = storage ? DrawSnapshotEntries : DrawInputEntries;
+    const auto budget = storage ? DrawSnapshotBudget : DrawInputBudgetBytes();
+    const auto maxEntries = storage ? DrawSnapshotEntries : DrawInputEntryLimit();
     auto& pool = drawSnapshotPools[SnapshotPool(use)];
     if (generation == 0 || bytes > budget) return;
     if (use == SnapshotUse::Vertex) {
@@ -4545,6 +4574,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
             const bool ownedVictim = !victim->second.owned.words.empty();
             OwnedDrawTraceCount(ownedVictim ? "OwnedDraw.evicted_owned" : "OwnedDraw.evicted_other");
             if (ownedInsertion) OwnedDrawTraceCount(ownedVictim ? "OwnedDraw.evicted_owned_by_owned" : "OwnedDraw.evicted_other_by_owned");
+            OwnedDrawTraceCount(pool.bytes + bytes > budget ? "OwnedDraw.evicted_for_bytes" : "OwnedDraw.evicted_for_entries");
         }
         eraseDrawSnapshot(victim);
     }
@@ -4562,7 +4592,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
 Recorder::OwnedDrawInputProof Recorder::ArmOwnedDrawInput(std::uint64_t address, std::size_t bytes) const {
     GuestMemory::AssertGpuLockHeld("arm owned draw input");
     OwnedDrawTraceCount("OwnedDraw.arm_attempt");
-    if (bytes == 0 || bytes > DrawInputBudget || bytes > std::numeric_limits<std::uint64_t>::max() - address || !GuestMemory::WriteWatched() || PendingWriteOverlaps(address, bytes)) {
+    if (bytes == 0 || bytes > DrawInputBudgetBytes() || bytes > std::numeric_limits<std::uint64_t>::max() - address || !GuestMemory::WriteWatched() || PendingWriteOverlaps(address, bytes)) {
         OwnedDrawTraceCount("OwnedDraw.arm_refused");
         return {};
     }

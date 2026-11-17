@@ -240,6 +240,11 @@ public:
     static constexpr std::size_t DrawInputBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawInputEntries = 16384;
     static constexpr std::size_t DrawInputMirrorBudget = std::size_t{512} << 20u;
+    // The limits in use: the constants above unless APS5_DRAW_INPUT_BUDGET_MIB, APS5_DRAW_INPUT_ENTRIES or
+    // APS5_DRAW_INPUT_MIRROR_MIB is set (read once, clamped; the mirror budget to half the budget).
+    static std::size_t DrawInputBudgetBytes();
+    static std::size_t DrawInputEntryLimit();
+    static std::size_t DrawInputMirrorBudgetBytes();
     static bool DrawInputMirrors();
     std::pair<std::size_t, std::size_t> DrawInputBytes() const;
     std::shared_ptr<Buffer> UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset = nullptr);

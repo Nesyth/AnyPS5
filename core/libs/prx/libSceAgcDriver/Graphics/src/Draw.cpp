@@ -2137,6 +2137,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         if (owned && recorder->OwnedDrawInputEntries() != 0) copy.buffer = recorder->ReusableOwnedDrawInput(address, bytes, use, &copy.derived, from, &copy.lowest);
         if (copy.buffer != nullptr && copy.buffer->Properties() != properties) copy.buffer = nullptr;
         if (copy.buffer != nullptr) {
+            PerformanceTrace::CountOwnedDraw("OwnedDraw.input_hit");
             copy.reused = true;
             return copy;
         }
@@ -2146,10 +2147,12 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         else if (owned) copy.owned = recorder->ArmOwnedDrawInput(address, bytes);
         if (copy.buffer != nullptr && copy.buffer->Properties() != properties && copy.buffer->Mapped()) copy.buffer = nullptr;
         if (copy.buffer != nullptr) {
+            PerformanceTrace::CountOwnedDraw("OwnedDraw.input_hit");
             copy.reused = true;
             return copy;
         }
     }
+    PerformanceTrace::CountOwnedDraw("OwnedDraw.input_miss");
     copy.buffer = std::make_shared<Buffer>(context, bytes, (use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT) | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, properties);
     static const bool poisonPrefix = std::getenv("APS5_POISON_VERTEX_PREFIX") != nullptr;
     const auto held = copy.buffer->Bytes();
