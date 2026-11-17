@@ -694,7 +694,7 @@ void Driver::executeLean(const Submission& first) {
         }
     } report{ThreadReport::Enabled()};
     const ThreadReport::WorkerStateScope executing(ThreadReport::WorkerState::Packets, true);
-    FlipHold flipHold{*this, first.queue, first.holdsFlip, first.holdsFlip};
+    FlipHold flipHold{*this, first.queue, first.holdsFlip, first.holdsFlip, first.flipWork};
     const LeanFront::SegmentNesting nesting(&frontLatch);
     DrawPipeline::Active() = true;
     struct PipelineDrain {
@@ -756,7 +756,7 @@ void Driver::executeLean(const Submission& first) {
     bool head = true;
     for (;;) {
         report.Segment();
-        FlipHold quiet{*this, segment->queue, false, false};
+        FlipHold quiet{*this, segment->queue, false, false, nullptr};
         auto& hold = head ? flipHold : quiet;
         runLeanSegment(*segment, *state, *slot, hold, run, verify);
         const bool follows = endSegment<true>(*segment, hold, true, FrontMode::Lean);
@@ -1240,7 +1240,7 @@ void Driver::runLeanPackets(const Submission& submission, QueueState& queue, con
                 DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, entry.Has(LeanPacket::FlipHeader) ? 0xffu : opcode);
             }
         }
-        if (predicated && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4) && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Predication)) PacketRules::awaitPredicationWriters(queue.predication.address, queue.predication.operation == 3 ? 8 : 4, opcode);
+        if (predicated && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(queue.predication.address, Pm4::PredicationBytes(queue.predication)) && !DrawFinisher::FlowSkips(DrawFinisher::FlowSite::Predication)) PacketRules::awaitPredicationWriters(queue.predication.address, Pm4::PredicationBytes(queue.predication), opcode);
         timing.Mark("pipeline_drain");
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
         if (!entry.Has(LeanPacket::Wait) && !entry.Has(LeanPacket::RenderingWait) && !entry.Has(LeanPacket::FlipHeader)) deviceUse.lock();

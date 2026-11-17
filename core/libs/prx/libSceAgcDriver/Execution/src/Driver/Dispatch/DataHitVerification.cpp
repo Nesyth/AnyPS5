@@ -18,8 +18,9 @@ void Driver::verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffse
         std::abort();
     };
     auto verifyMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
-    auto invocation = InvocationFor(snapshot, codeOffset, request);
-    const auto capture = CaptureInvocation(*verifyMemory, snapshot, codeOffset, request, invocation);
+    std::shared_ptr<const PreparedShaderState::UserDataLink> linking;
+    auto invocation = InvocationFor(snapshot, codeOffset, request, false, &linking);
+    const auto capture = CaptureInvocation(*verifyMemory, snapshot, codeOffset, request, invocation, &linking);
     const auto regions = verifyMemory->Regions();
     request.context.memory = regions;
     const auto result = invocation.Materialize(*capture);
@@ -31,9 +32,7 @@ void Driver::verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffse
         }
         std::vector<std::pair<std::uint64_t, std::uint64_t>> fresh;
         std::vector<std::byte> bytes;
-        for (const auto& region : regions) {
-            const bool registered = std::any_of(memory.begin(), memory.end(), [&](const auto& known) { return region.guestAddress >= known.guestAddress && region.guestAddress < known.guestAddress + known.bytes.size(); });
-            if (registered) continue;
+        for (const auto& region : dispatchRegions(memory, regions, linking.get())) {
             if (!fresh.empty() && fresh.back().second == region.guestAddress) fresh.back().second += region.bytes.size();
             else fresh.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
             bytes.insert(bytes.end(), region.bytes.begin(), region.bytes.end());
@@ -42,9 +41,7 @@ void Driver::verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffse
         if (bytes.size() != liveWords.size() * sizeof(std::uint32_t) || std::memcmp(bytes.data(), liveWords.data(), bytes.size()) != 0) fail("the captured bytes", 0, 0);
     } else {
         std::size_t position = 0, run = 0;
-        for (const auto& region : regions) {
-            const bool registered = std::any_of(memory.begin(), memory.end(), [&](const auto& known) { return region.guestAddress >= known.guestAddress && region.guestAddress < known.guestAddress + known.bytes.size(); });
-            if (registered) continue;
+        for (const auto& region : dispatchRegions(memory, regions, linking.get())) {
             if (run >= variant.runs.size() || variant.runs[run].first != region.guestAddress || variant.runs[run].second != region.guestAddress + region.bytes.size()) fail("the read set", position, run);
             const auto count = region.bytes.size() / sizeof(std::uint32_t);
             if (position + count > liveWords.size() || std::memcmp(region.bytes.data(), liveWords.data() + position, region.bytes.size()) != 0) fail("the captured bytes", position, run);

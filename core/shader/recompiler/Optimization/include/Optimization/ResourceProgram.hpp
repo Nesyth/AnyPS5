@@ -123,6 +123,9 @@ public:
     // no usable words) where that patch would throw or the donor cannot carry the capture.
     bool FillSharedSide(const ResourceCapture& capture, const RecompileResult& donor, const MemoPatch& patch, HeapStageWords& side) const;
     SideForwards TraceSideForwards(const ResourceCapture& capture, const RecompileResult& donor, const MemoPatch& patch) const;
+    [[nodiscard]] std::shared_ptr<const RecompileResult> MaterializeIfMemoized(const ResourceCapture& capture, bool* contended = nullptr) const;
+    [[nodiscard]] PreparedShaderInvocation Rebound(const RecompileRequest& request) const;
+    [[nodiscard]] std::uint64_t SnapshotKey(const ResourceCapture& capture) const;
 
 private:
     PreparedShaderInvocation(RecompileRequest request, const std::shared_ptr<const SourceHandle>& handle);

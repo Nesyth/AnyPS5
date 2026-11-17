@@ -103,6 +103,8 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
 // hook-free readers and a build's stage A.
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes);
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+bool LiveUnitsClear(std::uint64_t address, std::size_t bytes);
+bool AnyPublishInProgress();
 std::uint64_t ShadowLiveSerial();
 bool CpuPublishPendingOverlaps(std::uint64_t address, std::size_t bytes);
 std::uint64_t CpuPublishesNoted();

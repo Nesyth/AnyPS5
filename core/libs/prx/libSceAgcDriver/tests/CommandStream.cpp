@@ -537,7 +537,7 @@ struct Functions {
 
 Functions resolve(const Context& context) {
     Functions functions;
-#define TEST_RESOLVE(name) functions.cmd##name = context.Function<PFN_vkCmd##name>(name##Name);
+#define TEST_RESOLVE(name) functions.cmd##name = reinterpret_cast<PFN_vkCmd##name>(ResolveDeviceFunction(context.device, context.deviceProc, name##Name, context.descriptorHeap));
     TEST_ALL_OPS(TEST_RESOLVE)
 #undef TEST_RESOLVE
     return functions;

@@ -245,7 +245,7 @@ ConservativeZExport readConservativeZExport(Reader& reader) {
 
 ColorExportPacking readColorExportPacking(Reader& reader) {
     const auto value = reader.ReadU8();
-    if (value > static_cast<std::uint8_t>(ColorExportPacking::UintClamp16)) {
+    if (value > static_cast<std::uint8_t>(ColorExportPacking::UintMask16)) {
         throw std::runtime_error("RequestSerializer: invalid ColorExportPacking value");
     }
     return static_cast<ColorExportPacking>(value);
@@ -920,7 +920,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     const bool float32Tail = request.target.float32HardwareFlushOps != 0u || request.target.float32NativeUnaryOps != 0u;
     const bool formTail = request.target.float16NativeWiden || request.target.float16PackTowardZero != 0u || request.target.exactRobustLoadsAlign4;
     const bool targetTail = request.target.gpuResolvedImages || request.target.descriptorMemory || request.target.heapDataUniformDwords != 0u || request.target.ldsLockFences || request.target.meshWindowBuffer || request.target.waveLdsMemoryBarriers || request.target.deviceScopeLdsMemoryBarriers || request.target.exactRobustLoads || request.target.robustBufferAccess2 || request.target.heapBufferDescriptors || request.target.deviceImageTables || float16Forms || float32Tail || formTail;
-    writer.WriteU32(float16Forms || float32Tail || formTail ? 62u : request.target.deviceImageTables ? 61u : targetTail ? 60u : 56u);
+    writer.WriteU32(float16Forms || float32Tail || formTail ? 65u : request.target.deviceImageTables ? 64u : targetTail ? 63u : 62u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -967,6 +967,13 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.shaderImageMinLod);
     writer.WriteBool(request.target.float16WidenNans);
     writer.WriteBool(request.target.float16NarrowNans);
+    if (request.context.compute.has_value()) {
+        writer.WriteU32(request.context.compute->granulatedVgprCount);
+        writer.WriteU32(request.context.compute->sharedVgprBlocks);
+    }
+    writer.WriteU32(request.target.maxImageArrayLayers);
+    writer.WriteBool(request.target.fixedPushSlots);
+    writer.WriteBool(request.target.spannedAnySubgroup);
     if (targetTail) {
         writer.WriteBool(request.target.gpuResolvedImages);
         writer.WriteBool(request.target.descriptorMemory);
@@ -990,10 +997,6 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
         writer.WriteU32(request.target.float16PackTowardZero);
         writer.WriteBool(request.target.exactRobustLoadsAlign4);
     }
-    if (request.context.compute.has_value()) {
-        writer.WriteU32(request.context.compute->granulatedVgprCount);
-        writer.WriteU32(request.context.compute->sharedVgprBlocks);
-    }
     return base64Encode(buffer);
 }
 
@@ -1002,7 +1005,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     Reader reader(decoded);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    if (version < 1u || version > 62u || version == 50u || version == 57u || version == 58u || version == 59u) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version < 1u || version > 65u || version == 50u || (version >= 58u && version <= 61u)) throw std::runtime_error("unsupported recompile request serialization version");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
     result.request.context = readGuestContext(reader, result, version);
@@ -1069,7 +1072,16 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.request.target.float16WidenNans = reader.ReadBool();
         result.request.target.float16NarrowNans = reader.ReadBool();
     }
-    if (version >= 60u) {
+    if (version >= 56u && result.request.context.compute.has_value()) {
+        result.request.context.compute->granulatedVgprCount = reader.ReadU32();
+        result.request.context.compute->sharedVgprBlocks = reader.ReadU32();
+    }
+    if (version >= 57u) {
+        result.request.target.maxImageArrayLayers = reader.ReadU32();
+        result.request.target.fixedPushSlots = reader.ReadBool();
+    }
+    if (version >= 62u) result.request.target.spannedAnySubgroup = reader.ReadBool();
+    if (version >= 63u) {
         result.request.target.gpuResolvedImages = reader.ReadBool();
         result.request.target.descriptorMemory = reader.ReadBool();
         result.request.target.heapDataUniformDwords = reader.ReadU32();
@@ -1081,8 +1093,8 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.request.target.robustBufferAccess2 = reader.ReadBool();
         result.request.target.heapBufferDescriptors = reader.ReadBool();
     }
-    if (version >= 61u) result.request.target.deviceImageTables = reader.ReadBool();
-    if (version >= 62u) {
+    if (version >= 64u) result.request.target.deviceImageTables = reader.ReadBool();
+    if (version >= 65u) {
         result.request.target.float16WholeRegister = reader.ReadBool();
         result.request.target.float16ScalarOnVector = reader.ReadBool();
         result.request.target.float16NativeMinMax = reader.ReadBool();
@@ -1091,10 +1103,6 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.request.target.float16NativeWiden = reader.ReadBool();
         result.request.target.float16PackTowardZero = reader.ReadU32();
         result.request.target.exactRobustLoadsAlign4 = reader.ReadBool();
-    }
-    if (version >= 56u && result.request.context.compute.has_value()) {
-        result.request.context.compute->granulatedVgprCount = reader.ReadU32();
-        result.request.context.compute->sharedVgprBlocks = reader.ReadU32();
     }
     if (version >= 21u && reader.Remaining() != 0u) throw std::runtime_error("RequestSerializer: unexpected trailing data");
     return result;

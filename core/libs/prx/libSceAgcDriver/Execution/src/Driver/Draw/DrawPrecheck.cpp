@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include <algorithm>
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include <cstdlib>
 
@@ -13,10 +14,19 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
+bool indirectRecordsDraw(const Pm4::DrawParameters::IndirectDraw& indirect) {
+    const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
+    for (std::uint32_t record = 0; record < count; ++record) {
+        const auto arguments = Pm4::ReadDrawArguments(indirect, record);
+        if (arguments.count != 0 && arguments.instances != 0) return true;
+    }
+    return false;
+}
+
 QueueState DepthCopyDraw(const QueueState& queue, const Graphics::DepthCopyPass& copy) {
     const bool multisampled = copy.source.samples != 1u;
-    const auto address = DepthCopyPixelProgramAddress(multisampled);
-    const auto words = Graphics::DepthCopySourceWords(copy.source);
+    const auto address = copy.stencil ? StencilCopyPixelProgramAddress(multisampled) : DepthCopyPixelProgramAddress(multisampled);
+    const auto words = Graphics::DepthCopySourceWords(copy.source, copy.stencil);
     QueueState draw = queue;
     draw.context.insert_or_assign(0x000u, 0u);
     draw.shader.insert_or_assign(0x008u, static_cast<std::uint32_t>(address >> 8u));
@@ -29,8 +39,8 @@ QueueState DepthCopyDraw(const QueueState& queue, const Graphics::DepthCopyPass&
     draw.context.insert_or_assign(0x1b4u, 0x8002u);
     draw.context.insert_or_assign(0x1b6u, 0u);
     draw.context.insert_or_assign(0x1c4u, 0u);
-    draw.context.insert_or_assign(0x1c5u, 1u);
-    draw.context.insert_or_assign(0x08fu, 1u);
+    draw.context.insert_or_assign(0x1c5u, copy.stencil ? 2u : 1u);
+    draw.context.insert_or_assign(0x08fu, copy.stencil ? 3u : 1u);
     draw.context.insert_or_assign(0x203u, 0u);
     if (const auto alpha = draw.context.find(0x2dcu); alpha != draw.context.end()) draw.context.insert_or_assign(0x2dcu, alpha->second & ~1u);
     return draw;
@@ -53,6 +63,7 @@ LeanVerdict Driver::precheckVerdict(const QueueState& queue, bool indexed, std::
     try {
         if (!afterControl) {
             if (Graphics::DecodeColorMetadataPass(queue)) return fallback(LeanFallbackCause::ColorMetadata);
+            if (Graphics::DecodeDepthExpandPass(queue)) return fallback(LeanFallbackCause::Maintenance);
             if (Graphics::DecodeDepthCopyPass(queue)) return fallback(LeanFallbackCause::DepthCopy);
             if (Graphics::DecodeDepthRenderControl(queue)) return fallback(LeanFallbackCause::RenderControl);
         }
@@ -97,23 +108,34 @@ LeanVerdict Driver::precheckVerdict(const QueueState& queue, bool indexed, std::
 
 std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const Submission& submission, std::size_t packetOffset, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect) {
     if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
-    if (const auto pass = Graphics::DecodeColorMetadataPass(queue)) {
-        require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
-        if (std::vector<DrawPipeline::Range> writes; const auto localDevice = pipelinedColorMetadataDevice(*pass, writes)) {
-            DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::ColorMetadata, colorMetadataCommit(localDevice, submission.queue, (packet[0] >> 8u) & 0xffu, *pass), std::move(writes));
-            DrawPipeline::CountPipelinedMetadataPass();
-            return DrawVerdict::Drawn;
+    const auto metadata = Graphics::DecodeColorMetadataPass(queue);
+    std::optional<Graphics::DepthExpandPass> expand;
+    if (!metadata) expand = Graphics::DecodeDepthExpandPass(queue);
+    if (metadata || expand) {
+        require(!metadata || !drawParameters.indirect, "indirect CB metadata passes are unsupported");
+        if (expand && !drawParameters.indirect && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
+        if (metadata) {
+            if (std::vector<DrawPipeline::Range> writes; const auto localDevice = pipelinedColorMetadataDevice(*metadata, writes)) {
+                DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::ColorMetadata, colorMetadataCommit(localDevice, submission.queue, (packet[0] >> 8u) & 0xffu, *metadata), std::move(writes));
+                DrawPipeline::CountPipelinedMetadataPass();
+                return DrawVerdict::Drawn;
+            }
         }
         if (DrawPipeline::Active()) {
             DrawFinisher::NoteDeepKept(DeepKept::MetadataPass);
             DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
+        }
+        if (expand && drawParameters.indirect) {
+            recordQueuedLabelsBeforeRead(submission.queue);
+            if (!indirectRecordsDraw(*drawParameters.indirect)) return DrawVerdict::Nothing;
         }
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
         const std::shared_ptr<VulkanDevice> localDevice = device;
         recordLabelsForPacket(localDevice.get(), submission.queue);
-        localDevice->ColorMetadataPass(*pass);
+        if (metadata) localDevice->ColorMetadataPass(*metadata);
+        else localDevice->DepthExpandPass(*expand);
         return DrawVerdict::Drawn;
     }
     if (const auto copy = Graphics::DecodeDepthCopyPass(queue)) {
@@ -135,9 +157,11 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
     traceIndirect = traceIndirectEnabled;
     if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[draw] indirect packet %s args 0x%llx count %u reached\n", Pm4::Name(packet[0]).c_str(), static_cast<unsigned long long>(drawParameters.indirect->arguments), drawParameters.indirect->count);
     {
+        const auto colorControl = queue.context.find(0x202);
+        const bool colorDisabled = colorControl != queue.context.end() && ((colorControl->second >> 4u) & 7u) == 0u;
         const auto targetMask = queue.context.find(0x8e);
         const auto shaderMask = queue.context.find(0x8f);
-        const bool colorWrites = targetMask != queue.context.end() && shaderMask != queue.context.end() && Graphics::ColorWriteMask(queue.context) != 0;
+        const bool colorWrites = !colorDisabled && targetMask != queue.context.end() && shaderMask != queue.context.end() && Graphics::ColorWriteMask(queue.context) != 0;
         if (!colorWrites && !queue.shader.contains(0x8)) {
             const auto word = [&](std::uint32_t offset) { const auto it = queue.context.find(offset); return it == queue.context.end() ? 0u : it->second; };
             if ((word(0x200) & 3u) == 0 || ((word(0x010) & 3u) == 0 && (word(0x011) & 1u) == 0)) return DrawVerdict::Nothing;

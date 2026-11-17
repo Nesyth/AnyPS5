@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/LockProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libc/include/HostThread.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -448,7 +449,7 @@ struct ProcessSampler {
 void StartProcessSampler() {
     const auto path = ConfiguredPath(_wgetenv(L"APS5_SAMPLE_THREADS"));
     if (!path) return;
-    processSamplerThread = std::jthread([path = *path](std::stop_token token) {
+    processSamplerThread = Libc::StartHostJThread([path = *path](std::stop_token token) {
         auto sampler = std::make_unique<ProcessSampler>();
         sampler->path = path;
         sampler->self = GetCurrentThreadId();
@@ -502,7 +503,7 @@ void StartCallingThreadSampler(const std::optional<std::string>& path, std::jthr
             break;
         }
     }
-    slot = std::jthread([sampler = std::move(sampler)](std::stop_token token) {
+    slot = Libc::StartHostJThread([sampler = std::move(sampler)](std::stop_token token) {
         auto flushed = std::chrono::steady_clock::now();
         while (!token.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));

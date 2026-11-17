@@ -57,11 +57,13 @@ bool g_robust2 = false;
 bool g_waveLdsMemoryBarriers = false;
 bool g_deviceScopeLdsMemoryBarriers = false;
 bool g_ldsLockFences = false;
+bool g_deviceAtomicWorkgroupMemoryBarriers = false;
 bool g_shaderFma = false;
 bool g_gpuHeap = false;
 bool g_noGpuHeap = false;
 bool g_hasHeapDataUniformDwords = false;
 std::uint32_t g_heapDataUniformDwords = 0;
+bool g_shaderInt16 = false;
 
 constexpr std::uint32_t DefaultHeapDataUniformDwords = 16384u;
 
@@ -184,6 +186,7 @@ bool Replay(const char* path) {
     force(g_waveLdsMemoryBarriers, target.waveLdsMemoryBarriers, "wave-lds-memory-barriers");
     force(g_deviceScopeLdsMemoryBarriers, target.deviceScopeLdsMemoryBarriers, "device-scope-lds-memory-barriers");
     force(g_ldsLockFences, target.ldsLockFences, "lds-lock-fences");
+    force(g_deviceAtomicWorkgroupMemoryBarriers, target.deviceAtomicWorkgroupMemoryBarriers, "device-atomic-workgroup-memory-barriers");
     force(g_float16HostNans || g_float16WholeRegister || g_float16ScalarOnVector, target.float16HostNans, "f16-host-nans");
     force(g_float16WholeRegister, target.float16WholeRegister, "f16-whole-register");
     force(g_float16ScalarOnVector, target.float16ScalarOnVector, "f16-scalar-on-vector");
@@ -193,6 +196,10 @@ bool Replay(const char* path) {
         request.supportedExtensions.push_back("SPV_KHR_fma");
         request.request.target.supportedCapabilities = request.supportedCapabilities;
         request.request.target.supportedExtensions = request.supportedExtensions;
+    }
+    if (g_shaderInt16) {
+        request.supportedCapabilities.push_back(spv::CapabilityInt16);
+        request.request.target.supportedCapabilities = request.supportedCapabilities;
     }
     const auto heapProfile = SelectHeapProfile(request.request.target);
     if (g_float16WidenNans) request.request.target.float16WidenNans = true;
@@ -344,7 +351,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--lds-lock-fences] [--shader-fma] [--f16-widen-nans] [--f16-narrow-nans] [--f16-host-nans] [--f16-whole-register] [--f16-scalar-on-vector] [--f16-native-minmax] [--f32-hardware-flush-ops MASK] [--f32-native-unary MASK] [--f16-native-widen] [--f16-pack-toward-zero N] [--exact-robust-loads-align4] [--gpu-heap] [--no-gpu-heap] [--heap-data-uniform-dwords N] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n  a request replays with the heap profile it was captured with; --gpu-heap forces the heap profile (gpuResolvedImages, descriptorMemory, and 16384 data uniform dwords unless --heap-data-uniform-dwords is given, replacing a captured limit), --no-gpu-heap forces it off, --heap-data-uniform-dwords N forces the limit (0 selects ring-address reads); --gpu-heap with --no-gpu-heap, and --no-gpu-heap with a nonzero limit, exit 2\n  --maintenance8, --robust2, --wave-lds-memory-barriers, --device-scope-lds-memory-barriers and --lds-lock-fences force their target flag on over the captured value and are listed on a 'target flags forced on' line\n  --f16-host-nans forces float16HostNans on (a device sets it when its startup f16 NaN probe passes; requests do not carry it); --f16-whole-register and --f16-scalar-on-vector force it on too, because their packed and fma forms exist only with it, so compare them against a replay with --f16-host-nans alone; --f16-native-minmax forces float16NativeMinMax on, which compute programs take\n  --f32-hardware-flush-ops and --f32-native-unary set float32HardwareFlushOps and float32NativeUnaryOps to MASK over the captured value\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--lds-lock-fences] [--device-atomic-workgroup-memory-barriers] [--shader-fma] [--shader-int16] [--f16-widen-nans] [--f16-narrow-nans] [--f16-host-nans] [--f16-whole-register] [--f16-scalar-on-vector] [--f16-native-minmax] [--f32-hardware-flush-ops MASK] [--f32-native-unary MASK] [--f16-native-widen] [--f16-pack-toward-zero N] [--exact-robust-loads-align4] [--gpu-heap] [--no-gpu-heap] [--heap-data-uniform-dwords N] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n  a request replays with the heap profile it was captured with; --gpu-heap forces the heap profile (gpuResolvedImages, descriptorMemory, and 16384 data uniform dwords unless --heap-data-uniform-dwords is given, replacing a captured limit), --no-gpu-heap forces it off, --heap-data-uniform-dwords N forces the limit (0 selects ring-address reads); --gpu-heap with --no-gpu-heap, and --no-gpu-heap with a nonzero limit, exit 2\n  --maintenance8, --robust2, --wave-lds-memory-barriers, --device-scope-lds-memory-barriers, --lds-lock-fences and --device-atomic-workgroup-memory-barriers force their target flag on over the captured value and are listed on a 'target flags forced on' line\n  --f16-host-nans forces float16HostNans on (a device sets it when its startup f16 NaN probe passes; requests do not carry it); --f16-whole-register and --f16-scalar-on-vector force it on too, because their packed and fma forms exist only with it, so compare them against a replay with --f16-host-nans alone; --f16-native-minmax forces float16NativeMinMax on, which compute programs take\n  --f32-hardware-flush-ops and --f32-native-unary set float32HardwareFlushOps and float32NativeUnaryOps to MASK over the captured value\n");
         return 2;
     }
     if (HeapFlagsConflict(argc, argv)) return 2;
@@ -403,8 +410,16 @@ int main(int argc, char** argv) {
             g_ldsLockFences = true;
             continue;
         }
+        if (std::string(argv[i]) == "--device-atomic-workgroup-memory-barriers") {
+            g_deviceAtomicWorkgroupMemoryBarriers = true;
+            continue;
+        }
         if (std::string(argv[i]) == "--shader-fma") {
             g_shaderFma = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--shader-int16") {
+            g_shaderInt16 = true;
             continue;
         }
         if (std::string(argv[i]) == "--f16-widen-nans") {

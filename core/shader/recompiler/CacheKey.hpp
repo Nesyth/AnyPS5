@@ -376,6 +376,7 @@ private:
         append(key, value.tessellationEvaluationSubgroups);
         append(key, value.float16DenormPreserve);
         append(key, value.spannedWaves);
+        append(key, value.spannedAnySubgroup);
         append(key, value.robustBufferAccess2);
         append(key, value.float32FlushToZero);
         append(key, value.waveLdsMemoryBarriers);
@@ -390,6 +391,7 @@ private:
         append(key, value.heapDataUniformDwords);
         append(key, value.heapBufferDescriptors);
         append(key, value.ldsLockFences);
+        append(key, value.deviceAtomicWorkgroupMemoryBarriers);
         append(key, value.meshWindowBuffer);
         append(key, value.hostInterpolationFirst);
         append(key, value.shaderImageMinLod);
@@ -411,6 +413,7 @@ private:
             append(key, value.float16PackTowardZero);
         }
         if (value.exactRobustLoadsAlign4) append(key, 0x524f42414c494734ull);
+        append(key, value.meshInlineFunctions);
     }
 };
 

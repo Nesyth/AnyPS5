@@ -22,6 +22,12 @@
 
 namespace AgcDriver::DriverDetail {
 
+struct FlipWork {
+    bool finished = false;
+    std::uint64_t serial = 0;
+    std::shared_ptr<FlipWork> previous;
+};
+
 struct Submission {
     std::uint64_t serial;
     std::uint32_t queue;
@@ -30,6 +36,7 @@ struct Submission {
 
     std::shared_ptr<const ShaderRegistry> shaders;
     std::map<std::size_t, std::shared_ptr<IFlipRequest>> flips;
+    std::map<std::size_t, std::uint32_t> flipHandles;
     std::map<std::size_t, std::shared_ptr<IRenderingWait>> renderingWaits;
     std::map<std::size_t, std::size_t> conditionalEnds;
     std::map<std::size_t, std::vector<std::uint32_t>> registerLists;
@@ -37,6 +44,7 @@ struct Submission {
     bool suspend = false;
     bool waitFree = false;
     bool holdsFlip = false;
+    std::shared_ptr<FlipWork> flipWork;
     bool leanLists = false;
     bool verifySegment = false;
     FrontMode front = FrontMode::Unlatched;
@@ -55,6 +63,14 @@ struct Submission {
     std::chrono::steady_clock::time_point orderedAt{};
     const std::uint32_t* rewindTail = nullptr;
     std::size_t rewindWords = 0;
+    using PreparedWaits = std::map<std::pair<std::uint32_t, std::uint32_t>, std::shared_ptr<IRenderingWait>>;
+    struct IndirectSegment {
+        std::size_t start;
+        const std::uint32_t* target;
+        std::size_t words;
+        std::shared_ptr<const PreparedWaits> waits{};
+    };
+    std::vector<IndirectSegment> indirectSegments;
 };
 
 struct QueueWorker {

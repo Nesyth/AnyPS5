@@ -82,6 +82,7 @@ inline constexpr std::uint32_t BindlessTableSlots = 16u;
 inline constexpr std::uint32_t StorageMipSlots = 16u;
 inline constexpr std::uint32_t StorageHeapCapacity = 64u;
 inline constexpr std::uint32_t SamplerHeapCapacity = 64u;
+inline constexpr std::uint32_t AtomicLockCount = 1u << 20u;
 inline constexpr std::uint32_t GpuImageHeapSlots = static_cast<std::uint32_t>(Binding::Samplers) * 4096u;
 inline constexpr std::uint32_t GpuSamplerHeapSlots = 2048u;
 inline constexpr std::uint32_t GpuDataSet = 2u;

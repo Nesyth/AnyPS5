@@ -4261,7 +4261,8 @@ std::optional<Counter> Driver::resolveDirectStages(const LeanDrawJob& job, const
         }
         const auto& program = resolved.decode->programs[i];
         const auto pixel = program.binary.stage == Stage::Fragment && previous != nullptr ? Graphics::DefaultUnexportedInputs(decode.pixel, previous->parameterExports) : decode.pixel;
-        const auto request = [&] { return drawStageRequest(program, graphics, pixel, resolved.vertexInfos[i], resolved.memory, resolved.linked, device, cursor, job.parameters, std::nullopt); };
+        const bool hasFragment = std::ranges::any_of(resolved.decode->programs, [](const DrawProgram& value) { return value.binary.stage == Stage::Fragment; });
+        const auto request = [&] { return drawStageRequest(program, graphics, pixel, resolved.vertexInfos[i], resolved.memory, resolved.linked, device, cursor, job.parameters, std::nullopt, hasFragment); };
         auto built = request();
         lap(Step::Request);
         if (built.target.gpuResolvedImages) return Counter::FallbackHeap;

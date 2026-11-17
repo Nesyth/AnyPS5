@@ -44,6 +44,7 @@ struct TranslateOptions {
     bool gcnLegacyVertexInputs = false;
     bool nativeFloat16Fma = false;
     bool float16HostNans = false;
+    bool nativeInteger16 = false;
     bool float32HostNans = false;
     bool float32HostFmaNans = false;
     bool float16WholeRegister = false;
@@ -59,9 +60,6 @@ struct TranslateOptions {
 class InstructionTranslator {
 public:
     [[nodiscard]] IrProgram Translate(const RdnaProgram& decoded, const ControlFlowGraph& cfg, const TranslateOptions& options) const;
-
-private:
-    void translateInstruction(IrBuilder& builder, const RdnaInstruction& instruction, const ControlFlowGraph& cfg, const TranslateOptions& options) const;
 };
 
 }

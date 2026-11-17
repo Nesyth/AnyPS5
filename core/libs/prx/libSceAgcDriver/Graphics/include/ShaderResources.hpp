@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/WriteValidation.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuardSpans.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -55,6 +56,17 @@ struct WriteIndexOutcomes {
 };
 WriteIndexOutcomes WriteIndexOutcomesCounted();
 std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage = false);
+struct StorageTextureBudgetSnapshot {
+    std::optional<std::uint32_t> heap;
+    std::uint64_t sampledBytes = 0;
+    std::uint64_t storageBytes = 0;
+    std::uint64_t reserved = 0;
+    std::uint64_t available = 0;
+    std::uint64_t ceiling = 0;
+    std::uint64_t selectedBudget = 0;
+};
+
+StorageTextureBudgetSnapshot CalculateStorageTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t sampledBytes, std::uint64_t storageBytes);
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
 std::uint64_t StorageTextureCeiling(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported);
 std::uint64_t StorageTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t sampledBytes, std::uint64_t storageBytes);
@@ -72,6 +84,7 @@ struct TextureCacheUse {
 };
 TextureCacheUse TextureCacheUsage();
 void OverrideCacheBudgetForTest(std::uint64_t bytes);
+void SampledFromStorageForTest(bool enabled);
 std::uint64_t SampledTextureCacheBudget(const Context& context);
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
@@ -186,9 +199,11 @@ struct ImageTableReuseCounts {
     std::uint64_t variantSurfaces = 0;
     std::uint64_t variantSubstituted = 0;
     std::uint64_t variantRejected = 0;
+    std::uint64_t arrayViewsShared = 0;
 };
 ImageTableReuseCounts ImageTableReuses();
 std::uint64_t SampledTexturesCleared();
+std::uint64_t SampledTexturesImported();
 std::uint64_t SampledLookupKeyScans();
 std::uint64_t SampledLookupKeyProofs();
 
@@ -329,6 +344,8 @@ public:
         std::size_t size;
         std::span<const std::uint32_t> words;
         VkBuffer inPlace = VK_NULL_HANDLE;
+        VkDeviceSize inPlaceOffset = 0;
+        std::uint32_t adjustment = 0;
         VkDeviceSize importOffset = 0;
         std::uint64_t begin = 0;
         std::size_t bytes = 0;
@@ -897,6 +914,19 @@ public:
         for (const auto& [position, adjustment] : pushPatches) bytes[position] = static_cast<std::byte>(adjustment);
     }
     void PatchDataAddresses(std::span<std::byte, PipelinePushConstantBytes> bytes, std::span<const CompiledShader> shaders, const DrawBindings* rewritten) const;
+    bool PatchMovedPushConstants(std::span<std::byte, PipelinePushConstantBytes> bytes, std::span<const MovedBuffer> moved) const {
+        bool patched = false;
+        for (const auto& entry : moved) {
+            const auto& element = allocations[entry.allocation];
+            if (entry.inPlace == VK_NULL_HANDLE || element.pushByte < 0 || entry.adjustment == element.adjustment) continue;
+            bytes[static_cast<std::size_t>(element.pushByte)] = static_cast<std::byte>(entry.adjustment);
+            patched = true;
+        }
+        return patched;
+    }
+    static bool MovedPushPatches(std::span<const MovedBuffer> moved) {
+        return std::any_of(moved.begin(), moved.end(), [](const MovedBuffer& entry) { return entry.inPlace != VK_NULL_HANDLE; });
+    }
     // Whether RefreshData would record anything for `shader` (the per-word compare; verification).
     bool DataWordsDiffer(const CompiledShader& shader) const;
     std::size_t BindingCount() const { return bindings.size(); }
@@ -968,6 +998,8 @@ private:
         int tileMode = 0;
         std::uint64_t dccAddress = 0;
         bool imageTable = false;
+        std::optional<std::array<std::uint32_t, 8>> storedWords;
+        std::uint32_t storedMip = 0;
     };
     std::vector<DescribedRange> describedRanges;
     struct Allocation {
@@ -1069,6 +1101,7 @@ private:
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
     void requireGuestBuffers(std::span<const MovedBuffer> moved = {}, bool* found = nullptr) const;
     bool requireMovedGuestBuffers(std::span<const MovedBuffer> moved, const GuardTests* guards = nullptr, bool* found = nullptr, bool answered = false) const;
+    bool movedInPlace(Recorder& recorder, const Allocation& item, std::uint64_t address, std::uint64_t size, MovedBuffer& entry) const;
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
     // locks itself); stage B looks the sampled textures and storage images up (resolveImageBinding).
     void addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, std::span<const std::uint32_t> guest, VkShaderStageFlags flags);
@@ -1143,10 +1176,13 @@ private:
         const StorageTexture* source = nullptr;
         bool depth = false;
         bool valid = false;
+        std::uint64_t committedGeneration = 0;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> committed;
+        bool committedProved = false;
         std::array<std::uint64_t, 4> untracked{};
     };
     bool keepsTemplateRecords() const;
-    void captureValidation();
+    void captureValidation(bool spaceReusable);
     static void noteStampTaken();
     // A surface of this object the fast proof found a foreign image pending over: the element
     // (index into textures, or into storageTextures when `storage`) whose own object stands in for
@@ -1328,7 +1364,7 @@ private:
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceSize offset = 0;
     };
-    bool movedRangesClear(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::size_t>> ranges, MoveTicket* ticket, bool accessible, std::vector<InPlaceRange>* inPlace = nullptr, MovedCount* why = nullptr) const;
+    bool movedRangesClear(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::size_t>> ranges, MoveTicket* ticket, bool accessible, std::vector<InPlaceRange>* inPlace = nullptr, MovedCount* why = nullptr, std::vector<std::uint8_t>* behind = nullptr) const;
     bool takeMovedInPlace(const Recorder& recorder, std::uint64_t begin, std::size_t bytes, InPlaceRange& out) const;
     std::optional<MovedCount> inPlaceRefusalByWindows(const Recorder& recorder, std::uint64_t begin, std::size_t bytes, WriteValidation::Test test) const;
     std::shared_ptr<DrawBindings> selectDrawSnapshots(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, std::vector<std::size_t>& selected, bool census) const;
@@ -1463,6 +1499,7 @@ private:
     std::optional<std::pair<std::uint64_t, std::size_t>> htileClear;
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<bool> textureFirstLayer;
+    std::unordered_set<std::size_t> arrayViewTextures;
     std::vector<bool> textureBaseLevel;
     std::vector<bool> textureSrgb;
     std::vector<std::shared_ptr<StorageTexture>> storageTextures;
@@ -1473,6 +1510,7 @@ private:
     std::vector<bool> storageWritten;
     std::vector<bool> storageAtomic;
     std::vector<bool> storageAtomic64;
+    std::vector<bool> storageUint;
     std::vector<std::shared_ptr<Sampler>> samplers;
     std::shared_ptr<Sampler> paddingSampler;
     struct SamplerSource {
@@ -1562,6 +1600,7 @@ private:
     bool proofRangesBuilt = false;
     bool proofRangesKnown = false;
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>* rangedProofRanges();
+    std::uint64_t provedRetired = 0;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;

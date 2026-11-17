@@ -16,6 +16,7 @@ public:
     FirstSampleCopy& operator=(const FirstSampleCopy&) = delete;
 
     void Record(Recorder& recorder, Texture& source);
+    void Record(Recorder& recorder, VkImageView source, VkImageLayout layout);
     VkImage Image() const { return image; }
 
 private:

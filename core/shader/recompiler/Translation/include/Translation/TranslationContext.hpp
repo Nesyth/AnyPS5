@@ -17,6 +17,7 @@ public:
 
     void TranslateEmbeddedFetch(const RdnaInstruction& instruction, std::uint32_t attribute, std::uint32_t components);
     void TranslateInstruction(const RdnaInstruction& instruction);
+    void SetBufferLdsSize(std::uint32_t bytes) { bufferLdsBytes = bytes; }
     void SetPixelInput(const ShaderPixelInputInfo* info, bool barycentricEnabled) { pixelInput = info; fragmentShaderBarycentricEnabled = barycentricEnabled; }
     void SetFloatMode(const std::optional<ShaderFloatMode>& mode) {
         declaredFloatMode = mode;
@@ -26,6 +27,7 @@ public:
     }
     void SetEntryRounding(const RoundingState& state) { setRounding(state); }
     void SetNativeFloat16(bool enabled, bool fma, bool hostNans) { nativeFloat16 = enabled; nativeFloat16Fma = enabled && fma; float16HostNans = enabled && hostNans; }
+    void SetNativeInteger16(bool enabled) { nativeInteger16 = enabled; }
     void SetFloat16Forms(bool wholeRegister, bool scalarOnVector, bool nativeMinMax) { float16WholeRegister = wholeRegister; float16ScalarOnVector = scalarOnVector; float16NativeMinMax = nativeMinMax; }
     void SetFloat32DenormPreserve(bool enabled) { float32DenormPreserve = enabled; }
     void SetFloat32HostNans(bool enabled) { float32HostNans = enabled; }
@@ -122,6 +124,7 @@ private:
     std::array<IrU32, 2> readF64Bits(const RdnaOperand& operand);
     std::array<IrU32, 2> flushF64Bits(const std::array<IrU32, 2>& bits, std::uint32_t keepBit);
     IrValue& flushTinyF64Result(IrOpcode opcode, IrValue& lhs, IrValue& rhs, IrValue* addend, IrValue& result);
+    IrValue& nanResultF64(IrValue& lhs, IrValue& rhs, IrValue* addend, IrValue& result);
     IrU64 readF64(const RdnaOperand& operand);
     IrF32 readF16LaneAsF32(const RdnaOperand& operand, bool highLane, bool packed = false, bool nanPayloadUnused = false);
     IrF32 readF16AsF32(const RdnaOperand& operand, bool nanPayloadUnused = false);
@@ -138,6 +141,7 @@ private:
     IrU1 readMaskValid(const RdnaOperand& operand);
     static bool maskLanesExact(const RdnaOperand& operand);
     std::array<IrU32, 2> writeMask(const RdnaOperand& operand, IrU1 value, bool write64 = false);
+    void writeMaskLanes(const RdnaOperand& operand, IrU1 lane, IrU1 valid);
     void writeCompareResult(const RdnaOperand& operand, IrU1 value);
     MemoryFlags addMemoryInfo(const MemoryInfo& memory, std::uint32_t pc);
     bool floatAtomicFlush(IrOpcode opcode) const;
@@ -256,7 +260,9 @@ private:
     bool float16NativeFmaWords(const RdnaInstruction& inst, bool accumulator);
     bool minMaxF16Native(const RdnaInstruction& inst, IrOpcode opcode);
     IrF32 fmaF16RoundedToOdd(IrF32 lhs, IrF32 rhs, IrF32 addend);
+    IrF32 floatUnaryValue(const RdnaInstruction& inst, IrOpcode opcode);
     bool floatUnary(const RdnaInstruction& inst, IrOpcode opcode);
+    bool floatUnaryClampInfinity(const RdnaInstruction& inst, IrOpcode opcode);
     bool floatBinary(const RdnaInstruction& inst, IrOpcode opcode, bool reverse);
     bool floatTernary(const RdnaInstruction& inst, IrOpcode opcode, bool accumulator, bool mix);
     bool ieeeMinMaxF32(const RdnaInstruction& inst, IrOpcode opcode);
@@ -310,6 +316,8 @@ private:
     IrU32 saturateInteger16(const RdnaOperand& destination, IrU32 value, bool sign);
     bool packedInteger16Mad(const RdnaInstruction& inst, bool sign);
     bool packedInteger16MinMax(const RdnaInstruction& inst, IrOpcode opcode, bool sign);
+    IrU32 readPackedU16Source(const RdnaOperand& operand);
+    bool packedInteger16Native(const RdnaInstruction& inst, IrOpcode opcode, std::uint32_t first, std::uint32_t second);
     bool sU64Mask(const RdnaInstruction& inst, IrOpcode logicalOpcode, IrOpcode bitOpcode, bool negateRhs, bool negateResult, bool unary);
     IrU1 u64MaskBinary(const RdnaInstruction& inst, IrOpcode opcode, bool negateRhs, bool negateResult);
     template <typename TWord>
@@ -413,6 +421,7 @@ private:
     bool emitInterpolation(const RdnaInstruction& inst);
     bool emitMemory(const RdnaInstruction& inst);
 
+    std::uint32_t bufferLdsBytes = 0u;
     IrProgram& program;
     const ShaderPixelInputInfo* pixelInput = nullptr;
     bool fragmentShaderBarycentricEnabled = false;
@@ -423,6 +432,7 @@ private:
     bool nativeFloat16 = false;
     bool nativeFloat16Fma = false;
     bool float16HostNans = false;
+    bool nativeInteger16 = false;
     bool float16WholeRegister = false;
     bool float16ScalarOnVector = false;
     bool float16NativeMinMax = false;
