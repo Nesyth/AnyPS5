@@ -31,6 +31,17 @@ bool profiling() {
     return profile;
 }
 
+bool saveStats() {
+    static const bool stats = std::getenv("APS5_PIPELINE_CACHE_STATS") != nullptr;
+    return stats;
+}
+
+struct HeldFor {
+    double& total;
+    std::chrono::steady_clock::time_point from = std::chrono::steady_clock::now();
+    ~HeldFor() { total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count(); }
+};
+
 std::mutex& pathMutex(const std::filesystem::path& path) {
     struct Registry {
         std::mutex mutex;
@@ -209,9 +220,12 @@ void PipelineCache::save(bool final, bool waitForPipelines) try {
     const auto getData = context.Function<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
     const auto snapshot = [&] { return waitForPipelines ? synchronization.LockForSnapshot() : synchronization.TryLockForSnapshot(); };
     std::size_t liveBytes = 0;
+    double heldMs = 0.0;
+    double copyMs = 0.0;
     {
         auto synchronizationLock = snapshot();
         if (!synchronizationLock.owns_lock()) return;
+        const HeldFor held{heldMs};
         if (getData(context.device, cache, &liveBytes, nullptr) != VK_SUCCESS || liveBytes == 0) return;
     }
     const auto onDisk = readHeader();
@@ -259,6 +273,7 @@ void PipelineCache::save(bool final, bool waitForPipelines) try {
     if (merged != VK_NULL_HANDLE) {
         auto synchronizationLock = snapshot();
         if (!synchronizationLock.owns_lock()) return;
+        const HeldFor held{heldMs};
         const auto result = context.Function<PFN_vkMergePipelineCaches>("vkMergePipelineCaches")(context.device, merged, 1, &cache);
         if (result != VK_SUCCESS) {
             std::fprintf(stderr, "[pipeline-cache] cannot merge into %s (Vulkan result %d); not saving over it\n", path.string().c_str(), static_cast<int>(result));
@@ -271,6 +286,7 @@ void PipelineCache::save(bool final, bool waitForPipelines) try {
     {
         auto synchronizationLock = source == cache ? snapshot() : PipelineCacheSynchronization::SnapshotLock{};
         if (source == cache && !synchronizationLock.owns_lock()) return;
+        const HeldFor held{source == cache ? heldMs : copyMs};
         if (getData(context.device, source, &size, nullptr) != VK_SUCCESS || size == 0) return;
         if (merged != VK_NULL_HANDLE && size == disk.header.dataBytes) {
             settle(disk.header);
@@ -294,6 +310,7 @@ void PipelineCache::save(bool final, bool waitForPipelines) try {
         return;
     }
     settle(header);
+    if (saveStats()) std::fprintf(stderr, "[pipeline-cache] save stats: %.1f KiB written, pipeline creation held off %.1f ms, merged copy %.1f ms, whole save %.1f ms%s\n", static_cast<double>(size) / 1024.0, heldMs, copyMs, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), mergedWithFile ? " (merged with the file)" : "");
     if (final || profiling()) std::fprintf(stderr, "[pipeline-cache] saved %.1f KiB to %s in %.1f ms%s%s\n", static_cast<double>(size) / 1024.0, path.string().c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), mergedWithFile ? " (merged with the file)" : "", final ? " (teardown)" : "");
 } catch (const std::bad_alloc&) {
     std::fputs("[pipeline-cache] save skipped: host memory exhausted\n", stderr);

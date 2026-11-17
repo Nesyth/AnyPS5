@@ -81,32 +81,24 @@ Section OwnSection() noexcept {
     return section;
 }
 
-std::uintptr_t CallerInOwnModule(const void* returnAddress) noexcept {
+std::uintptr_t CallerInOwnModule() noexcept {
     static const Section section = OwnSection();
     if (section.end == 0) return 0;
-    std::uintptr_t anchor = 0;
-    const auto* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
-    const auto* slot = reinterpret_cast<const std::uintptr_t*>((reinterpret_cast<std::uintptr_t>(&anchor) + 7u) & ~std::uintptr_t{7});
-    const auto* top = static_cast<const std::uintptr_t*>(tib->StackBase);
-    if (slot >= top) return 0;
-    if (top - slot > 8192) top = slot + 8192;
-    bool started = false;
-    for (; slot < top; ++slot) {
-        const auto value = *slot;
-        if (!started) {
-            started = value == reinterpret_cast<std::uintptr_t>(returnAddress);
+    void* frames[62];
+    const USHORT count = RtlCaptureStackBackTrace(0, 62, frames, nullptr);
+    bool left = false;
+    for (USHORT index = 0; index < count; ++index) {
+        const auto value = reinterpret_cast<std::uintptr_t>(frames[index]);
+        if (value < section.low || value >= section.end) {
+            left = true;
             continue;
         }
-        if (value < section.low + 7 || value >= section.end) continue;
-        const auto* code = reinterpret_cast<const unsigned char*>(value);
-        const bool direct = code[-5] == 0xe8;
-        const bool indirect = code[-2] == 0xff || code[-3] == 0xff || code[-6] == 0xff || code[-7] == 0xff;
-        if (direct || indirect) return value;
+        if (left) return value;
     }
     return 0;
 }
 #else
-std::uintptr_t CallerInOwnModule(const void*) noexcept {
+std::uintptr_t CallerInOwnModule() noexcept {
     return 0;
 }
 #endif
@@ -173,7 +165,7 @@ void MaybeReport() noexcept {
     else if (now >= due && reportAt.compare_exchange_strong(due, now + ReportEveryMs, std::memory_order_relaxed)) Report();
 }
 
-void* Take(std::size_t size, std::size_t alignment, VkSystemAllocationScope scope, const void* returnAddress) noexcept {
+void* Take(std::size_t size, std::size_t alignment, VkSystemAllocationScope scope) noexcept {
     if (size == 0) return nullptr;
     const std::size_t align = std::max<std::size_t>(alignment, 16);
     if (size > static_cast<std::size_t>(-1) - align - sizeof(Header)) return nullptr;
@@ -183,7 +175,7 @@ void* Take(std::size_t size, std::size_t alignment, VkSystemAllocationScope scop
     Header header{size, static_cast<std::uint32_t>(address - reinterpret_cast<std::uintptr_t>(raw)), static_cast<std::uint16_t>(std::min<std::size_t>(static_cast<std::size_t>(scope), Scopes - 1)), NoSite};
     const auto before = sampleClock.fetch_add(size, std::memory_order_relaxed);
     if (size >= SampleBytes || before / SampleBytes != (before + size) / SampleBytes) {
-        const auto caller = CallerInOwnModule(returnAddress);
+        const auto caller = CallerInOwnModule();
         header.site = SiteOf(caller != 0 ? caller : NoFrame);
         if (header.site != NoSite) {
             sites[header.site].bytes.fetch_add(Weight(size), std::memory_order_relaxed);
@@ -220,18 +212,17 @@ void Give(void* memory) noexcept {
 }
 
 void* VKAPI_CALL Allocation(void*, std::size_t size, std::size_t alignment, VkSystemAllocationScope scope) {
-    return Take(size, alignment, scope, __builtin_return_address(0));
+    return Take(size, alignment, scope);
 }
 
 void* VKAPI_CALL Reallocation(void*, void* original, std::size_t size, std::size_t alignment, VkSystemAllocationScope scope) {
-    const void* const returnAddress = __builtin_return_address(0);
-    if (original == nullptr) return Take(size, alignment, scope, returnAddress);
+    if (original == nullptr) return Take(size, alignment, scope);
     if (size == 0) {
         Give(original);
         return nullptr;
     }
     const Header header = HeaderOf(original);
-    void* const fresh = Take(size, alignment, scope, returnAddress);
+    void* const fresh = Take(size, alignment, scope);
     if (fresh == nullptr) return nullptr;
     std::memcpy(fresh, original, std::min<std::size_t>(size, static_cast<std::size_t>(header.bytes)));
     Give(original);
